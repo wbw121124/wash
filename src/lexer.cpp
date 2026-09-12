@@ -1,0 +1,694 @@
+/**
+ * @file lexer.cpp
+ * @brief wash 词法分析器实现
+ * 
+ * @author wash
+ * @date 2026-09-12
+ */
+
+#include "lexer.h"
+#include <cctype>
+#include <stdexcept>
+
+namespace wash {
+
+// 保留关键字列表
+static const std::vector<std::string> RESERVED_KEYWORDS = {
+    "env", "if", "elif", "else", "for", "while", "in",
+    "return", "break", "continue", "true", "false", "calc"
+};
+
+Lexer::Lexer(const std::string& source, const std::string& filename)
+    : source_(source), filename_(filename), pos_(0), line_(1), column_(1),
+      tokenStart_(0), tokenLine_(1), tokenColumn_(1), tokenIndex_(0) {}
+
+std::vector<Token> Lexer::tokenize() {
+    tokens_.clear();
+    tokenIndex_ = 0;
+    
+    while (!isAtEnd()) {
+        Token token = scanToken();
+        tokens_.push_back(token);
+        
+        if (token.type == TokenType::EOF_TOKEN) {
+            break;
+        }
+    }
+    
+    return tokens_;
+}
+
+Token Lexer::nextToken() {
+    if (tokenIndex_ < tokens_.size()) {
+        return tokens_[tokenIndex_++];
+    }
+    return makeToken(TokenType::EOF_TOKEN);
+}
+
+Token Lexer::peekToken() {
+    if (tokenIndex_ < tokens_.size()) {
+        return tokens_[tokenIndex_];
+    }
+    return makeToken(TokenType::EOF_TOKEN);
+}
+
+bool Lexer::hasMore() const {
+    return tokenIndex_ < tokens_.size();
+}
+
+size_t Lexer::getCurrentLine() const {
+    return line_;
+}
+
+size_t Lexer::getCurrentColumn() const {
+    return column_;
+}
+
+const std::string& Lexer::getFilename() const {
+    return filename_;
+}
+
+bool Lexer::isReservedKeyword(const std::string& word) {
+    for (const auto& kw : RESERVED_KEYWORDS) {
+        if (kw == word) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool Lexer::isValidVariableName(const std::string& name) {
+    if (name.empty()) {
+        return false;
+    }
+    
+    // 第一个字符必须是字母或下划线
+    if (!std::isalpha(name[0]) && name[0] != '_') {
+        return false;
+    }
+    
+    // 后续字符必须是字母、数字、下划线或连字符
+    for (size_t i = 1; i < name.size(); ++i) {
+        char c = name[i];
+        if (!std::isalnum(c) && c != '_' && c != '-') {
+            return false;
+        }
+    }
+    
+    // 不能是保留关键字
+    return !isReservedKeyword(name);
+}
+
+bool Lexer::isValidFunctionName(const std::string& name) {
+    return isValidVariableName(name);
+}
+
+Token Lexer::scanToken() {
+    skipWhitespace();
+    
+    if (isAtEnd()) {
+        return makeToken(TokenType::EOF_TOKEN);
+    }
+    
+    tokenStart_ = pos_;
+    tokenLine_ = line_;
+    tokenColumn_ = column_;
+    
+    char c = current();
+    
+    // 数字
+    if (std::isdigit(c)) {
+        return scanNumber();
+    }
+    
+    // 标识符或关键字
+    if (std::isalpha(c) || c == '_') {
+        return scanIdentifier();
+    }
+    
+    // 变量 %var
+    if (c == '%') {
+        return scanVariable();
+    }
+    
+    // 命令 $cmd
+    if (c == '$') {
+        return scanCommand();
+    }
+    
+    // 重定向 @(...)
+    if (c == '@') {
+        return scanRedirect();
+    }
+    
+    // 字符串
+    if (c == '\'') {
+        return scanSingleQuoteString();
+    }
+    
+    if (c == '"') {
+        return scanDoubleQuoteString();
+    }
+    
+    if (c == '`') {
+        return scanBacktickString();
+    }
+    
+    // 注释
+    if (c == '#') {
+        // 检查是否为块注释 #[[ ... ]]#
+        if (peek() == '[' && peek(1) == '[') {
+            return scanBlockComment();
+        }
+        // 行注释
+        skipLineComment();
+        return scanToken();  // 递归获取下一个 Token
+    }
+    
+    if (c == '/' && peek() == '*') {
+        return scanBlockComment();
+    }
+    
+    // 运算符和分隔符
+    advance();
+    
+    switch (c) {
+        case '+': return makeToken(TokenType::PLUS, "+");
+        case '-': return makeToken(TokenType::MINUS, "-");
+        case '*': return makeToken(TokenType::STAR, "*");
+        case '/': return makeToken(TokenType::SLASH, "/");
+        case '%': return makeToken(TokenType::PERCENT, "%");
+        case '^': return makeToken(TokenType::CARET, "^");
+        case '&': {
+            if (current() == '&') {
+                advance();
+                return makeToken(TokenType::AND, "&&");
+            }
+            return makeToken(TokenType::AMPERSAND, "&");
+        }
+        case '|': {
+            if (current() == '|') {
+                advance();
+                return makeToken(TokenType::OR, "||");
+            }
+            return makeToken(TokenType::PIPE, "|");
+        }
+        case '~': return makeToken(TokenType::TILDE, "~");
+        case '<': {
+            if (current() == '=') {
+                advance();
+                return makeToken(TokenType::LESS_EQ, "<=");
+            }
+            if (current() == '<') {
+                advance();
+                return makeToken(TokenType::LSHIFT, "<<");
+            }
+            return makeToken(TokenType::LESS, "<");
+        }
+        case '>': {
+            if (current() == '=') {
+                advance();
+                return makeToken(TokenType::GREATER_EQ, ">=");
+            }
+            if (current() == '>') {
+                advance();
+                return makeToken(TokenType::RSHIFT, ">>");
+            }
+            return makeToken(TokenType::GREATER, ">");
+        }
+        case '=': {
+            if (current() == '=') {
+                advance();
+                return makeToken(TokenType::EQUAL, "==");
+            }
+            return makeToken(TokenType::ASSIGN, "=");
+        }
+        case '!': {
+            if (current() == '=') {
+                advance();
+                return makeToken(TokenType::NOT_EQUAL, "!=");
+            }
+            return makeToken(TokenType::NOT, "!");
+        }
+        case '(': return makeToken(TokenType::LPAREN, "(");
+        case ')': return makeToken(TokenType::RPAREN, ")");
+        case '{': return makeToken(TokenType::LBRACE, "{");
+        case '}': return makeToken(TokenType::RBRACE, "}");
+        case '[': return makeToken(TokenType::LBRACKET, "[");
+        case ']': return makeToken(TokenType::RBRACKET, "]");
+        case ';': return makeToken(TokenType::SEMICOLON, ";");
+        case ',': return makeToken(TokenType::COMMA, ",");
+        case ':': return makeToken(TokenType::COLON, ":");
+        case '.': return makeToken(TokenType::DOT, ".");
+        case '\n': return makeToken(TokenType::NEWLINE, "\n");
+        default:
+            return makeError(std::string("意外字符: ") + c);
+    }
+}
+
+Token Lexer::scanNumber() {
+    std::string num;
+    bool hasDot = false;
+    
+    while (!isAtEnd() && (std::isdigit(current()) || current() == '.')) {
+        if (current() == '.') {
+            if (hasDot) {
+                break;
+            }
+            hasDot = true;
+        }
+        num += current();
+        advance();
+    }
+    
+    return makeToken(TokenType::NUMBER, num);
+}
+
+Token Lexer::scanIdentifier() {
+    std::string id;
+    
+    while (!isAtEnd() && (std::isalnum(current()) || current() == '_' || current() == '-')) {
+        id += current();
+        advance();
+    }
+    
+    // 检查是否为关键字
+    if (isReservedKeyword(id)) {
+        if (id == "if") return makeToken(TokenType::IF, id);
+        if (id == "elif") return makeToken(TokenType::ELIF, id);
+        if (id == "else") return makeToken(TokenType::ELSE, id);
+        if (id == "for") return makeToken(TokenType::FOR, id);
+        if (id == "while") return makeToken(TokenType::WHILE, id);
+        if (id == "in") return makeToken(TokenType::IN, id);
+        if (id == "return") return makeToken(TokenType::RETURN, id);
+        if (id == "break") return makeToken(TokenType::BREAK, id);
+        if (id == "continue") return makeToken(TokenType::CONTINUE, id);
+        if (id == "true") return makeToken(TokenType::TRUE, id);
+        if (id == "false") return makeToken(TokenType::FALSE, id);
+        if (id == "calc") return makeToken(TokenType::CALC, id);
+        if (id == "env") {
+            // env 作为标识符时可能需要特殊处理
+            return makeToken(TokenType::IDENTIFIER, id);
+        }
+    }
+    
+    return makeToken(TokenType::IDENTIFIER, id);
+}
+
+Token Lexer::scanSingleQuoteString() {
+    advance();  // 跳过开头的 '
+    std::string str;
+    
+    while (!isAtEnd() && current() != '\'') {
+        if (current() == '\\') {
+            advance();
+            if (isAtEnd()) {
+                return makeError("字符串未结束");
+            }
+            char escaped = current();
+            if (escaped == '\'') {
+                str += '\'';
+            } else if (escaped == '\\') {
+                str += '\\';
+            } else {
+                str += '\\';
+                str += escaped;
+            }
+        } else {
+            str += current();
+        }
+        advance();
+    }
+    
+    if (isAtEnd()) {
+        return makeError("字符串未结束");
+    }
+    
+    advance();  // 跳过结尾的 '
+    return makeToken(TokenType::STRING, str);
+}
+
+Token Lexer::scanDoubleQuoteString() {
+    advance();  // 跳过开头的 "
+    std::string str;
+    
+    while (!isAtEnd() && current() != '"') {
+        if (current() == '\\') {
+            advance();
+            if (isAtEnd()) {
+                return makeError("字符串未结束");
+            }
+            char escaped = escapeChar(current());
+            if (escaped == '\0') {
+                return makeError(std::string("无效转义序列: \\") + current());
+            }
+            str += escaped;
+        } else if (current() == '%' && peek() == '{') {
+            // 变量插值 %{var}
+            str += "%{";
+            advance();
+            advance();
+            while (!isAtEnd() && current() != '}') {
+                str += current();
+                advance();
+            }
+            if (!isAtEnd()) {
+                str += '}';
+                advance();
+            }
+        } else {
+            str += current();
+        }
+        advance();
+    }
+    
+    if (isAtEnd()) {
+        return makeError("字符串未结束");
+    }
+    
+    advance();  // 跳过结尾的 "
+    return makeToken(TokenType::STRING, str);
+}
+
+Token Lexer::scanBacktickString() {
+    advance();  // 跳过开头的 `
+    std::string str;
+    
+    while (!isAtEnd() && current() != '`') {
+        if (current() == '\\') {
+            advance();
+            if (isAtEnd()) {
+                return makeError("字符串未结束");
+            }
+            char escaped = escapeChar(current());
+            if (escaped == '\0') {
+                return makeError(std::string("无效转义序列: \\") + current());
+            }
+            str += escaped;
+        } else if (current() == '%' && peek() == '{') {
+            // 变量插值 %{var}
+            str += "%{";
+            advance();
+            advance();
+            while (!isAtEnd() && current() != '}') {
+                str += current();
+                advance();
+            }
+            if (!isAtEnd()) {
+                str += '}';
+                advance();
+            }
+        } else {
+            if (current() == '\n') {
+                line_++;
+                column_ = 1;
+            }
+            str += current();
+        }
+        advance();
+    }
+    
+    if (isAtEnd()) {
+        return makeError("字符串未结束");
+    }
+    
+    advance();  // 跳过结尾的 `
+    return makeToken(TokenType::STRING, str);
+}
+
+Token Lexer::scanBlockComment() {
+    if (current() == '#' && peek() == '[' && peek(1) == '[') {
+        // #[[ ... ]]# 格式
+        advance();  // #
+        advance();  // [
+        advance();  // [
+        advance();  // 换行
+        
+        while (!isAtEnd()) {
+            if (current() == ']' && peek() == ']' && peek(1) == '#') {
+                advance();  // ]
+                advance();  // ]
+                advance();  // #
+                return makeToken(TokenType::NONE);
+            }
+            if (current() == '\n') {
+                line_++;
+                column_ = 1;
+            }
+            advance();
+        }
+    } else if (current() == '/' && peek() == '*') {
+        // /* ... */ 格式
+        advance();  // /
+        advance();  // *
+        
+        while (!isAtEnd()) {
+            if (current() == '*' && peek() == '/') {
+                advance();  // *
+                advance();  // /
+                return makeToken(TokenType::NONE);
+            }
+            if (current() == '\n') {
+                line_++;
+                column_ = 1;
+            }
+            advance();
+        }
+    }
+    
+    return makeError("注释未结束");
+}
+
+Token Lexer::scanVariable() {
+    advance();  // 跳过 %
+    
+    // 检查是否为 %env.var
+    if (current() == 'e' && peek() == 'n' && peek(1) == 'v') {
+        // 保存当前位置
+        size_t savedPos = pos_;
+        size_t savedLine = line_;
+        size_t savedCol = column_;
+        
+        advance();  // e
+        advance();  // n
+        advance();  // v
+        
+        if (current() == '.') {
+            // %env.var 格式
+            advance();  // 跳过 .
+            std::string varName;
+            while (!isAtEnd() && (std::isalnum(current()) || current() == '_' || current() == '-')) {
+                varName += current();
+                advance();
+            }
+            return makeToken(TokenType::ENV_VAR, varName);
+        } else {
+            // 不是 %env.var，恢复位置并作为普通变量处理
+            pos_ = savedPos;
+            line_ = savedLine;
+            column_ = savedCol;
+        }
+    }
+    
+    // 普通变量 %var
+    std::string varName;
+    while (!isAtEnd() && (std::isalnum(current()) || current() == '_' || current() == '-')) {
+        varName += current();
+        advance();
+    }
+    
+    if (varName.empty()) {
+        return makeError("变量名为空");
+    }
+    
+    if (!isValidVariableName(varName)) {
+        return makeError("无效的变量名: " + varName);
+    }
+    
+    return makeToken(TokenType::VAR, varName);
+}
+
+Token Lexer::scanCommand() {
+    advance();  // 跳过 $
+    
+    // 检查是否为 $(...) 命令输出替换
+    if (current() == '(') {
+        return scanCommandOutput();
+    }
+    
+    // 检查是否为 $"..." 带引号的命令
+    if (current() == '"') {
+        advance();  // 跳过 "
+        std::string cmd;
+        while (!isAtEnd() && current() != '"') {
+            if (current() == '\\') {
+                advance();
+                if (!isAtEnd()) {
+                    cmd += current();
+                }
+            } else {
+                cmd += current();
+            }
+            advance();
+        }
+        if (!isAtEnd()) {
+            advance();  // 跳过 "
+        }
+        return makeToken(TokenType::CMD_STRING, cmd);
+    }
+    
+    // 普通命令 $cmd
+    std::string cmd;
+    while (!isAtEnd() && !std::isspace(current()) && current() != '|' && 
+           current() != ';' && current() != '\n' && current() != '@') {
+        cmd += current();
+        advance();
+    }
+    
+    if (cmd.empty()) {
+        return makeError("命令名为空");
+    }
+    
+    return makeToken(TokenType::COMMAND, cmd);
+}
+
+Token Lexer::scanCommandOutput() {
+    advance();  // 跳过 (
+    
+    std::string cmd;
+    int depth = 1;
+    
+    while (!isAtEnd() && depth > 0) {
+        if (current() == '(') {
+            depth++;
+        } else if (current() == ')') {
+            depth--;
+            if (depth == 0) {
+                break;
+            }
+        }
+        cmd += current();
+        advance();
+    }
+    
+    if (!isAtEnd()) {
+        advance();  // 跳过 )
+    }
+    
+    return makeToken(TokenType::CMD_OUTPUT, cmd);
+}
+
+Token Lexer::scanRedirect() {
+    advance();  // 跳过 @
+    
+    if (current() != '(') {
+        return makeError("重定向格式错误，应为 @(...)");
+    }
+    
+    advance();  // 跳过 (
+    
+    std::string content;
+    int depth = 1;
+    
+    while (!isAtEnd() && depth > 0) {
+        if (current() == '(') {
+            depth++;
+        } else if (current() == ')') {
+            depth--;
+            if (depth == 0) {
+                break;
+            }
+        }
+        content += current();
+        advance();
+    }
+    
+    if (!isAtEnd()) {
+        advance();  // 跳过 )
+    }
+    
+    return makeToken(TokenType::REDIRECT, content);
+}
+
+void Lexer::skipWhitespace() {
+    while (!isAtEnd() && std::isspace(current()) && current() != '\n') {
+        advance();
+    }
+}
+
+void Lexer::skipLineComment() {
+    while (!isAtEnd() && current() != '\n') {
+        advance();
+    }
+}
+
+char Lexer::current() const {
+    if (pos_ >= source_.size()) {
+        return '\0';
+    }
+    return source_[pos_];
+}
+
+char Lexer::peek() const {
+    return peek(0);
+}
+
+char Lexer::peek(size_t n) const {
+    size_t idx = pos_ + n;
+    if (idx >= source_.size()) {
+        return '\0';
+    }
+    return source_[idx];
+}
+
+void Lexer::advance() {
+    if (pos_ < source_.size()) {
+        if (source_[pos_] == '\n') {
+            line_++;
+            column_ = 1;
+        } else {
+            column_++;
+        }
+        pos_++;
+    }
+}
+
+void Lexer::back() {
+    if (pos_ > 0) {
+        pos_--;
+        if (source_[pos_] == '\n') {
+            line_--;
+            // 这里简化处理，实际应该计算上一行的列数
+            column_ = 1;
+        } else {
+            column_--;
+        }
+    }
+}
+
+bool Lexer::isAtEnd() const {
+    return pos_ >= source_.size();
+}
+
+Token Lexer::makeToken(TokenType type, const std::string& value) {
+    return Token(type, value, tokenLine_, tokenColumn_);
+}
+
+Token Lexer::makeError(const std::string& message) {
+    return Token(TokenType::ERROR, message, tokenLine_, tokenColumn_);
+}
+
+char Lexer::escapeChar(char c) const {
+    switch (c) {
+        case 'n': return '\n';
+        case 't': return '\t';
+        case 'r': return '\r';
+        case '\\': return '\\';
+        case '"': return '"';
+        case '%': return '%';
+        case '$': return '$';
+        default: return '\0';
+    }
+}
+
+} // namespace wash
