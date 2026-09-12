@@ -1,0 +1,48 @@
+# wash 示例脚本
+
+# 测试变量
+%name="wash"
+%version="1.0"
+echo("欢迎使用 wash " + %version + "!")
+
+# 测试算术运算
+%a=10
+%b=20
+%c=calc(%a + %b)
+echo("10 + 20 = " + %c)
+
+# 测试比较运算
+%result=calc(%a > %b)
+echo("10 > 20: " + %result)
+
+# 测试 if 语句
+if(calc(%a < %b)){
+    echo("%a 小于 %b")
+} else {
+    echo("%a 大于等于 %b")
+}
+
+# 测试 for 循环
+echo("计算 1 到 5 的和:")
+%sum=0
+for(%i in 1..5){
+    %sum=calc(%sum + %i)
+}
+echo("总和: " + %sum)
+
+# 测试内建函数
+%d=calc(3.14)
+%rounded=round(%d)
+echo("round(3.14) = " + %rounded)
+
+%ceiled=ceil(%d)
+echo("ceil(3.14) = " + %ceiled)
+
+%floored=floor(%d)
+echo("floor(3.14) = " + %floored)
+
+# 测试环境变量
+%env:test_var="hello"
+echo("环境变量: " + %env:test_var)
+
+echo("测试完成!")

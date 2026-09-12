@@ -1,0 +1,14 @@
+# wash 系统级配置文件
+# 此文件在登录 shell 启动时加载
+
+# 设置默认 PS1 提示符
+%env:washPS1="[\u@\h \W]\$ "
+
+# 设置历史记录最大条数
+%env:HISTORY_MAX=10000
+
+# 示例：定义别名函数
+# alias: {
+#     %env:ll="ls -la"
+#     %env:la="ls -a"
+# }

@@ -18,6 +18,10 @@
 #include <map>
 #include <functional>
 
+#ifdef IN
+#undef IN
+#endif
+
 namespace wash {
 
 /**
@@ -90,18 +94,18 @@ enum class TokenType {
     FOR,            ///< for
     WHILE,          ///< while
     IN,             ///< in
-    RETURN,         ///< return
-    BREAK,          ///< break
-    CONTINUE,       ///< continue
-    TRUE,           ///< true
-    FALSE,          ///< false
+    RETURN_KW,      ///< return 关键字
+    BREAK_KW,       ///< break
+    CONTINUE_KW,    ///< continue
+    TRUE_KW,        ///< true
+    FALSE_KW,       ///< false
     CALC,           ///< calc
     
     // 特殊
-    NEWLINE,        ///< 换行
+    NEWLINE_TOK,    ///< 换行
     EOF_TOKEN,      ///< 文件结束
-    ERROR,          ///< 错误
-    NONE            ///< 无类型
+    ERROR_TOK,      ///< 错误
+    NONE_TOK        ///< 无类型
 };
 
 /**
@@ -120,7 +124,7 @@ struct Token {
      * @param l 行号
      * @param c 列号
      */
-    Token(TokenType t = TokenType::NONE, const std::string& v = "", 
+    Token(TokenType t = TokenType::NONE_TOK, const std::string& v = "", 
          size_t l = 0, size_t c = 0)
         : type(t), value(v), line(l), column(c) {}
 };
@@ -678,9 +682,9 @@ struct ExpressionStmtNode : public ASTNode {
  */
 enum class ExecResultType {
     NORMAL,         ///< 正常
-    RETURN,         ///< return 语句
-    BREAK,          ///< break 语句
-    CONTINUE,       ///< continue 语句
+    RETURN_RES,     ///< return 语句
+    BREAK_RES,      ///< break 语句
+    CONTINUE_RES,   ///< continue 语句
 };
 
 /**

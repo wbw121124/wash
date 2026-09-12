@@ -13,15 +13,8 @@
 #include <cmath>
 #include <algorithm>
 #include <cstdio>
-
-#ifdef _WIN32
-#include <windows.h>
-#include <io.h>
-#include <fcntl.h>
-#else
 #include <unistd.h>
 #include <sys/wait.h>
-#endif
 
 namespace wash {
 
@@ -55,15 +48,9 @@ Value Executor::getVariable(const std::string& name) {
 void Executor::setEnvVariable(const std::string& name, const Value& value) {
     envVars_[name] = value;
     
-    // 同步到系统环境变量
     std::string envName = "wash_" + name;
     std::string envValue = valueToString(value);
-    
-#ifdef _WIN32
-    SetEnvironmentVariableA(envName.c_str(), envValue.c_str());
-#else
     setenv(envName.c_str(), envValue.c_str(), 1);
-#endif
 }
 
 Value Executor::getEnvVariable(const std::string& name) {
@@ -72,20 +59,11 @@ Value Executor::getEnvVariable(const std::string& name) {
         return it->second;
     }
     
-    // 尝试从系统环境变量读取
     std::string envName = "wash_" + name;
-#ifdef _WIN32
-    char buf[1024];
-    DWORD len = GetEnvironmentVariableA(envName.c_str(), buf, sizeof(buf));
-    if (len > 0 && len < sizeof(buf)) {
-        return makeStringValue(std::string(buf, len));
-    }
-#else
     const char* val = getenv(envName.c_str());
     if (val) {
         return makeStringValue(std::string(val));
     }
-#endif
     
     return makeStringValue("");
 }
@@ -99,14 +77,10 @@ void Executor::defineFunction(const std::string& name, Function func) {
 }
 
 ExecResult Executor::callFunction(const std::string& name, const std::vector<Value>& args) {
-    // 检查内建函数
     auto it = functions_.find(name);
     if (it != functions_.end()) {
         return it->second(args);
     }
-    
-    // 检查用户定义函数
-    // TODO: 从作用域中查找用户定义的函数
     
     std::cerr << "错误: 未知函数: " << name << std::endl;
     return ExecResult(ExecResultType::NORMAL, makeNumberValue(1));
@@ -118,10 +92,6 @@ void Executor::enterScope() {
 }
 
 void Executor::exitScope() {
-    if (currentScope_) {
-        // 这里简化处理，实际应该保存父作用域
-        // currentScope_ = currentScope_->parent_;
-    }
 }
 
 int Executor::getExitCode() const {
@@ -174,9 +144,9 @@ ExecResult Executor::executeNode(ASTPtr node) {
         case NodeType::WHILE_STMT:
             return executeWhile(static_cast<WhileNode*>(node.get()));
         case NodeType::BREAK_STMT:
-            return ExecResult(ExecResultType::BREAK);
+            return ExecResult(ExecResultType::BREAK_RES);
         case NodeType::CONTINUE_STMT:
-            return ExecResult(ExecResultType::CONTINUE);
+            return ExecResult(ExecResultType::CONTINUE_RES);
         case NodeType::RETURN_STMT:
             return executeReturn(static_cast<ReturnNode*>(node.get()));
         case NodeType::FUNCTION_DEF:
@@ -244,7 +214,6 @@ ExecResult Executor::executeBinaryOp(BinaryOpNode* node) {
     Value left = leftResult.value;
     Value right = rightResult.value;
     
-    // 字符串拼接
     if (node->op == "+") {
         if (std::holds_alternative<std::string>(left) || std::holds_alternative<std::string>(right)) {
             std::string leftStr = valueToString(left);
@@ -253,57 +222,33 @@ ExecResult Executor::executeBinaryOp(BinaryOpNode* node) {
         }
     }
     
-    // 其他运算转换为数字
     double leftNum = valueToNumber(left);
     double rightNum = valueToNumber(right);
     
-    if (node->op == "+") {
-        return ExecResult(ExecResultType::NORMAL, makeNumberValue(leftNum + rightNum));
-    } else if (node->op == "-") {
-        return ExecResult(ExecResultType::NORMAL, makeNumberValue(leftNum - rightNum));
-    } else if (node->op == "*") {
-        return ExecResult(ExecResultType::NORMAL, makeNumberValue(leftNum * rightNum));
-    } else if (node->op == "/") {
-        if (rightNum == 0) {
-            std::cerr << "错误: 除零" << std::endl;
-            return ExecResult(ExecResultType::NORMAL, makeNumberValue(0));
-        }
+    if (node->op == "+") return ExecResult(ExecResultType::NORMAL, makeNumberValue(leftNum + rightNum));
+    if (node->op == "-") return ExecResult(ExecResultType::NORMAL, makeNumberValue(leftNum - rightNum));
+    if (node->op == "*") return ExecResult(ExecResultType::NORMAL, makeNumberValue(leftNum * rightNum));
+    if (node->op == "/") {
+        if (rightNum == 0) { std::cerr << "错误: 除零" << std::endl; return ExecResult(ExecResultType::NORMAL, makeNumberValue(0)); }
         return ExecResult(ExecResultType::NORMAL, makeNumberValue(leftNum / rightNum));
-    } else if (node->op == "%") {
-        if (rightNum == 0) {
-            std::cerr << "错误: 模零" << std::endl;
-            return ExecResult(ExecResultType::NORMAL, makeNumberValue(0));
-        }
-        return ExecResult(ExecResultType::NORMAL, makeNumberValue(std::fmod(leftNum, rightNum)));
-    } else if (node->op == "^") {
-        return ExecResult(ExecResultType::NORMAL, makeNumberValue(std::pow(leftNum, rightNum)));
-    } else if (node->op == "&") {
-        return ExecResult(ExecResultType::NORMAL, makeNumberValue(static_cast<int>(leftNum) & static_cast<int>(rightNum)));
-    } else if (node->op == "|") {
-        return ExecResult(ExecResultType::NORMAL, makeNumberValue(static_cast<int>(leftNum) | static_cast<int>(rightNum)));
-    } else if (node->op == "^") {
-        return ExecResult(ExecResultType::NORMAL, makeNumberValue(static_cast<int>(leftNum) ^ static_cast<int>(rightNum)));
-    } else if (node->op == "<<") {
-        return ExecResult(ExecResultType::NORMAL, makeNumberValue(static_cast<int>(leftNum) << static_cast<int>(rightNum)));
-    } else if (node->op == ">>") {
-        return ExecResult(ExecResultType::NORMAL, makeNumberValue(static_cast<int>(leftNum) >> static_cast<int>(rightNum)));
-    } else if (node->op == "<") {
-        return ExecResult(ExecResultType::NORMAL, makeNumberValue(leftNum < rightNum ? 1.0 : 0.0));
-    } else if (node->op == "<=") {
-        return ExecResult(ExecResultType::NORMAL, makeNumberValue(leftNum <= rightNum ? 1.0 : 0.0));
-    } else if (node->op == ">") {
-        return ExecResult(ExecResultType::NORMAL, makeNumberValue(leftNum > rightNum ? 1.0 : 0.0));
-    } else if (node->op == ">=") {
-        return ExecResult(ExecResultType::NORMAL, makeNumberValue(leftNum >= rightNum ? 1.0 : 0.0));
-    } else if (node->op == "==") {
-        return ExecResult(ExecResultType::NORMAL, makeNumberValue(leftNum == rightNum ? 1.0 : 0.0));
-    } else if (node->op == "!=") {
-        return ExecResult(ExecResultType::NORMAL, makeNumberValue(leftNum != rightNum ? 1.0 : 0.0));
-    } else if (node->op == "&&") {
-        return ExecResult(ExecResultType::NORMAL, makeNumberValue((leftNum != 0) && (rightNum != 0) ? 1.0 : 0.0));
-    } else if (node->op == "||") {
-        return ExecResult(ExecResultType::NORMAL, makeNumberValue((leftNum != 0) || (rightNum != 0) ? 1.0 : 0.0));
     }
+    if (node->op == "%") {
+        if (rightNum == 0) { std::cerr << "错误: 模零" << std::endl; return ExecResult(ExecResultType::NORMAL, makeNumberValue(0)); }
+        return ExecResult(ExecResultType::NORMAL, makeNumberValue(std::fmod(leftNum, rightNum)));
+    }
+    if (node->op == "^") return ExecResult(ExecResultType::NORMAL, makeNumberValue(std::pow(leftNum, rightNum)));
+    if (node->op == "&") return ExecResult(ExecResultType::NORMAL, makeNumberValue(static_cast<int>(leftNum) & static_cast<int>(rightNum)));
+    if (node->op == "|") return ExecResult(ExecResultType::NORMAL, makeNumberValue(static_cast<int>(leftNum) | static_cast<int>(rightNum)));
+    if (node->op == "<<") return ExecResult(ExecResultType::NORMAL, makeNumberValue(static_cast<int>(leftNum) << static_cast<int>(rightNum)));
+    if (node->op == ">>") return ExecResult(ExecResultType::NORMAL, makeNumberValue(static_cast<int>(leftNum) >> static_cast<int>(rightNum)));
+    if (node->op == "<") return ExecResult(ExecResultType::NORMAL, makeNumberValue(leftNum < rightNum ? 1.0 : 0.0));
+    if (node->op == "<=") return ExecResult(ExecResultType::NORMAL, makeNumberValue(leftNum <= rightNum ? 1.0 : 0.0));
+    if (node->op == ">") return ExecResult(ExecResultType::NORMAL, makeNumberValue(leftNum > rightNum ? 1.0 : 0.0));
+    if (node->op == ">=") return ExecResult(ExecResultType::NORMAL, makeNumberValue(leftNum >= rightNum ? 1.0 : 0.0));
+    if (node->op == "==") return ExecResult(ExecResultType::NORMAL, makeNumberValue(leftNum == rightNum ? 1.0 : 0.0));
+    if (node->op == "!=") return ExecResult(ExecResultType::NORMAL, makeNumberValue(leftNum != rightNum ? 1.0 : 0.0));
+    if (node->op == "&&") return ExecResult(ExecResultType::NORMAL, makeNumberValue((leftNum != 0) && (rightNum != 0) ? 1.0 : 0.0));
+    if (node->op == "||") return ExecResult(ExecResultType::NORMAL, makeNumberValue((leftNum != 0) || (rightNum != 0) ? 1.0 : 0.0));
     
     std::cerr << "错误: 未知运算符: " << node->op << std::endl;
     return ExecResult(ExecResultType::NORMAL, makeNumberValue(0));
@@ -311,20 +256,13 @@ ExecResult Executor::executeBinaryOp(BinaryOpNode* node) {
 
 ExecResult Executor::executeUnaryOp(UnaryOpNode* node) {
     ExecResult operandResult = executeNode(node->operand);
-    if (operandResult.type != ExecResultType::NORMAL) {
-        return operandResult;
-    }
+    if (operandResult.type != ExecResultType::NORMAL) return operandResult;
     
-    Value operand = operandResult.value;
-    double num = valueToNumber(operand);
+    double num = valueToNumber(operandResult.value);
     
-    if (node->op == "-") {
-        return ExecResult(ExecResultType::NORMAL, makeNumberValue(-num));
-    } else if (node->op == "!") {
-        return ExecResult(ExecResultType::NORMAL, makeNumberValue(num == 0 ? 1.0 : 0.0));
-    } else if (node->op == "~") {
-        return ExecResult(ExecResultType::NORMAL, makeNumberValue(~static_cast<int>(num)));
-    }
+    if (node->op == "-") return ExecResult(ExecResultType::NORMAL, makeNumberValue(-num));
+    if (node->op == "!") return ExecResult(ExecResultType::NORMAL, makeNumberValue(num == 0 ? 1.0 : 0.0));
+    if (node->op == "~") return ExecResult(ExecResultType::NORMAL, makeNumberValue(~static_cast<int>(num)));
     
     std::cerr << "错误: 未知一元运算符: " << node->op << std::endl;
     return ExecResult(ExecResultType::NORMAL, makeNumberValue(0));
@@ -332,46 +270,32 @@ ExecResult Executor::executeUnaryOp(UnaryOpNode* node) {
 
 ExecResult Executor::executeTernaryOp(TernaryOpNode* node) {
     ExecResult condResult = executeNode(node->condition);
-    if (condResult.type != ExecResultType::NORMAL) {
-        return condResult;
-    }
+    if (condResult.type != ExecResultType::NORMAL) return condResult;
     
-    if (isTruthy(condResult.value)) {
-        return executeNode(node->trueExpr);
-    } else {
-        return executeNode(node->falseExpr);
-    }
+    if (isTruthy(condResult.value)) return executeNode(node->trueExpr);
+    else return executeNode(node->falseExpr);
 }
 
 ExecResult Executor::executeFunctionCall(FunctionCallNode* node) {
     std::vector<Value> args;
     for (const auto& arg : node->args) {
         ExecResult result = executeNode(arg);
-        if (result.type != ExecResultType::NORMAL) {
-            return result;
-        }
+        if (result.type != ExecResultType::NORMAL) return result;
         args.push_back(result.value);
     }
-    
     return callFunction(node->name, args);
 }
 
 ExecResult Executor::executeAssignment(AssignmentNode* node) {
     ExecResult valueResult = executeNode(node->value);
-    if (valueResult.type != ExecResultType::NORMAL) {
-        return valueResult;
-    }
-    
+    if (valueResult.type != ExecResultType::NORMAL) return valueResult;
     setVariable(node->varName, valueResult.value);
     return ExecResult(ExecResultType::NORMAL, valueResult.value);
 }
 
 ExecResult Executor::executeEnvAssignment(EnvAssignmentNode* node) {
     ExecResult valueResult = executeNode(node->value);
-    if (valueResult.type != ExecResultType::NORMAL) {
-        return valueResult;
-    }
-    
+    if (valueResult.type != ExecResultType::NORMAL) return valueResult;
     setEnvVariable(node->varName, valueResult.value);
     return ExecResult(ExecResultType::NORMAL, valueResult.value);
 }
@@ -382,19 +306,10 @@ ExecResult Executor::executeCommand(CommandExecNode* node) {
     
     for (const auto& arg : node->args) {
         ExecResult result = executeNode(arg);
-        if (result.type != ExecResultType::NORMAL) {
-            return result;
-        }
+        if (result.type != ExecResultType::NORMAL) return result;
         args.push_back(valueToString(result.value));
     }
     
-    // 构建完整命令
-    std::string fullCmd = cmd;
-    for (const auto& arg : args) {
-        fullCmd += " " + arg;
-    }
-    
-    // 执行命令
     int exitCode = executeExternalCommand(cmd, args);
     setExitCode(exitCode);
     
@@ -402,22 +317,7 @@ ExecResult Executor::executeCommand(CommandExecNode* node) {
 }
 
 ExecResult Executor::executeCommandOutput(CommandOutputNode* node) {
-    // 执行命令并捕获输出
     std::string cmd = node->command;
-    
-#ifdef _WIN32
-    // Windows 实现
-    std::string output;
-    FILE* pipe = _popen((cmd + " 2>&1").c_str(), "r");
-    if (pipe) {
-        char buffer[4096];
-        while (fgets(buffer, sizeof(buffer), pipe)) {
-            output += buffer;
-        }
-        _pclose(pipe);
-    }
-#else
-    // Unix 实现
     std::string output;
     FILE* pipe = popen((cmd + " 2>&1").c_str(), "r");
     if (pipe) {
@@ -427,9 +327,7 @@ ExecResult Executor::executeCommandOutput(CommandOutputNode* node) {
         }
         pclose(pipe);
     }
-#endif
     
-    // 去掉末尾换行
     if (!output.empty() && output.back() == '\n') {
         output.pop_back();
     }
@@ -439,9 +337,7 @@ ExecResult Executor::executeCommandOutput(CommandOutputNode* node) {
 
 ExecResult Executor::executeIf(IfNode* node) {
     ExecResult condResult = executeNode(node->condition);
-    if (condResult.type != ExecResultType::NORMAL) {
-        return condResult;
-    }
+    if (condResult.type != ExecResultType::NORMAL) return condResult;
     
     if (isTruthy(condResult.value)) {
         return executeNode(node->thenBlock);
@@ -449,19 +345,11 @@ ExecResult Executor::executeIf(IfNode* node) {
     
     for (const auto& [elifCond, elifBlock] : node->elifBlocks) {
         ExecResult elifCondResult = executeNode(elifCond);
-        if (elifCondResult.type != ExecResultType::NORMAL) {
-            return elifCondResult;
-        }
-        
-        if (isTruthy(elifCondResult.value)) {
-            return executeNode(elifBlock);
-        }
+        if (elifCondResult.type != ExecResultType::NORMAL) return elifCondResult;
+        if (isTruthy(elifCondResult.value)) return executeNode(elifBlock);
     }
     
-    if (node->elseBlock) {
-        return executeNode(node->elseBlock);
-    }
-    
+    if (node->elseBlock) return executeNode(node->elseBlock);
     return ExecResult(ExecResultType::NORMAL, makeNumberValue(0));
 }
 
@@ -472,17 +360,11 @@ ExecResult Executor::executeFor(ForNode* node) {
     
     for (const auto& value : range) {
         setVariable(node->varName, value);
-        
         ExecResult result = executeNode(node->body);
         
-        if (result.type == ExecResultType::BREAK) {
-            break;
-        } else if (result.type == ExecResultType::CONTINUE) {
-            continue;
-        } else if (result.type == ExecResultType::RETURN) {
-            exitScope();
-            return result;
-        }
+        if (result.type == ExecResultType::BREAK_RES) break;
+        if (result.type == ExecResultType::CONTINUE_RES) continue;
+        if (result.type == ExecResultType::RETURN_RES) { exitScope(); return result; }
     }
     
     exitScope();
@@ -494,25 +376,13 @@ ExecResult Executor::executeWhile(WhileNode* node) {
     
     while (true) {
         ExecResult condResult = executeNode(node->condition);
-        if (condResult.type != ExecResultType::NORMAL) {
-            exitScope();
-            return condResult;
-        }
-        
-        if (!isTruthy(condResult.value)) {
-            break;
-        }
+        if (condResult.type != ExecResultType::NORMAL) { exitScope(); return condResult; }
+        if (!isTruthy(condResult.value)) break;
         
         ExecResult result = executeNode(node->body);
-        
-        if (result.type == ExecResultType::BREAK) {
-            break;
-        } else if (result.type == ExecResultType::CONTINUE) {
-            continue;
-        } else if (result.type == ExecResultType::RETURN) {
-            exitScope();
-            return result;
-        }
+        if (result.type == ExecResultType::BREAK_RES) break;
+        if (result.type == ExecResultType::CONTINUE_RES) continue;
+        if (result.type == ExecResultType::RETURN_RES) { exitScope(); return result; }
     }
     
     exitScope();
@@ -522,19 +392,16 @@ ExecResult Executor::executeWhile(WhileNode* node) {
 ExecResult Executor::executeReturn(ReturnNode* node) {
     if (node->value) {
         ExecResult valueResult = executeNode(node->value);
-        return ExecResult(ExecResultType::RETURN, valueResult.value);
+        return ExecResult(ExecResultType::RETURN_RES, valueResult.value);
     }
-    return ExecResult(ExecResultType::RETURN, makeNumberValue(0));
+    return ExecResult(ExecResultType::RETURN_RES, makeNumberValue(0));
 }
 
 ExecResult Executor::executeFunctionDef(FunctionDefNode* node) {
-    // 创建用户定义函数
     std::string name = node->name;
     ASTPtr body = node->body;
-    Executor* executor = this;
     
-    Function func = [executor, body](const std::vector<Value>& args) -> ExecResult {
-        // TODO: 实现用户定义函数调用
+    Function func = [](const std::vector<Value>& args) -> ExecResult {
         return ExecResult(ExecResultType::NORMAL, makeNumberValue(0));
     };
     
@@ -543,36 +410,25 @@ ExecResult Executor::executeFunctionDef(FunctionDefNode* node) {
 }
 
 ExecResult Executor::executeLambdaDef(LambdaDefNode* node) {
-    // 返回一个 lambda 值
-    // TODO: 实现 lambda 值
     return ExecResult(ExecResultType::NORMAL, makeStringValue("<lambda>"));
 }
 
 std::vector<Value> Executor::generateRange(ASTPtr range) {
     std::vector<Value> result;
+    if (!range) return result;
     
-    if (!range) {
-        return result;
-    }
-    
-    // 如果是字符串，解析范围
     if (range->type == NodeType::LITERAL) {
         auto literal = std::static_pointer_cast<LiteralNode>(range);
         if (std::holds_alternative<std::string>(literal->value)) {
             std::string rangeStr = std::get<std::string>(literal->value);
-            // TODO: 解析范围字符串 "1..10" 或 "1,2,3"
-            // 简单实现：尝试解析为数字
             try {
                 double num = std::stod(rangeStr);
                 result.push_back(makeNumberValue(num));
-            } catch (...) {
-                // 解析失败，返回空
-            }
+            } catch (...) {}
             return result;
         }
     }
     
-    // 如果是二元运算（范围运算符 ..）
     if (range->type == NodeType::BINARY_OP) {
         auto binOp = std::static_pointer_cast<BinaryOpNode>(range);
         if (binOp->op == ".." || binOp->op == "..<") {
@@ -606,7 +462,6 @@ std::vector<std::string> Executor::parseRedirectContent(const std::string& conte
     std::string token;
     
     while (std::getline(iss, token, ',')) {
-        // 去除前后空格
         size_t start = token.find_first_not_of(" \t");
         size_t end = token.find_last_not_of(" \t");
         if (start != std::string::npos) {
@@ -623,13 +478,9 @@ int Executor::executeExternalCommand(const std::string& cmd, const std::vector<s
         fullCmd += " " + arg;
     }
     
-#ifdef _WIN32
-    int result = system(fullCmd.c_str());
-#else
     pid_t pid = fork();
     
     if (pid == 0) {
-        // 子进程
         std::vector<char*> cArgs;
         cArgs.push_back(const_cast<char*>(cmd.c_str()));
         for (const auto& arg : args) {
@@ -641,7 +492,6 @@ int Executor::executeExternalCommand(const std::string& cmd, const std::vector<s
         perror("execvp");
         exit(1);
     } else if (pid > 0) {
-        // 父进程
         int status;
         waitpid(pid, &status, 0);
         
@@ -653,14 +503,6 @@ int Executor::executeExternalCommand(const std::string& cmd, const std::vector<s
         perror("fork");
         return -1;
     }
-#endif
-    
-    return 0;
-}
-
-int Executor::executePipe(const std::vector<std::string>& commands) {
-    // TODO: 实现管道
-    return 0;
 }
 
 void Executor::outputToStdout(const Value& value) {
@@ -672,7 +514,6 @@ void Executor::outputToStderr(const Value& value) {
 }
 
 void Executor::registerBuiltinFunctions() {
-    // echo 函数
     defineFunction("echo", [this](const std::vector<Value>& args) -> ExecResult {
         for (const auto& arg : args) {
             outputToStdout(arg);
@@ -682,7 +523,6 @@ void Executor::registerBuiltinFunctions() {
         return ExecResult(ExecResultType::NORMAL, makeNumberValue(0));
     });
     
-    // stderr 函数
     defineFunction("stderr", [this](const std::vector<Value>& args) -> ExecResult {
         for (const auto& arg : args) {
             outputToStderr(arg);
@@ -690,7 +530,6 @@ void Executor::registerBuiltinFunctions() {
         return ExecResult(ExecResultType::NORMAL, makeNumberValue(0));
     });
     
-    // panic 函数
     defineFunction("panic", [this](const std::vector<Value>& args) -> ExecResult {
         for (const auto& arg : args) {
             outputToStderr(arg);
@@ -700,64 +539,42 @@ void Executor::registerBuiltinFunctions() {
         return ExecResult(ExecResultType::NORMAL, makeNumberValue(1));
     });
     
-    // round 函数
     defineFunction("round", [](const std::vector<Value>& args) -> ExecResult {
-        if (args.empty()) {
-            return ExecResult(ExecResultType::NORMAL, makeNumberValue(0));
-        }
-        double num = valueToNumber(args[0]);
-        return ExecResult(ExecResultType::NORMAL, makeNumberValue(std::round(num)));
+        if (args.empty()) return ExecResult(ExecResultType::NORMAL, makeNumberValue(0));
+        return ExecResult(ExecResultType::NORMAL, makeNumberValue(std::round(valueToNumber(args[0]))));
     });
     
-    // ceil 函数
     defineFunction("ceil", [](const std::vector<Value>& args) -> ExecResult {
-        if (args.empty()) {
-            return ExecResult(ExecResultType::NORMAL, makeNumberValue(0));
-        }
-        double num = valueToNumber(args[0]);
-        return ExecResult(ExecResultType::NORMAL, makeNumberValue(std::ceil(num)));
+        if (args.empty()) return ExecResult(ExecResultType::NORMAL, makeNumberValue(0));
+        return ExecResult(ExecResultType::NORMAL, makeNumberValue(std::ceil(valueToNumber(args[0]))));
     });
     
-    // floor 函数
     defineFunction("floor", [](const std::vector<Value>& args) -> ExecResult {
-        if (args.empty()) {
-            return ExecResult(ExecResultType::NORMAL, makeNumberValue(0));
-        }
-        double num = valueToNumber(args[0]);
-        return ExecResult(ExecResultType::NORMAL, makeNumberValue(std::floor(num)));
+        if (args.empty()) return ExecResult(ExecResultType::NORMAL, makeNumberValue(0));
+        return ExecResult(ExecResultType::NORMAL, makeNumberValue(std::floor(valueToNumber(args[0]))));
     });
     
-    // argc 函数
-    defineFunction("argc", [this](const std::vector<Value>& args) -> ExecResult {
-        // TODO: 实现 argc
+    defineFunction("argc", [](const std::vector<Value>& args) -> ExecResult {
         return ExecResult(ExecResultType::NORMAL, makeNumberValue(0));
     });
     
-    // argv 函数
-    defineFunction("argv", [this](const std::vector<Value>& args) -> ExecResult {
-        // TODO: 实现 argv
+    defineFunction("argv", [](const std::vector<Value>& args) -> ExecResult {
         return ExecResult(ExecResultType::NORMAL, makeStringValue(""));
     });
     
-    // return 函数（特殊处理）
-    defineFunction("return", [this](const std::vector<Value>& args) -> ExecResult {
-        if (args.empty()) {
-            return ExecResult(ExecResultType::RETURN, makeNumberValue(0));
-        }
-        return ExecResult(ExecResultType::RETURN, args[0]);
+    defineFunction("return", [](const std::vector<Value>& args) -> ExecResult {
+        if (args.empty()) return ExecResult(ExecResultType::RETURN_RES, makeNumberValue(0));
+        return ExecResult(ExecResultType::RETURN_RES, args[0]);
     });
     
-    // break 函数
-    defineFunction("break", [this](const std::vector<Value>& args) -> ExecResult {
-        return ExecResult(ExecResultType::BREAK);
+    defineFunction("break", [](const std::vector<Value>& args) -> ExecResult {
+        return ExecResult(ExecResultType::BREAK_RES);
     });
     
-    // continue 函数
-    defineFunction("continue", [this](const std::vector<Value>& args) -> ExecResult {
-        return ExecResult(ExecResultType::CONTINUE);
+    defineFunction("continue", [](const std::vector<Value>& args) -> ExecResult {
+        return ExecResult(ExecResultType::CONTINUE_RES);
     });
     
-    // env 函数（查看所有环境变量）
     defineFunction("env", [this](const std::vector<Value>& args) -> ExecResult {
         for (const auto& [name, value] : envVars_) {
             outputToStdout(makeStringValue(name + "=" + valueToString(value) + "\n"));

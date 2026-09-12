@@ -47,7 +47,7 @@ ASTPtr Parser::parseStatement() {
     Token& tok = current();
     
     // 跳过换行和分号
-    if (tok.type == TokenType::NEWLINE || tok.type == TokenType::SEMICOLON) {
+    if (tok.type == TokenType::NEWLINE_TOK || tok.type == TokenType::SEMICOLON) {
         advance();
         return nullptr;
     }
@@ -68,17 +68,17 @@ ASTPtr Parser::parseStatement() {
     }
     
     // return 语句
-    if (tok.type == TokenType::RETURN) {
+    if (tok.type == TokenType::RETURN_KW) {
         return parseReturnStatement();
     }
     
     // break 语句
-    if (tok.type == TokenType::BREAK) {
+    if (tok.type == TokenType::BREAK_KW) {
         return parseBreakStatement();
     }
     
     // continue 语句
-    if (tok.type == TokenType::CONTINUE) {
+    if (tok.type == TokenType::CONTINUE_KW) {
         return parseContinueStatement();
     }
     
@@ -346,13 +346,19 @@ ASTPtr Parser::parsePrimary() {
         return std::make_shared<LiteralNode>(makeStringValue(tok.value), tok.line, tok.column);
     }
     
+    // 标识符（变量名或函数名）
+    if (tok.type == TokenType::IDENTIFIER) {
+        advance();
+        return std::make_shared<VariableNode>(tok.value, tok.line, tok.column);
+    }
+    
     // true/false
-    if (tok.type == TokenType::TRUE) {
+    if (tok.type == TokenType::TRUE_KW) {
         advance();
         return std::make_shared<LiteralNode>(makeNumberValue(1.0), tok.line, tok.column);
     }
     
-    if (tok.type == TokenType::FALSE) {
+    if (tok.type == TokenType::FALSE_KW) {
         advance();
         return std::make_shared<LiteralNode>(makeNumberValue(0.0), tok.line, tok.column);
     }
@@ -373,7 +379,8 @@ ASTPtr Parser::parsePrimary() {
     if (tok.type == TokenType::ENV_VIEW) {
         advance();
         // 这应该是一个特殊的内建函数调用
-        return std::make_shared<FunctionCallNode>("env", {}, tok.line, tok.column);
+        std::vector<ASTPtr> emptyArgs;
+        return std::make_shared<FunctionCallNode>("env", emptyArgs, tok.line, tok.column);
     }
     
     // 命令执行
@@ -384,7 +391,7 @@ ASTPtr Parser::parsePrimary() {
         
         // 收集命令参数
         while (pos_ < tokens_.size() && 
-               current().type != TokenType::NEWLINE &&
+               current().type != TokenType::NEWLINE_TOK &&
                current().type != TokenType::SEMICOLON &&
                current().type != TokenType::PIPE &&
                current().type != TokenType::REDIRECT &&
@@ -398,7 +405,8 @@ ASTPtr Parser::parsePrimary() {
     // 带引号的命令
     if (tok.type == TokenType::CMD_STRING) {
         advance();
-        return std::make_shared<CommandExecNode>(tok.value, {}, tok.line, tok.column);
+        std::vector<ASTPtr> emptyArgs;
+        return std::make_shared<CommandExecNode>(tok.value, emptyArgs, tok.line, tok.column);
     }
     
     // 命令输出替换
@@ -785,13 +793,13 @@ void Parser::error(const std::string& message) {
 
 void Parser::skipNewlines() {
     while (pos_ < tokens_.size() && 
-           (current().type == TokenType::NEWLINE || current().type == TokenType::SEMICOLON)) {
+           (current().type == TokenType::NEWLINE_TOK || current().type == TokenType::SEMICOLON)) {
         advance();
     }
 }
 
 bool Parser::isStatementEnd() {
-    return current().type == TokenType::NEWLINE ||
+    return current().type == TokenType::NEWLINE_TOK ||
            current().type == TokenType::SEMICOLON ||
            current().type == TokenType::EOF_TOKEN;
 }

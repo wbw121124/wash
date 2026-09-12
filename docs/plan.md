@@ -190,6 +190,9 @@ wash [选项] [文件名]
 - [x] 实现内建函数和环境变量
 - [x] 实现 rc 文件加载
 - [x] 实现 history 功能
+- [x] 修复 readline 宏冲突 (RETURN/NEWLINE/IN 等)
+- [x] 安装 msys64 readline-devel 并切换到 msys64 纯 POSIX 环境
+- [x] 首次编译通过并成功运行
 
 ## 更新日志
 
@@ -197,3 +200,6 @@ wash [选项] [文件名]
 |------|----------|
 | 2026-09-12 | 初始计划创建 |
 | 2026-09-12 | 修复 CMakeLists.txt，创建 types.h 类型定义 |
+| 2026-09-12 | 实现词法分析器、语法分析器、执行器、主程序 |
+| 2026-09-12 | 修复 readline 宏冲突，安装 msys64 readline-devel |
+| 2026-09-12 | 切换到 msys64 纯 POSIX 环境，首次编译运行成功 |

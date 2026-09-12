@@ -48,10 +48,16 @@ public:
     Token peekToken();
     
     /**
-     * @brief 检查是否还有更多 Token
-     * @return 是否还有 Token
+     * @brief 检查是否已无更多 Token
+     * @return 是否已无更多 Token
      */
     bool hasMore() const;
+    
+    /**
+     * @brief 检查是否有错误 Token
+     * @return 是否有错误
+     */
+    bool hasError() const;
     
     /**
      * @brief 获取当前行号

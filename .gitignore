@@ -1,0 +1,29 @@
+# 构建目录
+build/
+cmake-build-*/
+
+# 编译产物
+*.o
+*.obj
+*.exe
+*.dll
+*.so
+*.dylib
+
+# IDE 文件
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 历史记录
+~/.wash_history
+
+# 临时文件
+*.tmp
+*.bak
