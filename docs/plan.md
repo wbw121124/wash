@@ -184,7 +184,7 @@ wash [选项] [文件名]
 - [x] 修复 CMakeLists.txt 并配置 readline
 - [x] 创建基础头文件类型定义 (types.h)
 - [x] 实现词法分析器 (lexer.h/cpp)
-- [ ] 实现语法分析器 (parser.h/cpp)
+- [x] 实现语法分析器 (parser.h/cpp)
 - [ ] 实现执行器 (executor.h/cpp)
 - [ ] 实现 main.cpp 命令行参数和交互循环
 - [ ] 实现内建函数和环境变量

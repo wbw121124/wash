@@ -1,0 +1,799 @@
+/**
+ * @file parser.cpp
+ * @brief wash 语法分析器实现
+ * 
+ * @author wash
+ * @date 2026-09-12
+ */
+
+#include "parser.h"
+#include <stdexcept>
+
+namespace wash {
+
+Parser::Parser(const std::vector<Token>& tokens, const std::string& filename)
+    : tokens_(tokens), pos_(0), filename_(filename), hasError_(false) {}
+
+ASTPtr Parser::parse() {
+    auto program = std::make_shared<ProgramNode>();
+    
+    skipNewlines();
+    
+    while (pos_ < tokens_.size() && current().type != TokenType::EOF_TOKEN) {
+        ASTPtr stmt = parseStatement();
+        if (stmt) {
+            program->statements.push_back(stmt);
+        }
+        
+        if (hasError_) {
+            return nullptr;
+        }
+        
+        skipNewlines();
+    }
+    
+    return program;
+}
+
+const std::string& Parser::getError() const {
+    return error_;
+}
+
+bool Parser::hasError() const {
+    return hasError_;
+}
+
+ASTPtr Parser::parseStatement() {
+    Token& tok = current();
+    
+    // 跳过换行和分号
+    if (tok.type == TokenType::NEWLINE || tok.type == TokenType::SEMICOLON) {
+        advance();
+        return nullptr;
+    }
+    
+    // if 语句
+    if (tok.type == TokenType::IF) {
+        return parseIfStatement();
+    }
+    
+    // for 循环
+    if (tok.type == TokenType::FOR) {
+        return parseForStatement();
+    }
+    
+    // while 循环
+    if (tok.type == TokenType::WHILE) {
+        return parseWhileStatement();
+    }
+    
+    // return 语句
+    if (tok.type == TokenType::RETURN) {
+        return parseReturnStatement();
+    }
+    
+    // break 语句
+    if (tok.type == TokenType::BREAK) {
+        return parseBreakStatement();
+    }
+    
+    // continue 语句
+    if (tok.type == TokenType::CONTINUE) {
+        return parseContinueStatement();
+    }
+    
+    // 函数定义
+    if (tok.type == TokenType::IDENTIFIER && pos_ + 1 < tokens_.size() &&
+        tokens_[pos_ + 1].type == TokenType::LPAREN) {
+        // 检查是否为函数定义 f():{...}
+        size_t savedPos = pos_;
+        advance();  // 跳过函数名
+        advance();  // 跳过 (
+        
+        if (current().type == TokenType::RPAREN) {
+            advance();  // 跳过 )
+            if (current().type == TokenType::COLON) {
+                advance();  // 跳过 :
+                if (current().type == TokenType::LBRACE) {
+                    // 函数定义
+                    pos_ = savedPos;
+                    return parseFunctionDef();
+                }
+            }
+        }
+        
+        pos_ = savedPos;
+    }
+    
+    // 赋值语句或表达式
+    return parseAssignment();
+}
+
+ASTPtr Parser::parseBlock() {
+    if (!match(TokenType::LBRACE)) {
+        error("期望 '{'");
+        return nullptr;
+    }
+    
+    auto block = std::make_shared<BlockNode>();
+    
+    skipNewlines();
+    
+    while (pos_ < tokens_.size() && current().type != TokenType::RBRACE) {
+        ASTPtr stmt = parseStatement();
+        if (stmt) {
+            block->statements.push_back(stmt);
+        }
+        
+        if (hasError_) {
+            return nullptr;
+        }
+        
+        skipNewlines();
+    }
+    
+    if (!match(TokenType::RBRACE)) {
+        error("期望 '}'");
+        return nullptr;
+    }
+    
+    return block;
+}
+
+ASTPtr Parser::parseAssignment() {
+    // 检查是否为环境变量赋值 %env.var=...
+    if (current().type == TokenType::ENV_VAR) {
+        std::string varName = current().value;
+        advance();
+        
+        if (match(TokenType::ASSIGN)) {
+            ASTPtr value = parseExpression();
+            auto node = std::make_shared<EnvAssignmentNode>(varName, value);
+            return node;
+        }
+        
+        // 不是赋值，需要处理为表达式
+        pos_--;
+        return parseExpression();
+    }
+    
+    // 检查是否为普通变量赋值 %var=...
+    if (current().type == TokenType::VAR) {
+        std::string varName = current().value;
+        advance();
+        
+        if (match(TokenType::ASSIGN)) {
+            ASTPtr value = parseExpression();
+            auto node = std::make_shared<AssignmentNode>(varName, value);
+            return node;
+        }
+        
+        // 不是赋值，需要处理为表达式
+        pos_--;
+        return parseExpression();
+    }
+    
+    return parseExpression();
+}
+
+ASTPtr Parser::parseExpression() {
+    return parseLogicalOr();
+}
+
+ASTPtr Parser::parseLogicalOr() {
+    ASTPtr left = parseLogicalAnd();
+    
+    while (check(TokenType::OR)) {
+        advance();
+        ASTPtr right = parseLogicalAnd();
+        left = std::make_shared<BinaryOpNode>("||", left, right);
+    }
+    
+    return left;
+}
+
+ASTPtr Parser::parseLogicalAnd() {
+    ASTPtr left = parseBitwiseOr();
+    
+    while (check(TokenType::AND)) {
+        advance();
+        ASTPtr right = parseBitwiseOr();
+        left = std::make_shared<BinaryOpNode>("&&", left, right);
+    }
+    
+    return left;
+}
+
+ASTPtr Parser::parseBitwiseOr() {
+    ASTPtr left = parseBitwiseXor();
+    
+    while (check(TokenType::AMPERSAND)) {
+        advance();
+        ASTPtr right = parseBitwiseXor();
+        left = std::make_shared<BinaryOpNode>("|", left, right);
+    }
+    
+    return left;
+}
+
+ASTPtr Parser::parseBitwiseXor() {
+    ASTPtr left = parseBitwiseAnd();
+    
+    while (check(TokenType::CARET)) {
+        advance();
+        ASTPtr right = parseBitwiseAnd();
+        left = std::make_shared<BinaryOpNode>("^", left, right);
+    }
+    
+    return left;
+}
+
+ASTPtr Parser::parseBitwiseAnd() {
+    ASTPtr left = parseEquality();
+    
+    while (check(TokenType::AMPERSAND)) {
+        advance();
+        ASTPtr right = parseEquality();
+        left = std::make_shared<BinaryOpNode>("&", left, right);
+    }
+    
+    return left;
+}
+
+ASTPtr Parser::parseEquality() {
+    ASTPtr left = parseRelational();
+    
+    while (check(TokenType::EQUAL) || check(TokenType::NOT_EQUAL)) {
+        std::string op = current().value;
+        advance();
+        ASTPtr right = parseRelational();
+        left = std::make_shared<BinaryOpNode>(op, left, right);
+    }
+    
+    return left;
+}
+
+ASTPtr Parser::parseRelational() {
+    ASTPtr left = parseShift();
+    
+    while (check(TokenType::LESS) || check(TokenType::LESS_EQ) ||
+           check(TokenType::GREATER) || check(TokenType::GREATER_EQ)) {
+        std::string op = current().value;
+        advance();
+        ASTPtr right = parseShift();
+        left = std::make_shared<BinaryOpNode>(op, left, right);
+    }
+    
+    return left;
+}
+
+ASTPtr Parser::parseShift() {
+    ASTPtr left = parseAdditive();
+    
+    while (check(TokenType::LSHIFT) || check(TokenType::RSHIFT)) {
+        std::string op = current().value;
+        advance();
+        ASTPtr right = parseAdditive();
+        left = std::make_shared<BinaryOpNode>(op, left, right);
+    }
+    
+    return left;
+}
+
+ASTPtr Parser::parseAdditive() {
+    ASTPtr left = parseMultiplicative();
+    
+    while (check(TokenType::PLUS) || check(TokenType::MINUS)) {
+        std::string op = current().value;
+        advance();
+        ASTPtr right = parseMultiplicative();
+        left = std::make_shared<BinaryOpNode>(op, left, right);
+    }
+    
+    return left;
+}
+
+ASTPtr Parser::parseMultiplicative() {
+    ASTPtr left = parseUnary();
+    
+    while (check(TokenType::STAR) || check(TokenType::SLASH) || check(TokenType::PERCENT)) {
+        std::string op = current().value;
+        advance();
+        ASTPtr right = parseUnary();
+        left = std::make_shared<BinaryOpNode>(op, left, right);
+    }
+    
+    return left;
+}
+
+ASTPtr Parser::parseUnary() {
+    // 一元运算符
+    if (check(TokenType::MINUS) || check(TokenType::NOT) || check(TokenType::TILDE)) {
+        std::string op = current().value;
+        advance();
+        ASTPtr operand = parseUnary();
+        return std::make_shared<UnaryOpNode>(op, operand, true);
+    }
+    
+    return parsePostfix();
+}
+
+ASTPtr Parser::parsePostfix() {
+    ASTPtr expr = parsePrimary();
+    
+    // 函数调用
+    if (expr && expr->type == NodeType::VARIABLE && check(TokenType::LPAREN)) {
+        auto varNode = std::static_pointer_cast<VariableNode>(expr);
+        return parseFunctionCall(varNode->name);
+    }
+    
+    return expr;
+}
+
+ASTPtr Parser::parsePrimary() {
+    Token& tok = current();
+    
+    // 数字字面量
+    if (tok.type == TokenType::NUMBER) {
+        advance();
+        double value = std::stod(tok.value);
+        return std::make_shared<LiteralNode>(makeNumberValue(value), tok.line, tok.column);
+    }
+    
+    // 字符串字面量
+    if (tok.type == TokenType::STRING) {
+        advance();
+        return std::make_shared<LiteralNode>(makeStringValue(tok.value), tok.line, tok.column);
+    }
+    
+    // true/false
+    if (tok.type == TokenType::TRUE) {
+        advance();
+        return std::make_shared<LiteralNode>(makeNumberValue(1.0), tok.line, tok.column);
+    }
+    
+    if (tok.type == TokenType::FALSE) {
+        advance();
+        return std::make_shared<LiteralNode>(makeNumberValue(0.0), tok.line, tok.column);
+    }
+    
+    // 变量
+    if (tok.type == TokenType::VAR) {
+        advance();
+        return std::make_shared<VariableNode>(tok.value, tok.line, tok.column);
+    }
+    
+    // 环境变量
+    if (tok.type == TokenType::ENV_VAR) {
+        advance();
+        return std::make_shared<EnvVariableNode>(tok.value, tok.line, tok.column);
+    }
+    
+    // %env 查看所有环境变量
+    if (tok.type == TokenType::ENV_VIEW) {
+        advance();
+        // 这应该是一个特殊的内建函数调用
+        return std::make_shared<FunctionCallNode>("env", {}, tok.line, tok.column);
+    }
+    
+    // 命令执行
+    if (tok.type == TokenType::COMMAND) {
+        advance();
+        std::string cmd = tok.value;
+        std::vector<ASTPtr> args;
+        
+        // 收集命令参数
+        while (pos_ < tokens_.size() && 
+               current().type != TokenType::NEWLINE &&
+               current().type != TokenType::SEMICOLON &&
+               current().type != TokenType::PIPE &&
+               current().type != TokenType::REDIRECT &&
+               current().type != TokenType::EOF_TOKEN) {
+            args.push_back(parsePrimary());
+        }
+        
+        return std::make_shared<CommandExecNode>(cmd, args, tok.line, tok.column);
+    }
+    
+    // 带引号的命令
+    if (tok.type == TokenType::CMD_STRING) {
+        advance();
+        return std::make_shared<CommandExecNode>(tok.value, {}, tok.line, tok.column);
+    }
+    
+    // 命令输出替换
+    if (tok.type == TokenType::CMD_OUTPUT) {
+        advance();
+        return std::make_shared<CommandOutputNode>(tok.value, tok.line, tok.column);
+    }
+    
+    // 重定向
+    if (tok.type == TokenType::REDIRECT) {
+        advance();
+        // 解析重定向内容
+        std::vector<ASTPtr> targets;
+        // TODO: 解析重定向目标
+        return std::make_shared<RedirectExprNode>(nullptr, targets, tok.line, tok.column);
+    }
+    
+    // 括号表达式
+    if (tok.type == TokenType::LPAREN) {
+        advance();
+        ASTPtr expr = parseExpression();
+        if (!match(TokenType::RPAREN)) {
+            error("期望 ')'");
+            return nullptr;
+        }
+        return expr;
+    }
+    
+    // calc(...) 表达式
+    if (tok.type == TokenType::CALC) {
+        advance();
+        if (!match(TokenType::LPAREN)) {
+            error("calc 后期望 '('");
+            return nullptr;
+        }
+        ASTPtr expr = parseExpression();
+        if (!match(TokenType::RPAREN)) {
+            error("期望 ')'");
+            return nullptr;
+        }
+        return expr;
+    }
+    
+    // lambda 定义
+    if (tok.type == TokenType::LPAREN) {
+        // 检查是否为 lambda ():{...}
+        size_t savedPos = pos_;
+        advance();  // 跳过 (
+        
+        if (current().type == TokenType::RPAREN) {
+            advance();  // 跳过 )
+            if (current().type == TokenType::COLON) {
+                advance();  // 跳过 :
+                if (current().type == TokenType::LBRACE) {
+                    // lambda 定义
+                    pos_ = savedPos;
+                    advance();  // 跳过 (
+                    advance();  // 跳过 )
+                    advance();  // 跳过 :
+                    ASTPtr body = parseBlock();
+                    return std::make_shared<LambdaDefNode>(body, tok.line, tok.column);
+                }
+            }
+        }
+        
+        pos_ = savedPos;
+    }
+    
+    error("意外的 Token: " + tok.value);
+    return nullptr;
+}
+
+ASTPtr Parser::parseIfStatement() {
+    Token& ifTok = current();
+    advance();  // 跳过 if
+    
+    // 解析条件
+    ASTPtr condition;
+    if (check(TokenType::LPAREN)) {
+        advance();  // 跳过 (
+        condition = parseExpression();
+        if (!match(TokenType::RPAREN)) {
+            error("期望 ')'");
+            return nullptr;
+        }
+    } else {
+        condition = parseExpression();
+    }
+    
+    // 解析 then 块
+    ASTPtr thenBlock;
+    if (check(TokenType::LBRACE)) {
+        thenBlock = parseBlock();
+    } else {
+        // 单行 if
+        auto block = std::make_shared<BlockNode>();
+        block->statements.push_back(parseStatement());
+        thenBlock = block;
+    }
+    
+    auto ifNode = std::make_shared<IfNode>(condition, thenBlock, ifTok.line, ifTok.column);
+    
+    // 解析 elif 块
+    while (check(TokenType::ELIF)) {
+        advance();  // 跳过 elif
+        
+        ASTPtr elifCondition;
+        if (check(TokenType::LPAREN)) {
+            advance();
+            elifCondition = parseExpression();
+            if (!match(TokenType::RPAREN)) {
+                error("期望 ')'");
+                return nullptr;
+            }
+        } else {
+            elifCondition = parseExpression();
+        }
+        
+        ASTPtr elifBlock;
+        if (check(TokenType::LBRACE)) {
+            elifBlock = parseBlock();
+        } else {
+            auto block = std::make_shared<BlockNode>();
+            block->statements.push_back(parseStatement());
+            elifBlock = block;
+        }
+        
+        ifNode->elifBlocks.push_back({elifCondition, elifBlock});
+    }
+    
+    // 解析 else 块
+    if (check(TokenType::ELSE)) {
+        advance();  // 跳过 else
+        
+        if (check(TokenType::LBRACE)) {
+            ifNode->elseBlock = parseBlock();
+        } else {
+            auto block = std::make_shared<BlockNode>();
+            block->statements.push_back(parseStatement());
+            ifNode->elseBlock = block;
+        }
+    }
+    
+    return ifNode;
+}
+
+ASTPtr Parser::parseForStatement() {
+    Token& forTok = current();
+    advance();  // 跳过 for
+    
+    if (!match(TokenType::LPAREN)) {
+        error("for 后期望 '('");
+        return nullptr;
+    }
+    
+    // 解析循环变量
+    if (!check(TokenType::VAR)) {
+        error("for 循环中期望变量名");
+        return nullptr;
+    }
+    
+    std::string varName = current().value;
+    advance();
+    
+    // 跳过 in
+    if (!match(TokenType::IN)) {
+        error("for 循环中期望 'in'");
+        return nullptr;
+    }
+    
+    // 解析范围
+    ASTPtr range = parseExpression();
+    
+    if (!match(TokenType::RPAREN)) {
+        error("期望 ')'");
+        return nullptr;
+    }
+    
+    // 解析循环体
+    ASTPtr body;
+    if (check(TokenType::LBRACE)) {
+        body = parseBlock();
+    } else {
+        auto block = std::make_shared<BlockNode>();
+        block->statements.push_back(parseStatement());
+        body = block;
+    }
+    
+    return std::make_shared<ForNode>(varName, range, body, forTok.line, forTok.column);
+}
+
+ASTPtr Parser::parseWhileStatement() {
+    Token& whileTok = current();
+    advance();  // 跳过 while
+    
+    // 解析条件
+    ASTPtr condition;
+    if (check(TokenType::LPAREN)) {
+        advance();  // 跳过 (
+        condition = parseExpression();
+        if (!match(TokenType::RPAREN)) {
+            error("期望 ')'");
+            return nullptr;
+        }
+    } else {
+        condition = parseExpression();
+    }
+    
+    // 解析循环体
+    ASTPtr body;
+    if (check(TokenType::LBRACE)) {
+        body = parseBlock();
+    } else {
+        auto block = std::make_shared<BlockNode>();
+        block->statements.push_back(parseStatement());
+        body = block;
+    }
+    
+    return std::make_shared<WhileNode>(condition, body, whileTok.line, whileTok.column);
+}
+
+ASTPtr Parser::parseFunctionDef() {
+    Token& nameTok = current();
+    std::string funcName = nameTok.value;
+    advance();  // 跳过函数名
+    
+    advance();  // 跳过 (
+    advance();  // 跳过 )
+    advance();  // 跳过 :
+    
+    ASTPtr body = parseBlock();
+    
+    return std::make_shared<FunctionDefNode>(funcName, body, nameTok.line, nameTok.column);
+}
+
+ASTPtr Parser::parseReturnStatement() {
+    Token& retTok = current();
+    advance();  // 跳过 return
+    
+    ASTPtr value = nullptr;
+    if (check(TokenType::LPAREN)) {
+        advance();  // 跳过 (
+        value = parseExpression();
+        if (!match(TokenType::RPAREN)) {
+            error("期望 ')'");
+            return nullptr;
+        }
+    }
+    
+    return std::make_shared<ReturnNode>(value, retTok.line, retTok.column);
+}
+
+ASTPtr Parser::parseBreakStatement() {
+    Token& breakTok = current();
+    advance();  // 跳过 break
+    
+    if (check(TokenType::LPAREN)) {
+        advance();  // 跳过 (
+        if (!match(TokenType::RPAREN)) {
+            error("期望 ')'");
+            return nullptr;
+        }
+    }
+    
+    return std::make_shared<BreakNode>(breakTok.line, breakTok.column);
+}
+
+ASTPtr Parser::parseContinueStatement() {
+    Token& contTok = current();
+    advance();  // 跳过 continue
+    
+    if (check(TokenType::LPAREN)) {
+        advance();  // 跳过 (
+        if (!match(TokenType::RPAREN)) {
+            error("期望 ')'");
+            return nullptr;
+        }
+    }
+    
+    return std::make_shared<ContinueNode>(contTok.line, contTok.column);
+}
+
+ASTPtr Parser::parseFunctionCall(const std::string& name) {
+    Token& parenTok = current();
+    advance();  // 跳过 (
+    
+    std::vector<ASTPtr> args;
+    
+    if (!check(TokenType::RPAREN)) {
+        args = parseArgumentList();
+    }
+    
+    if (!match(TokenType::RPAREN)) {
+        error("期望 ')'");
+        return nullptr;
+    }
+    
+    return std::make_shared<FunctionCallNode>(name, args, parenTok.line, parenTok.column);
+}
+
+std::vector<ASTPtr> Parser::parseArgumentList() {
+    std::vector<ASTPtr> args;
+    
+    args.push_back(parseExpression());
+    
+    while (check(TokenType::COMMA)) {
+        advance();  // 跳过 ,
+        args.push_back(parseExpression());
+    }
+    
+    return args;
+}
+
+Token& Parser::current() {
+    if (pos_ >= tokens_.size()) {
+        // 返回一个 EOF Token
+        static Token eofToken(TokenType::EOF_TOKEN);
+        return eofToken;
+    }
+    return tokens_[pos_];
+}
+
+Token& Parser::advance() {
+    if (pos_ < tokens_.size()) {
+        pos_++;
+    }
+    return current();
+}
+
+Token& Parser::peek() {
+    if (pos_ + 1 >= tokens_.size()) {
+        static Token eofToken(TokenType::EOF_TOKEN);
+        return eofToken;
+    }
+    return tokens_[pos_ + 1];
+}
+
+bool Parser::check(TokenType type) {
+    return current().type == type;
+}
+
+bool Parser::checkValue(const std::string& value) {
+    return current().value == value;
+}
+
+bool Parser::match(TokenType type) {
+    if (check(type)) {
+        advance();
+        return true;
+    }
+    return false;
+}
+
+bool Parser::matchValue(const std::string& value) {
+    if (checkValue(value)) {
+        advance();
+        return true;
+    }
+    return false;
+}
+
+Token Parser::expect(TokenType type, const std::string& message) {
+    if (check(type)) {
+        return advance();
+    }
+    error(message);
+    return current();
+}
+
+Token Parser::expectValue(const std::string& value, const std::string& message) {
+    if (checkValue(value)) {
+        return advance();
+    }
+    error(message);
+    return current();
+}
+
+void Parser::error(const std::string& message) {
+    Token& tok = current();
+    error_ = filename_ + ":" + std::to_string(tok.line) + ":" + 
+             std::to_string(tok.column) + ": 错误: " + message;
+    hasError_ = true;
+}
+
+void Parser::skipNewlines() {
+    while (pos_ < tokens_.size() && 
+           (current().type == TokenType::NEWLINE || current().type == TokenType::SEMICOLON)) {
+        advance();
+    }
+}
+
+bool Parser::isStatementEnd() {
+    return current().type == TokenType::NEWLINE ||
+           current().type == TokenType::SEMICOLON ||
+           current().type == TokenType::EOF_TOKEN;
+}
+
+} // namespace wash
