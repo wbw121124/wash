@@ -11,6 +11,8 @@ wash (wbw121124's advanced shell) 是一个功能丰富的 shell，支持：
 - 函数与 lambda
 - 表达式运算（`calc(...)`）
 - 命令替换 `$(...)` 和重定向 `@(...)`
+- i18n 国际化（中/英文）
+- terminfo 彩色终端支持
 
 ## 架构设计
 
@@ -24,6 +26,12 @@ wash/
 │   └── plan.md           # 本文件
 ├── etc/
 │   └── washrc            # 系统级 rc 文件
+├── po/
+│   ├── wash.pot          # 翻译模板
+│   ├── zh_CN.po          # 中文翻译
+│   └── en_US.po          # 英文翻译
+├── share/
+│   └── locale/           # 编译后的 .mo 文件
 ├── src/
 │   ├── main.cpp          # 入口点、命令行解析、交互循环
 │   ├── types.h           # 类型定义、枚举、AST 节点
@@ -32,7 +40,9 @@ wash/
 │   ├── parser.h          # 语法分析器接口
 │   ├── parser.cpp        # 语法分析器实现
 │   ├── executor.h        # 执行器接口
-│   └── executor.cpp      # 执行器实现
+│   ├── executor.cpp      # 执行器实现
+│   ├── color.h           # terminfo 颜色支持
+│   └── color.cpp         # 颜色实现
 └── ~/.washrc             # 用户级 rc 文件（运行时创建）
 ```
 
@@ -40,113 +50,145 @@ wash/
 
 | 模块 | 职责 | 文件 |
 |------|------|------|
-| 类型定义 | Token、AST 节点、值类型 | types.h |
+| 类型定义 | Token、AST 节点、值类型（string/int64_t/double） | types.h |
 | 词法分析 | 源码 → Token 流 | lexer.h/cpp |
 | 语法分析 | Token 流 → AST | parser.h/cpp |
 | 执行器 | AST → 执行结果 | executor.h/cpp |
-| 主程序 | 入口、交互、参数解析 | main.cpp |
+| 颜色支持 | terminfo 颜色查询与输出 | color.h/cpp |
+| 主程序 | 入口、交互、参数解析、i18n | main.cpp |
+
+---
 
 ## 实现步骤
 
-### 阶段 1：基础设施
+### 阶段 0：关键 Bug 修复（基础层）
 
-#### 步骤 1.1：修复 CMakeLists.txt
-- 修正 `src/ain.cpp` → `src/main.cpp`
-- 添加 readline 库链接
-- 配置头文件搜索路径
+这些 bug 不修，后续功能全部无法正常工作。
 
-#### 步骤 1.2：创建类型定义 (types.h)
-- Token 类型枚举
-- AST 节点类型
-- 值类型（string/number）
-- 作用域管理
+| # | Bug | 文件 | 修复方案 |
+|---|-----|------|----------|
+| 0.1 | `exitScope()` 为空，作用域永不弹出 | executor.cpp | 恢复 `currentScope_ = currentScope_->parent` |
+| 0.2 | 函数定义是空操作，body 不执行 | executor.cpp | 存储 AST body，调用时创建子作用域执行 |
+| 0.3 | Lambda 定义返回字符串 `"<lambda>"` | executor.cpp | 返回可调用闭包对象 |
+| 0.4 | 函数参数拒绝裸标识符 `echo(yes)` | parser.cpp | `parsePrimary` 中非赋值上下文的 IDENTIFIER 作为字符串字面量 |
+| 0.5 | 位或解析器检查 AMPERSAND 而非 PIPE | parser.cpp | `parseBitwiseOr()` 改检查 `PIPE` |
+| 0.6 | 位异或 `^` 被当作幂运算 | executor.cpp | `^` 改为 XOR |
+| 0.7 | ENV_VIEW token 从未生成 | lexer.cpp | `%env` 后无 `.` 时生成 ENV_VIEW |
+| 0.8 | LBRACKET token 值为 `]` 应为 `[` | lexer.cpp | 修正值字符串 |
+| 0.9 | 三目运算符 `?:` 和逗号运算符未解析 | parser.cpp | 添加 `parseTernary()` 和 `parseComma()` |
+| 0.10 | `argc()`/`argv()` 是空壳 | executor.cpp | 连接 main 的 argc/argv 参数 |
 
-### 阶段 2：词法分析器
+### 阶段 1：类型系统 — 新增 int
 
-#### 步骤 2.1：实现基础 Tokenizer
-- 变量名 `[A-Za-z0-9_-]+`
-- 数字字面量
-- 字符串字面量（单引号、双引号、反引号）
-- 运算符和分隔符
+**目标**：在 Value variant 中新增 `int64_t`，与 `double` 共存。
 
-#### 步骤 2.2：实现字符串处理
-- 单引号：原样字符串，支持 `\'` 和 `\\`
-- 双引号：变量插值，支持转义
-- 反引号：多行字符串，变量插值
+```cpp
+// types.h
+using Value = std::variant<std::string, int64_t, double>;
+```
 
-#### 步骤 2.3：实现注释处理
-- `#` 行注释
-- `#[[ ]]#` 块注释
-- `/* */` 块注释
+**类型推断规则**（在 calc 内）：
+- 整数字面量 `42` → `int64_t`
+- 浮点字面量 `3.14` → `double`
+- `int64_t op int64_t` → `int64_t`（除法 `/` 仍为 `double`）
+- `int64_t op double` 或 `double op int64_t` → `double`
+- `round()/ceil()/floor()` 返回 `int64_t`
+- 位运算 `& | ^ << >>` 操作数强制转 `int64_t`
+- 字符串拼接时，int 输出无小数点（`"42"` 而非 `"42.000000"`）
 
-### 阶段 3：语法分析器
+**需改动的文件**：
+- `types.h`：Value 定义 + `makeIntValue()` / `makeDoubleValue()` 辅助函数
+- `executor.cpp`：所有 `std::holds_alternative<double>` 检查改为同时处理 int64_t
+- `parser.cpp`：数字字面量解析区分整数/浮点
 
-#### 步骤 3.1：实现表达式解析
-- `calc(...)` 包裹的表达式
-- 运算符优先级（C++-like）
-- 三目运算符和逗号运算符
+### 阶段 2：Parser/Executor 功能补全
 
-#### 步骤 3.2：实现语句解析
-- 变量赋值 `%name=expr`
-- 命令执行 `$cmd`
-- 管道 `$cmd | %var`
-- 命令替换 `$(...)`
-- 重定向 `@(...)`
+#### 2.1 三目与逗号运算符
+- parser：在 `parseLogicalOr()` 之后插入 `parseTernary()`，处理 `?:`
+- parser：在最外层插入 `parseComma()`，处理 `,`
+- executor：已有 `executeTernaryOp()`，补上逗号执行逻辑
 
-#### 步骤 3.3：实现控制流解析
-- if/elif/else
-- for(%i in ...)
-- while(...)
-- break/continue
+#### 2.2 管道表达式
+- parser：识别 `$cmd1 | $cmd2` 链，构造 `PipeExprNode` 链
+- executor：用 `pipe()` + `fork()` 实现管道串联
 
-#### 步骤 3.4：实现函数解析
-- 函数定义 `f():{...}`
-- lambda `():{...}`
-- return 语句
+#### 2.3 重定向目标
+- parser：解析 `@("in.txt", "out.txt", "err.txt")` 的实际参数
+- executor：用 `dup2()` + `open()` 实现文件描述符重定向
 
-### 阶段 4：执行器
+#### 2.4 行续 `\`
+- lexer：`skipWhitespace()` 中检测 `\` + `\n`，合并为单个空白 token
 
-#### 步骤 4.1：实现变量系统
-- 局部变量作用域
-- 环境变量 `%env.var`
-- 变量求值
+#### 2.5 范围增强
+- parser：支持 `a..b..s` 显式步长语法
+- executor：验证步长规则（s>0 时 a<=b，s<0 时 a>=b）
+- 支持字符串范围 `"1..10,20..40,0"` 和变量范围 `for(%i in %x)`
 
-#### 步骤 4.2：实现命令执行
-- 外部命令调用
-- 管道实现
-- 重定向实现
-- 命令替换 `$(...)`
+#### 2.6 字符串插值
+- lexer：双引号/反引号中的 `%{var}` 捕获变量名
+- executor：在字符串值构建时解析 `%{var}` 并替换为变量值
 
-#### 步骤 4.3：实现内建函数
-- echo()、stderr()、panic()
-- round()、ceil()、floor()
-- argc()、argv()
-- calc() 表达式求值
-- return()、break()、continue()
+#### 2.7 相邻字符串自动拼接
+- lexer：连续字符串字面量（无运算符分隔）合并为单个 STRING token
 
-#### 步骤 4.4：实现控制流执行
-- if/elif/else 执行
-- for 循环执行
-- while 循环执行
-- 范围生成器 `a..b..s`
+### 阶段 3：新内建命令
 
-### 阶段 5：主程序
+| 命令 | 签名 | 说明 |
+|------|------|------|
+| `len()` | `len(string)` → number | 返回字符串长度 |
+| `substr()` | `substr(str, start, len)` → string | 子串提取 |
+| `find()` | `find(str, sub)` → number | 查找子串位置，-1 表示未找到 |
+| `split()` | `split(str, delim)` → range | 按分隔符分割 |
+| `join()` | `join(range, delim)` → string | 按分隔符合并 |
+| `read()` | `read(prompt?)` → string | 从 stdin 读取一行输入 |
+| `source()` | `source(file)` | 加载并执行 .wash 文件 |
+| `unset()` | `unset(var)` | 删除变量 |
+| `export()` | `export(var)` | 将变量导出为环境变量 |
+| `help()` | `help()` | 显示所有内建命令列表 |
+| `type()` | `type(name)` | 显示变量/函数类型 |
+| `keys()` | `keys()` | 列出所有已定义变量名 |
 
-#### 步骤 5.1：实现命令行参数解析
-- `wash` 交互模式
-- `wash <文件名>` 执行脚本
-- `wash -c "命令"` 执行命令
-- `wash -l` 登录 shell 模式
+### 阶段 4：i18n — GNU gettext
 
-#### 步骤 5.2：实现交互循环
-- readline 集成
-- PS1 提示符（`%env:washPS1`，默认 `[\u@\h \W]\$`）
-- 历史记录（~/.wash_history，默认 10000 条）
+**方案**：标准 gettext 工作流，提供中文 (`zh_CN`) 和英文 (`en_US`) 翻译。
 
-#### 步骤 5.3：实现 rc 文件加载
-- 系统级 `/etc/washrc`
-- 用户级 `~/.washrc`
-- 登录 shell 时加载
+**步骤**：
+1. 所有用户面字符串用 `_("string")` 标记
+2. 生成 `.pot` 模板（`xgettext`）
+3. 创建 `po/zh_CN.po` 和 `po/en_US.po` 翻译文件
+4. 编译 `.mo` 到 `share/locale/`
+5. `main.cpp` 初始化 locale：`setlocale(LC_ALL, "")` + `bindtextdomain()` + `textdomain()`
+6. CMakeLists.txt 添加 gettext 编译规则
+
+**安装依赖**：`pacman -S gettext`
+
+### 阶段 5：交互式多行输入
+
+**方案**：在 readline 循环中追踪未闭合的 `{}`、`()`、`[]`，未闭合时显示续行提示符 `> `。
+
+**实现**：
+- 新增 `isIncomplete(const std::string& input)` 函数：逐字符计数引号/括号/大括号
+- 未闭合时循环追加 readline 输入（续行提示符 `"> "`）
+- 闭合后整体提交执行
+- 支持 `\` 续行符
+- 转义引号内的括号不计入计数
+
+### 阶段 6：terminfo 彩色支持（ncurses）
+
+**安装依赖**：`pacman -S ncurses`
+
+**实现**：
+1. CMakeLists.txt 链接 `-lncurses -ltinfo`
+2. 新增 `color.h/color.cpp`：
+   - 初始化：`setupterm(NULL, STDOUT_FILENO, NULL)`
+   - 查询颜色能力：`tigetstr("setaf")` / `tigetstr("setab")` / `tigetstr("sgr0")`
+   - 颜色枚举：`COLOR_BLACK` ~ `COLOR_WHITE` + `COLOR_DEFAULT`
+   - `color::setfg(color)` / `color::setbg(color)` / `color::reset()`
+   - `color::hasColor()` 检测终端是否支持颜色
+3. PS1 提示符支持颜色转义
+4. 内建命令 `colors()` 显示终端颜色能力
+
+---
 
 ## 命令行参数规范
 
@@ -169,6 +211,7 @@ wash [选项] [文件名]
 |------|--------|------|
 | `%env:washPS1` | `[\u@\h \W]\$` | 提示符 |
 | `%env:HISTORY_MAX` | `10000` | 历史记录最大条数 |
+| `%env:washLANG` | 系统 locale | 语言设置（zh_CN / en_US） |
 
 ## RC 文件
 
@@ -178,7 +221,44 @@ wash [选项] [文件名]
 ### 用户级 `~/.washrc`
 用户个人配置，登录 shell 时加载。
 
+---
+
+## 执行顺序与依赖
+
+```
+阶段 0 (Bug 修复)
+    ↓
+阶段 1 (int 类型) ← 依赖 0.1-0.10 修完
+    ↓
+阶段 2 (Parser/Executor 补全) ← 依赖阶段 1
+    ↓
+阶段 3 (新内建命令) ← 依赖阶段 1（int 类型）
+    ↓
+阶段 4 (i18n) ← 依赖阶段 3（所有内建命令的字符串已确定）
+    ↓
+阶段 5 (多行输入) ← 独立于 4，排在后面避免冲突
+    ↓
+阶段 6 (terminfo) ← 独立，最后做
+```
+
+## 预估工作量
+
+| 阶段 | 预估 commit 数 | 复杂度 |
+|------|---------------|--------|
+| 0. Bug 修复 | 2-3 | ★★★☆☆ |
+| 1. int 类型 | 1-2 | ★★★☆☆ |
+| 2. Parser/Executor | 3-4 | ★★★★☆ |
+| 3. 新内建命令 | 2-3 | ★★☆☆☆ |
+| 4. i18n | 1-2 | ★★☆☆☆ |
+| 5. 多行输入 | 1 | ★★☆☆☆ |
+| 6. terminfo | 1-2 | ★★☆☆☆ |
+| **合计** | **11-17** | |
+
+---
+
 ## 进度追踪
+
+### 已完成
 
 - [x] 创建 docs/plan.md
 - [x] 修复 CMakeLists.txt 并配置 readline
@@ -194,6 +274,30 @@ wash [选项] [文件名]
 - [x] 安装 msys64 readline-devel 并切换到 msys64 纯 POSIX 环境
 - [x] 首次编译通过并成功运行
 
+### 待完成
+
+- [ ] 阶段 0：修复 exitScope() 为空
+- [ ] 阶段 0：修复函数定义空操作
+- [ ] 阶段 0：修复 lambda 返回字符串
+- [ ] 阶段 0：修复函数参数裸标识符解析
+- [ ] 阶段 0：修复位或解析器 AMPERSAND bug
+- [ ] 阶段 0：修复 ^ 被当作幂运算
+- [ ] 阶段 0：修复 ENV_VIEW token 未生成
+- [ ] 阶段 0：修复 LBRACKET token 值错误
+- [ ] 阶段 0：实现三目和逗号运算符解析
+- [ ] 阶段 0：连接 argc/argv 到 main
+- [ ] 阶段 1：新增 int64_t 类型
+- [ ] 阶段 2：管道表达式
+- [ ] 阶段 2：重定向目标解析
+- [ ] 阶段 2：行续 `\`
+- [ ] 阶段 2：范围增强（步长、逗号分隔）
+- [ ] 阶段 2：字符串插值
+- [ ] 阶段 2：相邻字符串自动拼接
+- [ ] 阶段 3：新增内建命令（len/substr/find/split/join/read/source/unset/export/help/type/keys）
+- [ ] 阶段 4：i18n gettext 支持
+- [ ] 阶段 5：交互式多行输入
+- [ ] 阶段 6：terminfo 彩色支持
+
 ## 更新日志
 
 | 日期 | 更新内容 |
@@ -203,3 +307,4 @@ wash [选项] [文件名]
 | 2026-09-12 | 实现词法分析器、语法分析器、执行器、主程序 |
 | 2026-09-12 | 修复 readline 宏冲突，安装 msys64 readline-devel |
 | 2026-09-12 | 切换到 msys64 纯 POSIX 环境，首次编译运行成功 |
+| 2026-09-12 | 修订计划：新增 int 类型、i18n、新内建命令、terminfo、多行输入 |
