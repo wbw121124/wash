@@ -24,6 +24,7 @@
 #include "lexer.h"
 #include "parser.h"
 #include "executor.h"
+#include "color.h"
 
 #define _(STRING) gettext(STRING)
 
@@ -207,7 +208,11 @@ void interactiveLoop(wash::Executor& executor) {
     loadHistory(historyFile);
     rl_attempted_completion_function = nullptr;
     
-    std::cout << "wash - wbw121124's advanced shell" << std::endl;
+    wash::ColorManager colors;
+    
+    std::cout << colors.fgStr(wash::Color::CYAN) 
+              << "wash - wbw121124's advanced shell" 
+              << colors.resetStr() << std::endl;
     std::cout << "输入 'exit' 退出" << std::endl;
     std::cout << std::endl;
     

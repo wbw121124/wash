@@ -9,6 +9,7 @@
 #include "executor.h"
 #include "lexer.h"
 #include "parser.h"
+#include "color.h"
 #include <iostream>
 #include <sstream>
 #include <cstdlib>
@@ -1237,6 +1238,25 @@ void Executor::registerBuiltinFunctions() {
             outputToStdout(makeStringValue(name + "=" + valueToString(value) + "\n"));
         }
         return ExecResult(ExecResultType::NORMAL, makeNumberValue(0));
+    });
+    
+    defineFunction("colors", [this](const std::vector<Value>& args) -> ExecResult {
+        wash::ColorManager colors;
+        if (colors.hasColor()) {
+            outputToStdout("终端支持颜色\n");
+            outputToStdout("可用颜色:\n");
+            outputToStdout(colors.fgStr(wash::Color::BLACK) + "  黑色" + colors.resetStr() + "\n");
+            outputToStdout(colors.fgStr(wash::Color::RED) + "  红色" + colors.resetStr() + "\n");
+            outputToStdout(colors.fgStr(wash::Color::GREEN) + "  绿色" + colors.resetStr() + "\n");
+            outputToStdout(colors.fgStr(wash::Color::YELLOW) + "  黄色" + colors.resetStr() + "\n");
+            outputToStdout(colors.fgStr(wash::Color::BLUE) + "  蓝色" + colors.resetStr() + "\n");
+            outputToStdout(colors.fgStr(wash::Color::MAGENTA) + "  品红" + colors.resetStr() + "\n");
+            outputToStdout(colors.fgStr(wash::Color::CYAN) + "  青色" + colors.resetStr() + "\n");
+            outputToStdout(colors.fgStr(wash::Color::WHITE) + "  白色" + colors.resetStr() + "\n");
+        } else {
+            outputToStdout("终端不支持颜色\n");
+        }
+        return ExecResult(ExecResultType::NORMAL, makeIntValue(0));
     });
 }
 

@@ -13,6 +13,7 @@ set(SOURCES
     src/lexer.cpp
     src/parser.cpp
     src/executor.cpp
+    src/color.cpp
 )
 
 set(HEADERS
@@ -20,20 +21,21 @@ set(HEADERS
     src/lexer.h
     src/parser.h
     src/executor.h
+    src/color.h
 )
 
 add_executable(wash ${SOURCES} ${HEADERS})
 target_include_directories(wash PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(wash PRIVATE readline intl)
+target_link_libraries(wash PRIVATE readline intl ncurses)
 
 # 测试目标
-add_executable(wash_test test/test_phase2.cpp src/lexer.cpp src/parser.cpp src/executor.cpp)
+add_executable(wash_test test/test_phase2.cpp src/lexer.cpp src/parser.cpp src/executor.cpp src/color.cpp)
 target_include_directories(wash_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(wash_test PRIVATE readline intl)
+target_link_libraries(wash_test PRIVATE readline intl ncurses)
 
-add_executable(wash_test3 test/test_phase3.cpp src/lexer.cpp src/parser.cpp src/executor.cpp)
+add_executable(wash_test3 test/test_phase3.cpp src/lexer.cpp src/parser.cpp src/executor.cpp src/color.cpp)
 target_include_directories(wash_test3 PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(wash_test3 PRIVATE readline intl)
+target_link_libraries(wash_test3 PRIVATE readline intl ncurses)
 
 # i18n: 编译 .po 文件到 .mo 文件
 find_program(GETTEXT_MSGFMT msgfmt)
