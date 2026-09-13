@@ -18,23 +18,116 @@ wash 是一个功能丰富的现代 shell，支持变量系统、控制流、函
 
 ## 安装
 
-### 依赖
+### 预编译包
 
-- MSYS2 环境
-- GCC 17+
+从 [GitHub Releases](https://github.com/wbw121124/wash/releases) 下载预编译包：
+
+| 平台 | 架构 | 文件 |
+|------|------|------|
+| Windows | x86_64 | `wash-*-mingw-x86_64.zip` |
+| Windows | i686 | `wash-*-mingw-i686.zip` |
+| Windows | UCRT x86_64 | `wash-*-ucrt-x86_64.zip` |
+| Linux | x86_64 | `wash-*-linux-x86_64.tar.gz` |
+| Linux | aarch64 | `wash-*-linux-aarch64.tar.gz` |
+| Linux | armv7l | `wash-*-linux-armv7l.tar.gz` |
+
+### 从源码编译
+
+#### 依赖
+
 - CMake 3.16+
+- GCC 17+ (或 Clang 12+)
 - GNU Readline
 - GNU gettext
 - ncurses
 
-### 编译安装
+#### MSYS2 (MinGW)
 
 ```bash
-# 在 MSYS2 环境中
+# 安装依赖
+pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake \
+          msys/readline-devel msys/gettext-devel msys/ncurses-devel
+
+# 编译
 cd wash
 mkdir build && cd build
 cmake -G 'Unix Makefiles' ..
 make -j4
+
+# 安装到 /usr/local
+sudo cmake --install . --prefix /usr/local
+```
+
+#### MSYS2 (UCRT64)
+
+```bash
+# 安装依赖
+pacman -S mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-cmake \
+          msys/readline-devel msys/gettext-devel msys/ncurses-devel
+
+# 编译
+cd wash
+mkdir build && cd build
+cmake -G 'Unix Makefiles' ..
+make -j4
+
+# 安装
+sudo cmake --install . --prefix /ucrt64
+```
+
+#### Linux (Debian/Ubuntu)
+
+```bash
+# 安装依赖
+sudo apt install build-essential cmake libreadline-dev gettext libncurses-dev
+
+# 编译
+cd wash
+mkdir build && cd build
+cmake -G 'Unix Makefiles' ..
+make -j4
+
+# 安装
+sudo cmake --install . --prefix /usr/local
+```
+
+#### Linux (Fedora/RHEL)
+
+```bash
+# 安装依赖
+sudo dnf install gcc-c++ cmake readline-devel gettext-devel ncurses-devel
+
+# 编译
+cd wash
+mkdir build && cd build
+cmake -G 'Unix Makefiles' ..
+make -j4
+
+# 安装
+sudo cmake --install . --prefix /usr/local
+```
+
+#### macOS
+
+```bash
+# 安装依赖
+brew install cmake readline gettext ncurses
+
+# 编译
+cd wash
+mkdir build && cd build
+cmake -G 'Unix Makefiles' ..
+make -j4
+
+# 安装
+sudo cmake --install . --prefix /usr/local
+```
+
+### 使用 Docker
+
+```bash
+docker build -t wash .
+docker run -it wash
 ```
 
 ## 使用
@@ -43,12 +136,16 @@ make -j4
 
 ```bash
 ./wash
+# 或
+wash
 ```
 
 ### 执行脚本
 
 ```bash
 ./wash script.wash
+# 或
+wash script.wash
 ```
 
 ### 执行命令
@@ -135,6 +232,14 @@ include("utils.wash")
 | `%env:washPS1` | `[\u@\h \W]\$` | 提示符 |
 | `%env:washHISTORY_MAX` | `10000` | 历史记录最大条数 |
 | `%env:washLANG` | 系统 locale | 语言设置（zh_CN / en_US） |
+
+## 卸载
+
+```bash
+sudo cmake --install build --component Unspecified
+# 或手动删除
+sudo rm /usr/local/bin/wash
+```
 
 ## 许可证
 

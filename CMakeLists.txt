@@ -1,13 +1,21 @@
 cmake_minimum_required(VERSION 3.16)
-project(wash LANGUAGES CXX)
+project(wash LANGUAGES CXX VERSION 2.0.0)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# 启用 POSIX 特性
-add_compile_definitions(_GNU_SOURCE _POSIX_C_SOURCE=200809L)
+# 平台检测
+if(WIN32)
+    add_compile_definitions(_WIN32 WIN32)
+    if(MINGW)
+        add_compile_definitions(__MSYS__ __MINGW32__ __MINGW64__)
+    endif()
+elseif(UNIX)
+    add_compile_definitions(_GNU_SOURCE _POSIX_C_SOURCE=200809L)
+endif()
 
+# 源文件
 set(SOURCES
     src/main.cpp
     src/lexer.cpp
@@ -24,9 +32,16 @@ set(HEADERS
     src/color.h
 )
 
+# 主程序
 add_executable(wash ${SOURCES} ${HEADERS})
 target_include_directories(wash PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(wash PRIVATE readline intl ncurses)
+
+# 跨平台链接库
+if(WIN32)
+    target_link_libraries(wash PRIVATE readline intl ncurses)
+else()
+    target_link_libraries(wash PRIVATE readline intl ncurses)
+endif()
 
 # 测试目标
 add_executable(wash_test test/test_phase2.cpp src/lexer.cpp src/parser.cpp src/executor.cpp src/color.cpp)
@@ -43,7 +58,7 @@ if(GETTEXT_MSGFMT)
     file(GLOB PO_FILES po/*.po)
     foreach(PO_FILE ${PO_FILES})
         get_filename_component(LANG ${PO_FILE} NAME_WE)
-        set(MO_DIR ${CMAKE_SOURCE_DIR}/share/locale/${LANG}/LC_MESSAGES)
+        set(MO_DIR ${CMAKE_BINARY_DIR}/share/locale/${LANG}/LC_MESSAGES)
         file(MAKE_DIRECTORY ${MO_DIR})
         set(MO_FILE ${MO_DIR}/wash.mo)
         add_custom_command(
@@ -55,4 +70,41 @@ if(GETTEXT_MSGFMT)
         list(APPEND MO_FILES ${MO_FILE})
     endforeach()
     add_custom_target(translations ALL DEPENDS ${MO_FILES})
+    add_dependencies(wash translations)
 endif()
+
+# 安装目标
+include(GNUInstallDirs)
+
+# 安装可执行文件
+install(TARGETS wash
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+
+# 安装翻译文件
+if(GETTEXT_MSGFMT)
+    foreach(PO_FILE ${PO_FILES})
+        get_filename_component(LANG ${PO_FILE} NAME_WE)
+        install(FILES ${CMAKE_BINARY_DIR}/share/locale/${LANG}/LC_MESSAGES/wash.mo
+            DESTINATION ${CMAKE_INSTALL_LOCALEDIR}/${LANG}/LC_MESSAGES
+        )
+    endforeach()
+endif()
+
+# 安装文档
+install(FILES README.md LICENSE
+    DESTINATION ${CMAKE_INSTALL_DOCDIR}
+)
+
+# 安装示例
+install(DIRECTORY examples
+    DESTINATION ${CMAKE_INSTALL_DOCDIR}/wash
+)
+
+# 卸载目标（可选）
+add_custom_target(uninstall
+    COMMAND ${CMAKE_COMMAND} -E remove ${CMAKE_INSTALL_PREFIX}/bin/wash
+    COMMAND ${CMAKE_COMMAND} -E remove_directory ${CMAKE_INSTALL_PREFIX}/share/locale/zh_CN/LC_MESSAGES
+    COMMAND ${CMAKE_COMMAND} -E remove_directory ${CMAKE_INSTALL_PREFIX}/share/locale/en_US/LC_MESSAGES
+    COMMENT "Uninstalling wash..."
+)

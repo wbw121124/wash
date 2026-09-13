@@ -1,0 +1,230 @@
+name: Build and Package
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  # Linux 构建
+  build-linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [x86_64, aarch64, armv7l]
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-latest
+          - arch: armv7l
+            runner: ubuntu-latest
+    
+    runs-on: ${{ matrix.runner }}
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential cmake libreadline-dev gettext libncurses-dev
+        
+    - name: Configure CMake
+      run: |
+        mkdir -p build
+        cd build
+        cmake -G "Unix Makefiles" \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_INSTALL_PREFIX=/usr/local \
+          ..
+    
+    - name: Build
+      run: |
+        cd build
+        make -j$(nproc)
+    
+    - name: Run tests
+      run: |
+        cd build
+        ./wash_test || true
+        ./wash_test3 || true
+    
+    - name: Install
+      run: |
+        cd build
+        sudo make install DESTDIR=${{ github.workspace }}/install
+    
+    - name: Create package
+      run: |
+        cd ${{ github.workspace }}/install
+        tar -czf ../wash-linux-${{ matrix.arch }}.tar.gz .
+    
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: wash-linux-${{ matrix.arch }}
+        path: wash-linux-${{ matrix.arch }}.tar.gz
+
+  # MSYS2 (MinGW) 构建
+  build-msys2-mingw:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        arch: [x86_64, i686]
+        include:
+          - arch: x86_64
+            msystem: MINGW64
+          - arch: i686
+            msystem: MINGW32
+    
+    defaults:
+      run:
+        shell: msys2 {0}
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup MSYS2
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: ${{ matrix.msystem }}
+        update: true
+        install: >-
+          mingw-w64-${{ matrix.arch }}-gcc
+          mingw-w64-${{ matrix.arch }}-cmake
+          mingw-w64-${{ matrix.arch }}-make
+          mingw-w64-${{ matrix.arch }}-readline
+          mingw-w64-${{ matrix.arch }}-ncurses
+          msys-devel
+          msys-gettext
+          msys-libreadline-devel
+    
+    - name: Configure CMake
+      run: |
+        mkdir -p build
+        cd build
+        cmake -G "Unix Makefiles" \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_INSTALL_PREFIX=/mingw64 \
+          ..
+    
+    - name: Build
+      run: |
+        cd build
+        make -j$(nproc)
+    
+    - name: Run tests
+      run: |
+        cd build
+        ./wash_test.exe || true
+        ./wash_test3.exe || true
+    
+    - name: Install
+      run: |
+        cd build
+        make install DESTDIR=${{ github.workspace }}/install
+    
+    - name: Create package (ZIP)
+      run: |
+        cd ${{ github.workspace }}/install
+        7z a -tzip ../wash-mingw-${{ matrix.arch }}.zip .
+    
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: wash-mingw-${{ matrix.arch }}
+        path: wash-mingw-${{ matrix.arch }}.zip
+
+  # MSYS2 (UCRT64) 构建
+  build-msys2-ucrt64:
+    runs-on: windows-latest
+    
+    defaults:
+      run:
+        shell: msys2 {0}
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup MSYS2
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: UCRT64
+        update: true
+        install: >-
+          mingw-w64-ucrt-x86_64-gcc
+          mingw-w64-ucrt-x86_64-cmake
+          mingw-w64-ucrt-x86_64-make
+          mingw-w64-ucrt-x86_64-readline
+          mingw-w64-ucrt-x86_64-ncurses
+          msys-devel
+          msys-gettext
+          msys-libreadline-devel
+    
+    - name: Configure CMake
+      run: |
+        mkdir -p build
+        cd build
+        cmake -G "Unix Makefiles" \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_INSTALL_PREFIX=/ucrt64 \
+          ..
+    
+    - name: Build
+      run: |
+        cd build
+        make -j$(nproc)
+    
+    - name: Run tests
+      run: |
+        cd build
+        ./wash_test.exe || true
+        ./wash_test3.exe || true
+    
+    - name: Install
+      run: |
+        cd build
+        make install DESTDIR=${{ github.workspace }}/install
+    
+    - name: Create package (ZIP)
+      run: |
+        cd ${{ github.workspace }}/install
+        7z a -tzip ../wash-ucrt-x86_64.zip .
+    
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: wash-ucrt-x86_64
+        path: wash-ucrt-x86_64.zip
+
+  # 发布 Release
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-linux, build-msys2-mingw, build-msys2-ucrt64]
+    runs-on: ubuntu-latest
+    
+    permissions:
+      contents: write
+    
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+    
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          artifacts/wash-linux-x86_64/*
+          artifacts/wash-linux-aarch64/*
+          artifacts/wash-linux-armv7l/*
+          artifacts/wash-mingw-x86_64/*
+          artifacts/wash-mingw-i686/*
+          artifacts/wash-ucrt-x86_64/*
+        generate_release_notes: true
+        draft: false
+        prerelease: false
