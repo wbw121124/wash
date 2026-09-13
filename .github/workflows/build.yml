@@ -8,21 +8,9 @@ on:
     branches: [ main ]
 
 jobs:
-  # Linux 构建
-  build-linux:
-    # runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        arch: [x86_64, aarch64, armv7l]
-        include:
-          - arch: x86_64
-            runner: ubuntu-latest
-          - arch: aarch64
-            runner: ubuntu-latest
-          - arch: armv7l
-            runner: ubuntu-latest
-    
-    runs-on: ${{ matrix.runner }}
+  # Linux x86_64 构建
+  build-linux-x86_64:
+    runs-on: ubuntu-latest
     
     steps:
     - uses: actions/checkout@v4
@@ -30,7 +18,7 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y build-essential cmake libreadline-dev gettext libncurses-dev
+        sudo apt-get install -y build-essential cmake libreadline-dev gettext libncurses-dev libintl-dev
         
     - name: Configure CMake
       run: |
@@ -60,25 +48,111 @@ jobs:
     - name: Create package
       run: |
         cd ${{ github.workspace }}/install
-        tar -czf ../wash-linux-${{ matrix.arch }}.tar.gz .
+        tar -czf ../wash-linux-x86_64.tar.gz .
     
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: wash-linux-${{ matrix.arch }}
-        path: wash-linux-${{ matrix.arch }}.tar.gz
+        name: wash-linux-x86_64
+        path: wash-linux-x86_64.tar.gz
 
-  # MSYS2 (MinGW) 构建
-  build-msys2-mingw:
+  # Linux aarch64 交叉编译
+  build-linux-aarch64:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential cmake libreadline-dev gettext libncurses-dev libintl-dev \
+          gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+        
+    - name: Configure CMake
+      run: |
+        mkdir -p build
+        cd build
+        cmake -G "Unix Makefiles" \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_SYSTEM_NAME=Linux \
+          -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+          -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
+          -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
+          -DCMAKE_INSTALL_PREFIX=/usr/local \
+          ..
+    
+    - name: Build
+      run: |
+        cd build
+        make -j$(nproc)
+    
+    - name: Install
+      run: |
+        cd build
+        sudo make install DESTDIR=${{ github.workspace }}/install
+    
+    - name: Create package
+      run: |
+        cd ${{ github.workspace }}/install
+        tar -czf ../wash-linux-aarch64.tar.gz .
+    
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: wash-linux-aarch64
+        path: wash-linux-aarch64.tar.gz
+
+  # Linux armv7l 交叉编译
+  build-linux-armv7l:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential cmake libreadline-dev gettext libncurses-dev libintl-dev \
+          gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
+        
+    - name: Configure CMake
+      run: |
+        mkdir -p build
+        cd build
+        cmake -G "Unix Makefiles" \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_SYSTEM_NAME=Linux \
+          -DCMAKE_SYSTEM_PROCESSOR=armv7l \
+          -DCMAKE_C_COMPILER=arm-linux-gnueabihf-gcc \
+          -DCMAKE_CXX_COMPILER=arm-linux-gnueabihf-g++ \
+          -DCMAKE_INSTALL_PREFIX=/usr/local \
+          ..
+    
+    - name: Build
+      run: |
+        cd build
+        make -j$(nproc)
+    
+    - name: Install
+      run: |
+        cd build
+        sudo make install DESTDIR=${{ github.workspace }}/install
+    
+    - name: Create package
+      run: |
+        cd ${{ github.workspace }}/install
+        tar -czf ../wash-linux-armv7l.tar.gz .
+    
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: wash-linux-armv7l
+        path: wash-linux-armv7l.tar.gz
+
+  # MSYS2 (MinGW64) 构建
+  build-msys2-mingw64:
     runs-on: windows-latest
-    strategy:
-      matrix:
-        arch: [x86_64, i686]
-        include:
-          - arch: x86_64
-            msystem: MINGW64
-          - arch: i686
-            msystem: MINGW32
     
     defaults:
       run:
@@ -90,17 +164,15 @@ jobs:
     - name: Setup MSYS2
       uses: msys2/setup-msys2@v2
       with:
-        msystem: ${{ matrix.msystem }}
+        msystem: MINGW64
         update: true
         install: >-
-          mingw-w64-${{ matrix.arch }}-gcc
-          mingw-w64-${{ matrix.arch }}-cmake
-          mingw-w64-${{ matrix.arch }}-make
-          mingw-w64-${{ matrix.arch }}-readline
-          mingw-w64-${{ matrix.arch }}-ncurses
-          msys-devel
-          msys-gettext
-          msys-libreadline-devel
+          mingw-w64-x86_64-gcc
+          mingw-w64-x86_64-cmake
+          mingw-w64-x86_64-make
+          mingw-w64-x86_64-readline
+          mingw-w64-x86_64-ncurses
+          mingw-w64-x86_64-gettext
     
     - name: Configure CMake
       run: |
@@ -127,16 +199,76 @@ jobs:
         cd build
         make install DESTDIR=${{ github.workspace }}/install
     
-    - name: Create package (ZIP)
+    - name: Create package
       run: |
         cd ${{ github.workspace }}/install
-        7z a -tzip ../wash-mingw-${{ matrix.arch }}.zip .
+        7z a -tzip ../wash-mingw-x86_64.zip .
     
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: wash-mingw-${{ matrix.arch }}
-        path: wash-mingw-${{ matrix.arch }}.zip
+        name: wash-mingw-x86_64
+        path: wash-mingw-x86_64.zip
+
+  # MSYS2 (MinGW32) 构建
+  build-msys2-mingw32:
+    runs-on: windows-latest
+    
+    defaults:
+      run:
+        shell: msys2 {0}
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup MSYS2
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: MINGW32
+        update: true
+        install: >-
+          mingw-w64-i686-gcc
+          mingw-w64-i686-cmake
+          mingw-w64-i686-make
+          mingw-w64-i686-readline
+          mingw-w64-i686-ncurses
+          mingw-w64-i686-gettext
+    
+    - name: Configure CMake
+      run: |
+        mkdir -p build
+        cd build
+        cmake -G "Unix Makefiles" \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_INSTALL_PREFIX=/mingw32 \
+          ..
+    
+    - name: Build
+      run: |
+        cd build
+        make -j$(nproc)
+    
+    - name: Run tests
+      run: |
+        cd build
+        ./wash_test.exe || true
+        ./wash_test3.exe || true
+    
+    - name: Install
+      run: |
+        cd build
+        make install DESTDIR=${{ github.workspace }}/install
+    
+    - name: Create package
+      run: |
+        cd ${{ github.workspace }}/install
+        7z a -tzip ../wash-mingw-i686.zip .
+    
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: wash-mingw-i686
+        path: wash-mingw-i686.zip
 
   # MSYS2 (UCRT64) 构建
   build-msys2-ucrt64:
@@ -160,9 +292,7 @@ jobs:
           mingw-w64-ucrt-x86_64-make
           mingw-w64-ucrt-x86_64-readline
           mingw-w64-ucrt-x86_64-ncurses
-          msys-devel
-          msys-gettext
-          msys-libreadline-devel
+          mingw-w64-ucrt-x86_64-gettext
     
     - name: Configure CMake
       run: |
@@ -189,7 +319,7 @@ jobs:
         cd build
         make install DESTDIR=${{ github.workspace }}/install
     
-    - name: Create package (ZIP)
+    - name: Create package
       run: |
         cd ${{ github.workspace }}/install
         7z a -tzip ../wash-ucrt-x86_64.zip .
@@ -203,7 +333,7 @@ jobs:
   # 发布 Release
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build-linux, build-msys2-mingw, build-msys2-ucrt64]
+    needs: [build-linux-x86_64, build-linux-aarch64, build-linux-armv7l, build-msys2-mingw64, build-msys2-mingw32, build-msys2-ucrt64]
     runs-on: ubuntu-latest
     
     permissions:
