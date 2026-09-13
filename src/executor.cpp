@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <fcntl.h>
 
 namespace wash {
 
@@ -145,10 +146,16 @@ ExecResult Executor::executeNode(ASTPtr node) {
             return executeFunctionCall(static_cast<FunctionCallNode*>(node.get()));
         case NodeType::ASSIGNMENT:
             return executeAssignment(static_cast<AssignmentNode*>(node.get()));
+        case NodeType::ENV_ASSIGNMENT:
+            return executeEnvAssignment(static_cast<EnvAssignmentNode*>(node.get()));
         case NodeType::COMMAND_EXEC:
             return executeCommand(static_cast<CommandExecNode*>(node.get()));
         case NodeType::COMMAND_OUTPUT:
             return executeCommandOutput(static_cast<CommandOutputNode*>(node.get()));
+        case NodeType::PIPE_EXPR:
+            return executePipeExpr(static_cast<PipeExprNode*>(node.get()));
+        case NodeType::REDIRECT_EXPR:
+            return executeRedirectExpr(static_cast<RedirectExprNode*>(node.get()));
         case NodeType::IF_STMT:
             return executeIf(static_cast<IfNode*>(node.get()));
         case NodeType::FOR_STMT:
@@ -199,6 +206,12 @@ ExecResult Executor::executeStatements(const std::vector<ASTPtr>& statements) {
 }
 
 ExecResult Executor::executeLiteral(LiteralNode* node) {
+    // 如果是字符串，进行变量插值
+    if (std::holds_alternative<std::string>(node->value)) {
+        std::string str = std::get<std::string>(node->value);
+        std::string interpolated = interpolateString(str);
+        return ExecResult(ExecResultType::NORMAL, makeStringValue(interpolated));
+    }
     return ExecResult(ExecResultType::NORMAL, node->value);
 }
 
@@ -407,6 +420,217 @@ ExecResult Executor::executeCommandOutput(CommandOutputNode* node) {
     return ExecResult(ExecResultType::NORMAL, makeStringValue(output));
 }
 
+std::string Executor::interpolateString(const std::string& str) {
+    std::string result;
+    for (size_t i = 0; i < str.size(); ++i) {
+        if (str[i] == '%' && i + 1 < str.size() && str[i + 1] == '{') {
+            // 找到 %{var} 模式
+            i += 2; // 跳过 %{
+            std::string varName;
+            while (i < str.size() && str[i] != '}') {
+                varName += str[i];
+                i++;
+            }
+            // 获取变量值
+            Value val = getVariable(varName);
+            result += valueToString(val);
+        } else {
+            result += str[i];
+        }
+    }
+    return result;
+}
+
+ExecResult Executor::executePipeExpr(PipeExprNode* node) {
+    // 执行左边的命令，捕获 stdout
+    ExecResult leftResult = executeNode(node->left);
+    
+    // 如果左边是命令执行，stdout 已经泄露到终端
+    // 这里需要重新执行并捕获 stdout
+    std::string output;
+    if (node->left->type == NodeType::COMMAND_EXEC) {
+        auto cmdNode = std::static_pointer_cast<CommandExecNode>(node->left);
+        std::string cmd = cmdNode->command;
+        std::vector<std::string> args;
+        for (const auto& arg : cmdNode->args) {
+            ExecResult r = executeNode(arg);
+            if (r.type != ExecResultType::NORMAL) return r;
+            args.push_back(valueToString(r.value));
+        }
+        
+        // 构建完整命令行
+        std::string fullCmd = cmd;
+        for (const auto& a : args) {
+            fullCmd += " " + a;
+        }
+        
+        // 用 popen 捕获 stdout
+        FILE* pipe = popen((fullCmd + " 2>&1").c_str(), "r");
+        if (pipe) {
+            char buffer[4096];
+            while (fgets(buffer, sizeof(buffer), pipe)) {
+                output += buffer;
+            }
+            pclose(pipe);
+        }
+        
+        // 去掉末尾换行
+        if (!output.empty() && output.back() == '\n') {
+            output.pop_back();
+        }
+    } else if (node->left->type == NodeType::COMMAND_OUTPUT) {
+        // $(...) 命令输出替换
+        auto cmdNode = std::static_pointer_cast<CommandOutputNode>(node->left);
+        std::string cmd = cmdNode->command;
+        FILE* pipe = popen((cmd + " 2>&1").c_str(), "r");
+        if (pipe) {
+            char buffer[4096];
+            while (fgets(buffer, sizeof(buffer), pipe)) {
+                output += buffer;
+            }
+            pclose(pipe);
+        }
+        if (!output.empty() && output.back() == '\n') {
+            output.pop_back();
+        }
+    } else {
+        // 其他表达式，正常求值
+        if (leftResult.type != ExecResultType::NORMAL) return leftResult;
+        output = valueToString(leftResult.value);
+    }
+    
+    // 检查右边是什么
+    if (node->right->type == NodeType::VARIABLE) {
+        // $cmd | %var — 捕获 stdout 赋值给变量
+        auto varNode = std::static_pointer_cast<VariableNode>(node->right);
+        setVariable(varNode->name, makeStringValue(output));
+        return ExecResult(ExecResultType::NORMAL, makeIntValue(0));
+    } else if (node->right->type == NodeType::COMMAND_EXEC) {
+        // $cmd1 | $cmd2 — 管道：将 stdout 传给下一个命令
+        auto cmdNode = std::static_pointer_cast<CommandExecNode>(node->right);
+        std::string cmd = cmdNode->command;
+        std::vector<std::string> args;
+        for (const auto& arg : cmdNode->args) {
+            ExecResult r = executeNode(arg);
+            if (r.type != ExecResultType::NORMAL) return r;
+            args.push_back(valueToString(r.value));
+        }
+        
+        // 构建完整命令行，通过管道传递
+        std::string fullCmd = cmd;
+        for (const auto& a : args) {
+            fullCmd += " " + a;
+        }
+        
+        // 使用 echo 和管道
+        std::string pipeCmd = "echo " + output + " | " + fullCmd;
+        FILE* pipe = popen(pipeCmd.c_str(), "r");
+        std::string pipeOutput;
+        if (pipe) {
+            char buffer[4096];
+            while (fgets(buffer, sizeof(buffer), pipe)) {
+                pipeOutput += buffer;
+            }
+            pclose(pipe);
+        }
+        if (!pipeOutput.empty() && pipeOutput.back() == '\n') {
+            pipeOutput.pop_back();
+        }
+        return ExecResult(ExecResultType::NORMAL, makeStringValue(pipeOutput));
+    }
+    
+    return ExecResult(ExecResultType::NORMAL, makeStringValue(output));
+}
+
+ExecResult Executor::executeRedirectExpr(RedirectExprNode* node) {
+    // 解析重定向内容
+    // @("in.txt", "out.txt", "err.txt") - stdin, stdout, stderr
+    // @("in.txt", 1, 2) - 也可以使用 fd 编号
+    
+    if (!node->command) {
+        return ExecResult(ExecResultType::NORMAL, makeIntValue(0));
+    }
+    
+    // 保存原始 fd
+    int savedStdin = dup(STDIN_FILENO);
+    int savedStdout = dup(STDOUT_FILENO);
+    int savedStderr = dup(STDERR_FILENO);
+    
+    // 解析重定向目标
+    std::vector<std::string> targets;
+    for (const auto& target : node->targets) {
+        ExecResult r = executeNode(target);
+        if (r.type != ExecResultType::NORMAL) {
+            // 恢复 fd
+            dup2(savedStdin, STDIN_FILENO);
+            dup2(savedStdout, STDOUT_FILENO);
+            dup2(savedStderr, STDERR_FILENO);
+            close(savedStdin);
+            close(savedStdout);
+            close(savedStderr);
+            return r;
+        }
+        targets.push_back(valueToString(r.value));
+    }
+    
+    // 应用重定向
+    // targets[0] -> stdin, targets[1] -> stdout, targets[2] -> stderr
+    for (size_t i = 0; i < targets.size(); ++i) {
+        if (targets[i].empty()) continue;
+        
+        int fd = -1;
+        int targetFd = -1;
+        
+        if (i == 0) targetFd = STDIN_FILENO;
+        else if (i == 1) targetFd = STDOUT_FILENO;
+        else if (i == 2) targetFd = STDERR_FILENO;
+        else continue;
+        
+        // 检查是否为 fd 编号
+        try {
+            int fdNum = std::stoi(targets[i]);
+            if (fdNum >= 0 && fdNum <= 2) {
+                // 直接 dup2
+                if (fdNum != targetFd) {
+                    dup2(fdNum, targetFd);
+                }
+                continue;
+            }
+        } catch (...) {}
+        
+        // 打开文件
+        const char* mode = (targetFd == STDIN_FILENO) ? "r" : "w";
+        fd = open(targets[i].c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) {
+            // 恢复 fd
+            dup2(savedStdin, STDIN_FILENO);
+            dup2(savedStdout, STDOUT_FILENO);
+            dup2(savedStderr, STDERR_FILENO);
+            close(savedStdin);
+            close(savedStdout);
+            close(savedStderr);
+            std::cerr << "无法打开文件: " << targets[i] << std::endl;
+            return ExecResult(ExecResultType::NORMAL, makeIntValue(1));
+        }
+        
+        dup2(fd, targetFd);
+        close(fd);
+    }
+    
+    // 执行命令
+    ExecResult cmdResult = executeNode(node->command);
+    
+    // 恢复原始 fd
+    dup2(savedStdin, STDIN_FILENO);
+    dup2(savedStdout, STDOUT_FILENO);
+    dup2(savedStderr, STDERR_FILENO);
+    close(savedStdin);
+    close(savedStdout);
+    close(savedStderr);
+    
+    return cmdResult;
+}
+
 ExecResult Executor::executeIf(IfNode* node) {
     ExecResult condResult = executeNode(node->condition);
     if (condResult.type != ExecResultType::NORMAL) return condResult;
@@ -472,13 +696,19 @@ ExecResult Executor::executeReturn(ReturnNode* node) {
 ExecResult Executor::executeFunctionDef(FunctionDefNode* node) {
     std::string name = node->name;
     ASTPtr body = node->body;
+    std::vector<std::string> paramNames = node->paramNames;
     Executor* self = this;
     
-    Function func = [self, body](const std::vector<Value>& args) -> ExecResult {
+    Function func = [self, body, paramNames](const std::vector<Value>& args) -> ExecResult {
         self->enterScope();
         
-        // 绑定参数到局部变量 %0, %1, %2...
+        // 绑定参数到命名参数或位置参数
         for (size_t i = 0; i < args.size(); ++i) {
+            if (i < paramNames.size()) {
+                // 使用命名参数
+                self->setVariable(paramNames[i], args[i]);
+            }
+            // 也绑定到 %0, %1, %2... 位置参数
             self->setVariable("$" + std::to_string(i), args[i]);
         }
         
@@ -497,12 +727,19 @@ ExecResult Executor::executeFunctionDef(FunctionDefNode* node) {
 
 ExecResult Executor::executeLambdaDef(LambdaDefNode* node) {
     ASTPtr body = node->body;
+    std::vector<std::string> paramNames = node->paramNames;
     Executor* self = this;
     
-    Function func = [self, body](const std::vector<Value>& args) -> ExecResult {
+    Function func = [self, body, paramNames](const std::vector<Value>& args) -> ExecResult {
         self->enterScope();
         
+        // 绑定参数到命名参数或位置参数
         for (size_t i = 0; i < args.size(); ++i) {
+            if (i < paramNames.size()) {
+                // 使用命名参数
+                self->setVariable(paramNames[i], args[i]);
+            }
+            // 也绑定到 %0, %1, %2... 位置参数
             self->setVariable("$" + std::to_string(i), args[i]);
         }
         
@@ -532,17 +769,94 @@ std::vector<Value> Executor::generateRange(ASTPtr range) {
         auto literal = std::static_pointer_cast<LiteralNode>(range);
         if (std::holds_alternative<std::string>(literal->value)) {
             std::string rangeStr = std::get<std::string>(literal->value);
-            try {
-                double num = std::stod(rangeStr);
-                result.push_back(makeNumberValue(num));
-            } catch (...) {}
+            // 支持逗号分隔的范围："1..10,20..40,0"
+            std::istringstream iss(rangeStr);
+            std::string part;
+            while (std::getline(iss, part, ',')) {
+                // 去除空格
+                size_t start = part.find_first_not_of(" \t");
+                size_t end = part.find_last_not_of(" \t");
+                if (start == std::string::npos) continue;
+                std::string trimmed = part.substr(start, end - start + 1);
+                
+                // 检查是否为范围 a..b
+                size_t dotdot = trimmed.find("..");
+                if (dotdot != std::string::npos) {
+                    std::string s = trimmed.substr(0, dotdot);
+                    std::string e = trimmed.substr(dotdot + 2);
+                    bool excl = false;
+                    if (!e.empty() && e[0] == '<') {
+                        excl = true;
+                        e = e.substr(1);
+                    }
+                    try {
+                        double sv = std::stod(s);
+                        double ev = std::stod(e);
+                        if (sv <= ev) {
+                            for (double i = sv; excl ? i < ev : i <= ev; ++i) {
+                                result.push_back(makeIntValue(static_cast<int64_t>(i)));
+                            }
+                        } else {
+                            for (double i = sv; excl ? i > ev : i >= ev; --i) {
+                                result.push_back(makeIntValue(static_cast<int64_t>(i)));
+                            }
+                        }
+                    } catch (...) {}
+                } else {
+                    // 单个值
+                    try {
+                        double num = std::stod(trimmed);
+                        result.push_back(makeIntValue(static_cast<int64_t>(num)));
+                    } catch (...) {}
+                }
+            }
             return result;
         }
     }
     
     if (range->type == NodeType::BINARY_OP) {
         auto binOp = std::static_pointer_cast<BinaryOpNode>(range);
-        if (binOp->op == ".." || binOp->op == "..<") {
+        
+        // a..b..s 步长语法
+        if (binOp->op == "..step") {
+            // binOp->left 是 BinaryOpNode(op="..", left=start, right=end)
+            // binOp->right 是 step
+            auto innerOp = std::static_pointer_cast<BinaryOpNode>(binOp->left);
+            ExecResult startResult = executeNode(innerOp->left);
+            ExecResult endResult = executeNode(innerOp->right);
+            ExecResult stepResult = executeNode(binOp->right);
+            
+            if (startResult.type == ExecResultType::NORMAL && 
+                endResult.type == ExecResultType::NORMAL &&
+                stepResult.type == ExecResultType::NORMAL) {
+                double start = valueToNumber(startResult.value);
+                double end = valueToNumber(endResult.value);
+                double step = valueToNumber(stepResult.value);
+                
+                if (step == 0) {
+                    std::cerr << "错误: 范围步长不能为 0" << std::endl;
+                    return result;
+                }
+                if (step > 0 && start > end) {
+                    std::cerr << "错误: 步长为正时起始值不能大于结束值" << std::endl;
+                    return result;
+                }
+                if (step < 0 && start < end) {
+                    std::cerr << "错误: 步长为负时起始值不能小于结束值" << std::endl;
+                    return result;
+                }
+                
+                if (step > 0) {
+                    for (double i = start; i <= end; i += step) {
+                        result.push_back(makeIntValue(static_cast<int64_t>(i)));
+                    }
+                } else {
+                    for (double i = start; i >= end; i += step) {
+                        result.push_back(makeIntValue(static_cast<int64_t>(i)));
+                    }
+                }
+            }
+        } else if (binOp->op == ".." || binOp->op == "..<") {
             ExecResult startResult = executeNode(binOp->left);
             ExecResult endResult = executeNode(binOp->right);
             
@@ -553,11 +867,11 @@ std::vector<Value> Executor::generateRange(ASTPtr range) {
                 
                 if (start <= end) {
                     for (double i = start; exclusive ? i < end : i <= end; ++i) {
-                        result.push_back(makeNumberValue(i));
+                        result.push_back(makeIntValue(static_cast<int64_t>(i)));
                     }
                 } else {
                     for (double i = start; exclusive ? i > end : i >= end; --i) {
-                        result.push_back(makeNumberValue(i));
+                        result.push_back(makeIntValue(static_cast<int64_t>(i)));
                     }
                 }
             }
@@ -682,6 +996,52 @@ void Executor::registerBuiltinFunctions() {
     defineFunction("return", [](const std::vector<Value>& args) -> ExecResult {
         if (args.empty()) return ExecResult(ExecResultType::RETURN_RES, makeNumberValue(0));
         return ExecResult(ExecResultType::RETURN_RES, args[0]);
+    });
+    
+    defineFunction("length", [](const std::vector<Value>& args) -> ExecResult {
+        if (args.empty()) return ExecResult(ExecResultType::NORMAL, makeNumberValue(0));
+        std::string str = valueToString(args[0]);
+        return ExecResult(ExecResultType::NORMAL, makeIntValue(static_cast<int64_t>(str.size())));
+    });
+    
+    defineFunction("upper", [](const std::vector<Value>& args) -> ExecResult {
+        if (args.empty()) return ExecResult(ExecResultType::NORMAL, makeStringValue(""));
+        std::string str = valueToString(args[0]);
+        for (auto& c : str) c = std::toupper(c);
+        return ExecResult(ExecResultType::NORMAL, makeStringValue(str));
+    });
+    
+    defineFunction("lower", [](const std::vector<Value>& args) -> ExecResult {
+        if (args.empty()) return ExecResult(ExecResultType::NORMAL, makeStringValue(""));
+        std::string str = valueToString(args[0]);
+        for (auto& c : str) c = std::tolower(c);
+        return ExecResult(ExecResultType::NORMAL, makeStringValue(str));
+    });
+    
+    defineFunction("trim", [](const std::vector<Value>& args) -> ExecResult {
+        if (args.empty()) return ExecResult(ExecResultType::NORMAL, makeStringValue(""));
+        std::string str = valueToString(args[0]);
+        size_t start = str.find_first_not_of(" \t\n\r");
+        size_t end = str.find_last_not_of(" \t\n\r");
+        if (start == std::string::npos) return ExecResult(ExecResultType::NORMAL, makeStringValue(""));
+        return ExecResult(ExecResultType::NORMAL, makeStringValue(str.substr(start, end - start + 1)));
+    });
+    
+    defineFunction("substr", [](const std::vector<Value>& args) -> ExecResult {
+        if (args.size() < 2) return ExecResult(ExecResultType::NORMAL, makeStringValue(""));
+        std::string str = valueToString(args[0]);
+        size_t start = static_cast<size_t>(valueToInt64(args[1]));
+        size_t len = (args.size() >= 3) ? static_cast<size_t>(valueToInt64(args[2])) : std::string::npos;
+        if (start >= str.size()) return ExecResult(ExecResultType::NORMAL, makeStringValue(""));
+        return ExecResult(ExecResultType::NORMAL, makeStringValue(str.substr(start, len)));
+    });
+    
+    defineFunction("typeof", [](const std::vector<Value>& args) -> ExecResult {
+        if (args.empty()) return ExecResult(ExecResultType::NORMAL, makeStringValue("undefined"));
+        const Value& v = args[0];
+        if (isInt(v)) return ExecResult(ExecResultType::NORMAL, makeStringValue("int"));
+        if (isDouble(v)) return ExecResult(ExecResultType::NORMAL, makeStringValue("double"));
+        return ExecResult(ExecResultType::NORMAL, makeStringValue("string"));
     });
     
     defineFunction("break", [](const std::vector<Value>& args) -> ExecResult {

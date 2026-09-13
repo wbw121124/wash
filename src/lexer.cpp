@@ -34,7 +34,18 @@ std::vector<Token> Lexer::tokenize() {
         if (token.type == TokenType::EOF_TOKEN) break;
     }
     
-    return tokens_;
+    // 相邻字符串自动连接: "hello " "world" -> "hello world"
+    std::vector<Token> merged;
+    for (size_t i = 0; i < tokens_.size(); ++i) {
+        if (tokens_[i].type == TokenType::STRING && !merged.empty() && 
+            merged.back().type == TokenType::STRING) {
+            merged.back().value += tokens_[i].value;
+        } else {
+            merged.push_back(tokens_[i]);
+        }
+    }
+    
+    return merged;
 }
 
 Token Lexer::nextToken() {
@@ -306,12 +317,12 @@ Token Lexer::scanBlockComment() {
 Token Lexer::scanVariable() {
     advance();
     
-    if (current() == 'e' && peek() == 'n' && peek(1) == 'v') {
+    if (current() == 'e' && peek(1) == 'n' && peek(2) == 'v') {
         size_t savedPos = pos_;
         size_t savedLine = line_;
         size_t savedCol = column_;
         advance(); advance(); advance();
-        if (current() == '.') {
+        if (current() == '.' || current() == ':') {
             advance();
             std::string varName;
             while (!isAtEnd() && (std::isalnum(current()) || current() == '_' || current() == '-')) {
@@ -384,7 +395,17 @@ Token Lexer::scanRedirect() {
 }
 
 void Lexer::skipWhitespace() {
-    while (!isAtEnd() && std::isspace(current()) && current() != '\n') advance();
+    while (!isAtEnd() && std::isspace(current()) && current() != '\n') {
+        // 行续：\ + \n
+        if (current() == '\\' && pos_ + 1 < source_.size() && source_[pos_ + 1] == '\n') {
+            advance(); // 跳过 \
+            advance(); // 跳过 \n
+            line_++;
+            column_ = 1;
+            continue;
+        }
+        advance();
+    }
 }
 
 void Lexer::skipLineComment() {

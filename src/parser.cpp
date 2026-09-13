@@ -8,6 +8,7 @@
 
 #include "parser.h"
 #include <stdexcept>
+#include <sstream>
 
 namespace wash {
 
@@ -89,6 +90,11 @@ ASTPtr Parser::parseStatement() {
         // 形式 1: f():{...}
         if (tokens_[pos_ + 1].type == TokenType::LPAREN) {
             advance(); advance();  // 跳过函数名和 (
+            // 检查参数列表
+            while (current().type != TokenType::RPAREN && 
+                   current().type != TokenType::EOF_TOKEN) {
+                advance();
+            }
             if (current().type == TokenType::RPAREN) {
                 advance();  // 跳过 )
                 if (current().type == TokenType::COLON) {
@@ -112,7 +118,20 @@ ASTPtr Parser::parseStatement() {
     }
     
     // 赋值语句或表达式
-    return parseAssignment();
+    return parsePipeExpression();
+}
+
+ASTPtr Parser::parsePipeExpression() {
+    ASTPtr left = parseAssignment();
+    
+    // 处理管道 $cmd | %var 或 $cmd1 | $cmd2
+    if (check(TokenType::PIPE)) {
+        advance(); // 跳过 |
+        ASTPtr right = parseAssignment();
+        return std::make_shared<PipeExprNode>(left, right, left->line, left->column);
+    }
+    
+    return left;
 }
 
 ASTPtr Parser::parseBlock() {
@@ -229,6 +248,17 @@ ASTPtr Parser::parseRange() {
         ASTPtr right = parseLogicalOr();
         std::string op = exclusive ? "..<" : "..";
         left = std::make_shared<BinaryOpNode>(op, left, right);
+        
+        // 检查是否有步长 a..b..s
+        if (!exclusive && check(TokenType::DOT) && pos_ + 1 < tokens_.size() && 
+            tokens_[pos_ + 1].type == TokenType::DOT) {
+            advance(); // 跳过第一个 .
+            advance(); // 跳过第二个 .
+            ASTPtr step = parseLogicalOr();
+            // 用特殊标记存储步长：创建一个三元组 BinaryOpNode
+            // op="..", left=之前的范围, right=步长
+            left = std::make_shared<BinaryOpNode>("..step", left, step);
+        }
     }
     
     return left;
@@ -487,9 +517,25 @@ ASTPtr Parser::parsePrimary() {
     // 重定向
     if (tok.type == TokenType::REDIRECT) {
         advance();
-        // 解析重定向内容
+        // 解析重定向内容: @("in.txt", "out.txt", "err.txt")
         std::vector<ASTPtr> targets;
-        // TODO: 解析重定向目标
+        std::string content = tok.value;
+        
+        // 简单的逗号分隔解析
+        std::istringstream iss(content);
+        std::string part;
+        while (std::getline(iss, part, ',')) {
+            // 去除空格
+            size_t start = part.find_first_not_of(" \t");
+            size_t end = part.find_last_not_of(" \t");
+            if (start == std::string::npos) continue;
+            std::string trimmed = part.substr(start, end - start + 1);
+            
+            // 创建字符串字面量节点
+            targets.push_back(std::make_shared<LiteralNode>(
+                makeStringValue(trimmed), tok.line, tok.column));
+        }
+        
         return std::make_shared<RedirectExprNode>(nullptr, targets, tok.line, tok.column);
     }
     
@@ -521,9 +567,30 @@ ASTPtr Parser::parsePrimary() {
     
     // lambda 定义
     if (tok.type == TokenType::LPAREN) {
-        // 检查是否为 lambda ():{...}
+        // 检查是否为 lambda ():{...} 或 (x, y):{...}
         size_t savedPos = pos_;
         advance();  // 跳过 (
+        
+        // 检查参数列表
+        std::vector<std::string> lambdaParams;
+        bool hasParams = false;
+        while (current().type != TokenType::RPAREN && 
+               current().type != TokenType::EOF_TOKEN) {
+            if (current().type == TokenType::IDENTIFIER) {
+                lambdaParams.push_back(current().value);
+                hasParams = true;
+                advance();
+            } else if (current().type == TokenType::VAR) {
+                lambdaParams.push_back(current().value);
+                hasParams = true;
+                advance();
+            } else {
+                break;
+            }
+            if (check(TokenType::COMMA)) {
+                advance();
+            }
+        }
         
         if (current().type == TokenType::RPAREN) {
             advance();  // 跳过 )
@@ -531,12 +598,10 @@ ASTPtr Parser::parsePrimary() {
                 advance();  // 跳过 :
                 if (current().type == TokenType::LBRACE) {
                     // lambda 定义
-                    pos_ = savedPos;
-                    advance();  // 跳过 (
-                    advance();  // 跳过 )
-                    advance();  // 跳过 :
                     ASTPtr body = parseBlock();
-                    return std::make_shared<LambdaDefNode>(body, tok.line, tok.column);
+                    auto node = std::make_shared<LambdaDefNode>(body, tok.line, tok.column);
+                    node->paramNames = lambdaParams;
+                    return node;
                 }
             }
         }
@@ -707,13 +772,39 @@ ASTPtr Parser::parseFunctionDef() {
         advance();  // 跳过 =
     }
     
-    advance();  // 跳过 (
-    advance();  // 跳过 )
-    advance();  // 跳过 :
+    // 解析参数列表 (a, b)
+    std::vector<std::string> params;
+    if (match(TokenType::LPAREN)) {
+        while (!check(TokenType::RPAREN) && !check(TokenType::EOF_TOKEN)) {
+            if (current().type == TokenType::IDENTIFIER) {
+                params.push_back(current().value);
+                advance();
+            } else if (current().type == TokenType::VAR) {
+                params.push_back(current().value);
+                advance();
+            } else {
+                break;
+            }
+            if (check(TokenType::COMMA)) {
+                advance();
+            }
+        }
+        if (!match(TokenType::RPAREN)) {
+            error("期望 ')'");
+            return nullptr;
+        }
+    }
+    
+    if (!match(TokenType::COLON)) {
+        error("期望 ':'");
+        return nullptr;
+    }
     
     ASTPtr body = parseBlock();
     
-    return std::make_shared<FunctionDefNode>(funcName, body, nameTok.line, nameTok.column);
+    auto node = std::make_shared<FunctionDefNode>(funcName, body, nameTok.line, nameTok.column);
+    node->paramNames = params;
+    return node;
 }
 
 ASTPtr Parser::parseReturnStatement() {

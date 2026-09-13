@@ -56,6 +56,12 @@ private:
     ASTPtr parseStatement();
     
     /**
+     * @brief 解析管道表达式
+     * @return 管道节点或普通表达式节点
+     */
+    ASTPtr parsePipeExpression();
+    
+    /**
      * @brief 解析代码块
      * @return 代码块节点
      */

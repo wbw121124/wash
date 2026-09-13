@@ -224,6 +224,20 @@ private:
     ExecResult executeCommandOutput(CommandOutputNode* node);
     
     /**
+     * @brief 执行管道表达式
+     * @param node 管道节点
+     * @return 执行结果
+     */
+    ExecResult executePipeExpr(PipeExprNode* node);
+    
+    /**
+     * @brief 执行重定向表达式
+     * @param node 重定向节点
+     * @return 执行结果
+     */
+    ExecResult executeRedirectExpr(RedirectExprNode* node);
+    
+    /**
      * @brief 执行 if 语句
      * @param node if 节点
      * @return 执行结果
@@ -310,6 +324,13 @@ private:
      * @brief 注册内建函数
      */
     void registerBuiltinFunctions();
+    
+    /**
+     * @brief 插值字符串中的 %{var} 引用
+     * @param str 包含 %{var} 的字符串
+     * @return 插值后的字符串
+     */
+    std::string interpolateString(const std::string& str);
     
     std::shared_ptr<Scope> currentScope_;    ///< 当前作用域
     std::map<std::string, Value> envVars_;   ///< 环境变量

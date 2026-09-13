@@ -283,6 +283,7 @@ enum class NodeType {
     
     // 语句
     ASSIGNMENT,         ///< 赋值
+    ENV_ASSIGNMENT,     ///< 环境变量赋值
     COMMAND_EXEC,       ///< 命令执行
     COMMAND_OUTPUT,     ///< 命令输出替换
     PIPE_EXPR,          ///< 管道表达式
@@ -494,7 +495,7 @@ struct EnvAssignmentNode : public ASTNode {
      * @param c 列号
      */
     EnvAssignmentNode(const std::string& vn, ASTPtr v, size_t l = 0, size_t c = 0)
-        : ASTNode(NodeType::ASSIGNMENT, l, c), varName(vn), value(v) {}
+        : ASTNode(NodeType::ENV_ASSIGNMENT, l, c), varName(vn), value(v) {}
 };
 
 /**
@@ -675,6 +676,7 @@ struct ReturnNode : public ASTNode {
 struct FunctionDefNode : public ASTNode {
     std::string name;                       ///< 函数名
     ASTPtr body;                            ///< 函数体
+    std::vector<std::string> paramNames;    ///< 参数名列表
     
     /**
      * @brief 构造函数
@@ -692,6 +694,7 @@ struct FunctionDefNode : public ASTNode {
  */
 struct LambdaDefNode : public ASTNode {
     ASTPtr body;                            ///< 函数体
+    std::vector<std::string> paramNames;    ///< 参数名列表
     
     /**
      * @brief 构造函数
