@@ -1,48 +1,152 @@
-# wash 示例脚本
+# wash 示例脚本 - 展示所有主要功能
 
-# 测试变量
-%name="wash"
-%version="1.0"
-echo("欢迎使用 wash " + %version + "!")
+echo("=== wash 功能演示 ===")
+echo()
 
-# 测试算术运算
-%a=10
-%b=20
-%c=calc(%a + %b)
-echo("10 + 20 = " + %c)
+# ========== 1. 变量系统 ==========
+echo("--- 1. 变量系统 ---")
+%name = "wash"
+%version = "2.0"
+echo("欢迎使用 " + %name + " " + %version + "!")
 
-# 测试比较运算
-%result=calc(%a > %b)
-echo("10 > 20: " + %result)
+# 字符串插值
+echo("变量名: %{name}, 版本: %{version}")
 
-# 测试 if 语句
-if(calc(%a < %b)){
-    echo("%a 小于 %b")
+# ========== 2. 数学表达式 ==========
+echo()
+echo("--- 2. 数学表达式 (calc) ---")
+%a = 10
+%b = 3
+echo("%a + %b = " + calc(%a + %b))
+echo("%a - %b = " + calc(%a - %b))
+echo("%a * %b = " + calc(%a * %b))
+echo("%a / %b = " + calc(%a / %b))
+echo("%a %% %b = " + calc(%a %% %b))
+echo("%a ^ 2 = " + calc(%a ^ 2))
+
+# ========== 3. 字符串操作 ==========
+echo()
+echo("--- 3. 字符串操作 ---")
+%str = "  Hello, Wash!  "
+echo("原始: '" + %str + "'")
+echo("长度: " + length(%str))
+echo("大写: " + upper(%str))
+echo("小写: " + lower(%str))
+echo("去空格: '" + trim(%str) + "'")
+echo("子串: " + substr(%str, 2, 5))
+echo("查找: " + find(%str, "Wash"))
+
+# ========== 4. 条件语句 ==========
+echo()
+echo("--- 4. 条件语句 ---")
+%score = 85
+if(calc(%score >= 90)) {
+    echo("优秀")
+} elif(calc(%score >= 80)) {
+    echo("良好")
+} elif(calc(%score >= 70)) {
+    echo("中等")
 } else {
-    echo("%a 大于等于 %b")
+    echo("需要努力")
 }
 
-# 测试 for 循环
-echo("计算 1 到 5 的和:")
-%sum=0
-for(%i in 1..5){
-    %sum=calc(%sum + %i)
+# 三目运算符
+%grade = calc(%score >= 60) ? "及格" : "不及格"
+echo("三目运算: " + %grade)
+
+# ========== 5. 循环 ==========
+echo()
+echo("--- 5. 循环 ---")
+
+# for 循环
+echo("for 循环 (1..5):")
+for(%i in 1..5) {
+    echo("  " + %i)
 }
-echo("总和: " + %sum)
 
-# 测试内建函数
-%d=calc(3.14)
-%rounded=round(%d)
-echo("round(3.14) = " + %rounded)
+# while 循环
+echo("while 循环:")
+%count = 0
+while(calc(%count < 3)) {
+    echo("  计数: " + %count)
+    %count = calc(%count + 1)
+}
 
-%ceiled=ceil(%d)
-echo("ceil(3.14) = " + %ceiled)
+# 范围步长
+echo("带步长的范围 (0..10..2):")
+for(%i in 0..10..2) {
+    echo("  " + %i)
+}
 
-%floored=floor(%d)
-echo("floor(3.14) = " + %floored)
+# ========== 6. 函数 ==========
+echo()
+echo("--- 6. 函数 ---")
 
-# 测试环境变量
-%env:test_var="hello"
-echo("环境变量: " + %env:test_var)
+# 普通函数
+fadd(a, b) {
+    return(calc(%a + %b))
+}
+echo("fadd(3, 4) = " + fadd(3, 4))
 
-echo("测试完成!")
+# Lambda
+%double = (x) => { calc(%x * 2) }
+echo("double(5) = " + %double(5))
+
+# 递归函数
+ffib(n) {
+    if(calc(%n <= 1)) {
+        return(%n)
+    }
+    return(calc(ffib(calc(%n - 1)) + ffib(calc(%n - 2))))
+}
+echo("fib(10) = " + ffib(10))
+
+# ========== 7. 字符串拼接 ==========
+echo()
+echo("--- 7. 字符串拼接 ---")
+%greeting = "Hello" ", " "World" "!"
+echo(%greeting)
+
+# ========== 8. 环境变量 ==========
+echo()
+echo("--- 8. 环境变量 ---")
+%env:demo_var = "这是一个环境变量"
+echo("环境变量: " + %env:demo_var)
+
+# ========== 9. Unicode 字符串 ==========
+echo()
+echo("--- 9. Unicode 字符串 ---")
+%chinese = u"你好世界"
+%emoji = u"\u{1F600}"
+%japanese = u"こんにちは"
+echo("中文: " + %chinese)
+echo("日文: " + %japanese)
+echo("表情: " + %emoji)
+
+# ========== 10. 类型系统 ==========
+echo()
+echo("--- 10. 类型系统 ---")
+%int_val = 42
+%float_val = 3.14
+%str_val = "hello"
+echo("整数类型: " + typeof(%int_val))
+echo("浮点类型: " + typeof(%float_val))
+echo("字符串类型: " + typeof(%str_val))
+
+# ========== 11. 命令替换 ==========
+echo()
+echo("--- 11. 命令替换 ---")
+%current_date = $(date)
+echo("当前日期: " + %current_date)
+
+# ========== 12. 综合示例 ==========
+echo()
+echo("--- 12. 综合示例: 计算器 ---")
+fcalc(expr) {
+    return(calc(%expr))
+}
+echo("2 + 3 * 4 = " + fcalc(2 + 3 * 4))
+echo("(2 + 3) * 4 = " + fcalc((2 + 3) * 4))
+
+echo()
+echo("=== 演示完成! ===")

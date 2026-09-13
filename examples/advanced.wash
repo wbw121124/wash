@@ -1,0 +1,130 @@
+# 高级功能示例
+
+echo("=== 高级功能演示 ===")
+
+# ========== 1. 闭包 ==========
+echo()
+echo("--- 1. 闭包 ---")
+fmake_counter() {
+    %count = 0
+    fincrement() {
+        %count = calc(%count + 1)
+        return(%count)
+    }
+    fget_count() {
+        return(%count)
+    }
+    # 返回函数引用
+    return(fincrement)
+}
+
+%counter = fmake_counter()
+echo("计数器: " + %counter())
+echo("计数器: " + %counter())
+echo("计数器: " + %counter())
+
+# ========== 2. 高阶函数 ==========
+echo()
+echo("--- 2. 高阶函数 ---")
+fapply(func, value) {
+    return(func(%value))
+}
+
+fdouble(x) {
+    return(calc(%x * 2))
+}
+
+fsquare(x) {
+    return(calc(%x * %x))
+}
+
+echo("double(5) = " + fapply(fdouble, 5))
+echo("square(5) = " + fapply(fsquare, 5))
+
+# ========== 3. 字符串处理 ==========
+echo()
+echo("--- 3. 字符串处理 ---")
+# 反转字符串
+freverse(str) {
+    %result = ""
+    %len = length(%str)
+    for(%i in calc(%len - 1)..0..-1) {
+        %result = %result + substr(%str, %i, 1)
+    }
+    return(%result)
+}
+
+%text = "Hello, Wash!"
+echo("原始: " + %text)
+echo("反转: " + freverse(%text))
+
+# 检查回文
+fpalindrome(str) {
+    %reversed = freverse(%str)
+    return(calc(%str == %reversed))
+}
+
+echo("是回文: " + fpalindrome("abcba"))
+echo("是回文: " + fpalindrome("hello"))
+
+# ========== 4. 数组操作 ==========
+echo()
+echo("--- 4. 数组操作 ---")
+%numbers = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+
+# 过滤偶数
+filter_even(arr) {
+    %result = []
+    for(%item in %arr) {
+        if(calc(%item %% 2 == 0)) {
+            %result = %result + [%item]
+        }
+    }
+    return(%result)
+}
+
+%even_numbers = filter_even(%numbers)
+echo("偶数: " + %even_numbers)
+
+# 计算总和
+sum(arr) {
+    %total = 0
+    for(%item in %arr) {
+        %total = calc(%total + %item)
+    }
+    return(%total)
+}
+
+echo("总和: " + sum(%numbers))
+
+# ========== 5. 错误处理 ==========
+echo()
+echo("--- 5. 错误处理 ---")
+fsafe_divide(a, b) {
+    if(calc(%b == 0)) {
+        echo("错误: 除数不能为零!")
+        return(0)
+    }
+    return(calc(%a / %b))
+}
+
+echo("10 / 3 = " + fsafe_divide(10, 3))
+echo("10 / 0 = " + fsafe_divide(10, 0))
+
+# ========== 6. 递归 - 汉诺塔 ==========
+echo()
+echo("--- 6. 汉诺塔 ---")
+fhanoi(n, from, to, aux) {
+    if(calc(%n == 1)) {
+        echo("移动盘子 1 从 " + %from + " 到 " + %to)
+        return
+    }
+    fhanoi(calc(%n - 1), %from, %aux, %to)
+    echo("移动盘子 " + %n + " 从 " + %from + " 到 " + %to)
+    fhanoi(calc(%n - 1), %aux, %to, %from)
+}
+
+fhanoi(3, "A", "C", "B")
+
+echo()
+echo("高级功能演示完成!")

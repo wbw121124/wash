@@ -1,0 +1,17 @@
+# 模块系统示例
+
+echo("=== 模块系统演示 ===")
+
+# 定义可导出的函数
+fhelper() {
+    echo("这是一个帮助函数")
+}
+
+# 定义变量
+%module_name = "utils"
+
+# 导出函数和变量
+export("fhelper")
+export("module_name")
+
+echo("模块已定义，可以被其他脚本导入")

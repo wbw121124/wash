@@ -1,0 +1,88 @@
+# 控制流示例
+
+echo("=== 控制流演示 ===")
+
+# ========== 九九乘法表 ==========
+echo()
+echo("--- 九九乘法表 ---")
+for(%i in 1..9) {
+    for(%j in 1..%i) {
+        %product = calc(%i * %j)
+        echo("%j x %i = %product" "  ")
+    }
+    echo()
+}
+
+# ========== 判断素数 ==========
+echo()
+echo("--- 素数判断 ---")
+fis_prime(n) {
+    if(calc(%n <= 1)) {
+        return(0)
+    }
+    if(calc(%n <= 3)) {
+        return(1)
+    }
+    if(calc(%n %% 2 == 0) || calc(%n %% 3 == 0)) {
+        return(0)
+    }
+    %i = 5
+    while(calc(%i * %i <= %n)) {
+        if(calc(%n %% %i == 0) || calc(%n %% (%i + 2) == 0)) {
+            return(0)
+        }
+        %i = calc(%i + 6)
+    }
+    return(1)
+}
+
+echo("20 以内的素数:")
+for(%i in 2..20) {
+    if(fis_prime(%i)) {
+        echo("  " + %i)
+    }
+}
+
+# ========== 冒泡排序 ==========
+echo()
+echo("--- 冒泡排序 ---")
+%arr = [5, 3, 8, 1, 2, 9, 4, 7, 6]
+%n = length(%arr)
+
+for(%i in 0..calc(%n - 1)) {
+    for(%j in 0..calc(%n - %i - 2)) {
+        if(calc(%arr[%j] > %arr[%j + 1])) {
+            # 交换元素
+            %temp = %arr[%j]
+            %arr[%j] = %arr[%j + 1]
+            %arr[%j + 1] = %temp
+        }
+    }
+}
+
+echo("排序结果: " + %arr)
+
+# ========== 斐波那契数列 ==========
+echo()
+echo("--- 斐波那契数列 ---")
+ffibonacci(n) {
+    if(calc(%n <= 0)) { return(0) }
+    if(calc(%n == 1)) { return(1) }
+    %a = 0
+    %b = 1
+    for(%i in 2..%n) {
+        %temp = calc(%a + %b)
+        %a = %b
+        %b = %temp
+    }
+    return(%b)
+}
+
+echo("前 15 个斐波那契数:")
+for(%i in 0..14) {
+    %fib = ffibonacci(%i)
+    echo("  F(%i) = %fib")
+}
+
+echo()
+echo("控制流演示完成!")

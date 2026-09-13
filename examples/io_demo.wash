@@ -1,0 +1,26 @@
+# 管道和重定向示例
+
+echo("=== 管道和重定向 ===")
+
+# 管道示例
+echo("Hello, World!") | $cat
+
+# 重定向到文件
+echo("这行文字会被保存到文件") | @("output.txt")
+echo("输出已保存到 output.txt")
+
+# 从文件读取
+%content = read("请输入一些文字: ")
+echo("你输入了: " + %content)
+
+# 分割和合并字符串
+%csv = "apple,banana,cherry,date"
+%fruits = split(%csv, ",")
+echo("水果列表:")
+for(%fruit in %fruits) {
+    echo("  - " + %fruit)
+}
+
+# 合并回字符串
+%result = join(%fruits, " | ")
+echo("合并后: " + %result)

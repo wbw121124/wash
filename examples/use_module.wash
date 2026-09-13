@@ -1,0 +1,18 @@
+# 使用模块的示例
+
+echo("=== 使用模块 ===")
+
+# 导入模块
+include("examples/module_utils.wash")
+
+# 使用模块中的变量
+echo("模块名: " + %module_name)
+
+# 调用模块中的函数
+fhelper()
+
+# 使用 run() 在子环境中执行
+echo()
+echo("=== 子环境执行 ===")
+%result = run("examples/test.wash")
+echo("子环境执行完成，退出码: " + %result)
