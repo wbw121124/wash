@@ -226,7 +226,7 @@ ExecResult Executor::executeBinaryOp(BinaryOpNode* node) {
         if (!range.empty()) {
             return ExecResult(ExecResultType::NORMAL, range[0]);
         }
-        return ExecResult(ExecResultType::NORMAL, makeNumberValue(0));
+        return ExecResult(ExecResultType::NORMAL, makeIntValue(0));
     }
     
     ExecResult leftResult = executeNode(node->left);
@@ -242,6 +242,7 @@ ExecResult Executor::executeBinaryOp(BinaryOpNode* node) {
     Value left = leftResult.value;
     Value right = rightResult.value;
     
+    // 字符串拼接
     if (node->op == "+") {
         if (std::holds_alternative<std::string>(left) || std::holds_alternative<std::string>(right)) {
             std::string leftStr = valueToString(left);
@@ -250,47 +251,90 @@ ExecResult Executor::executeBinaryOp(BinaryOpNode* node) {
         }
     }
     
+    // 判断是否两个操作数都是整数
+    bool bothInt = isInt(left) && isInt(right);
+    bool eitherDouble = isDouble(left) || isDouble(right);
+    
+    // 整数运算
+    if (bothInt) {
+        int64_t l = valueToInt64(left);
+        int64_t r = valueToInt64(right);
+        
+        if (node->op == "+") return ExecResult(ExecResultType::NORMAL, makeIntValue(l + r));
+        if (node->op == "-") return ExecResult(ExecResultType::NORMAL, makeIntValue(l - r));
+        if (node->op == "*") return ExecResult(ExecResultType::NORMAL, makeIntValue(l * r));
+        if (node->op == "/") {
+            if (r == 0) { std::cerr << "错误: 除零" << std::endl; return ExecResult(ExecResultType::NORMAL, makeIntValue(0)); }
+            // 整数除法返回浮点（保持 C++ 语义）
+            return ExecResult(ExecResultType::NORMAL, makeDoubleValue(static_cast<double>(l) / static_cast<double>(r)));
+        }
+        if (node->op == "%") {
+            if (r == 0) { std::cerr << "错误: 模零" << std::endl; return ExecResult(ExecResultType::NORMAL, makeIntValue(0)); }
+            return ExecResult(ExecResultType::NORMAL, makeIntValue(l % r));
+        }
+        if (node->op == "^") return ExecResult(ExecResultType::NORMAL, makeIntValue(l ^ r));
+        if (node->op == "&") return ExecResult(ExecResultType::NORMAL, makeIntValue(l & r));
+        if (node->op == "|") return ExecResult(ExecResultType::NORMAL, makeIntValue(l | r));
+        if (node->op == "<<") return ExecResult(ExecResultType::NORMAL, makeIntValue(l << r));
+        if (node->op == ">>") return ExecResult(ExecResultType::NORMAL, makeIntValue(l >> r));
+        if (node->op == "<") return ExecResult(ExecResultType::NORMAL, makeIntValue(l < r ? 1 : 0));
+        if (node->op == "<=") return ExecResult(ExecResultType::NORMAL, makeIntValue(l <= r ? 1 : 0));
+        if (node->op == ">") return ExecResult(ExecResultType::NORMAL, makeIntValue(l > r ? 1 : 0));
+        if (node->op == ">=") return ExecResult(ExecResultType::NORMAL, makeIntValue(l >= r ? 1 : 0));
+        if (node->op == "==") return ExecResult(ExecResultType::NORMAL, makeIntValue(l == r ? 1 : 0));
+        if (node->op == "!=") return ExecResult(ExecResultType::NORMAL, makeIntValue(l != r ? 1 : 0));
+        if (node->op == "&&") return ExecResult(ExecResultType::NORMAL, makeIntValue((l != 0) && (r != 0) ? 1 : 0));
+        if (node->op == "||") return ExecResult(ExecResultType::NORMAL, makeIntValue((l != 0) || (r != 0) ? 1 : 0));
+    }
+    
+    // 浮点运算（至少一个操作数是 double）
     double leftNum = valueToNumber(left);
     double rightNum = valueToNumber(right);
     
-    if (node->op == "+") return ExecResult(ExecResultType::NORMAL, makeNumberValue(leftNum + rightNum));
-    if (node->op == "-") return ExecResult(ExecResultType::NORMAL, makeNumberValue(leftNum - rightNum));
-    if (node->op == "*") return ExecResult(ExecResultType::NORMAL, makeNumberValue(leftNum * rightNum));
+    if (node->op == "+") return ExecResult(ExecResultType::NORMAL, makeDoubleValue(leftNum + rightNum));
+    if (node->op == "-") return ExecResult(ExecResultType::NORMAL, makeDoubleValue(leftNum - rightNum));
+    if (node->op == "*") return ExecResult(ExecResultType::NORMAL, makeDoubleValue(leftNum * rightNum));
     if (node->op == "/") {
-        if (rightNum == 0) { std::cerr << "错误: 除零" << std::endl; return ExecResult(ExecResultType::NORMAL, makeNumberValue(0)); }
-        return ExecResult(ExecResultType::NORMAL, makeNumberValue(leftNum / rightNum));
+        if (rightNum == 0) { std::cerr << "错误: 除零" << std::endl; return ExecResult(ExecResultType::NORMAL, makeDoubleValue(0)); }
+        return ExecResult(ExecResultType::NORMAL, makeDoubleValue(leftNum / rightNum));
     }
     if (node->op == "%") {
-        if (rightNum == 0) { std::cerr << "错误: 模零" << std::endl; return ExecResult(ExecResultType::NORMAL, makeNumberValue(0)); }
-        return ExecResult(ExecResultType::NORMAL, makeNumberValue(std::fmod(leftNum, rightNum)));
+        if (rightNum == 0) { std::cerr << "错误: 模零" << std::endl; return ExecResult(ExecResultType::NORMAL, makeDoubleValue(0)); }
+        return ExecResult(ExecResultType::NORMAL, makeDoubleValue(std::fmod(leftNum, rightNum)));
     }
-    if (node->op == "^") return ExecResult(ExecResultType::NORMAL, makeNumberValue(static_cast<int>(leftNum) ^ static_cast<int>(rightNum)));
-    if (node->op == "&") return ExecResult(ExecResultType::NORMAL, makeNumberValue(static_cast<int>(leftNum) & static_cast<int>(rightNum)));
-    if (node->op == "|") return ExecResult(ExecResultType::NORMAL, makeNumberValue(static_cast<int>(leftNum) | static_cast<int>(rightNum)));
-    if (node->op == "<<") return ExecResult(ExecResultType::NORMAL, makeNumberValue(static_cast<int>(leftNum) << static_cast<int>(rightNum)));
-    if (node->op == ">>") return ExecResult(ExecResultType::NORMAL, makeNumberValue(static_cast<int>(leftNum) >> static_cast<int>(rightNum)));
-    if (node->op == "<") return ExecResult(ExecResultType::NORMAL, makeNumberValue(leftNum < rightNum ? 1.0 : 0.0));
-    if (node->op == "<=") return ExecResult(ExecResultType::NORMAL, makeNumberValue(leftNum <= rightNum ? 1.0 : 0.0));
-    if (node->op == ">") return ExecResult(ExecResultType::NORMAL, makeNumberValue(leftNum > rightNum ? 1.0 : 0.0));
-    if (node->op == ">=") return ExecResult(ExecResultType::NORMAL, makeNumberValue(leftNum >= rightNum ? 1.0 : 0.0));
-    if (node->op == "==") return ExecResult(ExecResultType::NORMAL, makeNumberValue(leftNum == rightNum ? 1.0 : 0.0));
-    if (node->op == "!=") return ExecResult(ExecResultType::NORMAL, makeNumberValue(leftNum != rightNum ? 1.0 : 0.0));
-    if (node->op == "&&") return ExecResult(ExecResultType::NORMAL, makeNumberValue((leftNum != 0) && (rightNum != 0) ? 1.0 : 0.0));
-    if (node->op == "||") return ExecResult(ExecResultType::NORMAL, makeNumberValue((leftNum != 0) || (rightNum != 0) ? 1.0 : 0.0));
+    if (node->op == "^") return ExecResult(ExecResultType::NORMAL, makeIntValue(valueToInt64(left) ^ valueToInt64(right)));
+    if (node->op == "&") return ExecResult(ExecResultType::NORMAL, makeIntValue(valueToInt64(left) & valueToInt64(right)));
+    if (node->op == "|") return ExecResult(ExecResultType::NORMAL, makeIntValue(valueToInt64(left) | valueToInt64(right)));
+    if (node->op == "<<") return ExecResult(ExecResultType::NORMAL, makeIntValue(valueToInt64(left) << valueToInt64(right)));
+    if (node->op == ">>") return ExecResult(ExecResultType::NORMAL, makeIntValue(valueToInt64(left) >> valueToInt64(right)));
+    if (node->op == "<") return ExecResult(ExecResultType::NORMAL, makeIntValue(leftNum < rightNum ? 1 : 0));
+    if (node->op == "<=") return ExecResult(ExecResultType::NORMAL, makeIntValue(leftNum <= rightNum ? 1 : 0));
+    if (node->op == ">") return ExecResult(ExecResultType::NORMAL, makeIntValue(leftNum > rightNum ? 1 : 0));
+    if (node->op == ">=") return ExecResult(ExecResultType::NORMAL, makeIntValue(leftNum >= rightNum ? 1 : 0));
+    if (node->op == "==") return ExecResult(ExecResultType::NORMAL, makeIntValue(leftNum == rightNum ? 1 : 0));
+    if (node->op == "!=") return ExecResult(ExecResultType::NORMAL, makeIntValue(leftNum != rightNum ? 1 : 0));
+    if (node->op == "&&") return ExecResult(ExecResultType::NORMAL, makeIntValue((leftNum != 0) && (rightNum != 0) ? 1 : 0));
+    if (node->op == "||") return ExecResult(ExecResultType::NORMAL, makeIntValue((leftNum != 0) || (rightNum != 0) ? 1 : 0));
     
     std::cerr << "错误: 未知运算符: " << node->op << std::endl;
-    return ExecResult(ExecResultType::NORMAL, makeNumberValue(0));
+    return ExecResult(ExecResultType::NORMAL, makeIntValue(0));
 }
 
 ExecResult Executor::executeUnaryOp(UnaryOpNode* node) {
     ExecResult operandResult = executeNode(node->operand);
     if (operandResult.type != ExecResultType::NORMAL) return operandResult;
     
-    double num = valueToNumber(operandResult.value);
+    if (isInt(operandResult.value)) {
+        int64_t num = valueToInt64(operandResult.value);
+        if (node->op == "-") return ExecResult(ExecResultType::NORMAL, makeIntValue(-num));
+        if (node->op == "!") return ExecResult(ExecResultType::NORMAL, makeIntValue(num == 0 ? 1 : 0));
+        if (node->op == "~") return ExecResult(ExecResultType::NORMAL, makeIntValue(~num));
+    }
     
-    if (node->op == "-") return ExecResult(ExecResultType::NORMAL, makeNumberValue(-num));
-    if (node->op == "!") return ExecResult(ExecResultType::NORMAL, makeNumberValue(num == 0 ? 1.0 : 0.0));
-    if (node->op == "~") return ExecResult(ExecResultType::NORMAL, makeNumberValue(~static_cast<int>(num)));
+    double num = valueToNumber(operandResult.value);
+    if (node->op == "-") return ExecResult(ExecResultType::NORMAL, makeDoubleValue(-num));
+    if (node->op == "!") return ExecResult(ExecResultType::NORMAL, makeIntValue(num == 0 ? 1 : 0));
+    if (node->op == "~") return ExecResult(ExecResultType::NORMAL, makeIntValue(~static_cast<int64_t>(num)));
     
     std::cerr << "错误: 未知一元运算符: " << node->op << std::endl;
     return ExecResult(ExecResultType::NORMAL, makeNumberValue(0));

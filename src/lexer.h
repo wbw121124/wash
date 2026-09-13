@@ -242,6 +242,7 @@ private:
     size_t tokenColumn_;            ///< 当前 Token 起始列号
     std::vector<Token> tokens_;     ///< Token 缓冲区
     size_t tokenIndex_;             ///< 当前 Token 索引
+    TokenType lastTokenType_;       ///< 上一个 Token 类型（用于 % 上下文判断）
 };
 
 } // namespace wash

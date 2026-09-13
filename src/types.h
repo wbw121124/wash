@@ -133,7 +133,7 @@ struct Token {
 /**
  * @brief 值类型（string 或 number）
  */
-using Value = std::variant<std::string, double>;
+using Value = std::variant<std::string, int64_t, double>;
 
 /**
  * @brief 将值转换为字符串
@@ -143,25 +143,54 @@ using Value = std::variant<std::string, double>;
 inline std::string valueToString(const Value& val) {
     if (std::holds_alternative<std::string>(val)) {
         return std::get<std::string>(val);
+    } else if (std::holds_alternative<int64_t>(val)) {
+        return std::to_string(std::get<int64_t>(val));
     } else {
-        return std::to_string(std::get<double>(val));
+        double d = std::get<double>(val);
+        // 整数输出无小数点
+        if (d == static_cast<int64_t>(d) && d >= -1e15 && d <= 1e15) {
+            return std::to_string(static_cast<int64_t>(d));
+        }
+        return std::to_string(d);
     }
 }
 
 /**
- * @brief 将值转换为数字
+ * @brief 将值转换为数字（double）
  * @param val 值
  * @return 数字值，转换失败返回 0
  */
 inline double valueToNumber(const Value& val) {
     if (std::holds_alternative<double>(val)) {
         return std::get<double>(val);
+    } else if (std::holds_alternative<int64_t>(val)) {
+        return static_cast<double>(std::get<int64_t>(val));
     } else {
         const std::string& s = std::get<std::string>(val);
         try {
             return std::stod(s);
         } catch (...) {
             return 0.0;
+        }
+    }
+}
+
+/**
+ * @brief 将值转换为 int64_t
+ * @param val 值
+ * @return int64_t 值，转换失败返回 0
+ */
+inline int64_t valueToInt64(const Value& val) {
+    if (std::holds_alternative<int64_t>(val)) {
+        return std::get<int64_t>(val);
+    } else if (std::holds_alternative<double>(val)) {
+        return static_cast<int64_t>(std::get<double>(val));
+    } else {
+        const std::string& s = std::get<std::string>(val);
+        try {
+            return std::stoll(s);
+        } catch (...) {
+            return 0;
         }
     }
 }
@@ -176,11 +205,33 @@ inline Value makeStringValue(const std::string& s) {
 }
 
 /**
- * @brief 创建数字值
+ * @brief 创建整数值
+ * @param n 整数
+ * @return Value 对象
+ */
+inline Value makeIntValue(int64_t n) {
+    return Value(n);
+}
+
+/**
+ * @brief 创建浮点数值
+ * @param n 浮点数
+ * @return Value 对象
+ */
+inline Value makeDoubleValue(double n) {
+    return Value(n);
+}
+
+/**
+ * @brief 创建数字值（兼容旧接口，自动推断 int/double）
  * @param n 数字
  * @return Value 对象
  */
 inline Value makeNumberValue(double n) {
+    // 整数值用 int64_t 存储
+    if (n == static_cast<int64_t>(n) && n >= -9223372036854775808.0 && n <= 9223372036854775807.0) {
+        return Value(static_cast<int64_t>(n));
+    }
     return Value(n);
 }
 
@@ -192,9 +243,29 @@ inline Value makeNumberValue(double n) {
 inline bool isTruthy(const Value& val) {
     if (std::holds_alternative<std::string>(val)) {
         return !std::get<std::string>(val).empty();
+    } else if (std::holds_alternative<int64_t>(val)) {
+        return std::get<int64_t>(val) != 0;
     } else {
         return std::get<double>(val) != 0.0;
     }
+}
+
+/**
+ * @brief 检查值是否为整数类型
+ * @param val 值
+ * @return 是否为 int64_t
+ */
+inline bool isInt(const Value& val) {
+    return std::holds_alternative<int64_t>(val);
+}
+
+/**
+ * @brief 检查值是否为浮点类型
+ * @param val 值
+ * @return 是否为 double
+ */
+inline bool isDouble(const Value& val) {
+    return std::holds_alternative<double>(val);
 }
 
 /**

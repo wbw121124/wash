@@ -395,11 +395,18 @@ ASTPtr Parser::parsePostfix() {
 ASTPtr Parser::parsePrimary() {
     Token& tok = current();
     
-    // 数字字面量
+    // 数字字面量（区分整数和浮点）
     if (tok.type == TokenType::NUMBER) {
         advance();
-        double value = std::stod(tok.value);
-        return std::make_shared<LiteralNode>(makeNumberValue(value), tok.line, tok.column);
+        if (tok.value.find('.') != std::string::npos) {
+            // 浮点数
+            double value = std::stod(tok.value);
+            return std::make_shared<LiteralNode>(makeDoubleValue(value), tok.line, tok.column);
+        } else {
+            // 整数
+            int64_t value = std::stoll(tok.value);
+            return std::make_shared<LiteralNode>(makeIntValue(value), tok.line, tok.column);
+        }
     }
     
     // 字符串字面量

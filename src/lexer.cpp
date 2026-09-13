@@ -19,14 +19,17 @@ static const std::vector<std::string> RESERVED_KEYWORDS = {
 
 Lexer::Lexer(const std::string& source, const std::string& filename)
     : source_(source), filename_(filename), pos_(0), line_(1), column_(1),
-      tokenStart_(0), tokenLine_(1), tokenColumn_(1), tokenIndex_(0) {}
+      tokenStart_(0), tokenLine_(1), tokenColumn_(1), tokenIndex_(0),
+      lastTokenType_(TokenType::NONE_TOK) {}
 
 std::vector<Token> Lexer::tokenize() {
     tokens_.clear();
     tokenIndex_ = 0;
+    lastTokenType_ = TokenType::NONE_TOK;
     
     while (!isAtEnd()) {
         Token token = scanToken();
+        lastTokenType_ = token.type;
         tokens_.push_back(token);
         if (token.type == TokenType::EOF_TOKEN) break;
     }
@@ -89,7 +92,23 @@ Token Lexer::scanToken() {
     
     if (std::isdigit(c)) return scanNumber();
     if (std::isalpha(c) || c == '_') return scanIdentifier();
-    if (c == '%') return scanVariable();
+    if (c == '%') {
+        // 上下文判断：% 是变量前缀还是取模运算符
+        // 如果上一个 token 是数字、标识符、右括号、右方括号，则 % 是取模
+        bool isModulo = (lastTokenType_ == TokenType::NUMBER ||
+                        lastTokenType_ == TokenType::IDENTIFIER ||
+                        lastTokenType_ == TokenType::VAR ||
+                        lastTokenType_ == TokenType::ENV_VAR ||
+                        lastTokenType_ == TokenType::RPAREN ||
+                        lastTokenType_ == TokenType::RBRACKET ||
+                        lastTokenType_ == TokenType::TRUE_KW ||
+                        lastTokenType_ == TokenType::FALSE_KW);
+        if (isModulo) {
+            advance();
+            return makeToken(TokenType::PERCENT, "%");
+        }
+        return scanVariable();
+    }
     if (c == '$') return scanCommand();
     if (c == '@') return scanRedirect();
     if (c == '\'') return scanSingleQuoteString();
