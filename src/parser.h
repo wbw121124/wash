@@ -74,6 +74,24 @@ private:
     ASTPtr parseExpression();
     
     /**
+     * @brief 解析逗号表达式
+     * @return 表达式节点
+     */
+    ASTPtr parseComma();
+    
+    /**
+     * @brief 解析三目表达式
+     * @return 表达式节点
+     */
+    ASTPtr parseTernary();
+    
+    /**
+     * @brief 解析范围表达式
+     * @return 表达式节点
+     */
+    ASTPtr parseRange();
+    
+    /**
      * @brief 解析逻辑或表达式
      * @return 表达式节点
      */

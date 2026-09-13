@@ -133,11 +133,12 @@ Token Lexer::scanToken() {
         case '!':
             if (current() == '=') { advance(); return makeToken(TokenType::NOT_EQUAL, "!="); }
             return makeToken(TokenType::NOT, "!");
+        case '?': return makeToken(TokenType::QUESTION, "?");
         case '(': return makeToken(TokenType::LPAREN, "(");
         case ')': return makeToken(TokenType::RPAREN, ")");
         case '{': return makeToken(TokenType::LBRACE, "{");
         case '}': return makeToken(TokenType::RBRACE, "}");
-        case '[': return makeToken(TokenType::LBRACKET, "]");
+        case '[': return makeToken(TokenType::LBRACKET, "[");
         case ']': return makeToken(TokenType::RBRACKET, "]");
         case ';': return makeToken(TokenType::SEMICOLON, ";");
         case ',': return makeToken(TokenType::COMMA, ",");
@@ -153,6 +154,10 @@ Token Lexer::scanNumber() {
     bool hasDot = false;
     while (!isAtEnd() && (std::isdigit(current()) || current() == '.')) {
         if (current() == '.') {
+            // 检查是否为范围运算符 .. 或 ..<
+            if (pos_ + 1 < source_.size() && source_[pos_ + 1] == '.') {
+                break; // 不消费第二个点，留给范围运算符处理
+            }
             if (hasDot) break;
             hasDot = true;
         }
@@ -295,7 +300,8 @@ Token Lexer::scanVariable() {
             }
             return makeToken(TokenType::ENV_VAR, varName);
         } else {
-            pos_ = savedPos; line_ = savedLine; column_ = savedCol;
+            // %env 无后缀，生成 ENV_VIEW token
+            return makeToken(TokenType::ENV_VIEW, "env");
         }
     }
     

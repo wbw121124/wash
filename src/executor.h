@@ -35,6 +35,13 @@ public:
     Executor();
     
     /**
+     * @brief 设置脚本命令行参数
+     * @param argc 参数个数
+     * @param argv 参数数组
+     */
+    void setScriptArgs(int argc, const char* const* argv);
+    
+    /**
      * @brief 执行程序
      * @param program 程序节点
      * @return 执行结果
@@ -309,6 +316,8 @@ private:
     std::map<std::string, Function> functions_;  ///< 函数表
     int exitCode_;                           ///< 退出码
     bool exitRequested_;                     ///< 是否请求退出
+    int scriptArgc_;                         ///< 脚本命令行参数个数
+    std::vector<std::string> scriptArgv_;    ///< 脚本命令行参数
 };
 
 } // namespace wash

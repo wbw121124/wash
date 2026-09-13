@@ -18,9 +18,17 @@
 
 namespace wash {
 
-Executor::Executor() : exitCode_(0), exitRequested_(false) {
+Executor::Executor() : exitCode_(0), exitRequested_(false), scriptArgc_(0) {
     currentScope_ = std::make_shared<Scope>();
     registerBuiltinFunctions();
+}
+
+void Executor::setScriptArgs(int argc, const char* const* argv) {
+    scriptArgc_ = argc;
+    scriptArgv_.clear();
+    for (int i = 0; i < argc; ++i) {
+        scriptArgv_.push_back(argv[i] ? argv[i] : "");
+    }
 }
 
 ExecResult Executor::execute(ASTPtr program) {
@@ -92,6 +100,10 @@ void Executor::enterScope() {
 }
 
 void Executor::exitScope() {
+    auto parent = currentScope_->getParent();
+    if (parent) {
+        currentScope_ = parent;
+    }
 }
 
 int Executor::getExitCode() const {
@@ -201,6 +213,22 @@ ExecResult Executor::executeEnvVariable(EnvVariableNode* node) {
 }
 
 ExecResult Executor::executeBinaryOp(BinaryOpNode* node) {
+    // 逗号运算符：求值左右表达式，返回右边的值
+    if (node->op == ",") {
+        ExecResult leftResult = executeNode(node->left);
+        ExecResult rightResult = executeNode(node->right);
+        return rightResult;
+    }
+    
+    // 范围运算符：生成序列
+    if (node->op == ".." || node->op == "..<") {
+        std::vector<Value> range = generateRange(std::make_shared<BinaryOpNode>(node->op, node->left, node->right));
+        if (!range.empty()) {
+            return ExecResult(ExecResultType::NORMAL, range[0]);
+        }
+        return ExecResult(ExecResultType::NORMAL, makeNumberValue(0));
+    }
+    
     ExecResult leftResult = executeNode(node->left);
     if (leftResult.type != ExecResultType::NORMAL) {
         return leftResult;
@@ -236,7 +264,7 @@ ExecResult Executor::executeBinaryOp(BinaryOpNode* node) {
         if (rightNum == 0) { std::cerr << "错误: 模零" << std::endl; return ExecResult(ExecResultType::NORMAL, makeNumberValue(0)); }
         return ExecResult(ExecResultType::NORMAL, makeNumberValue(std::fmod(leftNum, rightNum)));
     }
-    if (node->op == "^") return ExecResult(ExecResultType::NORMAL, makeNumberValue(std::pow(leftNum, rightNum)));
+    if (node->op == "^") return ExecResult(ExecResultType::NORMAL, makeNumberValue(static_cast<int>(leftNum) ^ static_cast<int>(rightNum)));
     if (node->op == "&") return ExecResult(ExecResultType::NORMAL, makeNumberValue(static_cast<int>(leftNum) & static_cast<int>(rightNum)));
     if (node->op == "|") return ExecResult(ExecResultType::NORMAL, makeNumberValue(static_cast<int>(leftNum) | static_cast<int>(rightNum)));
     if (node->op == "<<") return ExecResult(ExecResultType::NORMAL, makeNumberValue(static_cast<int>(leftNum) << static_cast<int>(rightNum)));
@@ -400,9 +428,23 @@ ExecResult Executor::executeReturn(ReturnNode* node) {
 ExecResult Executor::executeFunctionDef(FunctionDefNode* node) {
     std::string name = node->name;
     ASTPtr body = node->body;
+    Executor* self = this;
     
-    Function func = [](const std::vector<Value>& args) -> ExecResult {
-        return ExecResult(ExecResultType::NORMAL, makeNumberValue(0));
+    Function func = [self, body](const std::vector<Value>& args) -> ExecResult {
+        self->enterScope();
+        
+        // 绑定参数到局部变量 %0, %1, %2...
+        for (size_t i = 0; i < args.size(); ++i) {
+            self->setVariable("$" + std::to_string(i), args[i]);
+        }
+        
+        ExecResult result = self->executeNode(body);
+        self->exitScope();
+        
+        if (result.type == ExecResultType::RETURN_RES) {
+            return ExecResult(ExecResultType::NORMAL, result.value);
+        }
+        return result;
     };
     
     defineFunction(name, func);
@@ -410,7 +452,32 @@ ExecResult Executor::executeFunctionDef(FunctionDefNode* node) {
 }
 
 ExecResult Executor::executeLambdaDef(LambdaDefNode* node) {
-    return ExecResult(ExecResultType::NORMAL, makeStringValue("<lambda>"));
+    ASTPtr body = node->body;
+    Executor* self = this;
+    
+    Function func = [self, body](const std::vector<Value>& args) -> ExecResult {
+        self->enterScope();
+        
+        for (size_t i = 0; i < args.size(); ++i) {
+            self->setVariable("$" + std::to_string(i), args[i]);
+        }
+        
+        ExecResult result = self->executeNode(body);
+        self->exitScope();
+        
+        if (result.type == ExecResultType::RETURN_RES) {
+            return ExecResult(ExecResultType::NORMAL, result.value);
+        }
+        return result;
+    };
+    
+    // 存储 lambda 到临时函数表，返回函数引用
+    static int lambdaCounter = 0;
+    std::string lambdaName = "__lambda_" + std::to_string(lambdaCounter++);
+    defineFunction(lambdaName, func);
+    
+    // 返回一个包含函数名的特殊值，供后续调用
+    return ExecResult(ExecResultType::NORMAL, makeStringValue(lambdaName));
 }
 
 std::vector<Value> Executor::generateRange(ASTPtr range) {
@@ -554,12 +621,18 @@ void Executor::registerBuiltinFunctions() {
         return ExecResult(ExecResultType::NORMAL, makeNumberValue(std::floor(valueToNumber(args[0]))));
     });
     
-    defineFunction("argc", [](const std::vector<Value>& args) -> ExecResult {
-        return ExecResult(ExecResultType::NORMAL, makeNumberValue(0));
+    defineFunction("argc", [this](const std::vector<Value>& args) -> ExecResult {
+        // argc() 返回脚本参数个数（不包括脚本名），即 scriptArgc_ - 1
+        return ExecResult(ExecResultType::NORMAL, makeNumberValue(scriptArgc_ > 0 ? scriptArgc_ - 1 : 0));
     });
     
-    defineFunction("argv", [](const std::vector<Value>& args) -> ExecResult {
-        return ExecResult(ExecResultType::NORMAL, makeStringValue(""));
+    defineFunction("argv", [this](const std::vector<Value>& args) -> ExecResult {
+        if (args.empty()) return ExecResult(ExecResultType::NORMAL, makeStringValue(""));
+        int index = static_cast<int>(valueToNumber(args[0]));
+        if (index < 0 || index >= static_cast<int>(scriptArgv_.size())) {
+            return ExecResult(ExecResultType::NORMAL, makeStringValue(""));
+        }
+        return ExecResult(ExecResultType::NORMAL, makeStringValue(scriptArgv_[index]));
     });
     
     defineFunction("return", [](const std::vector<Value>& args) -> ExecResult {

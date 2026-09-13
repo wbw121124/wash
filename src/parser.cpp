@@ -82,27 +82,33 @@ ASTPtr Parser::parseStatement() {
         return parseContinueStatement();
     }
     
-    // 函数定义
-    if (tok.type == TokenType::IDENTIFIER && pos_ + 1 < tokens_.size() &&
-        tokens_[pos_ + 1].type == TokenType::LPAREN) {
-        // 检查是否为函数定义 f():{...}
+    // 函数定义：f():{...} 或 f=():{...}
+    if (tok.type == TokenType::IDENTIFIER && pos_ + 1 < tokens_.size()) {
         size_t savedPos = pos_;
-        advance();  // 跳过函数名
-        advance();  // 跳过 (
         
-        if (current().type == TokenType::RPAREN) {
-            advance();  // 跳过 )
-            if (current().type == TokenType::COLON) {
-                advance();  // 跳过 :
-                if (current().type == TokenType::LBRACE) {
-                    // 函数定义
-                    pos_ = savedPos;
-                    return parseFunctionDef();
+        // 形式 1: f():{...}
+        if (tokens_[pos_ + 1].type == TokenType::LPAREN) {
+            advance(); advance();  // 跳过函数名和 (
+            if (current().type == TokenType::RPAREN) {
+                advance();  // 跳过 )
+                if (current().type == TokenType::COLON) {
+                    advance();  // 跳过 :
+                    if (current().type == TokenType::LBRACE) {
+                        pos_ = savedPos;
+                        return parseFunctionDef();
+                    }
                 }
             }
+            pos_ = savedPos;
         }
         
-        pos_ = savedPos;
+        // 形式 2: f=():{...}
+        if (tokens_[pos_ + 1].type == TokenType::ASSIGN && pos_ + 2 < tokens_.size() &&
+            tokens_[pos_ + 2].type == TokenType::LPAREN) {
+            // 不预检查，直接交给 parseFunctionDef 处理
+            // parseFunctionDef 会检查 =():{ 模式
+            return parseFunctionDef();
+        }
     }
     
     // 赋值语句或表达式
@@ -177,7 +183,55 @@ ASTPtr Parser::parseAssignment() {
 }
 
 ASTPtr Parser::parseExpression() {
-    return parseLogicalOr();
+    return parseComma();
+}
+
+ASTPtr Parser::parseComma() {
+    ASTPtr left = parseTernary();
+    
+    while (check(TokenType::COMMA)) {
+        advance();
+        ASTPtr right = parseTernary();
+        left = std::make_shared<BinaryOpNode>(",", left, right);
+    }
+    
+    return left;
+}
+
+ASTPtr Parser::parseTernary() {
+    ASTPtr expr = parseRange();
+    
+    if (check(TokenType::QUESTION)) {
+        advance(); // 跳过 ?
+        ASTPtr trueExpr = parseTernary(); // 允许嵌套三目
+        if (!match(TokenType::COLON)) {
+            error("期望 ':'");
+            return nullptr;
+        }
+        ASTPtr falseExpr = parseTernary();
+        return std::make_shared<TernaryOpNode>(expr, trueExpr, falseExpr);
+    }
+    
+    return expr;
+}
+
+ASTPtr Parser::parseRange() {
+    ASTPtr left = parseLogicalOr();
+    
+    while (check(TokenType::DOT) && pos_ + 1 < tokens_.size() && 
+           (tokens_[pos_ + 1].type == TokenType::DOT)) {
+        // 处理 .. 或 ..<
+        advance(); // 跳过第一个 .
+        advance(); // 跳过第二个 .
+        bool exclusive = check(TokenType::LESS);
+        if (exclusive) advance(); // 跳过 <
+        
+        ASTPtr right = parseLogicalOr();
+        std::string op = exclusive ? "..<" : "..";
+        left = std::make_shared<BinaryOpNode>(op, left, right);
+    }
+    
+    return left;
 }
 
 ASTPtr Parser::parseLogicalOr() {
@@ -207,7 +261,7 @@ ASTPtr Parser::parseLogicalAnd() {
 ASTPtr Parser::parseBitwiseOr() {
     ASTPtr left = parseBitwiseXor();
     
-    while (check(TokenType::AMPERSAND)) {
+    while (check(TokenType::PIPE)) {
         advance();
         ASTPtr right = parseBitwiseXor();
         left = std::make_shared<BinaryOpNode>("|", left, right);
@@ -321,10 +375,18 @@ ASTPtr Parser::parseUnary() {
 ASTPtr Parser::parsePostfix() {
     ASTPtr expr = parsePrimary();
     
-    // 函数调用
-    if (expr && expr->type == NodeType::VARIABLE && check(TokenType::LPAREN)) {
-        auto varNode = std::static_pointer_cast<VariableNode>(expr);
-        return parseFunctionCall(varNode->name);
+    // 函数调用：支持两种形式
+    // 1. %func(args) - VAR token
+    // 2. func(args) - IDENTIFIER token
+    if (expr && check(TokenType::LPAREN)) {
+        if (expr->type == NodeType::VARIABLE) {
+            auto varNode = std::static_pointer_cast<VariableNode>(expr);
+            return parseFunctionCall(varNode->name);
+        }
+        if (expr->type == NodeType::LITERAL && std::holds_alternative<std::string>(std::static_pointer_cast<LiteralNode>(expr)->value)) {
+            std::string name = std::get<std::string>(std::static_pointer_cast<LiteralNode>(expr)->value);
+            return parseFunctionCall(name);
+        }
     }
     
     return expr;
@@ -346,10 +408,10 @@ ASTPtr Parser::parsePrimary() {
         return std::make_shared<LiteralNode>(makeStringValue(tok.value), tok.line, tok.column);
     }
     
-    // 标识符（变量名或函数名）
+    // 标识符作为字符串字面量（函数参数中的裸标识符）
     if (tok.type == TokenType::IDENTIFIER) {
         advance();
-        return std::make_shared<VariableNode>(tok.value, tok.line, tok.column);
+        return std::make_shared<LiteralNode>(makeStringValue(tok.value), tok.line, tok.column);
     }
     
     // true/false
@@ -632,6 +694,11 @@ ASTPtr Parser::parseFunctionDef() {
     Token& nameTok = current();
     std::string funcName = nameTok.value;
     advance();  // 跳过函数名
+    
+    // 检查是否有 =（覆盖形式 f=():{...}）
+    if (check(TokenType::ASSIGN)) {
+        advance();  // 跳过 =
+    }
     
     advance();  // 跳过 (
     advance();  // 跳过 )

@@ -53,6 +53,7 @@ enum class TokenType {
     CARET,          ///< ^
     AMPERSAND,      ///< &
     PIPE,           ///< |
+    QUESTION,       ///< ?
     TILDE,          ///< ~
     
     // 比较运算符
@@ -753,6 +754,14 @@ public:
             return true;
         }
         return parent_ ? parent_->has(name) : false;
+    }
+    
+    /**
+     * @brief 获取父作用域
+     * @return 父作用域，如果没有则返回 nullptr
+     */
+    std::shared_ptr<Scope> getParent() const {
+        return parent_;
     }
     
 private:

@@ -207,6 +207,9 @@ int main(int argc, char const* argv[]) {
     bool isLogin = false;
     std::string command, filename;
     
+    // 传递原始命令行参数给 executor
+    executor.setScriptArgs(argc, argv);
+    
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "-h" || arg == "--help") { showHelp(); return 0; }
