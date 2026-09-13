@@ -7,8 +7,10 @@
  */
 
 #include "parser.h"
+#include "types.h"
 #include <stdexcept>
 #include <sstream>
+#include <cstdint>
 #include <libintl.h>
 
 #define _(STRING) gettext(STRING)

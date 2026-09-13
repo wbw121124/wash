@@ -17,10 +17,18 @@
 #include <algorithm>
 #include <cstdio>
 #include <fstream>
-#include <unistd.h>
-#include <sys/wait.h>
-#include <fcntl.h>
 #include <libintl.h>
+
+#ifdef _WIN32
+    #include <windows.h>
+    #include <process.h>
+    #define popen _popen
+    #define pclose _pclose
+#else
+    #include <unistd.h>
+    #include <sys/wait.h>
+    #include <fcntl.h>
+#endif
 
 #define _(STRING) gettext(STRING)
 

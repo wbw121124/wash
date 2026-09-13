@@ -17,6 +17,7 @@
 #include <memory>
 #include <map>
 #include <functional>
+#include <cstdint>
 
 #ifdef IN
 #undef IN
@@ -855,8 +856,8 @@ public:
      */
     std::vector<std::string> getVariableNames() const {
         std::vector<std::string> names;
-        for (const auto& pair : variables_) {
-            names.push_back(pair.first);
+        for (auto it = variables_.begin(); it != variables_.end(); ++it) {
+            names.push_back(it->first);
         }
         return names;
     }
