@@ -1258,6 +1258,137 @@ void Executor::registerBuiltinFunctions() {
         }
         return ExecResult(ExecResultType::NORMAL, makeIntValue(0));
     });
+    
+    // 模块系统：run() - 子环境执行
+    defineFunction("run", [this](const std::vector<Value>& args) -> ExecResult {
+        if (args.empty()) return ExecResult(ExecResultType::NORMAL, makeIntValue(1));
+        
+        std::string filename = valueToString(args[0]);
+        
+        // 传递参数给子进程
+        std::vector<std::string> cmdArgs;
+        for (size_t i = 1; i < args.size(); ++i) {
+            cmdArgs.push_back(valueToString(args[i]));
+        }
+        
+        // 读取并执行文件
+        std::ifstream file(filename);
+        if (!file.is_open()) {
+            outputToStderr("错误: 无法打开文件: " + filename + "\n");
+            return ExecResult(ExecResultType::NORMAL, makeIntValue(1));
+        }
+        
+        std::string source((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        file.close();
+        
+        // 创建子作用域执行
+        enterScope();
+        setScriptArgs(args.size(), nullptr);
+        auto result = executeSource(source, filename);
+        exitScope();
+        
+        return ExecResult(ExecResultType::NORMAL, makeIntValue(result.exitCode));
+    });
+    
+    // 模块系统：include() - 当前环境执行
+    defineFunction("include", [this](const std::vector<Value>& args) -> ExecResult {
+        if (args.empty()) return ExecResult(ExecResultType::NORMAL, makeIntValue(1));
+        
+        std::string filename = valueToString(args[0]);
+        
+        // 读取并执行文件
+        std::ifstream file(filename);
+        if (!file.is_open()) {
+            outputToStderr("错误: 无法打开文件: " + filename + "\n");
+            return ExecResult(ExecResultType::NORMAL, makeIntValue(1));
+        }
+        
+        std::string source((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        file.close();
+        
+        // 在当前环境执行
+        auto result = executeSource(source, filename);
+        return ExecResult(ExecResultType::NORMAL, makeIntValue(result.exitCode));
+    });
+    
+    // 模块系统：export() - 导出函数/变量
+    defineFunction("export", [this](const std::vector<Value>& args) -> ExecResult {
+        if (args.empty()) return ExecResult(ExecResultType::NORMAL, makeIntValue(0));
+        
+        std::string name = valueToString(args[0]);
+        
+        // 获取变量值
+        Value val = getVariable(name);
+        if (std::holds_alternative<std::string>(val) && std::get<std::string>(val).empty()) {
+            // 变量不存在，检查是否为函数
+            // 函数导出：标记为可导出
+            exportTable_[name] = ExportItem::FUNCTION;
+        } else {
+            // 变量导出
+            exportTable_[name] = ExportItem::VARIABLE;
+            exportValues_[name] = val;
+        }
+        
+        return ExecResult(ExecResultType::NORMAL, makeIntValue(0));
+    });
+    
+    // 模块系统：import() - 模块导入与映射
+    defineFunction("import", [this](const std::vector<Value>& args) -> ExecResult {
+        if (args.empty()) return ExecResult(ExecResultType::NORMAL, makeStringValue(""));
+        
+        std::string filename = valueToString(args[0]);
+        
+        // 读取文件
+        std::ifstream file(filename);
+        if (!file.is_open()) {
+            outputToStderr("错误: 无法打开文件: " + filename + "\n");
+            return ExecResult(ExecResultType::NORMAL, makeStringValue(""));
+        }
+        
+        std::string source((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        file.close();
+        
+        // 创建临时作用域执行
+        enterScope();
+        auto result = executeSource(source, filename);
+        
+        // 收集导出的项
+        std::map<std::string, Value> exports;
+        if (!exportTable_.empty()) {
+            for (const auto& [name, type] : exportTable_) {
+                if (type == ExportItem::VARIABLE) {
+                    exports[name] = exportValues_[name];
+                }
+            }
+        }
+        exitScope();
+        
+        // 返回第一个参数（如果有映射）
+        if (args.size() > 1) {
+            return ExecResult(ExecResultType::NORMAL, args[1]);
+        }
+        
+        return ExecResult(ExecResultType::NORMAL, makeStringValue(""));
+    });
+}
+
+Executor::ExecResult2 Executor::executeSource(const std::string& source, const std::string& filename) {
+    wash::Lexer lexer(source);
+    auto tokens = lexer.tokenize();
+    if (lexer.hasError()) {
+        outputToStderr("词法错误\n");
+        return ExecResult2{1};
+    }
+    
+    wash::Parser parser(tokens, filename);
+    auto ast = parser.parse();
+    if (parser.hasError()) {
+        outputToStderr(parser.getError() + "\n");
+        return ExecResult2{1};
+    }
+    
+    auto result = execute(ast);
+    return ExecResult2{getExitCode()};
 }
 
 } // namespace wash

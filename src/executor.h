@@ -332,6 +332,14 @@ private:
      */
     std::string interpolateString(const std::string& str);
     
+    /**
+     * @brief 在当前作用域解析并执行源码
+     */
+    struct ExecResult2 {
+        int exitCode;
+    };
+    ExecResult2 executeSource(const std::string& source, const std::string& filename);
+    
     std::shared_ptr<Scope> currentScope_;    ///< 当前作用域
     std::map<std::string, Value> envVars_;   ///< 环境变量
     std::map<std::string, Function> functions_;  ///< 函数表
@@ -339,6 +347,11 @@ private:
     bool exitRequested_;                     ///< 是否请求退出
     int scriptArgc_;                         ///< 脚本命令行参数个数
     std::vector<std::string> scriptArgv_;    ///< 脚本命令行参数
+    
+    // 模块系统
+    enum class ExportItem { VARIABLE, FUNCTION };
+    std::map<std::string, ExportItem> exportTable_;  ///< 导出表
+    std::map<std::string, Value> exportValues_;     ///< 导出变量值
 };
 
 } // namespace wash
