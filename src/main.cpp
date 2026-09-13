@@ -200,7 +200,7 @@ void interactiveLoop(wash::Executor& executor) {
     std::string historyFile = getHomeDir() + "/.wash_history";
     
     int maxHistory = DEFAULT_HISTORY_MAX;
-    wash::Value historyMaxValue = executor.getEnvVariable("HISTORY_MAX");
+    wash::Value historyMaxValue = executor.getEnvVariable("washHISTORY_MAX");
     if (std::holds_alternative<std::string>(historyMaxValue)) {
         try { maxHistory = std::stoi(std::get<std::string>(historyMaxValue)); } catch (...) {}
     }

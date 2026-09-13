@@ -133,7 +133,7 @@ include("utils.wash")
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `%env:washPS1` | `[\u@\h \W]\$` | 提示符 |
-| `%env:HISTORY_MAX` | `10000` | 历史记录最大条数 |
+| `%env:washHISTORY_MAX` | `10000` | 历史记录最大条数 |
 | `%env:washLANG` | 系统 locale | 语言设置（zh_CN / en_US） |
 
 ## 许可证
