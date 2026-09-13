@@ -10,7 +10,7 @@ on:
 jobs:
   # Linux 构建
   build-linux:
-    runs-on: ubuntu-latest
+    # runs-on: ubuntu-latest
     strategy:
       matrix:
         arch: [x86_64, aarch64, armv7l]
