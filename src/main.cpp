@@ -157,6 +157,44 @@ int executeFile(const std::string& filename, wash::Executor& executor) {
     return executeSource(source, filename, executor);
 }
 
+bool isIncomplete(const std::string& input) {
+    int braces = 0, parens = 0, brackets = 0;
+    bool inSingleQuote = false, inDoubleQuote = false, inBacktick = false;
+    
+    for (size_t i = 0; i < input.size(); ++i) {
+        char c = input[i];
+        
+        // 转义字符跳过下一个字符
+        if (c == '\\' && !inSingleQuote && i + 1 < input.size()) {
+            ++i;
+            continue;
+        }
+        
+        // 引号状态切换
+        if (c == '\'' && !inDoubleQuote && !inBacktick) {
+            inSingleQuote = !inSingleQuote;
+        } else if (c == '"' && !inSingleQuote && !inBacktick) {
+            inDoubleQuote = !inDoubleQuote;
+        } else if (c == '`' && !inSingleQuote && !inDoubleQuote) {
+            inBacktick = !inBacktick;
+        }
+        
+        // 引号内不计数
+        if (inSingleQuote || inDoubleQuote || inBacktick) continue;
+        
+        // 括号计数
+        if (c == '{') ++braces;
+        else if (c == '}') --braces;
+        else if (c == '(') ++parens;
+        else if (c == ')') --parens;
+        else if (c == '[') ++brackets;
+        else if (c == ']') --brackets;
+    }
+    
+    // 未闭合则不完整
+    return braces > 0 || parens > 0 || brackets > 0;
+}
+
 void interactiveLoop(wash::Executor& executor) {
     std::string historyFile = getHomeDir() + "/.wash_history";
     
@@ -181,6 +219,16 @@ void interactiveLoop(wash::Executor& executor) {
         std::string line(input);
         free(input);
         if (line.empty()) continue;
+        
+        // 多行输入：检查未闭合的括号/引号
+        while (isIncomplete(line)) {
+            char* continuation = readline("> ");
+            if (!continuation) break;
+            std::string contLine(continuation);
+            free(continuation);
+            line += "\n" + contLine;
+            if (contLine.empty()) break;
+        }
         
         add_history(line.c_str());
         if (line == "exit") break;
