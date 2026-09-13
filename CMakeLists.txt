@@ -40,17 +40,26 @@ target_include_directories(wash PRIVATE ${CMAKE_SOURCE_DIR}/src)
 if(WIN32)
     target_link_libraries(wash PRIVATE readline intl ncurses)
 else()
-    target_link_libraries(wash PRIVATE readline intl ncurses)
+    # Linux: libintl is part of glibc, no need to link separately
+    target_link_libraries(wash PRIVATE readline ncurses)
 endif()
 
 # 测试目标
 add_executable(wash_test test/test_phase2.cpp src/lexer.cpp src/parser.cpp src/executor.cpp src/color.cpp)
 target_include_directories(wash_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(wash_test PRIVATE readline intl ncurses)
+if(WIN32)
+    target_link_libraries(wash_test PRIVATE readline intl ncurses)
+else()
+    target_link_libraries(wash_test PRIVATE readline ncurses)
+endif()
 
 add_executable(wash_test3 test/test_phase3.cpp src/lexer.cpp src/parser.cpp src/executor.cpp src/color.cpp)
 target_include_directories(wash_test3 PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(wash_test3 PRIVATE readline intl ncurses)
+if(WIN32)
+    target_link_libraries(wash_test3 PRIVATE readline intl ncurses)
+else()
+    target_link_libraries(wash_test3 PRIVATE readline ncurses)
+endif()
 
 # i18n: 编译 .po 文件到 .mo 文件
 find_program(GETTEXT_MSGFMT msgfmt)

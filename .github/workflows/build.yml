@@ -18,7 +18,7 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y build-essential cmake libreadline-dev gettext libncurses-dev libintl-dev
+        sudo apt-get install -y build-essential cmake libreadline-dev gettext libncurses-dev
         
     - name: Configure CMake
       run: |
@@ -66,7 +66,7 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y build-essential cmake libreadline-dev gettext libncurses-dev libintl-dev \
+        sudo apt-get install -y build-essential cmake libreadline-dev gettext libncurses-dev \
           gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
         
     - name: Configure CMake
@@ -113,7 +113,7 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y build-essential cmake libreadline-dev gettext libncurses-dev libintl-dev \
+        sudo apt-get install -y build-essential cmake libreadline-dev gettext libncurses-dev \
           gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
         
     - name: Configure CMake
@@ -169,10 +169,10 @@ jobs:
         install: >-
           mingw-w64-x86_64-gcc
           mingw-w64-x86_64-cmake
-          mingw-w64-x86_64-make
           mingw-w64-x86_64-readline
           mingw-w64-x86_64-ncurses
           mingw-w64-x86_64-gettext
+          make
     
     - name: Configure CMake
       run: |
@@ -229,10 +229,10 @@ jobs:
         install: >-
           mingw-w64-i686-gcc
           mingw-w64-i686-cmake
-          mingw-w64-i686-make
           mingw-w64-i686-readline
           mingw-w64-i686-ncurses
           mingw-w64-i686-gettext
+          make
     
     - name: Configure CMake
       run: |
@@ -289,10 +289,10 @@ jobs:
         install: >-
           mingw-w64-ucrt-x86_64-gcc
           mingw-w64-ucrt-x86_64-cmake
-          mingw-w64-ucrt-x86_64-make
           mingw-w64-ucrt-x86_64-readline
           mingw-w64-ucrt-x86_64-ncurses
           mingw-w64-ucrt-x86_64-gettext
+          make
     
     - name: Configure CMake
       run: |
