@@ -42,7 +42,7 @@ ExecResult Executor::execute(ASTPtr program) {
 }
 
 void Executor::setVariable(const std::string& name, const Value& value) {
-    currentScope_->set(name, value);
+    currentScope_->set(name, value, true);
 }
 
 Value Executor::getVariable(const std::string& name) {
@@ -303,6 +303,18 @@ ExecResult Executor::executeBinaryOp(BinaryOpNode* node) {
     // 浮点运算（至少一个操作数是 double）
     double leftNum = valueToNumber(left);
     double rightNum = valueToNumber(right);
+    
+    // 字符串比较（至少一个操作数是字符串）
+    if (std::holds_alternative<std::string>(left) || std::holds_alternative<std::string>(right)) {
+        std::string leftStr = valueToString(left);
+        std::string rightStr = valueToString(right);
+        if (node->op == "==") return ExecResult(ExecResultType::NORMAL, makeIntValue(leftStr == rightStr ? 1 : 0));
+        if (node->op == "!=") return ExecResult(ExecResultType::NORMAL, makeIntValue(leftStr != rightStr ? 1 : 0));
+        if (node->op == "<") return ExecResult(ExecResultType::NORMAL, makeIntValue(leftStr < rightStr ? 1 : 0));
+        if (node->op == "<=") return ExecResult(ExecResultType::NORMAL, makeIntValue(leftStr <= rightStr ? 1 : 0));
+        if (node->op == ">") return ExecResult(ExecResultType::NORMAL, makeIntValue(leftStr > rightStr ? 1 : 0));
+        if (node->op == ">=") return ExecResult(ExecResultType::NORMAL, makeIntValue(leftStr >= rightStr ? 1 : 0));
+    }
     
     if (node->op == "+") return ExecResult(ExecResultType::NORMAL, makeDoubleValue(leftNum + rightNum));
     if (node->op == "-") return ExecResult(ExecResultType::NORMAL, makeDoubleValue(leftNum - rightNum));

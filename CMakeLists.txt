@@ -25,3 +25,8 @@ set(HEADERS
 add_executable(wash ${SOURCES} ${HEADERS})
 target_include_directories(wash PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(wash PRIVATE readline)
+
+# 测试目标
+add_executable(wash_test test/test_phase2.cpp src/lexer.cpp src/parser.cpp src/executor.cpp)
+target_include_directories(wash_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(wash_test PRIVATE readline)

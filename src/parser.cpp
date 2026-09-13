@@ -875,11 +875,12 @@ ASTPtr Parser::parseFunctionCall(const std::string& name) {
 std::vector<ASTPtr> Parser::parseArgumentList() {
     std::vector<ASTPtr> args;
     
-    args.push_back(parseExpression());
+    // 参数列表中逗号用于分隔参数，不能走 parseComma
+    args.push_back(parseTernary());
     
     while (check(TokenType::COMMA)) {
         advance();  // 跳过 ,
-        args.push_back(parseExpression());
+        args.push_back(parseTernary());
     }
     
     return args;

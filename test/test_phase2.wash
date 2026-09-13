@@ -30,11 +30,11 @@ for(%i in "1..3,7..9") { %result = calc(%result + %i) }
 calc(%result == "123789")
 
 # 7. 函数定义
-fadd = (a, b):{ calc(a + b) }
+fadd = (a, b):{ calc(%a + %b) }
 calc(fadd(3, 4) == 7)
 
 # 8. Lambda
-double_it = (x):{ calc(x * 2) }
+double_it = (x):{ calc(%x * 2) }
 calc(double_it(5) == 10)
 
 # 9. 内建函数

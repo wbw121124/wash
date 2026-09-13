@@ -794,8 +794,18 @@ public:
      * @brief 设置变量
      * @param name 变量名
      * @param value 变量值
+     * @param updateExisting 是否更新父作用域中的已有变量
      */
-    void set(const std::string& name, const Value& value) {
+    void set(const std::string& name, const Value& value, bool updateExisting = false) {
+        if (updateExisting && parent_) {
+            // 先在父作用域中查找
+            bool found = false;
+            parent_->get(name, found);
+            if (found) {
+                parent_->set(name, value, true);
+                return;
+            }
+        }
         variables_[name] = value;
     }
     
