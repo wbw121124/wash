@@ -361,6 +361,7 @@ wash [选项] [文件名]
 - [x] 阶段 2：范围增强（步长、逗号分隔）
 - [x] 阶段 2：字符串插值
 - [x] 阶段 2：相邻字符串自动拼接
+- [ ] 阶段 3：新内建命令
 - [ ] 阶段 3：新增内建命令（len/substr/find/split/join/read/source/unset/export/help/type/keys）
 - [ ] 阶段 4：i18n gettext 支持
 - [ ] 阶段 5：交互式多行输入

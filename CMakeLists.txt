@@ -30,3 +30,7 @@ target_link_libraries(wash PRIVATE readline)
 add_executable(wash_test test/test_phase2.cpp src/lexer.cpp src/parser.cpp src/executor.cpp)
 target_include_directories(wash_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(wash_test PRIVATE readline)
+
+add_executable(wash_test3 test/test_phase3.cpp src/lexer.cpp src/parser.cpp src/executor.cpp)
+target_include_directories(wash_test3 PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(wash_test3 PRIVATE readline)

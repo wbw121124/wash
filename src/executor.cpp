@@ -7,12 +7,15 @@
  */
 
 #include "executor.h"
+#include "lexer.h"
+#include "parser.h"
 #include <iostream>
 #include <sstream>
 #include <cstdlib>
 #include <cmath>
 #include <algorithm>
 #include <cstdio>
+#include <fstream>
 #include <unistd.h>
 #include <sys/wait.h>
 #include <fcntl.h>
@@ -1054,6 +1057,168 @@ void Executor::registerBuiltinFunctions() {
         if (isInt(v)) return ExecResult(ExecResultType::NORMAL, makeStringValue("int"));
         if (isDouble(v)) return ExecResult(ExecResultType::NORMAL, makeStringValue("double"));
         return ExecResult(ExecResultType::NORMAL, makeStringValue("string"));
+    });
+    
+    defineFunction("find", [](const std::vector<Value>& args) -> ExecResult {
+        if (args.size() < 2) return ExecResult(ExecResultType::NORMAL, makeIntValue(-1));
+        std::string str = valueToString(args[0]);
+        std::string sub = valueToString(args[1]);
+        size_t pos = str.find(sub);
+        if (pos == std::string::npos) return ExecResult(ExecResultType::NORMAL, makeIntValue(-1));
+        return ExecResult(ExecResultType::NORMAL, makeIntValue(static_cast<int64_t>(pos)));
+    });
+    
+    defineFunction("split", [this](const std::vector<Value>& args) -> ExecResult {
+        if (args.empty()) return ExecResult(ExecResultType::NORMAL, makeStringValue(""));
+        std::string str = valueToString(args[0]);
+        std::string delim = (args.size() >= 2) ? valueToString(args[1]) : " ";
+        
+        // 返回一个逗号分隔的字符串，可以用 for..in 遍历
+        std::string result;
+        size_t start = 0;
+        size_t end;
+        bool first = true;
+        while ((end = str.find(delim, start)) != std::string::npos) {
+            if (!first) result += ",";
+            result += str.substr(start, end - start);
+            start = end + delim.size();
+            first = false;
+        }
+        if (!first) result += ",";
+        result += str.substr(start);
+        
+        return ExecResult(ExecResultType::NORMAL, makeStringValue(result));
+    });
+    
+    defineFunction("join", [](const std::vector<Value>& args) -> ExecResult {
+        if (args.empty()) return ExecResult(ExecResultType::NORMAL, makeStringValue(""));
+        std::string rangeStr = valueToString(args[0]);
+        std::string delim = (args.size() >= 2) ? valueToString(args[1]) : " ";
+        
+        // 简单实现：直接用分隔符替换逗号
+        std::string result;
+        for (size_t i = 0; i < rangeStr.size(); ++i) {
+            if (rangeStr[i] == ',') {
+                result += delim;
+            } else {
+                result += rangeStr[i];
+            }
+        }
+        return ExecResult(ExecResultType::NORMAL, makeStringValue(result));
+    });
+    
+    defineFunction("read", [this](const std::vector<Value>& args) -> ExecResult {
+        std::string prompt;
+        if (!args.empty()) {
+            prompt = valueToString(args[0]);
+        }
+        
+        if (!prompt.empty()) {
+            std::cout << prompt << std::flush;
+        }
+        
+        std::string line;
+        std::getline(std::cin, line);
+        return ExecResult(ExecResultType::NORMAL, makeStringValue(line));
+    });
+    
+    defineFunction("source", [this](const std::vector<Value>& args) -> ExecResult {
+        if (args.empty()) return ExecResult(ExecResultType::NORMAL, makeIntValue(1));
+        std::string filename = valueToString(args[0]);
+        
+        // 读取文件内容
+        std::ifstream file(filename);
+        if (!file.is_open()) {
+            std::cerr << "错误: 无法打开文件: " << filename << std::endl;
+            return ExecResult(ExecResultType::NORMAL, makeIntValue(1));
+        }
+        
+        std::string content((std::istreambuf_iterator<char>(file)),
+                            std::istreambuf_iterator<char>());
+        file.close();
+        
+        // 词法分析
+        Lexer lexer(content, filename);
+        auto tokens = lexer.tokenize();
+        
+        if (lexer.hasError()) {
+            std::cerr << "错误: 词法分析失败" << std::endl;
+            return ExecResult(ExecResultType::NORMAL, makeIntValue(1));
+        }
+        
+        // 语法分析
+        Parser parser(tokens, filename);
+        auto ast = parser.parse();
+        
+        if (parser.hasError()) {
+            std::cerr << parser.getError() << std::endl;
+            return ExecResult(ExecResultType::NORMAL, makeIntValue(1));
+        }
+        
+        // 执行
+        return executeNode(ast);
+    });
+    
+    defineFunction("unset", [this](const std::vector<Value>& args) -> ExecResult {
+        if (args.empty()) return ExecResult(ExecResultType::NORMAL, makeIntValue(1));
+        std::string name = valueToString(args[0]);
+        // 简单实现：设置为空字符串
+        setVariable(name, makeStringValue(""));
+        return ExecResult(ExecResultType::NORMAL, makeIntValue(0));
+    });
+    
+    defineFunction("export", [this](const std::vector<Value>& args) -> ExecResult {
+        if (args.empty()) return ExecResult(ExecResultType::NORMAL, makeIntValue(1));
+        std::string name = valueToString(args[0]);
+        Value val = getVariable(name);
+        setEnvVariable(name, val);
+        return ExecResult(ExecResultType::NORMAL, makeIntValue(0));
+    });
+    
+    defineFunction("help", [this](const std::vector<Value>& args) -> ExecResult {
+        outputToStdout("wash 内建函数:\n");
+        outputToStdout("  echo(...)        - 输出到 stdout\n");
+        outputToStdout("  stderr(...)      - 输出到 stderr\n");
+        outputToStdout("  panic(...)       - 输出到 stderr 并退出\n");
+        outputToStdout("  round(n)         - 四舍五入\n");
+        outputToStdout("  ceil(n)          - 向上取整\n");
+        outputToStdout("  floor(n)         - 向下取整\n");
+        outputToStdout("  length(s)        - 字符串长度\n");
+        outputToStdout("  upper(s)         - 转大写\n");
+        outputToStdout("  lower(s)         - 转小写\n");
+        outputToStdout("  trim(s)          - 去除首尾空白\n");
+        outputToStdout("  substr(s,i,n)    - 子串提取\n");
+        outputToStdout("  find(s,sub)      - 查找子串位置\n");
+        outputToStdout("  split(s,delim)   - 分割字符串\n");
+        outputToStdout("  join(range,d)    - 合并为字符串\n");
+        outputToStdout("  read(prompt?)    - 从 stdin 读取一行\n");
+        outputToStdout("  source(file)     - 加载执行 .wash 文件\n");
+        outputToStdout("  unset(var)       - 删除变量\n");
+        outputToStdout("  export(var)      - 导出为环境变量\n");
+        outputToStdout("  typeof(v)        - 返回类型名\n");
+        outputToStdout("  help()           - 显示此帮助\n");
+        outputToStdout("  argc()           - 脚本参数个数\n");
+        outputToStdout("  argv(i)          - 获取脚本参数\n");
+        outputToStdout("  return(v)        - 从函数返回值\n");
+        outputToStdout("  break()          - 跳出循环\n");
+        outputToStdout("  continue()       - 继续下一次循环\n");
+        return ExecResult(ExecResultType::NORMAL, makeIntValue(0));
+    });
+    
+    defineFunction("keys", [this](const std::vector<Value>& args) -> ExecResult {
+        std::string result;
+        std::shared_ptr<Scope> scope = currentScope_;
+        bool first = true;
+        while (scope) {
+            auto names = scope->getVariableNames();
+            for (const auto& name : names) {
+                if (!first) result += ",";
+                result += name;
+                first = false;
+            }
+            scope = scope->getParent();
+        }
+        return ExecResult(ExecResultType::NORMAL, makeStringValue(result));
     });
     
     defineFunction("break", [](const std::vector<Value>& args) -> ExecResult {

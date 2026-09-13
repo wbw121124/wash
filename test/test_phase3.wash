@@ -1,0 +1,28 @@
+# Phase 3 新内建函数测试
+
+# 1. find
+calc(find("hello world", "world") == 6)
+calc(find("hello", "xyz") == -1)
+
+# 2. typeof
+calc(typeof(42) == "int")
+calc(typeof("hello") == "string")
+calc(typeof(3.14) == "double")
+
+# 3. length
+calc(length("hello") == 5)
+
+# 4. upper/lower
+calc(upper("hello") == "HELLO")
+calc(lower("HELLO") == "hello")
+
+# 5. trim
+calc(trim("  hello  ") == "hello")
+
+# 6. substr
+calc(substr("hello", 1, 3) == "ell")
+
+# 7. help
+help()
+
+echo("=== Phase 3 tests passed! ===")

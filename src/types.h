@@ -848,6 +848,18 @@ public:
         return parent_;
     }
     
+    /**
+     * @brief 获取当前作用域的所有变量名
+     * @return 变量名列表
+     */
+    std::vector<std::string> getVariableNames() const {
+        std::vector<std::string> names;
+        for (const auto& pair : variables_) {
+            names.push_back(pair.first);
+        }
+        return names;
+    }
+    
 private:
     std::map<std::string, Value> variables_;    ///< 变量表
     std::shared_ptr<Scope> parent_;             ///< 父作用域
