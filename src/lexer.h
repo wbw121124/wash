@@ -136,6 +136,12 @@ private:
     Token scanBacktickString();
     
     /**
+     * @brief 扫描 Unicode 字符串（u'...' u"..." u`...`）
+     * @return Token
+     */
+    Token scanUnicodeString();
+    
+    /**
      * @brief 扫描块注释
      * @return Token（可能为 NONE）
      */

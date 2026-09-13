@@ -220,7 +220,104 @@ Token Lexer::scanIdentifier() {
     if (id == "false") return makeToken(TokenType::FALSE_KW, id);
     if (id == "calc") return makeToken(TokenType::CALC, id);
     
+    // Unicode 字符串前缀检测
+    if (id == "u" && !isAtEnd() && (current() == '\'' || current() == '"' || current() == '`')) {
+        return scanUnicodeString();
+    }
+    
     return makeToken(TokenType::IDENTIFIER, id);
+}
+
+Token Lexer::scanUnicodeString() {
+    // 消费引号字符
+    char quote = current();
+    advance();
+    
+    std::string str;
+    while (!isAtEnd() && current() != quote) {
+        if (current() == '\\') {
+            advance();
+            if (isAtEnd()) return makeError("字符串未结束");
+            char c = current();
+            if (c == 'u') {
+                // \uXXXX 4位 Unicode 转义
+                advance();
+                std::string hex;
+                for (int i = 0; i < 4 && !isAtEnd(); ++i) {
+                    hex += current();
+                    advance();
+                }
+                if (hex.size() < 4) return makeError("Unicode 转义不完整");
+                try {
+                    uint32_t codepoint = std::stoul(hex, nullptr, 16);
+                    // 简单的 UTF-8 编码
+                    if (codepoint < 0x80) {
+                        str += static_cast<char>(codepoint);
+                    } else if (codepoint < 0x800) {
+                        str += static_cast<char>(0xC0 | (codepoint >> 6));
+                        str += static_cast<char>(0x80 | (codepoint & 0x3F));
+                    } else if (codepoint < 0x10000) {
+                        str += static_cast<char>(0xE0 | (codepoint >> 12));
+                        str += static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F));
+                        str += static_cast<char>(0x80 | (codepoint & 0x3F));
+                    } else {
+                        str += static_cast<char>(0xF0 | (codepoint >> 18));
+                        str += static_cast<char>(0x80 | ((codepoint >> 12) & 0x3F));
+                        str += static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F));
+                        str += static_cast<char>(0x80 | (codepoint & 0x3F));
+                    }
+                } catch (...) {
+                    return makeError("无效的 Unicode 转义: \\u" + hex);
+                }
+            } else if (c == 'U') {
+                // \UXXXXXXXX 8位 Unicode 转义
+                advance();
+                std::string hex;
+                for (int i = 0; i < 8 && !isAtEnd(); ++i) {
+                    hex += current();
+                    advance();
+                }
+                if (hex.size() < 8) return makeError("Unicode 转义不完整");
+                try {
+                    uint32_t codepoint = std::stoul(hex, nullptr, 16);
+                    // UTF-8 编码
+                    if (codepoint < 0x80) {
+                        str += static_cast<char>(codepoint);
+                    } else if (codepoint < 0x800) {
+                        str += static_cast<char>(0xC0 | (codepoint >> 6));
+                        str += static_cast<char>(0x80 | (codepoint & 0x3F));
+                    } else if (codepoint < 0x10000) {
+                        str += static_cast<char>(0xE0 | (codepoint >> 12));
+                        str += static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F));
+                        str += static_cast<char>(0x80 | (codepoint & 0x3F));
+                    } else {
+                        str += static_cast<char>(0xF0 | (codepoint >> 18));
+                        str += static_cast<char>(0x80 | ((codepoint >> 12) & 0x3F));
+                        str += static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F));
+                        str += static_cast<char>(0x80 | (codepoint & 0x3F));
+                    }
+                } catch (...) {
+                    return makeError("无效的 Unicode 转义: \\U" + hex);
+                }
+            } else if (c == 'n') { str += '\n'; advance(); }
+            else if (c == 't') { str += '\t'; advance(); }
+            else if (c == 'r') { str += '\r'; advance(); }
+            else if (c == '\\') { str += '\\'; advance(); }
+            else if (c == quote) { str += quote; advance(); }
+            else { str += '\\'; str += c; advance(); }
+        } else if (current() == '%' && peek() == '{') {
+            str += "%{"; advance(); advance();
+            while (!isAtEnd() && current() != '}') { str += current(); advance(); }
+            if (!isAtEnd()) { str += '}'; advance(); }
+        } else {
+            if (current() == '\n' && quote == '`') { line_++; column_ = 1; }
+            str += current();
+            advance();
+        }
+    }
+    if (isAtEnd()) return makeError("字符串未结束");
+    advance();
+    return makeToken(TokenType::UNICODE_STRING, str);
 }
 
 Token Lexer::scanSingleQuoteString() {

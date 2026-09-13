@@ -448,6 +448,12 @@ ASTPtr Parser::parsePrimary() {
         return std::make_shared<LiteralNode>(makeStringValue(tok.value), tok.line, tok.column);
     }
     
+    // Unicode 字符串字面量
+    if (tok.type == TokenType::UNICODE_STRING) {
+        advance();
+        return std::make_shared<LiteralNode>(makeStringValue(tok.value), tok.line, tok.column);
+    }
+    
     // 标识符作为字符串字面量（函数参数中的裸标识符）
     if (tok.type == TokenType::IDENTIFIER) {
         advance();

@@ -31,6 +31,7 @@ enum class TokenType {
     // 基础类型
     NUMBER,         ///< 数字字面量
     STRING,         ///< 字符串字面量
+    UNICODE_STRING, ///< Unicode 字符串字面量 u'...' u"..." u`...`
     IDENTIFIER,     ///< 标识符
     
     // 变量相关
