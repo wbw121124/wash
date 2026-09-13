@@ -1,0 +1,176 @@
+# Chinese (Simplified) translation for wash
+# Copyright (C) 2026 wash
+# This file is distributed under the same license as the wash package.
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: wash 1.0\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2026-09-13 18:50+0800\n"
+"PO-Revision-Date: 2026-09-13 18:50+0800\n"
+"Last-Translator: wash <wash@wash>\n"
+"Language-Team: Chinese (Simplified)\n"
+"Language: zh_CN\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+
+#: src/executor.cpp
+msgid "错误: 除零"
+msgstr "错误: 除零"
+
+#: src/executor.cpp
+msgid "错误: 模零"
+msgstr "错误: 模零"
+
+#: src/executor.cpp
+msgid "错误: 未知节点类型"
+msgstr "错误: 未知节点类型"
+
+#: src/executor.cpp
+msgid "错误: 未知函数: "
+msgstr "错误: 未知函数: "
+
+#: src/executor.cpp
+msgid "错误: 无法打开文件: "
+msgstr "错误: 无法打开文件: "
+
+#: src/main.cpp
+msgid "欢迎使用 wash "
+msgstr "欢迎使用 wash "
+
+#: src/main.cpp
+msgid "输入 help() 查看帮助"
+msgstr "输入 help() 查看帮助"
+
+#: src/main.cpp
+msgid "错误: 词法分析失败"
+msgstr "错误: 词法分析失败"
+
+#: src/lexer.cpp
+msgid "字符串未结束"
+msgstr "字符串未结束"
+
+#: src/lexer.cpp
+msgid "无效转义序列: "
+msgstr "无效转义序列: "
+
+#: src/lexer.cpp
+msgid "变量名为空"
+msgstr "变量名为空"
+
+#: src/lexer.cpp
+msgid "注释未结束"
+msgstr "注释未结束"
+
+#: src/parser.cpp
+msgid "期望 "
+msgstr "期望 "
+
+#: src/parser.cpp
+msgid "意外的 Token: "
+msgstr "意外的 Token: "
+
+#: src/executor.cpp
+msgid "wash 内建函数:"
+msgstr "wash 内建函数:"
+
+#: src/executor.cpp
+msgid "  echo(...)        - 输出到 stdout"
+msgstr "  echo(...)        - 输出到标准输出"
+
+#: src/executor.cpp
+msgid "  stderr(...)      - 输出到 stderr"
+msgstr "  stderr(...)      - 输出到标准错误"
+
+#: src/executor.cpp
+msgid "  panic(...)       - 输出到 stderr 并退出"
+msgstr "  panic(...)       - 输出到标准错误并退出"
+
+#: src/executor.cpp
+msgid "  round(n)         - 四舍五入"
+msgstr "  round(n)         - 四舍五入"
+
+#: src/executor.cpp
+msgid "  ceil(n)          - 向上取整"
+msgstr "  ceil(n)          - 向上取整"
+
+#: src/executor.cpp
+msgid "  floor(n)         - 向下取整"
+msgstr "  floor(n)         - 向下取整"
+
+#: src/executor.cpp
+msgid "  length(s)        - 字符串长度"
+msgstr "  length(s)        - 字符串长度"
+
+#: src/executor.cpp
+msgid "  upper(s)         - 转大写"
+msgstr "  upper(s)         - 转大写"
+
+#: src/executor.cpp
+msgid "  lower(s)         - 转小写"
+msgstr "  lower(s)         - 转小写"
+
+#: src/executor.cpp
+msgid "  trim(s)          - 去除首尾空白"
+msgstr "  trim(s)          - 去除首尾空白"
+
+#: src/executor.cpp
+msgid "  substr(s,i,n)    - 子串提取"
+msgstr "  substr(s,i,n)    - 子串提取"
+
+#: src/executor.cpp
+msgid "  find(s,sub)      - 查找子串位置"
+msgstr "  find(s,sub)      - 查找子串位置"
+
+#: src/executor.cpp
+msgid "  split(s,delim)   - 分割字符串"
+msgstr "  split(s,delim)   - 分割字符串"
+
+#: src/executor.cpp
+msgid "  join(range,d)    - 合并为字符串"
+msgstr "  join(range,d)    - 合并为字符串"
+
+#: src/executor.cpp
+msgid "  read(prompt?)    - 从 stdin 读取一行"
+msgstr "  read(prompt?)    - 从标准输入读取一行"
+
+#: src/executor.cpp
+msgid "  source(file)     - 加载执行 .wash 文件"
+msgstr "  source(file)     - 加载执行 .wash 文件"
+
+#: src/executor.cpp
+msgid "  unset(var)       - 删除变量"
+msgstr "  unset(var)       - 删除变量"
+
+#: src/executor.cpp
+msgid "  export(var)      - 导出为环境变量"
+msgstr "  export(var)      - 导出为环境变量"
+
+#: src/executor.cpp
+msgid "  typeof(v)        - 返回类型名"
+msgstr "  typeof(v)        - 返回类型名"
+
+#: src/executor.cpp
+msgid "  help()           - 显示此帮助"
+msgstr "  help()           - 显示此帮助"
+
+#: src/executor.cpp
+msgid "  argc()           - 脚本参数个数"
+msgstr "  argc()           - 脚本参数个数"
+
+#: src/executor.cpp
+msgid "  argv(i)          - 获取脚本参数"
+msgstr "  argv(i)          - 获取脚本参数"
+
+#: src/executor.cpp
+msgid "  return(v)        - 从函数返回值"
+msgstr "  return(v)        - 从函数返回值"
+
+#: src/executor.cpp
+msgid "  break()          - 跳出循环"
+msgstr "  break()          - 跳出循环"
+
+#: src/executor.cpp
+msgid "  continue()       - 继续下一次循环"
+msgstr "  continue()       - 继续下一次循环"

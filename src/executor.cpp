@@ -19,6 +19,9 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <fcntl.h>
+#include <libintl.h>
+
+#define _(STRING) gettext(STRING)
 
 namespace wash {
 
@@ -1176,32 +1179,32 @@ void Executor::registerBuiltinFunctions() {
     });
     
     defineFunction("help", [this](const std::vector<Value>& args) -> ExecResult {
-        outputToStdout("wash 内建函数:\n");
-        outputToStdout("  echo(...)        - 输出到 stdout\n");
-        outputToStdout("  stderr(...)      - 输出到 stderr\n");
-        outputToStdout("  panic(...)       - 输出到 stderr 并退出\n");
-        outputToStdout("  round(n)         - 四舍五入\n");
-        outputToStdout("  ceil(n)          - 向上取整\n");
-        outputToStdout("  floor(n)         - 向下取整\n");
-        outputToStdout("  length(s)        - 字符串长度\n");
-        outputToStdout("  upper(s)         - 转大写\n");
-        outputToStdout("  lower(s)         - 转小写\n");
-        outputToStdout("  trim(s)          - 去除首尾空白\n");
-        outputToStdout("  substr(s,i,n)    - 子串提取\n");
-        outputToStdout("  find(s,sub)      - 查找子串位置\n");
-        outputToStdout("  split(s,delim)   - 分割字符串\n");
-        outputToStdout("  join(range,d)    - 合并为字符串\n");
-        outputToStdout("  read(prompt?)    - 从 stdin 读取一行\n");
-        outputToStdout("  source(file)     - 加载执行 .wash 文件\n");
-        outputToStdout("  unset(var)       - 删除变量\n");
-        outputToStdout("  export(var)      - 导出为环境变量\n");
-        outputToStdout("  typeof(v)        - 返回类型名\n");
-        outputToStdout("  help()           - 显示此帮助\n");
-        outputToStdout("  argc()           - 脚本参数个数\n");
-        outputToStdout("  argv(i)          - 获取脚本参数\n");
-        outputToStdout("  return(v)        - 从函数返回值\n");
-        outputToStdout("  break()          - 跳出循环\n");
-        outputToStdout("  continue()       - 继续下一次循环\n");
+        outputToStdout(_("wash 内建函数:\n"));
+        outputToStdout(_("  echo(...)        - 输出到 stdout\n"));
+        outputToStdout(_("  stderr(...)      - 输出到 stderr\n"));
+        outputToStdout(_("  panic(...)       - 输出到 stderr 并退出\n"));
+        outputToStdout(_("  round(n)         - 四舍五入\n"));
+        outputToStdout(_("  ceil(n)          - 向上取整\n"));
+        outputToStdout(_("  floor(n)         - 向下取整\n"));
+        outputToStdout(_("  length(s)        - 字符串长度\n"));
+        outputToStdout(_("  upper(s)         - 转大写\n"));
+        outputToStdout(_("  lower(s)         - 转小写\n"));
+        outputToStdout(_("  trim(s)          - 去除首尾空白\n"));
+        outputToStdout(_("  substr(s,i,n)    - 子串提取\n"));
+        outputToStdout(_("  find(s,sub)      - 查找子串位置\n"));
+        outputToStdout(_("  split(s,delim)   - 分割字符串\n"));
+        outputToStdout(_("  join(range,d)    - 合并为字符串\n"));
+        outputToStdout(_("  read(prompt?)    - 从 stdin 读取一行\n"));
+        outputToStdout(_("  source(file)     - 加载执行 .wash 文件\n"));
+        outputToStdout(_("  unset(var)       - 删除变量\n"));
+        outputToStdout(_("  export(var)      - 导出为环境变量\n"));
+        outputToStdout(_("  typeof(v)        - 返回类型名\n"));
+        outputToStdout(_("  help()           - 显示此帮助\n"));
+        outputToStdout(_("  argc()           - 脚本参数个数\n"));
+        outputToStdout(_("  argv(i)          - 获取脚本参数\n"));
+        outputToStdout(_("  return(v)        - 从函数返回值\n"));
+        outputToStdout(_("  break()          - 跳出循环\n"));
+        outputToStdout(_("  continue()       - 继续下一次循环\n"));
         return ExecResult(ExecResultType::NORMAL, makeIntValue(0));
     });
     

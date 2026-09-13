@@ -16,12 +16,16 @@
 #include <algorithm>
 #include <cstdlib>
 #include <unistd.h>
+#include <libintl.h>
+#include <locale.h>
 #include <readline/readline.h>
 #include <readline/history.h>
 
 #include "lexer.h"
 #include "parser.h"
 #include "executor.h"
+
+#define _(STRING) gettext(STRING)
 
 static const char* DEFAULT_PS1 = "[\\u@\\h \\W]\\$ ";
 static const int DEFAULT_HISTORY_MAX = 10000;
@@ -203,6 +207,11 @@ void showHelp() {
 }
 
 int main(int argc, char const* argv[]) {
+    // 初始化 i18n
+    setlocale(LC_ALL, "");
+    bindtextdomain("wash", "share/locale");
+    textdomain("wash");
+    
     wash::Executor executor;
     bool isLogin = false;
     std::string command, filename;

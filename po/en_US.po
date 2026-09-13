@@ -1,0 +1,176 @@
+# English translation for wash
+# Copyright (C) 2026 wash
+# This file is distributed under the same license as the wash package.
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: wash 1.0\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2026-09-13 18:50+0800\n"
+"PO-Revision-Date: 2026-09-13 18:50+0800\n"
+"Last-Translator: wash <wash@wash>\n"
+"Language-Team: English\n"
+"Language: en_US\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+
+#: src/executor.cpp
+msgid "错误: 除零"
+msgstr "Error: division by zero"
+
+#: src/executor.cpp
+msgid "错误: 模零"
+msgstr "Error: modulo by zero"
+
+#: src/executor.cpp
+msgid "错误: 未知节点类型"
+msgstr "Error: unknown node type"
+
+#: src/executor.cpp
+msgid "错误: 未知函数: "
+msgstr "Error: unknown function: "
+
+#: src/executor.cpp
+msgid "错误: 无法打开文件: "
+msgstr "Error: cannot open file: "
+
+#: src/main.cpp
+msgid "欢迎使用 wash "
+msgstr "Welcome to wash "
+
+#: src/main.cpp
+msgid "输入 help() 查看帮助"
+msgstr "Type help() for help"
+
+#: src/main.cpp
+msgid "错误: 词法分析失败"
+msgstr "Error: lexer analysis failed"
+
+#: src/lexer.cpp
+msgid "字符串未结束"
+msgstr "Unterminated string"
+
+#: src/lexer.cpp
+msgid "无效转义序列: "
+msgstr "Invalid escape sequence: "
+
+#: src/lexer.cpp
+msgid "变量名为空"
+msgstr "Empty variable name"
+
+#: src/lexer.cpp
+msgid "注释未结束"
+msgstr "Unterminated comment"
+
+#: src/parser.cpp
+msgid "期望 "
+msgstr "Expected "
+
+#: src/parser.cpp
+msgid "意外的 Token: "
+msgstr "Unexpected token: "
+
+#: src/executor.cpp
+msgid "wash 内建函数:"
+msgstr "wash built-in functions:"
+
+#: src/executor.cpp
+msgid "  echo(...)        - 输出到 stdout"
+msgstr "  echo(...)        - Output to stdout"
+
+#: src/executor.cpp
+msgid "  stderr(...)      - 输出到 stderr"
+msgstr "  stderr(...)      - Output to stderr"
+
+#: src/executor.cpp
+msgid "  panic(...)       - 输出到 stderr 并退出"
+msgstr "  panic(...)       - Output to stderr and exit"
+
+#: src/executor.cpp
+msgid "  round(n)         - 四舍五入"
+msgstr "  round(n)         - Round to nearest integer"
+
+#: src/executor.cpp
+msgid "  ceil(n)          - 向上取整"
+msgstr "  ceil(n)          - Round up"
+
+#: src/executor.cpp
+msgid "  floor(n)         - 向下取整"
+msgstr "  floor(n)         - Round down"
+
+#: src/executor.cpp
+msgid "  length(s)        - 字符串长度"
+msgstr "  length(s)        - String length"
+
+#: src/executor.cpp
+msgid "  upper(s)         - 转大写"
+msgstr "  upper(s)         - Convert to uppercase"
+
+#: src/executor.cpp
+msgid "  lower(s)         - 转小写"
+msgstr "  lower(s)         - Convert to lowercase"
+
+#: src/executor.cpp
+msgid "  trim(s)          - 去除首尾空白"
+msgstr "  trim(s)          - Trim whitespace"
+
+#: src/executor.cpp
+msgid "  substr(s,i,n)    - 子串提取"
+msgstr "  substr(s,i,n)    - Extract substring"
+
+#: src/executor.cpp
+msgid "  find(s,sub)      - 查找子串位置"
+msgstr "  find(s,sub)      - Find substring position"
+
+#: src/executor.cpp
+msgid "  split(s,delim)   - 分割字符串"
+msgstr "  split(s,delim)   - Split string"
+
+#: src/executor.cpp
+msgid "  join(range,d)    - 合并为字符串"
+msgstr "  join(range,d)    - Join into string"
+
+#: src/executor.cpp
+msgid "  read(prompt?)    - 从 stdin 读取一行"
+msgstr "  read(prompt?)    - Read a line from stdin"
+
+#: src/executor.cpp
+msgid "  source(file)     - 加载执行 .wash 文件"
+msgstr "  source(file)     - Load and execute .wash file"
+
+#: src/executor.cpp
+msgid "  unset(var)       - 删除变量"
+msgstr "  unset(var)       - Delete variable"
+
+#: src/executor.cpp
+msgid "  export(var)      - 导出为环境变量"
+msgstr "  export(var)      - Export as environment variable"
+
+#: src/executor.cpp
+msgid "  typeof(v)        - 返回类型名"
+msgstr "  typeof(v)        - Return type name"
+
+#: src/executor.cpp
+msgid "  help()           - 显示此帮助"
+msgstr "  help()           - Show this help"
+
+#: src/executor.cpp
+msgid "  argc()           - 脚本参数个数"
+msgstr "  argc()           - Script argument count"
+
+#: src/executor.cpp
+msgid "  argv(i)          - 获取脚本参数"
+msgstr "  argv(i)          - Get script argument"
+
+#: src/executor.cpp
+msgid "  return(v)        - 从函数返回值"
+msgstr "  return(v)        - Return from function"
+
+#: src/executor.cpp
+msgid "  break()          - 跳出循环"
+msgstr "  break()          - Break out of loop"
+
+#: src/executor.cpp
+msgid "  continue()       - 继续下一次循环"
+msgstr "  continue()       - Continue to next iteration"

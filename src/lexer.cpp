@@ -9,6 +9,9 @@
 #include "lexer.h"
 #include <cctype>
 #include <stdexcept>
+#include <libintl.h>
+
+#define _(STRING) gettext(STRING)
 
 namespace wash {
 

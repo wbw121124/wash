@@ -9,6 +9,9 @@
 #include "parser.h"
 #include <stdexcept>
 #include <sstream>
+#include <libintl.h>
+
+#define _(STRING) gettext(STRING)
 
 namespace wash {
 
