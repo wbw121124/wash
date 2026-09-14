@@ -2,7 +2,8 @@
  * @file color.h
  * @brief wash 终端颜色支持
  * 
- * 基于 terminfo 的颜色查询与输出。
+ * 基于 ANSI 转义码的颜色输出，不依赖 ncurses/terminfo，
+ * 避免与 readline 的终端状态管理冲突。
  * 
  * @author wash
  * @date 2026-09-13
@@ -12,6 +13,7 @@
 #define WASH_COLOR_H
 
 #include <string>
+#include <cstdlib>
 
 namespace wash {
 
@@ -31,49 +33,25 @@ enum class Color {
 };
 
 /**
- * @brief 颜色管理器
+ * @brief 颜色管理器（纯 ANSI 转义码实现）
+ * 
+ * 不使用 ncurses/terminfo，完全通过 ANSI 转义序列控制颜色。
+ * 这样可以避免与 readline 的终端处理产生冲突。
  */
 class ColorManager {
 public:
     ColorManager();
-    ~ColorManager();
+    ~ColorManager() = default;
     
-    /**
-     * @brief 检测终端是否支持颜色
-     */
     bool hasColor() const;
-    
-    /**
-     * @brief 设置前景色
-     */
     void setFg(Color color) const;
-    
-    /**
-     * @brief 设置背景色
-     */
     void setBg(Color color) const;
-    
-    /**
-     * @brief 重置颜色
-     */
     void reset() const;
-    
-    /**
-     * @brief 获取颜色代码字符串（用于输出）
-     */
     std::string fgStr(Color color) const;
-    
-    /**
-     * @brief 获取重置代码字符串
-     */
     std::string resetStr() const;
 
 private:
-    bool initialized_;
     bool hasColor_;
-    char* setaf_;  // set a foreground color
-    char* setab_;  // set a background color
-    char* sgr0_;   // turn off all attributes
 };
 
 } // namespace wash

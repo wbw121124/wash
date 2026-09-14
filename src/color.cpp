@@ -2,47 +2,26 @@
  * @file color.cpp
  * @brief wash 终端颜色支持实现
  * 
+ * 纯 ANSI 转义码实现，不依赖 ncurses/terminfo。
+ * 
  * @author wash
  * @date 2026-09-13
  */
 
 #include "color.h"
-#if defined(__MINGW32__) || defined(__MINGW64__)
-    // UCRT64/MinGW64 不包含 MSYS 的 <unistd.h>
-    // STDOUT_FILENO 已在 compat.h 或此处定义
-    #ifndef STDOUT_FILENO
-        #define STDOUT_FILENO 1
-    #endif
-#else
-    #include <unistd.h>
-#endif
-
-extern "C" {
-#include <term.h>
-#include <curses.h>
-}
+#include <cstdlib>
+#include <cstring>
 
 namespace wash {
 
-ColorManager::ColorManager() : initialized_(false), hasColor_(false),
-    setaf_(nullptr), setab_(nullptr), sgr0_(nullptr) {
-    int err = 0;
-    if (setupterm(nullptr, STDOUT_FILENO, &err) == OK) {
-        initialized_ = true;
-        setaf_ = tigetstr(const_cast<char*>("setaf"));
-        setab_ = tigetstr(const_cast<char*>("setab"));
-        sgr0_ = tigetstr(const_cast<char*>("sgr0"));
-        
-        // 检查是否支持颜色
-        if (setaf_ && setab_ && tigetnum(const_cast<char*>("colors")) >= 8) {
-            hasColor_ = true;
-        }
+ColorManager::ColorManager() : hasColor_(false) {
+    const char* term = getenv("TERM");
+    if (term && std::strcmp(term, "dumb") != 0) {
+        hasColor_ = true;
     }
-}
-
-ColorManager::~ColorManager() {
-    if (initialized_) {
-        del_curterm(cur_term);
+    // MSYS2/UCRT64/MinGW 终端都支持 ANSI，只要不是 dumb
+    if (!term) {
+        hasColor_ = true;
     }
 }
 
@@ -50,30 +29,45 @@ bool ColorManager::hasColor() const {
     return hasColor_;
 }
 
+static std::string ansiFg(Color color) {
+    int code = static_cast<int>(color);
+    if (code == static_cast<int>(Color::DEFAULT)) {
+        return "\033[39m";
+    }
+    return "\033[3" + std::to_string(code) + "m";
+}
+
+static std::string ansiBg(Color color) {
+    int code = static_cast<int>(color);
+    if (code == static_cast<int>(Color::DEFAULT)) {
+        return "\033[49m";
+    }
+    return "\033[4" + std::to_string(code) + "m";
+}
+
 void ColorManager::setFg(Color color) const {
-    if (hasColor_ && setaf_) {
-        tputs(tigetstr(const_cast<char*>("setaf")), 1, putchar);
+    if (hasColor_) {
+        std::string seq = ansiFg(color);
+        fputs(seq.c_str(), stdout);
     }
 }
 
 void ColorManager::setBg(Color color) const {
-    if (hasColor_ && setab_) {
-        tputs(tigetstr(const_cast<char*>("setab")), 1, putchar);
+    if (hasColor_) {
+        std::string seq = ansiBg(color);
+        fputs(seq.c_str(), stdout);
     }
 }
 
 void ColorManager::reset() const {
-    if (hasColor_ && sgr0_) {
-        tputs(sgr0_, 1, putchar);
+    if (hasColor_) {
+        fputs("\033[0m", stdout);
     }
 }
 
 std::string ColorManager::fgStr(Color color) const {
     if (!hasColor_) return "";
-    
-    // 使用 ANSI 转义序列作为后备
-    int colorNum = static_cast<int>(color);
-    return "\033[3" + std::to_string(colorNum) + "m";
+    return ansiFg(color);
 }
 
 std::string ColorManager::resetStr() const {

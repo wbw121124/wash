@@ -15,7 +15,6 @@
 #include <vector>
 #include <algorithm>
 #include <cstdlib>
-#include <unistd.h>
 #include <libintl.h>
 #include <locale.h>
 #include <readline/readline.h>
@@ -25,6 +24,7 @@
 #include "parser.h"
 #include "executor.h"
 #include "color.h"
+#include "compat.h"
 
 #define _(STRING) gettext(STRING)
 
@@ -32,36 +32,16 @@ static const char* DEFAULT_PS1 = "[\\u@\\h \\W]\\$ ";
 static const int DEFAULT_HISTORY_MAX = 10000;
 
 std::string getHomeDir() {
-    const char* home = getenv("HOME");
-    return home ? home : ".";
-}
-
-std::string getUsername() {
-    const char* user = getenv("USER");
-    return user ? user : "unknown";
-}
-
-std::string getHostname() {
-    char hostname[256];
-    gethostname(hostname, sizeof(hostname));
-    return hostname;
-}
-
-std::string getCurrentDir() {
-    char* cwd = getcwd(nullptr, 0);
-    if (!cwd) return ".";
-    std::string path(cwd);
-    free(cwd);
-    size_t pos = path.find_last_of("/");
-    if (pos != std::string::npos) return path.substr(pos + 1);
-    return path;
+    std::string home = wash::compat::getEnvVar("HOME");
+    if (home.empty()) home = wash::compat::getEnvVar("USERPROFILE");
+    return home.empty() ? "." : home;
 }
 
 std::string parsePS1(const std::string& ps1) {
     std::string result;
-    std::string username = getUsername();
-    std::string hostname = getHostname();
-    std::string workdir = getCurrentDir();
+    std::string username = wash::compat::getUsername();
+    std::string hostname = wash::compat::getHostname();
+    std::string workdir = wash::compat::getCurrentDir();
     
     for (size_t i = 0; i < ps1.size(); ++i) {
         if (ps1[i] == '\\' && i + 1 < ps1.size()) {
@@ -69,8 +49,8 @@ std::string parsePS1(const std::string& ps1) {
                 case 'u': result += username; i++; break;
                 case 'h': result += hostname; i++; break;
                 case 'W': result += workdir; i++; break;
-                case 'w': result += getCurrentDir(); i++; break;
-                case '$': result += (getuid() == 0) ? "#" : "$"; i++; break;
+                case 'w': result += wash::compat::getCurrentDir(); i++; break;
+                case '$': result += (wash::compat::getUserId() == 0) ? "#" : "$"; i++; break;
                 case '\\': result += '\\'; i++; break;
                 default: result += ps1[i]; break;
             }

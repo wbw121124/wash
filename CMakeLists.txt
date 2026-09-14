@@ -59,8 +59,6 @@ if(WASH_MINGW_ENV)
     set_target_properties(Intl::Intl PROPERTIES
         IMPORTED_LOCATION "/ucrt64/lib/libintl.dll.a"
     )
-    # UCRT64 ncurses 的 term.h/curses.h 在子目录中
-    include_directories("/ucrt64/include/ncurses")
 else()
     find_package(Intl REQUIRED)
 endif()
@@ -90,26 +88,26 @@ target_include_directories(wash PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
 # 跨平台链接库
 if(WASH_MINGW_ENV)
-    target_link_libraries(wash PRIVATE readline Intl::Intl ncursesw)
+    target_link_libraries(wash PRIVATE readline Intl::Intl)
 else()
-    target_link_libraries(wash PRIVATE readline Intl::Intl ncurses)
+    target_link_libraries(wash PRIVATE readline Intl::Intl)
 endif()
 
 # 测试目标
 add_executable(wash_test test/test_phase2.cpp src/lexer.cpp src/parser.cpp src/executor.cpp src/color.cpp src/compat.cpp)
 target_include_directories(wash_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 if(WASH_MINGW_ENV)
-    target_link_libraries(wash_test PRIVATE readline Intl::Intl ncursesw)
+    target_link_libraries(wash_test PRIVATE readline Intl::Intl)
 else()
-    target_link_libraries(wash_test PRIVATE readline Intl::Intl ncurses)
+    target_link_libraries(wash_test PRIVATE readline Intl::Intl)
 endif()
 
 add_executable(wash_test3 test/test_phase3.cpp src/lexer.cpp src/parser.cpp src/executor.cpp src/color.cpp src/compat.cpp)
 target_include_directories(wash_test3 PRIVATE ${CMAKE_SOURCE_DIR}/src)
 if(WASH_MINGW_ENV)
-    target_link_libraries(wash_test3 PRIVATE readline Intl::Intl ncursesw)
+    target_link_libraries(wash_test3 PRIVATE readline Intl::Intl)
 else()
-    target_link_libraries(wash_test3 PRIVATE readline Intl::Intl ncurses)
+    target_link_libraries(wash_test3 PRIVATE readline Intl::Intl)
 endif()
 
 # i18n: 编译 .po 文件到 .mo 文件
