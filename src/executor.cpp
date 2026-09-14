@@ -27,6 +27,11 @@
     #define WNOHANG 1
 #elif defined(__MINGW32__) || defined(__MINGW64__)
     // ========== UCRT64 / MinGW64 ==========
+    #ifndef WIN32_LEAN_AND_MEAN
+        #define WIN32_LEAN_AND_MEAN
+    #endif
+    #include <windows.h>
+    #include <process.h>
     // UCRT64 的 <sys/types.h> 已通过 <cwchar> 链定义了 pid_t
     #ifndef STDIN_FILENO
         #define STDIN_FILENO 0
@@ -69,6 +74,59 @@ namespace wash {
 Executor::Executor() : exitCode_(0), exitRequested_(false), scriptArgc_(0) {
     currentScope_ = std::make_shared<Scope>();
     registerBuiltinFunctions();
+    initSystemEnvVars();
+}
+
+void Executor::initSystemEnvVars() {
+#ifdef WASH_NATIVE_WIN32
+    // MSVC: 从 Windows 环境块读取
+    char* envBlock = GetEnvironmentStringsA();
+    if (envBlock) {
+        const char* p = envBlock;
+        while (*p) {
+            std::string entry(p);
+            size_t eq = entry.find('=');
+            if (eq != std::string::npos && eq > 0) {
+                std::string name = entry.substr(0, eq);
+                std::string value = entry.substr(eq + 1);
+                envVars_[name] = makeStringValue(value);
+            }
+            p += entry.size() + 1;
+        }
+        FreeEnvironmentStringsA(envBlock);
+    }
+#elif defined(__MINGW32__) || defined(__MINGW64__)
+    // UCRT64/MinGW: 使用 Windows API 读取环境变量
+    char* envBlock = GetEnvironmentStringsA();
+    if (envBlock) {
+        const char* p = envBlock;
+        while (*p) {
+            std::string entry(p);
+            size_t eq = entry.find('=');
+            if (eq != std::string::npos && eq > 0) {
+                std::string name = entry.substr(0, eq);
+                std::string value = entry.substr(eq + 1);
+                envVars_[name] = makeStringValue(value);
+            }
+            p += entry.size() + 1;
+        }
+        FreeEnvironmentStringsA(envBlock);
+    }
+#else
+    // POSIX: 从 environ 读取
+    extern char** environ;
+    if (environ) {
+        for (char** env = environ; *env; ++env) {
+            std::string entry(*env);
+            size_t eq = entry.find('=');
+            if (eq != std::string::npos) {
+                std::string name = entry.substr(0, eq);
+                std::string value = entry.substr(eq + 1);
+                envVars_[name] = makeStringValue(value);
+            }
+        }
+    }
+#endif
 }
 
 void Executor::setScriptArgs(int argc, const char* const* argv) {
@@ -115,8 +173,15 @@ Value Executor::getEnvVariable(const std::string& name) {
         return it->second;
     }
     
-    std::string envName = "wash_" + name;
-    std::string val = wash::compat::getEnvVar(envName);
+    // 直接查 OS 环境变量（无前缀）
+    std::string val = wash::compat::getEnvVar(name);
+    if (!val.empty()) {
+        return makeStringValue(val);
+    }
+    
+    // wash_ 前缀回退
+    std::string washPrefixed = "wash_" + name;
+    val = wash::compat::getEnvVar(washPrefixed);
     if (!val.empty()) {
         return makeStringValue(val);
     }
@@ -962,6 +1027,15 @@ int Executor::executeExternalCommand(const std::string& cmd, const std::vector<s
         fullCmd += " " + arg;
     }
     
+#if defined(__MINGW32__) || defined(__MINGW64__)
+    // UCRT64/MinGW: 使用 system() 替代 fork/execvp
+    // system() 会通过 cmd.exe 执行，继承父进程的 stdout/stderr
+    int ret = system(fullCmd.c_str());
+    if (ret == -1) {
+        return -1;
+    }
+    return ret;
+#else
     pid_t pid = fork();
     
     if (pid == 0) {
@@ -987,6 +1061,7 @@ int Executor::executeExternalCommand(const std::string& cmd, const std::vector<s
         perror("fork");
         return -1;
     }
+#endif
 }
 
 void Executor::outputToStdout(const Value& value) {
@@ -1220,37 +1295,96 @@ void Executor::registerBuiltinFunctions() {
     });
     
     defineFunction("help", [this](const std::vector<Value>& args) -> ExecResult {
-        outputToStdout(makeStringValue(
-            "wash 内建函数:\n"
-            "  echo(...)        - 输出到 stdout\n"
-            "  stderr(...)      - 输出到 stderr\n"
-            "  panic(...)       - 输出到 stderr 并退出\n"
-            "  round(n)         - 四舍五入\n"
-            "  ceil(n)          - 向上取整\n"
-            "  floor(n)         - 向下取整\n"
-            "  length(s)        - 字符串长度\n"
-            "  upper(s)         - 转大写\n"
-            "  lower(s)         - 转小写\n"
-            "  trim(s)          - 去除首尾空白\n"
-            "  substr(s,i,n)    - 子串提取\n"
-            "  find(s,sub)      - 查找子串位置\n"
-            "  split(s,delim)   - 分割字符串\n"
-            "  join(range,d)    - 合并为字符串\n"
-            "  read(prompt?)    - 从 stdin 读取一行\n"
-            "  source(file)     - 加载执行 .wash 文件\n"
-            "  unset(var)       - 删除变量\n"
-            "  export(var)      - 导出为环境变量\n"
-            "  typeof(v)        - 返回类型名\n"
-            "  help()           - 显示此帮助\n"
-            "  argc()           - 脚本参数个数\n"
-            "  argv(i)          - 获取脚本参数\n"
-            "  return(v)        - 从函数返回值\n"
-            "  break()          - 跳出循环\n"
-            "  continue()       - 继续下一次循环\n"
-            "  fg(color)        - 设置前景色（名称/256色/真彩色/reset）\n"
-            "  bg(color)        - 设置背景色（名称/256色/真彩色/reset）\n"
-            "  colors()         - 显示终端颜色能力\n"
-        ));
+        wash::ColorManager cm;
+        std::string bold = "\033[1m";
+        std::string cyan = cm.fgStr(wash::Color::CYAN);
+        std::string green = cm.fgStr(wash::Color::GREEN);
+        std::string yellow = cm.fgStr(wash::Color::YELLOW);
+        std::string dim = "\033[2m";
+        std::string rst = cm.resetStr();
+        
+        // 单命令详细帮助
+        if (!args.empty()) {
+            std::string cmd = valueToString(args[0]);
+            
+            static const std::map<std::string, std::string> helpDB = {
+                {"echo",     _("help_echo")},
+                {"stderr",   _("help_stderr")},
+                {"panic",    _("help_panic")},
+                {"round",    _("help_round")},
+                {"ceil",     _("help_ceil")},
+                {"floor",    _("help_floor")},
+                {"length",   _("help_length")},
+                {"upper",    _("help_upper")},
+                {"lower",    _("help_lower")},
+                {"trim",     _("help_trim")},
+                {"substr",   _("help_substr")},
+                {"find",     _("help_find")},
+                {"split",    _("help_split")},
+                {"join",     _("help_join")},
+                {"read",     _("help_read")},
+                {"source",   _("help_source")},
+                {"unset",    _("help_unset")},
+                {"export",   _("help_export")},
+                {"typeof",   _("help_typeof")},
+                {"help",     _("help_help")},
+                {"argc",     _("help_argc")},
+                {"argv",     _("help_argv")},
+                {"return",   _("help_return")},
+                {"break",    _("help_break")},
+                {"continue", _("help_continue")},
+                {"fg",       _("help_fg")},
+                {"bg",       _("help_bg")},
+                {"colors",   _("help_colors")},
+            };
+            
+            auto it = helpDB.find(cmd);
+            if (it != helpDB.end()) {
+                outputToStdout(makeStringValue(bold + cyan + cmd + rst + "\n" + dim + "------" + rst + "\n" + green + it->second + rst + "\n"));
+            } else {
+                outputToStdout(makeStringValue(_("help_unknown") + cmd + "\n"));
+            }
+            return ExecResult(ExecResultType::NORMAL, makeIntValue(0));
+        }
+        
+        // 完整帮助列表
+        struct HelpEntry { const char* name; const char* brief; };
+        static const HelpEntry entries[] = {
+            {"echo",     _("help_brief_echo")},
+            {"stderr",   _("help_brief_stderr")},
+            {"panic",    _("help_brief_panic")},
+            {"round",    _("help_brief_round")},
+            {"ceil",     _("help_brief_ceil")},
+            {"floor",    _("help_brief_floor")},
+            {"length",   _("help_brief_length")},
+            {"upper",    _("help_brief_upper")},
+            {"lower",    _("help_brief_lower")},
+            {"trim",     _("help_brief_trim")},
+            {"substr",   _("help_brief_substr")},
+            {"find",     _("help_brief_find")},
+            {"split",    _("help_brief_split")},
+            {"join",     _("help_brief_join")},
+            {"read",     _("help_brief_read")},
+            {"source",   _("help_brief_source")},
+            {"unset",    _("help_brief_unset")},
+            {"export",   _("help_brief_export")},
+            {"typeof",   _("help_brief_typeof")},
+            {"help",     _("help_brief_help")},
+            {"argc",     _("help_brief_argc")},
+            {"argv",     _("help_brief_argv")},
+            {"return",   _("help_brief_return")},
+            {"break",    _("help_brief_break")},
+            {"continue", _("help_brief_continue")},
+            {"fg",       _("help_brief_fg")},
+            {"bg",       _("help_brief_bg")},
+            {"colors",   _("help_brief_colors")},
+        };
+        
+        outputToStdout(makeStringValue(bold + _("wash_builtins_title") + rst + "\n"));
+        outputToStdout(makeStringValue(dim + _("wash_builtins_hint") + rst + "\n\n"));
+        for (const auto& e : entries) {
+            outputToStdout(makeStringValue("  " + cyan + std::string(e.name) + rst + "  " + dim + std::string(e.brief) + rst + "\n"));
+        }
         return ExecResult(ExecResultType::NORMAL, makeIntValue(0));
     });
     

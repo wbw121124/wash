@@ -326,6 +326,11 @@ private:
     void registerBuiltinFunctions();
     
     /**
+     * @brief 初始化系统环境变量到 envVars_
+     */
+    void initSystemEnvVars();
+    
+    /**
      * @brief 插值字符串中的 %{var} 引用
      * @param str 包含 %{var} 的字符串
      * @return 插值后的字符串

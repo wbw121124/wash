@@ -5,9 +5,9 @@
 msgid ""
 msgstr ""
 "Project-Id-Version: wash 1.0\n"
-"Report-Msgid-Bugs-To: \n"
-"POT-Creation-Date: 2026-09-13 18:50+0800\n"
-"PO-Revision-Date: 2026-09-13 18:50+0800\n"
+"Report-Mid-Bugs-To: \n"
+"POT-Creation-Date: 2026-09-14 18:00+0800\n"
+"PO-Revision-Date: 2026-09-14 18:00+0800\n"
 "Last-Translator: wash <wash@wash>\n"
 "Language-Team: Chinese (Simplified)\n"
 "Language: zh_CN\n"
@@ -15,162 +15,337 @@ msgstr ""
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
 
-#: src/executor.cpp
-msgid "错误: 除零"
-msgstr "错误: 除零"
+# help() 详细帮助内容
+msgid "help_echo"
+msgstr ""
+"echo(...)\n"
+"输出参数到 stdout，参数间以空格分隔，末尾换行。\n"
+"\n"
+"示例:\n"
+"  echo(\"hello\")         → hello\n"
+"  echo(1, 2, 3)         → 1 2 3"
 
-#: src/executor.cpp
-msgid "错误: 模零"
-msgstr "错误: 模零"
+msgid "help_stderr"
+msgstr ""
+"stderr(...)\n"
+"输出参数到 stderr。\n"
+"\n"
+"示例:\n"
+"  stderr(\"error!\")      → (输出到 stderr)"
 
-#: src/executor.cpp
-msgid "错误: 未知节点类型"
-msgstr "错误: 未知节点类型"
+msgid "help_panic"
+msgstr ""
+"panic(...)\n"
+"输出到 stderr 并以退出码 1 终止 shell。\n"
+"\n"
+"示例:\n"
+"  panic(\"fatal error\")"
 
-#: src/executor.cpp
-msgid "错误: 未知函数: "
-msgstr "错误: 未知函数: "
+msgid "help_round"
+msgstr ""
+"round(number)\n"
+"四舍五入取整，返回 int。\n"
+"\n"
+"示例:\n"
+"  round(3.5)            → 4\n"
+"  round(3.4)            → 3"
 
-#: src/executor.cpp
-msgid "错误: 无法打开文件: "
-msgstr "错误: 无法打开文件: "
+msgid "help_ceil"
+msgstr ""
+"ceil(number)\n"
+"向上取整，返回 int。\n"
+"\n"
+"示例:\n"
+"  ceil(3.1)             → 4"
 
-#: src/main.cpp
-msgid "欢迎使用 wash "
-msgstr "欢迎使用 wash "
+msgid "help_floor"
+msgstr ""
+"floor(number)\n"
+"向下取整，返回 int。\n"
+"\n"
+"示例:\n"
+"  floor(3.9)            → 3"
 
-#: src/main.cpp
-msgid "输入 help() 查看帮助"
-msgstr "输入 help() 查看帮助"
+msgid "help_length"
+msgstr ""
+"length(string)\n"
+"返回字符串长度。\n"
+"\n"
+"示例:\n"
+"  length(\"hello\")       → 5"
 
-#: src/main.cpp
-msgid "错误: 词法分析失败"
-msgstr "错误: 词法分析失败"
+msgid "help_upper"
+msgstr ""
+"upper(string)\n"
+"转大写。\n"
+"\n"
+"示例:\n"
+"  upper(\"hello\")        → HELLO"
 
-#: src/lexer.cpp
-msgid "字符串未结束"
-msgstr "字符串未结束"
+msgid "help_lower"
+msgstr ""
+"lower(string)\n"
+"转小写。\n"
+"\n"
+"示例:\n"
+"  lower(\"HELLO\")        → hello"
 
-#: src/lexer.cpp
-msgid "无效转义序列: "
-msgstr "无效转义序列: "
+msgid "help_trim"
+msgstr ""
+"trim(string)\n"
+"去除首尾空白字符。\n"
+"\n"
+"示例:\n"
+"  trim(\"  hi  \")        → hi"
 
-#: src/lexer.cpp
-msgid "变量名为空"
-msgstr "变量名为空"
+msgid "help_substr"
+msgstr ""
+"substr(string, start, length)\n"
+"子串提取。start 从 0 开始。\n"
+"\n"
+"示例:\n"
+"  substr(\"hello\", 1, 3) → ell"
 
-#: src/lexer.cpp
-msgid "注释未结束"
-msgstr "注释未结束"
+msgid "help_find"
+msgstr ""
+"find(string, substring)\n"
+"查找子串位置，未找到返回 -1。\n"
+"\n"
+"示例:\n"
+"  find(\"hello\", \"ll\")   → 2"
 
-#: src/parser.cpp
-msgid "期望 "
-msgstr "期望 "
+msgid "help_split"
+msgstr ""
+"split(string, delimiter)\n"
+"按分隔符分割为 range。\n"
+"\n"
+"示例:\n"
+"  split(\"a,b,c\", \",\")    → [\"a\",\"b\",\"c\"]"
 
-#: src/parser.cpp
-msgid "意外的 Token: "
-msgstr "意外的 Token: "
+msgid "help_join"
+msgstr ""
+"join(range, delimiter)\n"
+"按分隔符合并为字符串。\n"
+"\n"
+"示例:\n"
+"  join([\"a\",\"b\"], \"-\")  → a-b"
 
-#: src/executor.cpp
-msgid "wash 内建函数:"
+msgid "help_read"
+msgstr ""
+"read(prompt?)\n"
+"从 stdin 读取一行输入。\n"
+"\n"
+"示例:\n"
+"  %name=read(\"姓名: \")"
+
+msgid "help_source"
+msgstr ""
+"source(file)\n"
+"加载并执行 .wash 文件。\n"
+"\n"
+"示例:\n"
+"  source(\"config.wash\")"
+
+msgid "help_unset"
+msgstr ""
+"unset(variable)\n"
+"删除变量。\n"
+"\n"
+"示例:\n"
+"  %a=1\n"
+"  unset(%a)"
+
+msgid "help_export"
+msgstr ""
+"export(variable)\n"
+"将 wash 变量导出为环境变量。\n"
+"\n"
+"示例:\n"
+"  %env.PATH=\"/usr/bin\"\n"
+"  export(%env.PATH)"
+
+msgid "help_typeof"
+msgstr ""
+"typeof(value)\n"
+"返回类型名: \"string\"、\"int\" 或 \"double\"。\n"
+"\n"
+"示例:\n"
+"  typeof(\"hi\")          → string\n"
+"  typeof(42)            → int\n"
+"  typeof(3.14)          → double"
+
+msgid "help_help"
+msgstr ""
+"help()\n"
+"显示所有内建命令列表。\n"
+"\n"
+"help(\"cmd\")\n"
+"显示指定命令的详细帮助。\n"
+"\n"
+"示例:\n"
+"  help(\"echo\")"
+
+msgid "help_argc"
+msgstr ""
+"argc()\n"
+"返回脚本命令行参数个数（不包括脚本名）。\n"
+"\n"
+"示例:\n"
+"  # wash script.wash a b c\n"
+"  argc()                → 3"
+
+msgid "help_argv"
+msgstr ""
+"argv(number)\n"
+"获取脚本参数。索引从 0 开始：argv(0) 为脚本名。\n"
+"越界返回空字符串。\n"
+"\n"
+"示例:\n"
+"  # wash script.wash hello\n"
+"  argv(1)               → hello"
+
+msgid "help_return"
+msgstr ""
+"return(value)\n"
+"从函数返回值。\n"
+"\n"
+"示例:\n"
+"  add(a, b):{\n"
+"    return(calc(%a + %b))\n"
+"  }"
+
+msgid "help_break"
+msgstr ""
+"break()\n"
+"跳出当前 for/while 循环。"
+
+msgid "help_continue"
+msgstr ""
+"continue()\n"
+"跳过当前循环迭代，继续下一次。"
+
+msgid "help_fg"
+msgstr ""
+"fg(color)\n"
+"设置前景色。\n"
+"\n"
+"参数格式:\n"
+"  颜色名称: \"red\", \"green\", \"blue\", \"bright_red\" 等\n"
+"  256色索引: 0-255 (数字)\n"
+"  真彩色:    \"255,128,0\"\n"
+"  重置:      \"reset\"\n"
+"\n"
+"示例:\n"
+"  fg(\"red\")\n"
+"  fg(196)\n"
+"  fg(\"255,128,0\")\n"
+"  fg(\"reset\")"
+
+msgid "help_bg"
+msgstr ""
+"bg(color)\n"
+"设置背景色。参数格式同 fg()。\n"
+"\n"
+"示例:\n"
+"  bg(\"blue\")\n"
+"  bg(\"reset\")"
+
+msgid "help_colors"
+msgstr ""
+"colors()\n"
+"显示终端颜色能力，包括颜色深度和颜色示例。"
+
+# help() 列表摘要
+msgid "help_brief_echo"
+msgstr "输出到 stdout"
+
+msgid "help_brief_stderr"
+msgstr "输出到 stderr"
+
+msgid "help_brief_panic"
+msgstr "输出到 stderr 并退出"
+
+msgid "help_brief_round"
+msgstr "四舍五入"
+
+msgid "help_brief_ceil"
+msgstr "向上取整"
+
+msgid "help_brief_floor"
+msgstr "向下取整"
+
+msgid "help_brief_length"
+msgstr "字符串长度"
+
+msgid "help_brief_upper"
+msgstr "转大写"
+
+msgid "help_brief_lower"
+msgstr "转小写"
+
+msgid "help_brief_trim"
+msgstr "去除首尾空白"
+
+msgid "help_brief_substr"
+msgstr "子串提取"
+
+msgid "help_brief_find"
+msgstr "查找子串位置"
+
+msgid "help_brief_split"
+msgstr "分割字符串"
+
+msgid "help_brief_join"
+msgstr "合并为字符串"
+
+msgid "help_brief_read"
+msgstr "从 stdin 读取一行"
+
+msgid "help_brief_source"
+msgstr "加载执行 .wash 文件"
+
+msgid "help_brief_unset"
+msgstr "删除变量"
+
+msgid "help_brief_export"
+msgstr "导出为环境变量"
+
+msgid "help_brief_typeof"
+msgstr "返回类型名"
+
+msgid "help_brief_help"
+msgstr "显示帮助"
+
+msgid "help_brief_argc"
+msgstr "脚本参数个数"
+
+msgid "help_brief_argv"
+msgstr "获取脚本参数"
+
+msgid "help_brief_return"
+msgstr "从函数返回值"
+
+msgid "help_brief_break"
+msgstr "跳出循环"
+
+msgid "help_brief_continue"
+msgstr "继续下一次循环"
+
+msgid "help_brief_fg"
+msgstr "设置前景色"
+
+msgid "help_brief_bg"
+msgstr "设置背景色"
+
+msgid "help_brief_colors"
+msgstr "显示终端颜色能力"
+
+# help() 其他文本
+msgid "help_unknown"
+msgstr "未知命令: "
+
+msgid "wash_builtins_title"
 msgstr "wash 内建函数:"
 
-#: src/executor.cpp
-msgid "  echo(...)        - 输出到 stdout"
-msgstr "  echo(...)        - 输出到标准输出"
-
-#: src/executor.cpp
-msgid "  stderr(...)      - 输出到 stderr"
-msgstr "  stderr(...)      - 输出到标准错误"
-
-#: src/executor.cpp
-msgid "  panic(...)       - 输出到 stderr 并退出"
-msgstr "  panic(...)       - 输出到标准错误并退出"
-
-#: src/executor.cpp
-msgid "  round(n)         - 四舍五入"
-msgstr "  round(n)         - 四舍五入"
-
-#: src/executor.cpp
-msgid "  ceil(n)          - 向上取整"
-msgstr "  ceil(n)          - 向上取整"
-
-#: src/executor.cpp
-msgid "  floor(n)         - 向下取整"
-msgstr "  floor(n)         - 向下取整"
-
-#: src/executor.cpp
-msgid "  length(s)        - 字符串长度"
-msgstr "  length(s)        - 字符串长度"
-
-#: src/executor.cpp
-msgid "  upper(s)         - 转大写"
-msgstr "  upper(s)         - 转大写"
-
-#: src/executor.cpp
-msgid "  lower(s)         - 转小写"
-msgstr "  lower(s)         - 转小写"
-
-#: src/executor.cpp
-msgid "  trim(s)          - 去除首尾空白"
-msgstr "  trim(s)          - 去除首尾空白"
-
-#: src/executor.cpp
-msgid "  substr(s,i,n)    - 子串提取"
-msgstr "  substr(s,i,n)    - 子串提取"
-
-#: src/executor.cpp
-msgid "  find(s,sub)      - 查找子串位置"
-msgstr "  find(s,sub)      - 查找子串位置"
-
-#: src/executor.cpp
-msgid "  split(s,delim)   - 分割字符串"
-msgstr "  split(s,delim)   - 分割字符串"
-
-#: src/executor.cpp
-msgid "  join(range,d)    - 合并为字符串"
-msgstr "  join(range,d)    - 合并为字符串"
-
-#: src/executor.cpp
-msgid "  read(prompt?)    - 从 stdin 读取一行"
-msgstr "  read(prompt?)    - 从标准输入读取一行"
-
-#: src/executor.cpp
-msgid "  source(file)     - 加载执行 .wash 文件"
-msgstr "  source(file)     - 加载执行 .wash 文件"
-
-#: src/executor.cpp
-msgid "  unset(var)       - 删除变量"
-msgstr "  unset(var)       - 删除变量"
-
-#: src/executor.cpp
-msgid "  export(var)      - 导出为环境变量"
-msgstr "  export(var)      - 导出为环境变量"
-
-#: src/executor.cpp
-msgid "  typeof(v)        - 返回类型名"
-msgstr "  typeof(v)        - 返回类型名"
-
-#: src/executor.cpp
-msgid "  help()           - 显示此帮助"
-msgstr "  help()           - 显示此帮助"
-
-#: src/executor.cpp
-msgid "  argc()           - 脚本参数个数"
-msgstr "  argc()           - 脚本参数个数"
-
-#: src/executor.cpp
-msgid "  argv(i)          - 获取脚本参数"
-msgstr "  argv(i)          - 获取脚本参数"
-
-#: src/executor.cpp
-msgid "  return(v)        - 从函数返回值"
-msgstr "  return(v)        - 从函数返回值"
-
-#: src/executor.cpp
-msgid "  break()          - 跳出循环"
-msgstr "  break()          - 跳出循环"
-
-#: src/executor.cpp
-msgid "  continue()       - 继续下一次循环"
-msgstr "  continue()       - 继续下一次循环"
+msgid "wash_builtins_hint"
+msgstr "输入 help(\"命令名\") 查看详细帮助"
