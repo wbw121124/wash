@@ -7,7 +7,15 @@
  */
 
 #include "color.h"
-#include <unistd.h>
+#if defined(__MINGW32__) || defined(__MINGW64__)
+    // UCRT64/MinGW64 不包含 MSYS 的 <unistd.h>
+    // STDOUT_FILENO 已在 compat.h 或此处定义
+    #ifndef STDOUT_FILENO
+        #define STDOUT_FILENO 1
+    #endif
+#else
+    #include <unistd.h>
+#endif
 
 extern "C" {
 #include <term.h>

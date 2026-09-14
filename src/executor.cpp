@@ -10,6 +10,7 @@
 #include "lexer.h"
 #include "parser.h"
 #include "color.h"
+#include "compat.h"
 #include <iostream>
 #include <sstream>
 #include <cstdlib>
@@ -19,15 +20,46 @@
 #include <fstream>
 #include <libintl.h>
 
-#ifdef _WIN32
+#if defined(__MSYS__)
+    // ========== MSYS 子系统（完整 POSIX）==========
+    #include <unistd.h>
+    #include <sys/wait.h>
+    #define WNOHANG 1
+#elif defined(__MINGW32__) || defined(__MINGW64__)
+    // ========== UCRT64 / MinGW64 ==========
+    // UCRT64 的 <sys/types.h> 已通过 <cwchar> 链定义了 pid_t
+    #ifndef STDIN_FILENO
+        #define STDIN_FILENO 0
+        #define STDOUT_FILENO 1
+        #define STDERR_FILENO 2
+    #endif
+    #define WNOHANG 1
+    #define fork() ((pid_t)-1)
+    #define execvp(cmd, args) (-1)
+    #define waitpid(p, s, o) 0
+    #define WIFEXITED(s) 1
+    #define WEXITSTATUS(s) (s)
+#elif defined(_WIN32)
+    // ========== 原生 Windows（MSVC）==========
     #include <windows.h>
     #include <process.h>
     #define popen _popen
     #define pclose _pclose
+    #define STDIN_FILENO 0
+    #define STDOUT_FILENO 1
+    #define STDERR_FILENO 2
+    #define execvp(cmd, args) (-1)
+    #define perror(s) ((void)0)
+    typedef int pid_t;
+    #define fork() ((pid_t)-1)
+    #define waitpid(p, s, o) 0
+    #define WIFEXITED(s) 1
+    #define WEXITSTATUS(s) (s)
+    #define WNOHANG 1
 #else
+    // ========== 纯 POSIX（Linux / macOS）==========
     #include <unistd.h>
     #include <sys/wait.h>
-    #include <fcntl.h>
 #endif
 
 #define _(STRING) gettext(STRING)
@@ -74,7 +106,7 @@ void Executor::setEnvVariable(const std::string& name, const Value& value) {
     
     std::string envName = "wash_" + name;
     std::string envValue = valueToString(value);
-    setenv(envName.c_str(), envValue.c_str(), 1);
+    wash::compat::setEnvVar(envName, envValue);
 }
 
 Value Executor::getEnvVariable(const std::string& name) {
@@ -84,9 +116,9 @@ Value Executor::getEnvVariable(const std::string& name) {
     }
     
     std::string envName = "wash_" + name;
-    const char* val = getenv(envName.c_str());
-    if (val) {
-        return makeStringValue(std::string(val));
+    std::string val = wash::compat::getEnvVar(envName);
+    if (!val.empty()) {
+        return makeStringValue(val);
     }
     
     return makeStringValue("");
@@ -579,9 +611,9 @@ ExecResult Executor::executeRedirectExpr(RedirectExprNode* node) {
     }
     
     // 保存原始 fd
-    int savedStdin = dup(STDIN_FILENO);
-    int savedStdout = dup(STDOUT_FILENO);
-    int savedStderr = dup(STDERR_FILENO);
+    int savedStdin = wash::compat::dupFd(STDIN_FILENO);
+    int savedStdout = wash::compat::dupFd(STDOUT_FILENO);
+    int savedStderr = wash::compat::dupFd(STDERR_FILENO);
     
     // 解析重定向目标
     std::vector<std::string> targets;
@@ -589,12 +621,12 @@ ExecResult Executor::executeRedirectExpr(RedirectExprNode* node) {
         ExecResult r = executeNode(target);
         if (r.type != ExecResultType::NORMAL) {
             // 恢复 fd
-            dup2(savedStdin, STDIN_FILENO);
-            dup2(savedStdout, STDOUT_FILENO);
-            dup2(savedStderr, STDERR_FILENO);
-            close(savedStdin);
-            close(savedStdout);
-            close(savedStderr);
+            wash::compat::dup2Fd(savedStdin, STDIN_FILENO);
+            wash::compat::dup2Fd(savedStdout, STDOUT_FILENO);
+            wash::compat::dup2Fd(savedStderr, STDERR_FILENO);
+            wash::compat::closeFd(savedStdin);
+            wash::compat::closeFd(savedStdout);
+            wash::compat::closeFd(savedStderr);
             return r;
         }
         targets.push_back(valueToString(r.value));
@@ -619,41 +651,41 @@ ExecResult Executor::executeRedirectExpr(RedirectExprNode* node) {
             if (fdNum >= 0 && fdNum <= 2) {
                 // 直接 dup2
                 if (fdNum != targetFd) {
-                    dup2(fdNum, targetFd);
+                    wash::compat::dup2Fd(fdNum, targetFd);
                 }
                 continue;
             }
         } catch (...) {}
         
         // 打开文件
-        const char* mode = (targetFd == STDIN_FILENO) ? "r" : "w";
-        fd = open(targets[i].c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        int flags = wash::compat::FDC_O_WRONLY | wash::compat::FDC_O_CREAT | wash::compat::FDC_O_TRUNC;
+        fd = wash::compat::fileOpen(targets[i], flags, 0644);
         if (fd < 0) {
             // 恢复 fd
-            dup2(savedStdin, STDIN_FILENO);
-            dup2(savedStdout, STDOUT_FILENO);
-            dup2(savedStderr, STDERR_FILENO);
-            close(savedStdin);
-            close(savedStdout);
-            close(savedStderr);
+            wash::compat::dup2Fd(savedStdin, STDIN_FILENO);
+            wash::compat::dup2Fd(savedStdout, STDOUT_FILENO);
+            wash::compat::dup2Fd(savedStderr, STDERR_FILENO);
+            wash::compat::closeFd(savedStdin);
+            wash::compat::closeFd(savedStdout);
+            wash::compat::closeFd(savedStderr);
             std::cerr << "无法打开文件: " << targets[i] << std::endl;
             return ExecResult(ExecResultType::NORMAL, makeIntValue(1));
         }
         
-        dup2(fd, targetFd);
-        close(fd);
+        wash::compat::dup2Fd(fd, targetFd);
+        wash::compat::closeFd(fd);
     }
     
     // 执行命令
     ExecResult cmdResult = executeNode(node->command);
     
     // 恢复原始 fd
-    dup2(savedStdin, STDIN_FILENO);
-    dup2(savedStdout, STDOUT_FILENO);
-    dup2(savedStderr, STDERR_FILENO);
-    close(savedStdin);
-    close(savedStdout);
-    close(savedStderr);
+    wash::compat::dup2Fd(savedStdin, STDIN_FILENO);
+    wash::compat::dup2Fd(savedStdout, STDOUT_FILENO);
+    wash::compat::dup2Fd(savedStderr, STDERR_FILENO);
+    wash::compat::closeFd(savedStdin);
+    wash::compat::closeFd(savedStdout);
+    wash::compat::closeFd(savedStderr);
     
     return cmdResult;
 }
