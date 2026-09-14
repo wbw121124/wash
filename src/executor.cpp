@@ -1247,6 +1247,9 @@ void Executor::registerBuiltinFunctions() {
             "  return(v)        - 从函数返回值\n"
             "  break()          - 跳出循环\n"
             "  continue()       - 继续下一次循环\n"
+            "  fg(color)        - 设置前景色（名称/256色/真彩色/reset）\n"
+            "  bg(color)        - 设置背景色（名称/256色/真彩色/reset）\n"
+            "  colors()         - 显示终端颜色能力\n"
         ));
         return ExecResult(ExecResultType::NORMAL, makeIntValue(0));
     });
@@ -1283,22 +1286,103 @@ void Executor::registerBuiltinFunctions() {
     });
     
     defineFunction("colors", [this](const std::vector<Value>& args) -> ExecResult {
-        wash::ColorManager colors;
-        if (colors.hasColor()) {
+        wash::ColorManager cm;
+        if (cm.hasColor()) {
             outputToStdout("终端支持颜色\n");
+            // 显示深度信息
+            switch (cm.getDepth()) {
+                case wash::ColorDepth::TRUECOLOR:
+                    outputToStdout("颜色深度: 真彩色 (24-bit)\n"); break;
+                case wash::ColorDepth::COLOR_256:
+                    outputToStdout("颜色深度: 256 色\n"); break;
+                case wash::ColorDepth::COLOR_16:
+                    outputToStdout("颜色深度: 16 色\n"); break;
+                case wash::ColorDepth::COLOR_8:
+                    outputToStdout("颜色深度: 8 色\n"); break;
+                default:
+                    outputToStdout("颜色深度: 未知\n"); break;
+            }
             outputToStdout("可用颜色:\n");
-            outputToStdout(colors.fgStr(wash::Color::BLACK) + "  黑色" + colors.resetStr() + "\n");
-            outputToStdout(colors.fgStr(wash::Color::RED) + "  红色" + colors.resetStr() + "\n");
-            outputToStdout(colors.fgStr(wash::Color::GREEN) + "  绿色" + colors.resetStr() + "\n");
-            outputToStdout(colors.fgStr(wash::Color::YELLOW) + "  黄色" + colors.resetStr() + "\n");
-            outputToStdout(colors.fgStr(wash::Color::BLUE) + "  蓝色" + colors.resetStr() + "\n");
-            outputToStdout(colors.fgStr(wash::Color::MAGENTA) + "  品红" + colors.resetStr() + "\n");
-            outputToStdout(colors.fgStr(wash::Color::CYAN) + "  青色" + colors.resetStr() + "\n");
-            outputToStdout(colors.fgStr(wash::Color::WHITE) + "  白色" + colors.resetStr() + "\n");
+            outputToStdout(cm.fgStr(wash::Color::BLACK) + "  黑色" + cm.resetStr() + "\n");
+            outputToStdout(cm.fgStr(wash::Color::RED) + "  红色" + cm.resetStr() + "\n");
+            outputToStdout(cm.fgStr(wash::Color::GREEN) + "  绿色" + cm.resetStr() + "\n");
+            outputToStdout(cm.fgStr(wash::Color::YELLOW) + "  黄色" + cm.resetStr() + "\n");
+            outputToStdout(cm.fgStr(wash::Color::BLUE) + "  蓝色" + cm.resetStr() + "\n");
+            outputToStdout(cm.fgStr(wash::Color::MAGENTA) + "  品红" + cm.resetStr() + "\n");
+            outputToStdout(cm.fgStr(wash::Color::CYAN) + "  青色" + cm.resetStr() + "\n");
+            outputToStdout(cm.fgStr(wash::Color::WHITE) + "  白色" + cm.resetStr() + "\n");
+            if (cm.getDepth() == wash::ColorDepth::COLOR_256 ||
+                cm.getDepth() == wash::ColorDepth::TRUECOLOR) {
+                outputToStdout("\n256 色示例:\n");
+                for (int i = 0; i < 12; ++i) {
+                    outputToStdout(cm.fgStr(i) + " " + std::to_string(i) + cm.resetStr() + " ");
+                }
+                outputToStdout("\n");
+            }
         } else {
             outputToStdout("终端不支持颜色\n");
         }
         return ExecResult(ExecResultType::NORMAL, makeIntValue(0));
+    });
+    
+    defineFunction("fg", [this](const std::vector<Value>& args) -> ExecResult {
+        if (args.empty()) {
+            outputToStderr("用法: fg(color)\n");
+            outputToStderr("  颜色名称: red, green, blue, ...\n");
+            outputToStderr("  256色索引: 0-255\n");
+            outputToStderr("  真彩色: \"R,G,B\"\n");
+            outputToStderr("  重置: \"reset\"\n");
+            return ExecResult(ExecResultType::NORMAL, makeIntValue(1));
+        }
+        
+        wash::ColorManager cm;
+        std::string seq;
+        
+        if (isInt(args[0])) {
+            seq = cm.fgStr(static_cast<int>(valueToInt64(args[0])));
+        } else if (isDouble(args[0])) {
+            seq = cm.fgStr(static_cast<int>(valueToNumber(args[0])));
+        } else {
+            seq = cm.fgStr(valueToString(args[0]));
+        }
+        
+        if (!seq.empty()) {
+            outputToStdout(seq);
+            return ExecResult(ExecResultType::NORMAL, makeIntValue(0));
+        }
+        
+        outputToStderr("错误: 无法识别的颜色参数\n");
+        return ExecResult(ExecResultType::NORMAL, makeIntValue(1));
+    });
+    
+    defineFunction("bg", [this](const std::vector<Value>& args) -> ExecResult {
+        if (args.empty()) {
+            outputToStderr("用法: bg(color)\n");
+            outputToStderr("  颜色名称: red, green, blue, ...\n");
+            outputToStderr("  256色索引: 0-255\n");
+            outputToStderr("  真彩色: \"R,G,B\"\n");
+            outputToStderr("  重置: \"reset\"\n");
+            return ExecResult(ExecResultType::NORMAL, makeIntValue(1));
+        }
+        
+        wash::ColorManager cm;
+        std::string seq;
+        
+        if (isInt(args[0])) {
+            seq = cm.bgStr(static_cast<int>(valueToInt64(args[0])));
+        } else if (isDouble(args[0])) {
+            seq = cm.bgStr(static_cast<int>(valueToNumber(args[0])));
+        } else {
+            seq = cm.bgStr(valueToString(args[0]));
+        }
+        
+        if (!seq.empty()) {
+            outputToStdout(seq);
+            return ExecResult(ExecResultType::NORMAL, makeIntValue(0));
+        }
+        
+        outputToStderr("错误: 无法识别的颜色参数\n");
+        return ExecResult(ExecResultType::NORMAL, makeIntValue(1));
     });
     
     // 模块系统：run() - 子环境执行

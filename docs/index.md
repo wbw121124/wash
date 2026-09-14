@@ -231,38 +231,87 @@ while(%u){
 
 内建函数统一使用括号风格：
 
-```wash
-echo("...")
-stderr("...")
-panic("...")
-return(...)
-break()
-continue()
-calc(...)
-round(...)
-ceil(...)
-floor(...)
-argc()
-argv(number)
-```
+#### 输出与输入
 
-`calc(...)` 用于包裹所有运算（除 `=` 赋值外），例如算术、比较、逻辑运算等。  
-`calc(...)` 内运算符的优先级固定为 C++-like。  
-`calc(...)` 允许嵌套。  
-`calc(...)` 内允许函数调用，例如 `calc(round(%a) + 1)`、`calc(f(%a))`。  
-`calc` 必须带括号调用。
+- `echo(...)` — 输出到 stdout
+- `stderr(...)` — 输出到 stderr
+- `panic(...)` — 输出到 stderr 并退出
+- `read(prompt?)` — 从 stdin 读取一行输入
+- `source(file)` — 加载执行 .wash 文件
 
-`round(number)`：四舍五入取整。  
-`ceil(number)`：向上取整。  
-`floor(number)`：向下取整。
+#### 数学
 
-`argc()`：返回脚本命令行参数个数（不包括脚本名）。  
-`argv(number)`：返回第 `number` 个参数。索引从 `0` 开始：
+- `round(number)` — 四舍五入
+- `ceil(number)` — 向上取整
+- `floor(number)` — 向下取整
 
-- 若脚本为 `aaa.wash`，则 `argv(0)` 为 `aaa.wash`。
-- `argv(1)` 为第一个参数。
-- 以此类推。
-- `argv` 越界返回空字符串。
+#### 字符串
+
+- `length(string)` — 返回字符串长度
+- `upper(string)` — 转大写
+- `lower(string)` — 转小写
+- `trim(string)` — 去除首尾空白
+- `substr(string, start, length)` — 子串提取
+- `find(string, substring)` — 查找子串位置，-1 表示未找到
+- `split(string, delimiter)` — 按分隔符分割为 range
+- `join(range, delimiter)` — 按分隔符合并为字符串
+
+#### 类型
+
+- `typeof(value)` — 返回类型名（`"string"`、`"int"` 或 `"double"`）
+
+#### 变量
+
+- `unset(variable)` — 删除变量
+- `export(variable)` — 将变量导出为环境变量
+
+#### 颜色
+
+- `colors()` — 显示终端颜色能力（深度信息、颜色示例）
+- `fg(color)` — 设置前景色，支持以下格式：
+  - 颜色名称：`"red"`、`"green"`、`"blue"`、`"bright_red"` 等
+  - 256 色索引：`0`-`255`（数字）
+  - 真彩色 RGB：`"255,128,0"`
+  - 重置：`"reset"`
+- `bg(color)` — 设置背景色，参数格式同 `fg()`
+
+#### 脚本
+
+- `argc()` — 返回脚本命令行参数个数（不包括脚本名）
+- `argv(number)` — 返回第 `number` 个参数，索引从 0 开始，越界返回空字符串
+
+#### 控制流
+
+- `return(expr)` — 从函数返回值
+- `break()` — 跳出循环
+- `continue()` — 继续下一次循环
+
+#### 其他
+
+- `help()` — 显示所有内建命令列表
+
+### `calc(...)` 说明
+
+`calc(...)` 用于包裹所有运算（除 `=` 赋值外），例如算术、比较、逻辑运算等。
+
+- `calc(...)` 内运算符的优先级固定为 C++-like。
+- `calc(...)` 允许嵌套。
+- `calc(...)` 内允许函数调用，例如 `calc(round(%a) + 1)`、`calc(f(%a))`。
+- `calc` 必须带括号调用。
+
+### 颜色系统
+
+wash 内置 terminfo 二进制解析器，自动检测终端颜色能力：
+
+| 颜色深度 | 支持格式 |
+|---|---|
+| 真彩色 (24-bit) | `\033[38;2;R;G;Bm` / `\033[48;2;R;G;Bm` |
+| 256 色 | `\033[38;5;Nm` / `\033[48;5;Nm` |
+| 16 色 | SGR 30-37, 90-97 |
+| 8 色 | SGR 30-37 |
+
+检测流程：terminfo 二进制解析 → `$TERM` 启发式 → 默认 8 色。
+支持的命名颜色：`black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `white` 及其 `bright_` 变体，还有 `gray`, `orange`, `purple` 等常用别名。
 
 ### 注释
 
@@ -473,22 +522,35 @@ argv(number)
 
 ### 内建函数
 
-- `echo(string)`
-- `stderr(string)`
-- `panic(string)`
-- `return(expr)`
-- `break()`
-- `continue()`
-- `calc(expr)`：必须带括号调用，允许嵌套，允许函数调用。
-- `round(number)`
-- `ceil(number)`
-- `floor(number)`
-- `argc()`：返回脚本命令行参数个数（不包括脚本名）。
-- `argv(number)`：返回第 `number` 个参数。索引从 `0` 开始：
-  - `argv(0)` 为脚本名。
-  - `argv(1)` 为第一个参数。
-  - 以此类推。
-  - `argv` 越界返回空字符串。
+- `echo(string)` — 输出到 stdout
+- `stderr(string)` — 输出到 stderr
+- `panic(string)` — 输出到 stderr 并退出
+- `return(expr)` — 从函数返回值
+- `break()` — 跳出循环
+- `continue()` — 继续下一次循环
+- `calc(expr)` — 必须带括号调用，允许嵌套，允许函数调用
+- `round(number)` — 四舍五入
+- `ceil(number)` — 向上取整
+- `floor(number)` — 向下取整
+- `length(string)` — 字符串长度
+- `upper(string)` — 转大写
+- `lower(string)` — 转小写
+- `trim(string)` — 去除首尾空白
+- `substr(string, start, length)` — 子串提取
+- `find(string, substring)` — 查找子串位置
+- `split(string, delimiter)` — 分割字符串
+- `join(range, delimiter)` — 合并为字符串
+- `typeof(value)` — 返回类型名
+- `read(prompt?)` — 从 stdin 读取一行
+- `source(file)` — 加载执行 .wash 文件
+- `unset(variable)` — 删除变量
+- `export(variable)` — 导出为环境变量
+- `colors()` — 显示终端颜色能力
+- `fg(color)` — 设置前景色（名称/256色/真彩色/reset）
+- `bg(color)` — 设置背景色（名称/256色/真彩色/reset）
+- `argc()` — 脚本参数个数
+- `argv(number)` — 获取脚本参数，索引从 0 开始
+- `help()` — 显示所有内建命令列表
 
 ## 未定项
 

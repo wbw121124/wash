@@ -12,7 +12,7 @@ wash (wbw121124's advanced shell) 是一个功能丰富的 shell，支持：
 - 表达式运算（`calc(...)`）
 - 命令替换 `$(...)` 和重定向 `@(...)`
 - i18n 国际化（中/英文）
-- terminfo 彩色终端支持
+- terminfo 终端能力检测与彩色支持
 
 ## 架构设计
 
@@ -41,8 +41,10 @@ wash/
 │   ├── parser.cpp        # 语法分析器实现
 │   ├── executor.h        # 执行器接口
 │   ├── executor.cpp      # 执行器实现
-│   ├── color.h           # terminfo 颜色支持
-│   └── color.cpp         # 颜色实现
+│   ├── color.h           # ANSI 颜色支持（多级深度）
+│   ├── color.cpp         # 颜色实现
+│   ├── terminfo.h        # terminfo 二进制解析器
+│   └── terminfo.cpp      # terminfo 实现
 └── ~/.washrc             # 用户级 rc 文件（运行时创建）
 ```
 
@@ -54,7 +56,8 @@ wash/
 | 词法分析 | 源码 → Token 流 | lexer.h/cpp |
 | 语法分析 | Token 流 → AST | parser.h/cpp |
 | 执行器 | AST → 执行结果 | executor.h/cpp |
-| 颜色支持 | terminfo 颜色查询与输出 | color.h/cpp |
+| 颜色支持 | ANSI 颜色查询与输出（多级深度） | color.h/cpp |
+| terminfo | terminfo 二进制解析器 | terminfo.h/cpp |
 | 主程序 | 入口、交互、参数解析、i18n | main.cpp |
 
 ---
@@ -173,20 +176,118 @@ using Value = std::variant<std::string, int64_t, double>;
 - 支持 `\` 续行符
 - 转义引号内的括号不计入计数
 
-### 阶段 6：terminfo 彩色支持（ncurses）
+### 阶段 6：terminfo 彩色支持 + fg/bg 内建命令
 
-**安装依赖**：`pacman -S ncurses`
+**方案**：自包含 terminfo 二进制解析器（不依赖 ncurses），避免与 readline 终端状态冲突。
+
+**已知问题**：ncurses `setupterm()`/`del_curterm()` 与 readline 冲突导致交互模式 segfault，已移除 ncurses 依赖。
+
+#### 6.1 terminfo 二进制解析器（`src/terminfo.h/cpp`）
+
+**terminfo 二进制格式**：
+```
+Header (18 bytes):
+  2B magic (0432)
+  2B names length
+  2B bool count, 2B num count, 2B str count, 2B str table size
+  8B reserved
+Names: null-terminated, '|' 分隔
+Booleans: 1 byte each
+Numbers: 2 bytes each (-1 = absent)
+Strings: 2 bytes offset into table (-1 = absent)
+String table: null-terminated strings
+```
+
+**提取的 capability**：
+
+| Capability | 类型 | 用途 |
+|---|---|---|
+| `colors` | num | 终端支持的颜色数 |
+| `setaf` | str | 设置前景色模板（如 `\E[3%dm`） |
+| `setab` | str | 设置背景色模板（如 `\E[4%dm`） |
+| `sgr0` | str | 重置所有属性 |
+| `bold` | str | 粗体模式 |
+| `smul`/`rmul` | str | 下划线进入/退出 |
+| `sitm`/`ritm` | str | 斜体进入/退出 |
+
+**查找路径**：`$TERMINFO` → `$TERMINFO_DIRS` → `~/.terminfo:/usr/share/terminfo`
+
+**字符串转义**：`\E` → 0x1B, `\n` → 换行, `%%` → `%`
+
+#### 6.2 多级颜色深度系统（`src/color.h/cpp`）
+
+**颜色深度枚举**：
+```cpp
+enum class ColorDepth {
+    NO_COLOR,    // 不支持颜色
+    COLOR_8,     // 基本 8 色 (SGR 30-37)
+    COLOR_16,    // 16 色 (SGR 30-37 + 90-97)
+    COLOR_256,   // 256 色 (SGR 38;5;N)
+    TRUECOLOR    // 24位真彩色 (SGR 38;2;R;G;B)
+};
+```
+
+**检测流程**：
+1. 读取 `$TERM` → 查找 terminfo 二进制文件
+2. 解析 `colors` capability → 确定深度
+3. terminfo 未找到 → `$TERM` 启发式检测
+4. 最终 fallback → 默认 8 色
+
+**$TERM 启发式映射**：
+- `*256color*` → 256色
+- `*color*`, `*ansi*` → 16色
+- `xterm`, `vt100`, `vt220`, `linux` → 8色
+- `dumb` 或空 → 无颜色
+
+**新增 API**：
+```cpp
+ColorDepth getDepth() const;
+std::string fgStr(int colorIndex) const;      // 256色索引
+std::string fgStr(int r, int g, int b) const; // truecolor
+std::string fgStr(const std::string& name) const; // 命名颜色
+std::string bgStr(int colorIndex) const;
+std::string bgStr(int r, int g, int b) const;
+std::string bgStr(const std::string& name) const;
+std::string resetFgStr() const;
+std::string resetBgStr() const;
+```
+
+**命名颜色表**（8 基本色 + 8 亮色）：
+```
+black, red, green, yellow, blue, magenta, cyan, white
+bright_black, bright_red, ..., bright_white
+```
+
+#### 6.3 fg/bg 内建命令（`src/executor.cpp`）
+
+**语法**：
+```bash
+fg("red")          # 命名颜色
+fg(196)            # 256色索引
+fg("255,128,0")    # truecolor RGB
+fg("reset")        # 重置前景色
+bg("blue")         # 命名背景色
+bg(240)            # 256色背景索引
+bg("reset")        # 重置背景色
+```
 
 **实现**：
-1. CMakeLists.txt 链接 `-lncurses -ltinfo`
-2. 新增 `color.h/color.cpp`：
-   - 初始化：`setupterm(NULL, STDOUT_FILENO, NULL)`
-   - 查询颜色能力：`tigetstr("setaf")` / `tigetstr("setab")` / `tigetstr("sgr0")`
-   - 颜色枚举：`COLOR_BLACK` ~ `COLOR_WHITE` + `COLOR_DEFAULT`
-   - `color::setfg(color)` / `color::setbg(color)` / `color::reset()`
-   - `color::hasColor()` 检测终端是否支持颜色
-3. PS1 提示符支持颜色转义
-4. 内建命令 `colors()` 显示终端颜色能力
+- `fg()`/`bg()` 作为内建函数注册
+- 参数为 string 时：检查是否为颜色名、数字字符串、"reset"、或 "R,G,B" 格式
+- 参数为 int 时：作为 256 色索引
+- 输出对应的 ANSI 转义序列到 stdout
+
+#### 6.4 更新 help 文本
+
+在帮助输出中添加：
+```
+  fg(color)        - 设置前景色（支持名称/256色/真彩色/reset）
+  bg(color)        - 设置背景色（支持名称/256色/真彩色/reset）
+```
+
+#### 6.5 CMakeLists.txt
+
+在 `SOURCES` 中添加 `src/terminfo.cpp`，在 `HEADERS` 中添加 `src/terminfo.h`。不再链接 ncurses/ncursesw。
 
 ---
 
@@ -365,7 +466,7 @@ wash [选项] [文件名]
 - [x] 阶段 3：新增内建命令（len/substr/find/split/join/read/source/unset/export/help/type/keys）
 - [x] 阶段 4：i18n gettext 支持
 - [x] 阶段 5：交互式多行输入
-- [x] 阶段 6：terminfo 彩色支持
+- [x] 阶段 6：terminfo 彩色支持（自包含解析器，不依赖 ncurses）
 - [x] 阶段 7：Unicode 字符串支持
 - [x] 阶段 8.1：run() 子环境执行
 - [x] 阶段 8.2：include() 当前环境执行
@@ -402,3 +503,4 @@ wash [选项] [文件名]
 | 2026-09-13 | 阶段 10 完成：CMakeLists.txt 添加 install 目标 |
 | 2026-09-13 | 阶段 11 完成：GitHub Actions 工作流（Linux/MSYS2/UCRT64） |
 | 2026-09-13 | 阶段 12 完成：添加 Dockerfile 支持 |
+| 2026-09-14 | 阶段 6 重构：移除 ncurses（与 readline 冲突导致 segfault），改用自包含 terminfo 二进制解析器 + ANSI 转义码，新增 fg()/bg() 内建命令 |

@@ -109,6 +109,7 @@ Token Lexer::scanToken() {
     if (c == '%') {
         // 上下文判断：% 是变量前缀还是取模运算符
         // 如果上一个 token 是数字、标识符、右括号、右方括号，则 % 是取模
+        // 但如果下一个字符是字母，则 % 是变量前缀
         bool isModulo = (lastTokenType_ == TokenType::NUMBER ||
                         lastTokenType_ == TokenType::IDENTIFIER ||
                         lastTokenType_ == TokenType::VAR ||
@@ -117,9 +118,27 @@ Token Lexer::scanToken() {
                         lastTokenType_ == TokenType::RBRACKET ||
                         lastTokenType_ == TokenType::TRUE_KW ||
                         lastTokenType_ == TokenType::FALSE_KW);
-        if (isModulo) {
-            advance();
-            return makeToken(TokenType::PERCENT, "%");
+        // 如果下一个字符是字母，总是作为变量前缀
+        if (isModulo && peek() >= 'a' && peek() <= 'z') {
+            // 检查前面是否是标识符/变量，且后面紧跟字母，说明是变量前缀
+            if (lastTokenType_ == TokenType::IDENTIFIER || 
+                lastTokenType_ == TokenType::VAR ||
+                lastTokenType_ == TokenType::ENV_VAR) {
+                // 前面是标识符/变量，% 是取模运算符
+                advance();
+                return makeToken(TokenType::PERCENT, "%");
+            }
+        }
+        if (isModulo && !(peek() >= 'a' && peek() <= 'z' && peek() >= 'A' && peek() <= 'Z')) {
+            // 下一个字符不是字母，且上下文是取模
+            if (lastTokenType_ == TokenType::NUMBER ||
+                lastTokenType_ == TokenType::VAR ||
+                lastTokenType_ == TokenType::ENV_VAR ||
+                lastTokenType_ == TokenType::RPAREN ||
+                lastTokenType_ == TokenType::RBRACKET) {
+                advance();
+                return makeToken(TokenType::PERCENT, "%");
+            }
         }
         return scanVariable();
     }

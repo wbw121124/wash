@@ -39,14 +39,13 @@ wash 是一个功能丰富的现代 shell，支持变量系统、控制流、函
 - GCC 17+ (或 Clang 12+)
 - GNU Readline
 - GNU gettext
-- ncurses
 
 #### MSYS2 (MinGW)
 
 ```bash
 # 安装依赖
 pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake \
-          msys/readline-devel msys/gettext-devel msys/ncurses-devel
+          msys/readline-devel msys/gettext-devel
 
 # 编译
 cd wash
@@ -63,7 +62,7 @@ sudo cmake --install . --prefix /usr/local
 ```bash
 # 安装依赖
 pacman -S mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-cmake \
-          msys/readline-devel msys/gettext-devel msys/ncurses-devel
+          msys/readline-devel msys/gettext-devel
 
 # 编译
 cd wash
@@ -79,7 +78,7 @@ sudo cmake --install . --prefix /ucrt64
 
 ```bash
 # 安装依赖
-sudo apt install build-essential cmake libreadline-dev gettext libncurses-dev
+sudo apt install build-essential cmake libreadline-dev gettext
 
 # 编译
 cd wash
@@ -95,7 +94,7 @@ sudo cmake --install . --prefix /usr/local
 
 ```bash
 # 安装依赖
-sudo dnf install gcc-c++ cmake readline-devel gettext-devel ncurses-devel
+sudo dnf install gcc-c++ cmake readline-devel gettext-devel
 
 # 编译
 cd wash
@@ -111,7 +110,7 @@ sudo cmake --install . --prefix /usr/local
 
 ```bash
 # 安装依赖
-brew install cmake readline gettext ncurses
+brew install cmake readline gettext
 
 # 编译
 cd wash
@@ -220,6 +219,8 @@ include("utils.wash")
 | `break()` | 跳出循环 |
 | `continue()` | 继续下一次循环 |
 | `colors()` | 显示终端颜色能力 |
+| `fg(color)` | 设置前景色（名称/256色/真彩色/reset） |
+| `bg(color)` | 设置背景色（名称/256色/真彩色/reset） |
 | `run(file,...)` | 子环境执行 |
 | `include(file)` | 当前环境执行 |
 | `export(name)` | 导出函数/变量 |

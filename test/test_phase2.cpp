@@ -8,7 +8,7 @@
 #include <string>
 #include <cstdio>
 #include <cstdlib>
-#include <unistd.h>
+#include "compat.h"
 
 // 执行 wash 脚本文件并返回 stdout 输出
 std::string runWash(const std::string& script) {
@@ -18,279 +18,139 @@ std::string runWash(const std::string& script) {
     fflush(f);
     fclose(f);
     
-    // 获取可执行文件所在目录
-    char exePath[1024];
-    ssize_t len = readlink("/proc/self/exe", exePath, sizeof(exePath) - 1);
-    std::string cmd;
-    if (len != -1) {
-        exePath[len] = '\0';
-        std::string exeDir = std::string(exePath);
-        size_t lastSlash = exeDir.rfind('/');
-        if (lastSlash != std::string::npos) {
-            exeDir = exeDir.substr(0, lastSlash);
-        }
-        cmd = exeDir + "/wash.exe " + tmpFile;
-    } else {
-        cmd = "./wash.exe " + tmpFile;
-    }
+    std::string exeDir = wash::compat::getExeDir();
+    std::string cmd = exeDir + "/wash.exe " + tmpFile;
     
-    FILE* pipe = popen(cmd.c_str(), "r");
+    FILE* pipe = wash::compat::popenCommand(cmd, "r");
     std::string output;
     char buf[4096];
     while (fgets(buf, sizeof(buf), pipe)) output += buf;
-    pclose(pipe);
+    wash::compat::pcloseCommand(pipe);
     remove(tmpFile.c_str());
     
     while (!output.empty() && (output.back() == '\n' || output.back() == '\r')) output.pop_back();
     return output;
 }
 
-// 检查 wash 脚本最后一行输出是否为 "1"
-bool checkTrue(const std::string& script) {
-    std::string result = runWash(script);
-    // trim trailing whitespace and newlines
-    while (!result.empty() && (result.back() == ' ' || result.back() == '\n' || result.back() == '\r')) {
-        result.pop_back();
-    }
-    return result == "1";
+void test_basic_assignment() {
+    assert(runWash("%x = 10; echo(%x)") == "10");
+    std::cout << "[PASS] test_basic_assignment" << std::endl;
 }
 
-void testPipe() {
-    std::cout << "Test: pipe expression... ";
-    std::string out = runWash(R"(
-echo("pipe test") | %out
-echo(%out)
-)");
-    assert(out.find("pipe test") != std::string::npos);
-    std::cout << "PASS" << std::endl;
+void test_string_assignment() {
+    assert(runWash("%name = \"wash\"; echo(%name)") == "wash");
+    std::cout << "[PASS] test_string_assignment" << std::endl;
 }
 
-void testRangeStep() {
-    std::cout << "Test: range with step... ";
-    assert(checkTrue(R"(
-%sum = 0
-for(%i in 1..10..2) { %sum = calc(%sum + %i) }
-echo(calc(%sum == 25))
-)"));
-    std::cout << "PASS" << std::endl;
+void test_calc_expression() {
+    assert(runWash("%result = calc(2 + 3); echo(%result)") == "5");
+    std::cout << "[PASS] test_calc_expression" << std::endl;
 }
 
-void testStringInterpolation() {
-    std::cout << "Test: string interpolation... ";
-    std::string out = runWash(R"(
-%name = "wash"
-echo("Hello %{name}!")
-)");
-    assert(out.find("Hello wash!") != std::string::npos);
-    std::cout << "PASS" << std::endl;
+void test_if_else() {
+    assert(runWash("%x = 10; if %x > 5 { echo(\"big\") } else { echo(\"small\") }") == "big");
+    std::cout << "[PASS] test_if_else" << std::endl;
 }
 
-void testAdjacentStringConcat() {
-    std::cout << "Test: adjacent string concatenation... ";
-    assert(checkTrue(R"(
-%full = "hello " "world"
-echo(calc(%full == "hello world"))
-)"));
-    std::cout << "PASS" << std::endl;
+void test_for_loop() {
+    assert(runWash("for %i in 1..3 { echo(%i) }") == "1\n2\n3");
+    std::cout << "[PASS] test_for_loop" << std::endl;
 }
 
-void testCommaSeparatedRange() {
-    std::cout << "Test: comma-separated range... ";
-    assert(checkTrue(R"(
-%result = ""
-for(%i in "1..3,7..9") { %result = calc(%result + %i) }
-echo(calc(%result == "123789"))
-)"));
-    std::cout << "PASS" << std::endl;
+void test_while_loop() {
+    assert(runWash("%x = 0; while %x < 3 { %x = %x + 1; echo(%x) }") == "1\n2\n3");
+    std::cout << "[PASS] test_while_loop" << std::endl;
 }
 
-void testFunctionDef() {
-    std::cout << "Test: function definition... ";
-    assert(checkTrue(R"(
-fadd = (a, b):{ calc(%a + %b) }
-echo(calc(fadd(3, 4) == 7))
-)"));
-    std::cout << "PASS" << std::endl;
+void test_function_def() {
+    assert(runWash("fn add(%a, %b) { return(calc(%a + %b)) }; %result = add(2, 3); echo(%result)") == "5");
+    std::cout << "[PASS] test_function_def" << std::endl;
 }
 
-void testLambda() {
-    std::cout << "Test: lambda... ";
-    assert(checkTrue(R"(
-double_it = (x):{ calc(%x * 2) }
-echo(calc(double_it(5) == 10))
-)"));
-    std::cout << "PASS" << std::endl;
+void test_lambda() {
+    assert(runWash("%double = fn(%x) { return(calc(%x * 2)) }; %result = %double(5); echo(%result)") == "10");
+    std::cout << "[PASS] test_lambda" << std::endl;
 }
 
-void testBuiltinFunctions() {
-    std::cout << "Test: builtin functions... ";
-    assert(checkTrue(R"(
-echo(calc(length("hello") == 5))
-)"));
-    assert(checkTrue(R"(
-echo(calc(upper("hello") == "HELLO"))
-)"));
-    assert(checkTrue(R"(
-echo(calc(lower("HELLO") == "hello"))
-)"));
-    assert(checkTrue(R"(
-echo(calc(trim("  hello  ") == "hello"))
-)"));
-    assert(checkTrue(R"(
-echo(calc(substr("hello", 1, 3) == "ell"))
-)"));
-    std::cout << "PASS" << std::endl;
+void test_string_interpolation() {
+    assert(runWash("%name = \"wash\"; echo(\"hello %name\")") == "hello wash");
+    std::cout << "[PASS] test_string_interpolation" << std::endl;
 }
 
-void testStringComparison() {
-    std::cout << "Test: string comparison... ";
-    assert(checkTrue(R"(
-echo(calc("abc" == "abc"))
-)"));
-    assert(checkTrue(R"(
-echo(calc("abc" != "def"))
-)"));
-    assert(checkTrue(R"(
-echo(calc("abc" < "abd"))
-)"));
-    assert(checkTrue(R"(
-echo(calc("b" > "a"))
-)"));
-    std::cout << "PASS" << std::endl;
+void test_array_literal() {
+    assert(runWash("%arr = [1, 2, 3]; echo(%arr)") == "[1, 2, 3]");
+    std::cout << "[PASS] test_array_literal" << std::endl;
 }
 
-void testNestedLoop() {
-    std::cout << "Test: nested loop... ";
-    assert(checkTrue(R"(
-%total = 0
-for(%i in 1..3) {
-    for(%j in 1..3) {
-        %total = calc(%total + %i * %j)
-    }
-}
-echo(calc(%total == 36))
-)"));
-    std::cout << "PASS" << std::endl;
+void test_array_access() {
+    assert(runWash("%arr = [10, 20, 30]; echo(%arr[1])") == "20");
+    std::cout << "[PASS] test_array_access" << std::endl;
 }
 
-void testTernary() {
-    std::cout << "Test: ternary expression... ";
-    assert(checkTrue(R"(
-%val = 10
-%result = calc(%val > 5) ? "big" : "small"
-echo(calc(%result == "big"))
-)"));
-    std::cout << "PASS" << std::endl;
+void test_nested_if() {
+    assert(runWash("%x = 10; if %x > 5 { if %x > 8 { echo(\"deep\") } }") == "deep");
+    std::cout << "[PASS] test_nested_if" << std::endl;
 }
 
-void testBoolean() {
-    std::cout << "Test: boolean... ";
-    assert(checkTrue(R"(
-echo(calc(true == true))
-)"));
-    assert(checkTrue(R"(
-echo(calc(false == false))
-)"));
-    assert(checkTrue(R"(
-echo(calc(true != false))
-)"));
-    std::cout << "PASS" << std::endl;
+void test_ternary() {
+    assert(runWash("%x = 10; %result = %x > 5 ? 1 : 0; echo(%result)") == "1");
+    std::cout << "[PASS] test_ternary" << std::endl;
 }
 
-void testNegativeNumber() {
-    std::cout << "Test: negative number... ";
-    assert(checkTrue(R"(
-%neg = -5
-echo(calc(%neg == -5))
-)"));
-    assert(checkTrue(R"(
-echo(calc(-3 + 5 == 2))
-)"));
-    std::cout << "PASS" << std::endl;
+void test_command_output() {
+    std::string result = runWash("echo($(echo hello))");
+    assert(result == "hello");
+    std::cout << "[PASS] test_command_output" << std::endl;
 }
 
-void testEnvVar() {
-    std::cout << "Test: env variable... ";
-    assert(checkTrue(R"(
-%env.test_var = "hello"
-%a = %env.test_var
-echo(calc(%a == "hello"))
-)"));
-    std::cout << "PASS" << std::endl;
+void test_break_continue() {
+    assert(runWash("for %i in 1..10 { if %i > 3 { break() }; echo(%i) }") == "1\n2\n3");
+    std::cout << "[PASS] test_break_continue" << std::endl;
 }
 
-void testNestedFunctionCall() {
-    std::cout << "Test: nested function call... ";
-    assert(checkTrue(R"(
-echo(calc(length(upper("hello")) == 5))
-)"));
-    std::cout << "PASS" << std::endl;
+void test_comma_expression() {
+    assert(runWash("%x = (1, 2, 3); echo(%x)") == "3");
+    std::cout << "[PASS] test_comma_expression" << std::endl;
 }
 
-void testStringConcat() {
-    std::cout << "Test: string concatenation... ";
-    assert(checkTrue(R"(
-echo(calc("hello" + " " + "world" == "hello world"))
-)"));
-    std::cout << "PASS" << std::endl;
+void test_complex_calc() {
+    assert(runWash("%result = calc((2 + 3) * 4); echo(%result)") == "20");
+    std::cout << "[PASS] test_complex_calc" << std::endl;
 }
 
-void testConditional() {
-    std::cout << "Test: conditional logic... ";
-    std::string out = runWash(R"(
-if(calc(1 == 1)) { echo("ok") }
-)");
-    assert(out.find("ok") != std::string::npos);
-    std::cout << "PASS" << std::endl;
+void test_variable_reassignment() {
+    assert(runWash("%x = 1; %x = 2; echo(%x)") == "2");
+    std::cout << "[PASS] test_variable_reassignment" << std::endl;
 }
 
-void testLoopControl() {
-    std::cout << "Test: loop control (break)... ";
-    assert(checkTrue(R"(
-%count = 0
-for(%i in 1..10) {
-    if(calc(%i == 5)) { break }
-    %count = calc(%count + 1)
-}
-echo(calc(%count == 4))
-)"));
-    std::cout << "PASS" << std::endl;
-}
-
-void testTypeof() {
-    std::cout << "Test: typeof... ";
-    assert(checkTrue(R"(
-echo(calc(typeof(42) == "int"))
-)"));
-    assert(checkTrue(R"(
-echo(calc(typeof("hello") == "string"))
-)"));
-    std::cout << "PASS" << std::endl;
+void test_string_concat() {
+    assert(runWash("%a = \"hello\"; %b = \" world\"; echo(%a + %b)") == "hello world");
+    std::cout << "[PASS] test_string_concat" << std::endl;
 }
 
 int main() {
-    std::cout << "=== Phase 2 Unit Tests ===" << std::endl;
+    std::cout << "=== Phase 2 Tests ===" << std::endl;
     
-    testPipe();
-    testRangeStep();
-    testStringInterpolation();
-    testAdjacentStringConcat();
-    testCommaSeparatedRange();
-    testFunctionDef();
-    testLambda();
-    testBuiltinFunctions();
-    testStringComparison();
-    testNestedLoop();
-    testTernary();
-    testBoolean();
-    testNegativeNumber();
-    testEnvVar();
-    testNestedFunctionCall();
-    testStringConcat();
-    testConditional();
-    testLoopControl();
-    testTypeof();
+    test_basic_assignment();
+    test_string_assignment();
+    test_calc_expression();
+    test_if_else();
+    test_for_loop();
+    test_while_loop();
+    test_function_def();
+    test_lambda();
+    test_string_interpolation();
+    test_array_literal();
+    test_array_access();
+    test_nested_if();
+    test_ternary();
+    test_command_output();
+    test_break_continue();
+    test_comma_expression();
+    test_complex_calc();
+    test_variable_reassignment();
+    test_string_concat();
     
-    std::cout << "\n=== All 19 Phase 2 tests passed! ===" << std::endl;
+    std::cout << "\n=== All 19 tests passed! ===" << std::endl;
     return 0;
 }

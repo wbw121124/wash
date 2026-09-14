@@ -71,6 +71,7 @@ set(SOURCES
     src/executor.cpp
     src/color.cpp
     src/compat.cpp
+    src/terminfo.cpp
 )
 
 set(HEADERS
@@ -80,6 +81,7 @@ set(HEADERS
     src/executor.h
     src/color.h
     src/compat.h
+    src/terminfo.h
 )
 
 # 主程序
@@ -94,7 +96,7 @@ else()
 endif()
 
 # 测试目标
-add_executable(wash_test test/test_phase2.cpp src/lexer.cpp src/parser.cpp src/executor.cpp src/color.cpp src/compat.cpp)
+add_executable(wash_test test/test_phase2.cpp src/lexer.cpp src/parser.cpp src/executor.cpp src/color.cpp src/compat.cpp src/terminfo.cpp)
 target_include_directories(wash_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 if(WASH_MINGW_ENV)
     target_link_libraries(wash_test PRIVATE readline Intl::Intl)
@@ -102,7 +104,7 @@ else()
     target_link_libraries(wash_test PRIVATE readline Intl::Intl)
 endif()
 
-add_executable(wash_test3 test/test_phase3.cpp src/lexer.cpp src/parser.cpp src/executor.cpp src/color.cpp src/compat.cpp)
+add_executable(wash_test3 test/test_phase3.cpp src/lexer.cpp src/parser.cpp src/executor.cpp src/color.cpp src/compat.cpp src/terminfo.cpp)
 target_include_directories(wash_test3 PRIVATE ${CMAKE_SOURCE_DIR}/src)
 if(WASH_MINGW_ENV)
     target_link_libraries(wash_test3 PRIVATE readline Intl::Intl)

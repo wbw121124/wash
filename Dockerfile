@@ -6,7 +6,6 @@ RUN apt-get update && apt-get install -y \
     cmake \
     libreadline-dev \
     gettext \
-    libncurses-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # 复制源码

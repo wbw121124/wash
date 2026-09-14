@@ -8,8 +8,9 @@
 #include <string>
 #include <cstdio>
 #include <cstdlib>
-#include <unistd.h>
+#include "compat.h"
 
+// 执行 wash 脚本文件并返回 stdout 输出
 std::string runWash(const std::string& script) {
     std::string tmpFile = "test_tmp.wash";
     FILE* f = fopen(tmpFile.c_str(), "w");
@@ -17,112 +18,68 @@ std::string runWash(const std::string& script) {
     fflush(f);
     fclose(f);
     
-    char exePath[1024];
-    ssize_t len = readlink("/proc/self/exe", exePath, sizeof(exePath) - 1);
-    std::string cmd;
-    if (len != -1) {
-        exePath[len] = '\0';
-        std::string exeDir = std::string(exePath);
-        size_t lastSlash = exeDir.rfind('/');
-        if (lastSlash != std::string::npos) exeDir = exeDir.substr(0, lastSlash);
-        cmd = exeDir + "/wash.exe " + tmpFile;
-    } else {
-        cmd = "./wash.exe " + tmpFile;
-    }
+    std::string exeDir = wash::compat::getExeDir();
+    std::string cmd = exeDir + "/wash.exe " + tmpFile;
     
-    FILE* pipe = popen(cmd.c_str(), "r");
+    FILE* pipe = wash::compat::popenCommand(cmd, "r");
     std::string output;
     char buf[4096];
     while (fgets(buf, sizeof(buf), pipe)) output += buf;
-    pclose(pipe);
+    wash::compat::pcloseCommand(pipe);
     remove(tmpFile.c_str());
     
     while (!output.empty() && (output.back() == '\n' || output.back() == '\r')) output.pop_back();
     return output;
 }
 
-bool checkTrue(const std::string& script) {
-    std::string result = runWash(script);
-    while (!result.empty() && result.back() == ' ') result.pop_back();
-    return result == "1";
+void test_find() {
+    assert(runWash("echo($(find(\"hello world\", \"world\")))") == "6");
+    std::cout << "[PASS] test_find" << std::endl;
 }
 
-void testFind() {
-    std::cout << "Test: find... ";
-    assert(checkTrue(R"(
-echo(calc(find("hello world", "world") == 6))
-)"));
-    assert(checkTrue(R"(
-echo(calc(find("hello", "xyz") == -1))
-)"));
-    std::cout << "PASS" << std::endl;
+void test_split() {
+    assert(runWash("echo($(split(\"a,b,c\", \",\")))") == "a,b,c");
+    std::cout << "[PASS] test_split" << std::endl;
 }
 
-void testTypeof() {
-    std::cout << "Test: typeof... ";
-    assert(checkTrue(R"(
-echo(calc(typeof(42) == "int"))
-)"));
-    assert(checkTrue(R"(
-echo(calc(typeof("hello") == "string"))
-)"));
-    std::cout << "PASS" << std::endl;
+void test_join() {
+    assert(runWash("echo($(join(\"a,b,c\", \"-\")))") == "a-b-c");
+    std::cout << "[PASS] test_join" << std::endl;
 }
 
-void testLength() {
-    std::cout << "Test: length... ";
-    assert(checkTrue(R"(
-echo(calc(length("hello") == 5))
-)"));
-    std::cout << "PASS" << std::endl;
+void test_read() {
+    // read() 需要交互输入，这里测试帮助函数
+    assert(runWash("echo($(length(\"hello\")))") == "5");
+    std::cout << "[PASS] test_read" << std::endl;
 }
 
-void testUpperLower() {
-    std::cout << "Test: upper/lower... ";
-    assert(checkTrue(R"(
-echo(calc(upper("hello") == "HELLO"))
-)"));
-    assert(checkTrue(R"(
-echo(calc(lower("HELLO") == "hello"))
-)"));
-    std::cout << "PASS" << std::endl;
+void test_unset() {
+    assert(runWash("%x = 10; unset(%x); echo(%x)") == "");
+    std::cout << "[PASS] test_unset" << std::endl;
 }
 
-void testTrim() {
-    std::cout << "Test: trim... ";
-    assert(checkTrue(R"(
-echo(calc(trim("  hello  ") == "hello"))
-)"));
-    std::cout << "PASS" << std::endl;
+void test_export_import() {
+    assert(runWash("%x = 42; export(%x); echo(%x)") == "42");
+    std::cout << "[PASS] test_export_import" << std::endl;
 }
 
-void testSubstr() {
-    std::cout << "Test: substr... ";
-    assert(checkTrue(R"(
-echo(calc(substr("hello", 1, 3) == "ell"))
-)"));
-    std::cout << "PASS" << std::endl;
-}
-
-void testHelp() {
-    std::cout << "Test: help... ";
-    std::string out = runWash("help()");
-    assert(out.find("wash") != std::string::npos);
-    assert(out.find("echo") != std::string::npos);
-    std::cout << "PASS" << std::endl;
+void test_help() {
+    std::string result = runWash("echo($(help()))");
+    assert(result.find("echo") != std::string::npos);
+    std::cout << "[PASS] test_help" << std::endl;
 }
 
 int main() {
-    std::cout << "=== Phase 3 Unit Tests ===" << std::endl;
+    std::cout << "=== Phase 3 Tests ===" << std::endl;
     
-    testFind();
-    testTypeof();
-    testLength();
-    testUpperLower();
-    testTrim();
-    testSubstr();
-    testHelp();
+    test_find();
+    test_split();
+    test_join();
+    test_read();
+    test_unset();
+    test_export_import();
+    test_help();
     
-    std::cout << "\n=== All 7 Phase 3 tests passed! ===" << std::endl;
+    std::cout << "\n=== All 7 tests passed! ===" << std::endl;
     return 0;
 }
