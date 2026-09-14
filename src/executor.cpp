@@ -69,6 +69,11 @@
 
 #define _(STRING) gettext(STRING)
 
+// POSIX environ: 声明在文件作用域，避免在 wash 命名空间内被解析为 wash::environ
+#if !defined(_WIN32) || defined(__MINGW32__) || defined(__MINGW64__)
+    extern char** environ;
+#endif
+
 namespace wash {
 
 Executor::Executor() : exitCode_(0), exitRequested_(false), scriptArgc_(0) {
@@ -114,9 +119,8 @@ void Executor::initSystemEnvVars() {
     }
 #else
     // POSIX: 从 environ 读取
-    extern char** environ;
-    if (environ) {
-        for (char** env = environ; *env; ++env) {
+    if (::environ) {
+        for (char** env = ::environ; *env; ++env) {
             std::string entry(*env);
             size_t eq = entry.find('=');
             if (eq != std::string::npos) {

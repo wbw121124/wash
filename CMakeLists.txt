@@ -33,31 +33,74 @@ endif()
 # CXX 隐式搜索路径，导致 MSYS 头文件（wchar.h/wctype.h/pthread.h 等）
 # 与 UCRT64 头文件严重冲突（mbstate_t/wctype_t 重定义）。
 if(WASH_MINGW_ENV)
-    # 替换隐式搜索路径：用 /ucrt64/include 替代 /usr/include，
-    # 防止 MSYS 头文件污染 UCRT64 编译，同时保留 C++ 标准库的 #include_next 链
+    # 根据编译器路径确定 msystem 前缀
+    if(CMAKE_CXX_COMPILER MATCHES "ucrt64")
+        set(_msys2_prefix "/ucrt64")
+    elseif(CMAKE_CXX_COMPILER MATCHES "mingw64")
+        set(_msys2_prefix "/mingw64")
+    elseif(CMAKE_CXX_COMPILER MATCHES "mingw32")
+        set(_msys2_prefix "/mingw32")
+    else()
+        set(_msys2_prefix "/usr")
+    endif()
+
+    # 调整隐式搜索路径：把 msystem/include 放到最前面，/usr/include 放到最后，
+    # 确保 MinGW 头文件优先，同时保留 /usr/include 供 #include_next 链使用
     foreach(_dir IN LISTS CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES)
         if(_dir MATCHES "usr/include")
             list(REMOVE_ITEM CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES "${_dir}")
-            list(APPEND CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES "/ucrt64/include")
         endif()
     endforeach()
+    list(REMOVE_ITEM CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES "${_msys2_prefix}/include")
+    list(INSERT CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES 0 "${_msys2_prefix}/include")
+    list(APPEND CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES "/usr/include")
+
     foreach(_dir IN LISTS CMAKE_C_IMPLICIT_INCLUDE_DIRECTORIES)
         if(_dir MATCHES "usr/include")
             list(REMOVE_ITEM CMAKE_C_IMPLICIT_INCLUDE_DIRECTORIES "${_dir}")
-            list(APPEND CMAKE_C_IMPLICIT_INCLUDE_DIRECTORIES "/ucrt64/include")
         endif()
     endforeach()
+    list(REMOVE_ITEM CMAKE_C_IMPLICIT_INCLUDE_DIRECTORIES "${_msys2_prefix}/include")
+    list(INSERT CMAKE_C_IMPLICIT_INCLUDE_DIRECTORIES 0 "${_msys2_prefix}/include")
+    list(APPEND CMAKE_C_IMPLICIT_INCLUDE_DIRECTORIES "/usr/include")
 endif()
 
 # =====================================================================
 # 查找 gettext/libintl
 # =====================================================================
 if(WASH_MINGW_ENV)
-    # 手动创建 Intl::Intl imported target，仅引用 /ucrt64 的库和头文件
-    # 避免 find_package(Intl) 找到 /usr/include（MSYS）引发头文件冲突
+    # MSYS2 MinGW: find_package(Intl) 不可靠，直接用 find_library/find_path
+    # 根据编译器路径确定 msystem 前缀
+    if(CMAKE_CXX_COMPILER MATCHES "ucrt64")
+        set(_intl_prefix "/ucrt64")
+    elseif(CMAKE_CXX_COMPILER MATCHES "mingw64")
+        set(_intl_prefix "/mingw64")
+    elseif(CMAKE_CXX_COMPILER MATCHES "mingw32")
+        set(_intl_prefix "/mingw32")
+    else()
+        set(_intl_prefix "/usr")
+    endif()
+    message(STATUS "MSYS2 msystem prefix: ${_intl_prefix}")
+
+    find_path(Intl_INCLUDE_DIR libintl.h
+        HINTS "${_intl_prefix}/include"
+        NO_DEFAULT_PATH
+    )
+    find_library(Intl_LIBRARY
+        NAMES intl libintl
+        HINTS "${_intl_prefix}/lib"
+        NO_DEFAULT_PATH
+    )
+    if(NOT Intl_INCLUDE_DIR OR NOT Intl_LIBRARY)
+        message(FATAL_ERROR "Could not find libintl in ${_intl_prefix}. Install gettext package.")
+    endif()
+    message(STATUS "Intl include: ${Intl_INCLUDE_DIR}")
+    message(STATUS "Intl library: ${Intl_LIBRARY}")
+
     add_library(Intl::Intl UNKNOWN IMPORTED)
     set_target_properties(Intl::Intl PROPERTIES
-        IMPORTED_LOCATION "/ucrt64/lib/libintl.dll.a"
+        IMPORTED_LOCATION "${Intl_LIBRARY}"
+        INTERFACE_INCLUDE_DIRECTORIES "${Intl_INCLUDE_DIR}"
     )
 else()
     find_package(Intl REQUIRED)
