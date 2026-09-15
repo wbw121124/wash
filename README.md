@@ -244,4 +244,22 @@ sudo rm /usr/local/bin/wash
 
 ## 许可证
 
-Mozilla Public License 2.0 (MPL-2.0)
+wash 的**源代码**采用 Mozilla Public License 2.0 (MPL-2.0) 授权。
+你可以自由使用、修改和分发源代码，但需遵守 MPL-2.0 的条款。
+
+由于 wash 链接了 GNU Readline，而 GNU Readline 采用 GPL 授权，
+因此分发的**二进制文件**作为组合作品，整体依据所链接的
+GNU Readline 版本对应的 GPL 许可证分发：
+
+- 若链接 GNU Readline 6.0 及以上版本（GPL-3.0-or-later），
+  则二进制文件以 **GPL-3.0** 分发。
+- 若链接 GNU Readline 6.0 之前版本（GPL-2.0-or-later），
+  则二进制文件以 **GPL-2.0** 分发。
+
+分发二进制文件时，必须同时提供完整的对应源代码，包括：
+- wash 的 MPL-2.0 源代码；
+- 所链接的 GNU Readline 源代码；
+- 用于构建该二进制文件的构建脚本和配置。
+
+除另有说明外，本项目所有源代码均按 MPL-2.0 授权。二进制文件因链接 GNU Readline，按对应 GPL 版本分发。
+接收者可以依据 MPL-2.0 或相应的 GPL 版本使用这些源代码。
