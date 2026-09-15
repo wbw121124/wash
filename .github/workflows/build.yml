@@ -116,12 +116,13 @@ jobs:
         make install DESTDIR=$(cygpath -u "${{ github.workspace }}/install")
     
     - name: Create package
-      run: |
-        WORKSPACE=$(cygpath -u "${{ github.workspace }}")
-        cd "$WORKSPACE/install"
-        7z a -tzip "$WORKSPACE/wash-mingw-x86_64.zip" .
-        cd "$WORKSPACE/build/dist"
-        7z a -tzip "$WORKSPACE/wash-mingw-x86_64-dlls.zip" *.exe *.dll
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const { execSync } = require('child_process');
+          const ws = process.env.GITHUB_WORKSPACE;
+          execSync(`cd "${ws}/install" && "/c/Program Files/7-Zip/7z.exe" a -tzip "${ws}/wash-mingw-x86_64.zip" .`, { stdio: 'inherit' });
+          execSync(`cd "${ws}/build/dist" && "/c/Program Files/7-Zip/7z.exe" a -tzip "${ws}/wash-mingw-x86_64-dlls.zip" *.exe *.dll`, { stdio: 'inherit' });
     
     - name: Upload artifact
       uses: actions/upload-artifact@v4
@@ -194,12 +195,13 @@ jobs:
         make install DESTDIR=$(cygpath -u "${{ github.workspace }}/install")
     
     - name: Create package
-      run: |
-        WORKSPACE=$(cygpath -u "${{ github.workspace }}")
-        cd "$WORKSPACE/install"
-        7z a -tzip "$WORKSPACE/wash-mingw-i686.zip" .
-        cd "$WORKSPACE/build/dist"
-        7z a -tzip "$WORKSPACE/wash-mingw-i686-dlls.zip" *.exe *.dll
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const { execSync } = require('child_process');
+          const ws = process.env.GITHUB_WORKSPACE;
+          execSync(`cd "${ws}/install" && "/c/Program Files/7-Zip/7z.exe" a -tzip "${ws}/wash-mingw-i686.zip" .`, { stdio: 'inherit' });
+          execSync(`cd "${ws}/build/dist" && "/c/Program Files/7-Zip/7z.exe" a -tzip "${ws}/wash-mingw-i686-dlls.zip" *.exe *.dll`, { stdio: 'inherit' });
     
     - name: Upload artifact
       uses: actions/upload-artifact@v4
@@ -272,12 +274,13 @@ jobs:
         make install DESTDIR=$(cygpath -u "${{ github.workspace }}/install")
     
     - name: Create package
-      run: |
-        WORKSPACE=$(cygpath -u "${{ github.workspace }}")
-        cd "$WORKSPACE/install"
-        7z a -tzip "$WORKSPACE/wash-ucrt-x86_64.zip" .
-        cd "$WORKSPACE/build/dist"
-        7z a -tzip "$WORKSPACE/wash-ucrt-x86_64-dlls.zip" *.exe *.dll
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const { execSync } = require('child_process');
+          const ws = process.env.GITHUB_WORKSPACE;
+          execSync(`cd "${ws}/install" && "/c/Program Files/7-Zip/7z.exe" a -tzip "${ws}/wash-ucrt-x86_64.zip" .`, { stdio: 'inherit' });
+          execSync(`cd "${ws}/build/dist" && "/c/Program Files/7-Zip/7z.exe" a -tzip "${ws}/wash-ucrt-x86_64-dlls.zip" *.exe *.dll`, { stdio: 'inherit' });
     
     - name: Upload artifact
       uses: actions/upload-artifact@v4
