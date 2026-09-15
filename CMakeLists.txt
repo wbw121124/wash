@@ -81,18 +81,22 @@ if(WASH_MINGW_ENV)
     endif()
     message(STATUS "MSYS2 msystem prefix: ${_intl_prefix}")
 
-    # 先用 CMake 内置模块查找
-    find_package(Intl QUIET)
+    # WASH_MINGW_ENV: skip find_package to avoid picking up MSYS's libintl
+    if(NOT WASH_MINGW_ENV)
+        find_package(Intl QUIET)
+    endif()
     if(Intl_FOUND)
         message(STATUS "Found Intl via find_package")
     else()
         # 回退：手动查找
         find_path(Intl_INCLUDE_DIR libintl.h
-            HINTS "${_intl_prefix}/include" "/usr/include"
+            PATHS "${_intl_prefix}/include"
+            NO_DEFAULT_PATH
         )
         find_library(Intl_LIBRARY
             NAMES intl libintl
-            HINTS "${_intl_prefix}/lib" "/usr/lib"
+            PATHS "${_intl_prefix}/lib"
+            NO_DEFAULT_PATH
         )
         if(NOT Intl_INCLUDE_DIR OR NOT Intl_LIBRARY)
             message(FATAL_ERROR "Could not find libintl. Install gettext package (${_intl_prefix}).")

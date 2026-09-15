@@ -31,6 +31,8 @@ wash 是一个功能丰富的现代 shell，支持变量系统、控制流、函
 | Linux | aarch64 | `wash-*-linux-aarch64.tar.gz` |
 | Linux | armv7l | `wash-*-linux-armv7l.tar.gz` |
 
+每个发布包都附带对应的源码归档（wash 源码 + GNU Readline 源码，满足 GPL 分发要求），文件名即上述包名追加 `-code`，例如 `wash-*-mingw-x86_64-code.zip`。也可直接获取当前源码 [GitHub 仓库](https://github.com/wbw121124/wash)。
+
 ### 从源码编译
 
 #### 依赖

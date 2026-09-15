@@ -243,6 +243,7 @@ int main(int argc, char const* argv[]) {
     // 初始化 i18n
     setlocale(LC_ALL, "");
     bindtextdomain("wash", "share/locale");
+    bind_textdomain_codeset("wash", "UTF-8");
     textdomain("wash");
     
     wash::Executor executor;

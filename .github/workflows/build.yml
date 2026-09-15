@@ -56,6 +56,28 @@ jobs:
         name: wash-linux-x86_64
         path: wash-linux-x86_64.tar.gz
 
+    - name: Package source code (wash + readline)
+      run: |
+        sudo apt-get install -y xz-utils >/dev/null 2>&1
+        READLINE_VER=$(pkg-config --modversion readline 2>/dev/null | cut -d. -f1-2)
+        [ -n "$READLINE_VER" ] || READLINE_VER=8.2
+        WORK=/tmp/wash-src-pkg
+        rm -rf "$WORK"
+        mkdir -p "$WORK/readline" "$WORK/wash"
+        curl -fsSL -o "$WORK/readline.tar.gz" "https://ftp.gnu.org/gnu/readline/readline-${READLINE_VER}.tar.gz" \
+          || curl -fsSL -o "$WORK/readline.tar.gz" "https://ftp.gnu.org/gnu/readline/readline-8.2.tar.gz"
+        tar -xzf "$WORK/readline.tar.gz" -C "$WORK/readline" --strip-components=1
+        rm -f "$WORK/readline.tar.gz"
+        cp -a ${{ github.workspace }}/. "$WORK/wash/"
+        rm -rf "$WORK/wash/build" "$WORK/wash/.git"
+        tar -cJf ${{ github.workspace }}/wash-linux-x86_64-code.tar.xz -C "$WORK" .
+
+    - name: Upload source code artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: wash-linux-x86_64-code
+        path: wash-linux-x86_64-code.tar.xz
+
   # MSYS2 (MinGW64) 构建
   build-msys2-mingw64:
     runs-on: windows-latest
@@ -138,6 +160,29 @@ jobs:
         name: wash-mingw-x86_64-dlls
         path: wash-mingw-x86_64-dlls.zip
 
+    - name: Package source code (wash + readline)
+      run: |
+        PKG=mingw-w64-x86_64-readline
+        READLINE_VER=$(pacman -Q "$PKG" | awk '{print $2}' | cut -d. -f1-2)
+        [ -n "$READLINE_VER" ] || READLINE_VER=8.3
+        WORK=$(cygpath -u "$RUNNER_TEMP")/wash-src-pkg
+        rm -rf "$WORK"
+        mkdir -p "$WORK/readline" "$WORK/wash"
+        curl -fsSL -o "$WORK/readline.tar.gz" "https://ftp.gnu.org/gnu/readline/readline-${READLINE_VER}.tar.gz" \
+          || curl -fsSL -o "$WORK/readline.tar.gz" "https://ftp.gnu.org/gnu/readline/readline-8.3.tar.gz"
+        tar -xzf "$WORK/readline.tar.gz" -C "$WORK/readline" --strip-components=1
+        rm -f "$WORK/readline.tar.gz"
+        cp -a "$(cygpath -u "$GITHUB_WORKSPACE")/." "$WORK/wash/"
+        rm -rf "$WORK/wash/build" "$WORK/wash/.git"
+        cd "$WORK"
+        "/c/Program Files/7-Zip/7z.exe" a -tzip "$(cygpath -u "$GITHUB_WORKSPACE")/wash-mingw-x86_64-code.zip" .
+
+    - name: Upload source code artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: wash-mingw-x86_64-code
+        path: wash-mingw-x86_64-code.zip
+
   # MSYS2 (MinGW32) 构建
   build-msys2-mingw32:
     runs-on: windows-latest
@@ -218,6 +263,29 @@ jobs:
       with:
         name: wash-mingw-i686-dlls
         path: wash-mingw-i686-dlls.zip
+
+    - name: Package source code (wash + readline)
+      run: |
+        PKG=mingw-w64-i686-readline
+        READLINE_VER=$(pacman -Q "$PKG" | awk '{print $2}' | cut -d. -f1-2)
+        [ -n "$READLINE_VER" ] || READLINE_VER=8.3
+        WORK=$(cygpath -u "$RUNNER_TEMP")/wash-src-pkg
+        rm -rf "$WORK"
+        mkdir -p "$WORK/readline" "$WORK/wash"
+        curl -fsSL -o "$WORK/readline.tar.gz" "https://ftp.gnu.org/gnu/readline/readline-${READLINE_VER}.tar.gz" \
+          || curl -fsSL -o "$WORK/readline.tar.gz" "https://ftp.gnu.org/gnu/readline/readline-8.3.tar.gz"
+        tar -xzf "$WORK/readline.tar.gz" -C "$WORK/readline" --strip-components=1
+        rm -f "$WORK/readline.tar.gz"
+        cp -a "$(cygpath -u "$GITHUB_WORKSPACE")/." "$WORK/wash/"
+        rm -rf "$WORK/wash/build" "$WORK/wash/.git"
+        cd "$WORK"
+        "/c/Program Files/7-Zip/7z.exe" a -tzip "$(cygpath -u "$GITHUB_WORKSPACE")/wash-mingw-i686-code.zip" .
+
+    - name: Upload source code artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: wash-mingw-i686-code
+        path: wash-mingw-i686-code.zip
 
   # MSYS2 (UCRT64) 构建
   build-msys2-ucrt64:
@@ -300,6 +368,29 @@ jobs:
         name: wash-ucrt-x86_64-dlls
         path: wash-ucrt-x86_64-dlls.zip
 
+    - name: Package source code (wash + readline)
+      run: |
+        PKG=mingw-w64-ucrt-x86_64-readline
+        READLINE_VER=$(pacman -Q "$PKG" | awk '{print $2}' | cut -d. -f1-2)
+        [ -n "$READLINE_VER" ] || READLINE_VER=8.3
+        WORK=$(cygpath -u "$RUNNER_TEMP")/wash-src-pkg
+        rm -rf "$WORK"
+        mkdir -p "$WORK/readline" "$WORK/wash"
+        curl -fsSL -o "$WORK/readline.tar.gz" "https://ftp.gnu.org/gnu/readline/readline-${READLINE_VER}.tar.gz" \
+          || curl -fsSL -o "$WORK/readline.tar.gz" "https://ftp.gnu.org/gnu/readline/readline-8.3.tar.gz"
+        tar -xzf "$WORK/readline.tar.gz" -C "$WORK/readline" --strip-components=1
+        rm -f "$WORK/readline.tar.gz"
+        cp -a "$(cygpath -u "$GITHUB_WORKSPACE")/." "$WORK/wash/"
+        rm -rf "$WORK/wash/build" "$WORK/wash/.git"
+        cd "$WORK"
+        "/c/Program Files/7-Zip/7z.exe" a -tzip "$(cygpath -u "$GITHUB_WORKSPACE")/wash-ucrt-x86_64-code.zip" .
+
+    - name: Upload source code artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: wash-ucrt-x86_64-code
+        path: wash-ucrt-x86_64-code.zip
+
   # 发布 Release
   release:
     if: startsWith(github.ref, 'refs/tags/v')
@@ -320,9 +411,13 @@ jobs:
       with:
         files: |
           artifacts/wash-linux-x86_64/*
+          artifacts/wash-linux-x86_64-code/*
           artifacts/wash-mingw-x86_64/*
+          artifacts/wash-mingw-x86_64-code/*
           artifacts/wash-mingw-i686/*
+          artifacts/wash-mingw-i686-code/*
           artifacts/wash-ucrt-x86_64/*
+          artifacts/wash-ucrt-x86_64-code/*
         generate_release_notes: true
         draft: false
         prerelease: false
