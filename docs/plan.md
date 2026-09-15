@@ -44,7 +44,9 @@ wash/
 │   ├── color.h           # ANSI 颜色支持（多级深度）
 │   ├── color.cpp         # 颜色实现
 │   ├── terminfo.h        # terminfo 二进制解析器
-│   └── terminfo.cpp      # terminfo 实现
+│   ├── terminfo.cpp      # terminfo 实现
+│   ├── compat.h          # 跨平台兼容层（POSIX/Win/MSYS2）
+│   └── compat.cpp        # 兼容层实现
 └── ~/.washrc             # 用户级 rc 文件（运行时创建）
 ```
 
@@ -58,6 +60,7 @@ wash/
 | 执行器 | AST → 执行结果 | executor.h/cpp |
 | 颜色支持 | ANSI 颜色查询与输出（多级深度） | color.h/cpp |
 | terminfo | terminfo 二进制解析器 | terminfo.h/cpp |
+| 跨平台兼容层 | POSIX/Win/MSYS2 API 统一封装 | compat.h/cpp |
 | 主程序 | 入口、交互、参数解析、i18n | main.cpp |
 
 ---
@@ -504,3 +507,4 @@ wash [选项] [文件名]
 | 2026-09-13 | 阶段 11 完成：GitHub Actions 工作流（Linux/MSYS2/UCRT64） |
 | 2026-09-13 | 阶段 12 完成：添加 Dockerfile 支持 |
 | 2026-09-14 | 阶段 6 重构：移除 ncurses（与 readline 冲突导致 segfault），改用自包含 terminfo 二进制解析器 + ANSI 转义码，新增 fg()/bg() 内建命令 |
+| 2026-09-14 | 修复 CMake Intl 检测：MSYS2 环境下先尝试 find_package(Intl)，失败再用 find_library 回退；修复 CI DLL 打包与 environ 链接 |

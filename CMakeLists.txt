@@ -69,8 +69,7 @@ endif()
 # 查找 gettext/libintl
 # =====================================================================
 if(WASH_MINGW_ENV)
-    # MSYS2 MinGW: find_package(Intl) 不可靠，直接用 find_library/find_path
-    # 根据编译器路径确定 msystem 前缀
+    # MSYS2 MinGW: 先尝试 find_package，失败再用 find_library 回退
     if(CMAKE_CXX_COMPILER MATCHES "ucrt64")
         set(_intl_prefix "/ucrt64")
     elseif(CMAKE_CXX_COMPILER MATCHES "mingw64")
@@ -82,26 +81,31 @@ if(WASH_MINGW_ENV)
     endif()
     message(STATUS "MSYS2 msystem prefix: ${_intl_prefix}")
 
-    find_path(Intl_INCLUDE_DIR libintl.h
-        HINTS "${_intl_prefix}/include"
-        NO_DEFAULT_PATH
-    )
-    find_library(Intl_LIBRARY
-        NAMES intl libintl
-        HINTS "${_intl_prefix}/lib"
-        NO_DEFAULT_PATH
-    )
-    if(NOT Intl_INCLUDE_DIR OR NOT Intl_LIBRARY)
-        message(FATAL_ERROR "Could not find libintl in ${_intl_prefix}. Install gettext package.")
-    endif()
-    message(STATUS "Intl include: ${Intl_INCLUDE_DIR}")
-    message(STATUS "Intl library: ${Intl_LIBRARY}")
+    # 先用 CMake 内置模块查找
+    find_package(Intl QUIET)
+    if(Intl_FOUND)
+        message(STATUS "Found Intl via find_package")
+    else()
+        # 回退：手动查找
+        find_path(Intl_INCLUDE_DIR libintl.h
+            HINTS "${_intl_prefix}/include" "/usr/include"
+        )
+        find_library(Intl_LIBRARY
+            NAMES intl libintl
+            HINTS "${_intl_prefix}/lib" "/usr/lib"
+        )
+        if(NOT Intl_INCLUDE_DIR OR NOT Intl_LIBRARY)
+            message(FATAL_ERROR "Could not find libintl. Install gettext package (${_intl_prefix}).")
+        endif()
+        message(STATUS "Intl include: ${Intl_INCLUDE_DIR}")
+        message(STATUS "Intl library: ${Intl_LIBRARY}")
 
-    add_library(Intl::Intl UNKNOWN IMPORTED)
-    set_target_properties(Intl::Intl PROPERTIES
-        IMPORTED_LOCATION "${Intl_LIBRARY}"
-        INTERFACE_INCLUDE_DIRECTORIES "${Intl_INCLUDE_DIR}"
-    )
+        add_library(Intl::Intl UNKNOWN IMPORTED)
+        set_target_properties(Intl::Intl PROPERTIES
+            IMPORTED_LOCATION "${Intl_LIBRARY}"
+            INTERFACE_INCLUDE_DIRECTORIES "${Intl_INCLUDE_DIR}"
+        )
+    endif()
 else()
     find_package(Intl REQUIRED)
 endif()

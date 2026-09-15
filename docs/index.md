@@ -233,28 +233,28 @@ while(%u){
 
 #### 输出与输入
 
-- `echo(...)` — 输出到 stdout
-- `stderr(...)` — 输出到 stderr
-- `panic(...)` — 输出到 stderr 并退出
+- `echo(...)` — 输出到 stdout（各参数间加空格，末尾加换行）
+- `stderr(...)` — 输出到 stderr（各参数间不加空格）
+- `panic(...)` — 输出到 stderr 并退出（退出码 1）
 - `read(prompt?)` — 从 stdin 读取一行输入
 - `source(file)` — 加载执行 .wash 文件
 
 #### 数学
 
-- `round(number)` — 四舍五入
-- `ceil(number)` — 向上取整
-- `floor(number)` — 向下取整
+- `round(number)` — 四舍五入，返回 int
+- `ceil(number)` — 向上取整，返回 int
+- `floor(number)` — 向下取整，返回 int
 
 #### 字符串
 
-- `length(string)` — 返回字符串长度
+- `length(string)` — 返回字符串长度（int）
 - `upper(string)` — 转大写
 - `lower(string)` — 转小写
 - `trim(string)` — 去除首尾空白
-- `substr(string, start, length)` — 子串提取
+- `substr(string, start, length?)` — 子串提取，省略 length 则取到末尾
 - `find(string, substring)` — 查找子串位置，-1 表示未找到
-- `split(string, delimiter)` — 按分隔符分割为 range
-- `join(range, delimiter)` — 按分隔符合并为字符串
+- `split(string, delimiter?)` — 按分隔符分割为逗号分隔字符串，默认空格
+- `join(range, delimiter)` — 将逗号分隔字符串按分隔符合并为字符串
 
 #### 类型
 
@@ -264,6 +264,11 @@ while(%u){
 
 - `unset(variable)` — 删除变量
 - `export(variable)` — 将变量导出为环境变量
+- `keys()` — 列出当前作用域所有已定义变量名，逗号分隔
+
+#### 环境变量
+
+- `env()` — 列出所有环境变量（`name=value` 格式）
 
 #### 颜色
 
@@ -286,9 +291,17 @@ while(%u){
 - `break()` — 跳出循环
 - `continue()` — 继续下一次循环
 
+#### 模块系统
+
+- `run(file, ...args)` — 子环境执行：创建新作用域执行目标文件，函数/变量定义不污染当前环境，返回退出码
+- `include(file)` — 当前环境执行：直接解析并执行目标文件，函数/变量定义保留在当前作用域
+- `export(name)` — 将函数或变量标记为可导出，供 `import()` 使用
+- `import(file, mapping?)` — 模块导入：创建临时作用域执行目标文件，收集其导出项，返回导入映射
+
 #### 其他
 
 - `help()` — 显示所有内建命令列表
+- `help("command")` — 显示指定命令的详细帮助（用法、参数、说明）
 
 ### `calc(...)` 说明
 
@@ -312,6 +325,46 @@ wash 内置 terminfo 二进制解析器，自动检测终端颜色能力：
 
 检测流程：terminfo 二进制解析 → `$TERM` 启发式 → 默认 8 色。
 支持的命名颜色：`black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `white` 及其 `bright_` 变体，还有 `gray`, `orange`, `purple` 等常用别名。
+
+### 模块系统
+
+wash 提供模块化编程支持：
+
+#### `run(file, ...args)` — 子环境执行
+
+创建新作用域执行目标文件，函数和变量定义不污染当前环境。返回子进程退出码。
+
+```wash
+%result = run("utils.wash", "arg1", "arg2")
+```
+
+#### `include(file)` — 当前环境执行
+
+直接解析并执行目标文件，函数和变量定义保留在当前作用域。
+
+```wash
+include("config.wash")
+echo(%loaded_var)
+```
+
+#### `export(name)` — 导出
+
+将函数或变量标记为可导出，供其他模块的 `import()` 使用。
+
+```wash
+# 在 module.wash 中
+%greeting = "hello"
+export(%greeting)
+```
+
+#### `import(file, mapping?)` — 模块导入
+
+创建临时作用域执行目标文件，收集其导出项。可选的 mapping 参数指定导入映射。
+
+```wash
+# 基本导入
+import("module.wash")
+```
 
 ### 注释
 
@@ -522,35 +575,42 @@ wash 内置 terminfo 二进制解析器，自动检测终端颜色能力：
 
 ### 内建函数
 
-- `echo(string)` — 输出到 stdout
-- `stderr(string)` — 输出到 stderr
-- `panic(string)` — 输出到 stderr 并退出
+- `echo(...)` — 输出到 stdout（各参数间加空格，末尾加换行）
+- `stderr(...)` — 输出到 stderr（各参数间不加空格）
+- `panic(...)` — 输出到 stderr 并退出（退出码 1）
 - `return(expr)` — 从函数返回值
 - `break()` — 跳出循环
 - `continue()` — 继续下一次循环
 - `calc(expr)` — 必须带括号调用，允许嵌套，允许函数调用
-- `round(number)` — 四舍五入
-- `ceil(number)` — 向上取整
-- `floor(number)` — 向下取整
+- `round(number)` — 四舍五入，返回 int
+- `ceil(number)` — 向上取整，返回 int
+- `floor(number)` — 向下取整，返回 int
 - `length(string)` — 字符串长度
 - `upper(string)` — 转大写
 - `lower(string)` — 转小写
 - `trim(string)` — 去除首尾空白
-- `substr(string, start, length)` — 子串提取
+- `substr(string, start, length?)` — 子串提取
 - `find(string, substring)` — 查找子串位置
-- `split(string, delimiter)` — 分割字符串
+- `split(string, delimiter?)` — 分割字符串
 - `join(range, delimiter)` — 合并为字符串
 - `typeof(value)` — 返回类型名
 - `read(prompt?)` — 从 stdin 读取一行
 - `source(file)` — 加载执行 .wash 文件
 - `unset(variable)` — 删除变量
 - `export(variable)` — 导出为环境变量
+- `keys()` — 列出当前作用域所有已定义变量名
+- `env()` — 列出所有环境变量
 - `colors()` — 显示终端颜色能力
 - `fg(color)` — 设置前景色（名称/256色/真彩色/reset）
 - `bg(color)` — 设置背景色（名称/256色/真彩色/reset）
 - `argc()` — 脚本参数个数
 - `argv(number)` — 获取脚本参数，索引从 0 开始
+- `run(file, ...args)` — 子环境执行，返回退出码
+- `include(file)` — 当前环境执行
+- `export(name)` — 导出函数/变量供 import 使用
+- `import(file, mapping?)` — 模块导入
 - `help()` — 显示所有内建命令列表
+- `help("command")` — 显示指定命令的详细帮助
 
 ## 未定项
 
