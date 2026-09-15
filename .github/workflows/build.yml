@@ -81,6 +81,7 @@ jobs:
     
     - name: Configure CMake
       run: |
+        WORKSPACE=$(cygpath -u "${{ github.workspace }}")
         mkdir -p build
         cd build
         cmake -G "Unix Makefiles" \
@@ -112,14 +113,15 @@ jobs:
     - name: Install
       run: |
         cd build
-        make install DESTDIR=${{ github.workspace }}/install
+        make install DESTDIR=$(cygpath -u "${{ github.workspace }}/install")
     
     - name: Create package
       run: |
-        cd ${{ github.workspace }}/install
-        7z a -tzip ../wash-mingw-x86_64.zip .
-        cd ${{ github.workspace }}/build/dist
-        7z a -tzip ${{ github.workspace }}/wash-mingw-x86_64-dlls.zip *.exe *.dll
+        WORKSPACE=$(cygpath -u "${{ github.workspace }}")
+        cd "$WORKSPACE/install"
+        7z a -tzip "$WORKSPACE/wash-mingw-x86_64.zip" .
+        cd "$WORKSPACE/build/dist"
+        7z a -tzip "$WORKSPACE/wash-mingw-x86_64-dlls.zip" *.exe *.dll
     
     - name: Upload artifact
       uses: actions/upload-artifact@v4
@@ -189,14 +191,15 @@ jobs:
     - name: Install
       run: |
         cd build
-        make install DESTDIR=${{ github.workspace }}/install
+        make install DESTDIR=$(cygpath -u "${{ github.workspace }}/install")
     
     - name: Create package
       run: |
-        cd ${{ github.workspace }}/install
-        7z a -tzip ../wash-mingw-i686.zip .
-        cd ${{ github.workspace }}/build/dist
-        7z a -tzip ${{ github.workspace }}/wash-mingw-i686-dlls.zip *.exe *.dll
+        WORKSPACE=$(cygpath -u "${{ github.workspace }}")
+        cd "$WORKSPACE/install"
+        7z a -tzip "$WORKSPACE/wash-mingw-i686.zip" .
+        cd "$WORKSPACE/build/dist"
+        7z a -tzip "$WORKSPACE/wash-mingw-i686-dlls.zip" *.exe *.dll
     
     - name: Upload artifact
       uses: actions/upload-artifact@v4
@@ -266,14 +269,15 @@ jobs:
     - name: Install
       run: |
         cd build
-        make install DESTDIR=${{ github.workspace }}/install
+        make install DESTDIR=$(cygpath -u "${{ github.workspace }}/install")
     
     - name: Create package
       run: |
-        cd ${{ github.workspace }}/install
-        7z a -tzip ../wash-ucrt-x86_64.zip .
-        cd ${{ github.workspace }}/build/dist
-        7z a -tzip ${{ github.workspace }}/wash-ucrt-x86_64-dlls.zip *.exe *.dll
+        WORKSPACE=$(cygpath -u "${{ github.workspace }}")
+        cd "$WORKSPACE/install"
+        7z a -tzip "$WORKSPACE/wash-ucrt-x86_64.zip" .
+        cd "$WORKSPACE/build/dist"
+        7z a -tzip "$WORKSPACE/wash-ucrt-x86_64-dlls.zip" *.exe *.dll
     
     - name: Upload artifact
       uses: actions/upload-artifact@v4
