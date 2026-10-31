@@ -40,6 +40,12 @@ extern "C" {
     ) -> c_int;
     fn wash_snprintf_ll_d(buf: *mut c_char, n: usize, fmt: *const c_char, v: i64) -> c_int;
     fn wash_snprintf_ll_u(buf: *mut c_char, n: usize, fmt: *const c_char, v: u64) -> c_int;
+
+    // raw terminal handling for the interactive REPL
+    fn wash_enable_raw(fd: c_int) -> c_int;
+    fn wash_disable_raw(fd: c_int) -> c_int;
+    fn wash_isatty(fd: c_int) -> c_int;
+    fn wash_poll_readable(fd: c_int, ms: c_int) -> c_int;
 }
 
 pub const X_OK: c_int = 1;
@@ -246,4 +252,45 @@ pub fn read_all(fd: i32) -> String {
         out.extend_from_slice(&buf[..n as usize]);
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+// --- raw terminal handling for the interactive REPL -------------------------
+
+/// Put stdin (fd 0) into raw mode. Returns true on success.
+pub fn enable_raw_mode() -> bool {
+    unsafe { wash_enable_raw(0) == 0 }
+}
+
+/// Restore stdin to its original cooked mode. Returns true on success.
+pub fn disable_raw_mode() -> bool {
+    unsafe { wash_disable_raw(0) == 0 }
+}
+
+/// Returns true if `fd` refers to a terminal (TTY/PTY).
+pub fn isatty(fd: i32) -> bool {
+    unsafe { wash_isatty(fd) != 0 }
+}
+
+/// Returns true if `fd` is readable within `ms` milliseconds.
+pub fn poll_readable(fd: i32, ms: i32) -> bool {
+    unsafe { wash_poll_readable(fd, ms) > 0 }
+}
+
+/// Blocking read of a single byte from stdin. Returns `None` on EOF.
+pub fn read_byte() -> Option<u8> {
+    let mut buf = [0u8; 1];
+    let n = unsafe { wash_read(0, buf.as_mut_ptr(), 1) };
+    if n == 1 {
+        Some(buf[0])
+    } else {
+        None
+    }
+}
+
+/// Read a single byte from stdin if one is available within `ms` milliseconds.
+pub fn read_byte_timeout(ms: i32) -> Option<u8> {
+    if !poll_readable(0, ms) {
+        return None;
+    }
+    read_byte()
 }

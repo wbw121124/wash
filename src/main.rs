@@ -7,6 +7,7 @@ mod expand;
 mod lexer;
 mod parser;
 mod posix;
+mod repl;
 mod shell;
 
 use std::process::exit;

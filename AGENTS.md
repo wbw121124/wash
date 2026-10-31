@@ -68,6 +68,9 @@ executor.rs    展开词 -> 通过 fork/execve 运行；管道、重定向、
 posix.rs       Rust 侧 extern "C" + 安全封装，调用 posix_shim
 posix_shim.c   C 垫片，路由 fork/execve/pipe/dup2/open/waitpid/... 到 msys libc
 shell.rs       Shell 状态（env/cwd/positional/last_status/self_pid）+ REPL
+               入口；`run_interactive` 委托给 `repl::run`，`run_str` 不变
+repl.rs         fish 风格交互式行编辑器：termios 原始模式 + ANSI 转义，
+               语法高亮、历史 ghost 建议、Tab 补全、多行编辑、历史持久化
 error.rs       WashError { message, exit_code } / Result / syntax()
 build.rs       编译 posix_shim.c 为 washposix 静态库；从 rustc --print sysroot
                推导 msys gcc，避免误用 PATH 里的 MinGW-w64 gcc
@@ -94,7 +97,7 @@ build.rs       编译 posix_shim.c 为 washposix 静态库；从 rustc --print s
 | 3 | 控制流 `if/for/while/until/case/select`、函数、更多内建 | 待开始 |
 | 4 | 高级内建/数组/`[[ ]]`/`(( ))`/`declare`/`mapfile`/`trap`/`eval` 等 | 待开始 |
 | 5 | 长尾 100% 兼容：边缘语义、locale、shopt 等 | 待开始 |
-| 6 | 交互式 REPL（fish 风格）：语法高亮、历史命令自动建议（ghost text）、Tab 补全、多行编辑、友好报错 | 待开始 |
+| 6 | 交互式 REPL（fish 风格）：语法高亮、历史命令自动建议（ghost text）、Tab 补全、多行编辑、友好报错 | 已完成（自研 termios+ANSI 行编辑器，见 `repl.rs`） |
 
 ### Phase 1 残余问题（已解决）
 
@@ -144,3 +147,36 @@ oracle 由 18/20 提升至 **20/20**，Phase 0 维持 **9/9**。这也是 Phase 
 - 按阶段提交，commit message 用 `feat: Phase N ...` 风格（英文，简洁）。
 - 已提交：`40caffc feat: Phase 0 bootstrap ...`。
 - Phase 1 已提交（含展开系统与 echo/printf 内建，oracle 9/9 + 20/20）。
+
+## 阶段 6：交互式 REPL（fish 风格）实现说明
+
+交互式 REPL 完全自研，**不使用任何 Win32 控制台 API、不使用 rustyline 等带
+Win32 后端的行编辑器 crate**。底层只用 `posix_shim.c` 提供的 msys termios：
+`wash_enable_raw` / `wash_disable_raw`（关闭 `ECHO|ICANON|ISIG`，`VMIN=1/VTIME=0`，
+`IXON/OPOST` 关闭，`CS8`）做原始终端；stdin 逐字节读取，方向键等用 ANSI CSI
+序列（`\x1b[...`）解析。仅新增 `unicode-width` 一个依赖，用于多字节字符（CJK/emoji）
+的显示宽度计算以正确放置光标。
+
+`run_interactive`（shell.rs）仅做委托，所有交互逻辑在 `repl.rs`，`-c` / `run_str`
+路径完全未动，oracle 9/9 + 20/20 不受影响。
+
+四项 fish 特性：
+1. **语法高亮**：`classify()` 对当前行做流式分词着色（命令=绿、flag/`-x`=橙、
+   引号字符串=黄、`$var`/命令替换=青、运算符/重定向=红）。分类维度对齐
+   `lexer.rs` 的 `WordPart` 模型；对**部分输入**（未闭合引号、`&` 等 lexer 会
+   拒绝的内容）也健壮不崩溃。
+2. **历史自动建议（ghost text）**：从最新历史往前找第一条以当前输入为前缀的行，
+   在光标后用灰色渲染剩余部分；Right-Arrow / End 接受补全。
+3. **Tab 补全**：命令名查 `PATH` 可执行文件 + 已知内建；当前 token 含 `/` 或处于
+   参数位置时做文件路径补全。唯一候选直接补全（目录补 `/`，文件补空格），
+   多个候选补全公共前缀并列出候选。
+4. **多行编辑**：逻辑行存在未闭合引号、未闭合 `(){}[]`、或末尾为 operator
+   （`|` `&` `&&` `||` `|&`）时，显示续行提示符 `> ` 继续输入；整段缓冲作为一条
+   命令提交。当前物理行内可正常编辑（左右/Home/End/退格/删除）。
+
+其他键位：可打印字符、Backspace、Left/Right、Home/End、Enter（提交）、
+Ctrl-C（取消当前行）、Ctrl-D（行空则 EOF 退出，否则前向删除）、Ctrl-L（清屏）、
+Up/Down（历史上下，与 ghost 建议分离）。历史持久化到 `~/.wash_history`（退出时
+追加，启动时加载；路径集中在 `history_file()` 便于修改）。
+
+非 TTY 输入（管道，如冒烟测试）自动回退为逐行读取，保证非交互用法正常。

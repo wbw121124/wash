@@ -7,6 +7,10 @@ license = "MIT OR Apache-2.0"
 build = "build.rs"
 
 [dependencies]
+# Display-width math for correct cursor positioning with multi-byte (CJK,
+# emoji) characters in the hand-rolled termios/ANSI line editor (repl.rs).
+# Kept minimal: no line-editor/TUI framework, no Win32 backend.
+unicode-width = "0.1"
 
 [build-dependencies]
 cc = "1"

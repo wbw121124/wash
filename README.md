@@ -22,7 +22,7 @@ bash 的交互体验长期落后于 fish/zsh，而 fish 又有自己的非 POSIX
 | 3 | 控制流与函数：`if` / `for` / `while` / `until` / `case` / `select`、函数 | 待开始 |
 | 4 | 高级内建与特性：数组、`[[ ]]`、`(( ))`、`declare`、`mapfile`、`trap`、`eval` 等（内建 `printf`/`echo` 已在 Phase 1 提前实现） | 待开始 |
 | 5 | 长尾 100% 兼容：边缘语义、locale、shopt 等 | 待开始 |
-| 6 | 交互式 REPL（fish 风格）：语法高亮、历史命令自动建议、Tab 补全、多行编辑 | 待开始 |
+| 6 | 交互式 REPL（fish 风格）：语法高亮、历史命令自动建议、Tab 补全、多行编辑 | 已完成（自研 termios+ANSI 行编辑器，见 `src/repl.rs`） |
 
 验证方式（oracle 测试）：同一条命令分别跑 MSYS2 bash 与 wash，逐字节比对
 stdout 与退出码。
@@ -53,8 +53,25 @@ MSYSTEM=MSYS "/d/msys2/usr/bin/bash.exe" -lc 'cd /d/project/WorkBuddy/wash && ca
 
 ```bash
 ./target/debug/wash -c "echo hello $USER"
-./target/debug/wash            # 进入交互 REPL（当前为朴素提示符 wash$）
+./target/debug/wash            # 进入交互 REPL（fish 风格：语法高亮/ghost 建议/Tab 补全/多行）
 ```
+
+### 交互式 REPL（Phase 6，fish 风格）
+
+交互层**完全自研**，只基于 msys 的 termios 原始模式 + ANSI 转义码，不依赖任何
+Win32 控制台 API、也不使用带 Win32 后端的行编辑器 crate（如 rustyline 的 windows
+后端）。仅新增 `unicode-width` 用于多字节字符的光标定位。
+
+- **语法高亮**：命令（绿）/ 选项 `-x`（橙）/ 引号字符串（黄）/ 变量 `$x`（青）/
+  运算符与重定向（红），随输入实时着色。
+- **历史自动建议（ghost text）**：输入时若历史中有以当前内容为前缀的命令，剩余部分
+  以灰色显示在光标后；Right-Arrow / End 接受补全。
+- **Tab 补全**：命令名查 `PATH` 与内建；参数位置补全文件路径；唯一候选直接补全，
+  多候选补全公共前缀并列出候选。
+- **多行编辑**：未闭合引号 / `(){}[]` 或末尾为 `|` `&` `&&` `||` `|&` 时进入续行
+  提示符 `> `，整段作为一条命令提交。
+- 历史持久化到 `~/.wash_history`（启动时加载、退出时追加）。
+- 仅 `run_interactive` 被改写，`-c` / `run_str` 路径保持不变（oracle 9/9 + 20/20）。
 
 ### 测试
 
@@ -68,7 +85,7 @@ MSYSTEM=MSYS "/d/msys2/usr/bin/bash.exe" -lc 'cd /d/project/WorkBuddy/wash && ca
 ```
 词法 lexer.rs   ->  解析 parser.rs  ->  展开 expand.rs  ->  执行 executor.rs
                                          （fork/execve，管道，重定向，命令替换）
-        Shell 状态 shell.rs  |  POSIX 垫片 posix.rs + posix_shim.c
+        Shell 状态 shell.rs + 交互 repl.rs  |  POSIX 垫片 posix.rs + posix_shim.c
 ```
 
 - `lexer.rs` 把命令行切成由 `WordPart` 组成的词，保留引号上下文（决定后续

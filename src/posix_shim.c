@@ -21,6 +21,8 @@
 #include <string.h>
 #include <ctype.h>
 #include <errno.h>
+#include <termios.h>
+#include <poll.h>
 
 int wash_fork(void) { return fork(); }
 
@@ -127,4 +129,62 @@ int wash_snprintf_ll_d(char *buf, size_t n, const char *fmt, long long v) {
 
 int wash_snprintf_ll_u(char *buf, size_t n, const char *fmt, unsigned long long v) {
     return snprintf(buf, n, fmt, v);
+}
+
+// --- raw terminal handling for the interactive REPL -------------------------
+//
+// The REPL implements its own line editor over an MSYS2 PTY using termios +
+// ANSI escapes (no Win32 console API). We route tcgetattr/tcsetattr through
+// this shim so the `struct termios` layout and the ECHO/ICANON/ISIG/VMIN/VTIME
+// constants come from the real msys <termios.h> (Cygwin values), not from any
+// hardcoded rust libc.
+
+static struct termios g_orig_termios;
+static int g_raw_enabled = 0;
+
+// Put fd (stdin) into raw mode: disable canonical line editing (ICANON), local
+// echo (ECHO) and signal generation (ISIG, so Ctrl-C becomes a byte we handle);
+// disable output post-processing (OPOST) and software flow control (IXON); set
+// 8-bit chars (CS8); read one byte at a time (VMIN=1, VTIME=0). Returns 0 on
+// success, -1 on failure (e.g. fd is not a tty).
+int wash_enable_raw(int fd) {
+    struct termios raw;
+    if (tcgetattr(fd, &g_orig_termios) != 0) {
+        return -1;
+    }
+    raw = g_orig_termios;
+    raw.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
+    raw.c_oflag &= ~(OPOST);
+    raw.c_cflag |= (CS8);
+    raw.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
+    raw.c_cc[VMIN] = 1;
+    raw.c_cc[VTIME] = 0;
+    if (tcsetattr(fd, TCSAFLUSH, &raw) != 0) {
+        return -1;
+    }
+    g_raw_enabled = 1;
+    return 0;
+}
+
+// Restore the terminal to its original (cooked) mode. Safe to call even if raw
+// mode was never enabled.
+int wash_disable_raw(int fd) {
+    if (!g_raw_enabled) {
+        return 0;
+    }
+    int r = tcsetattr(fd, TCSAFLUSH, &g_orig_termios);
+    g_raw_enabled = 0;
+    return r;
+}
+
+int wash_isatty(int fd) { return isatty(fd); }
+
+// Return >0 if fd is readable within `ms` milliseconds (for non-blocking
+// detection of the tail of an escape sequence after ESC).
+int wash_poll_readable(int fd, int ms) {
+    struct pollfd pfd;
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    return poll(&pfd, 1, ms);
 }

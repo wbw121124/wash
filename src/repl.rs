@@ -1,0 +1,1022 @@
+// Fish-style interactive REPL for wash.
+//
+// This is a from-scratch line editor built on **termios raw mode + ANSI escape
+// codes** (see `posix_shim.c` / `posix.rs`). It deliberately avoids any Win32
+// console API and any line-editor crate with a Win32 backend — the msys/cygwin
+// runtime gives us a real PTY, so raw byte reads + ANSI is all we need. The
+// `-c` non-interactive path in `shell::run_str` is never touched.
+//
+// Features (fish-like):
+//   1. Syntax highlighting — a streaming classifier (token categories mirror
+//      `lexer.rs`'s WordPart model: command / flag / quoted-string / variable /
+//      operator) colors the line as you type. It is robust to *partial* input
+//      (unclosed quotes, `&` which the lexer rejects) and never crashes.
+//   2. History autosuggestion (ghost text) — the first history line that
+//      STARTS WITH the current input is shown dim/gray after the cursor.
+//      Accept it with Right-Arrow or End.
+//   3. Tab completion — command names from PATH (and known builtins), plus
+//      file/dir paths in the current token; common prefix is completed and an
+//      ambiguous list is shown below the input.
+//   4. Multi-line editing — when the logical line has an unclosed quote or
+//      bracket, or ends with an operator (`|` `&` `&&` `||` `|&`), a secondary
+//      prompt is shown and input continues on the next physical line; the whole
+//      buffer is submitted as one command.
+//
+// When stdin is not a TTY (e.g. piped input in the smoke test) we fall back to
+// the plain line reader so non-interactive usage keeps working.
+
+#![allow(dead_code)]
+
+use crate::posix;
+use crate::shell::Shell;
+use std::fs;
+use std::io::{self, BufRead, Write};
+use std::path::{Path, PathBuf};
+use unicode_width::UnicodeWidthChar;
+
+// Prompts. Single place to change them.
+const PRIMARY_PROMPT: &str = "wash$ ";
+const CONT_PROMPT: &str = "> ";
+
+// SGR color codes (256-color, widely supported on msys PTYs).
+const C_CMD: &str = "\x1b[38;5;76m"; // command name: green
+const C_OPT: &str = "\x1b[38;5;214m"; // flags/options: orange
+const C_STR: &str = "\x1b[38;5;221m"; // quoted strings: yellow
+const C_VAR: &str = "\x1b[38;5;81m"; // variables: cyan
+const C_OP: &str = "\x1b[38;5;203m"; // operators/redirects: red
+const C_RST: &str = "\x1b[0m"; // reset
+const C_GHOST: &str = "\x1b[38;5;245m"; // ghost suggestion: gray
+
+// ---------------------------------------------------------------------------
+// Key input
+// ---------------------------------------------------------------------------
+
+#[derive(PartialEq)]
+enum Key {
+    Char(char),
+    Enter,
+    Backspace,
+    Tab,
+    CtrlC,
+    CtrlD,
+    CtrlL,
+    Up,
+    Down,
+    Left,
+    Right,
+    Home,
+    End,
+    Esc,
+    Eof,
+    Unknown,
+}
+
+fn read_key() -> Key {
+    let b = match posix::read_byte() {
+        Some(b) => b,
+        None => return Key::Eof,
+    };
+    // A bare NUL byte has no meaning as a keystroke (and would otherwise be
+    // inserted into the line as a literal NUL). Drop it.
+    if b == 0 {
+        return Key::Unknown;
+    }
+    match b {
+        0x03 => Key::CtrlC,
+        0x0c => Key::CtrlL,
+        0x04 => Key::CtrlD,
+        0x0d | 0x0a => Key::Enter,
+        0x7f | 0x08 => Key::Backspace,
+        0x09 => Key::Tab,
+        0x1b => {
+            // ESC: lone Esc (cancel) or the start of a CSI/SS3 sequence.
+            if !posix::poll_readable(0, 50) {
+                return Key::Esc;
+            }
+            let b2 = match posix::read_byte() {
+                Some(b) => b,
+                None => return Key::Esc,
+            };
+            if b2 == b'[' {
+                let mut seq = Vec::new();
+                loop {
+                    let c = match posix::read_byte_timeout(50) {
+                        Some(c) => c,
+                        None => break,
+                    };
+                    seq.push(c);
+                    if c.is_ascii_alphabetic() || c == b'~' {
+                        break;
+                    }
+                }
+                parse_csi(&seq)
+            } else if b2 == b'O' {
+                match posix::read_byte() {
+                    Some(b'H') => Key::Home,
+                    Some(b'F') => Key::End,
+                    _ => Key::Unknown,
+                }
+            } else {
+                Key::Unknown
+            }
+        }
+        _ => Key::Char(decode_utf8(b)),
+    }
+}
+
+fn parse_csi(seq: &[u8]) -> Key {
+    if seq.is_empty() {
+        return Key::Unknown;
+    }
+    match seq[seq.len() - 1] {
+        b'A' => Key::Up,
+        b'B' => Key::Down,
+        b'C' => Key::Right,
+        b'D' => Key::Left,
+        b'H' => Key::Home,
+        b'F' => Key::End,
+        b'~' => {
+            let num: String = seq[..seq.len() - 1].iter().map(|c| *c as char).collect();
+            match num.as_str() {
+                "1" | "7" => Key::Home,
+                "4" | "8" => Key::End,
+                _ => Key::Unknown,
+            }
+        }
+        _ => Key::Unknown,
+    }
+}
+
+fn decode_utf8(first: u8) -> char {
+    if first < 0x80 {
+        return first as char;
+    }
+    let len = if first & 0xE0 == 0xC0 {
+        2
+    } else if first & 0xF0 == 0xE0 {
+        3
+    } else if first & 0xF8 == 0xF0 {
+        4
+    } else {
+        return '\u{FFFD}';
+    };
+    let mut buf = [first, 0, 0, 0];
+    for k in 1..len {
+        match posix::read_byte() {
+            Some(b) => buf[k] = b,
+            None => return '\u{FFFD}',
+        }
+    }
+    std::str::from_utf8(&buf[..len])
+        .ok()
+        .and_then(|s| s.chars().next())
+        .unwrap_or('\u{FFFD}')
+}
+
+// ---------------------------------------------------------------------------
+// Editor state
+// ---------------------------------------------------------------------------
+
+struct Editor {
+    buffer: String,
+    cursor: usize, // char index into buffer
+    history: Vec<String>,
+    hist_pos: Option<usize>, // Some(i) while navigating, None when editing fresh
+    draft: String,           // saved buffer when history navigation began
+    completions: Option<Vec<String>>, // candidate list shown below input
+    last_total: usize,       // physical lines rendered last time (for clearing)
+}
+
+impl Editor {
+    fn new(history: Vec<String>) -> Self {
+        Editor {
+            buffer: String::new(),
+            cursor: 0,
+            history,
+            hist_pos: None,
+            draft: String::new(),
+            completions: None,
+            last_total: 0,
+        }
+    }
+
+    // --- low-level buffer helpers ------------------------------------------
+
+    fn char_count(&self) -> usize {
+        self.buffer.chars().count()
+    }
+
+    fn insert(&mut self, ch: char) {
+        self.hist_pos = None;
+        self.completions = None;
+        let byte = char_to_byte(&self.buffer, self.cursor);
+        self.buffer.insert(byte, ch);
+        self.cursor += 1;
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        self.hist_pos = None;
+        self.completions = None;
+        self.cursor -= 1;
+        let byte = char_to_byte(&self.buffer, self.cursor);
+        let len = self.buffer[byte..]
+            .chars()
+            .next()
+            .map(|c| c.len_utf8())
+            .unwrap_or(1);
+        self.buffer.drain(byte..byte + len);
+    }
+
+    fn delete_forward(&mut self) {
+        if self.cursor >= self.char_count() {
+            return;
+        }
+        self.hist_pos = None;
+        self.completions = None;
+        let byte = char_to_byte(&self.buffer, self.cursor);
+        let len = self.buffer[byte..]
+            .chars()
+            .next()
+            .map(|c| c.len_utf8())
+            .unwrap_or(1);
+        self.buffer.drain(byte..byte + len);
+    }
+
+    fn move_left(&mut self) {
+        if self.cursor > 0 {
+            self.cursor -= 1;
+        }
+        self.completions = None;
+    }
+
+    fn move_right(&mut self) {
+        if self.cursor < self.char_count() {
+            self.cursor += 1;
+        }
+        self.completions = None;
+    }
+
+    fn move_home(&mut self) {
+        let byte = char_to_byte(&self.buffer, self.cursor);
+        let prefix = &self.buffer[..byte];
+        let start = match prefix.rfind('\n') {
+            Some(p) => p + 1,
+            None => 0,
+        };
+        self.cursor = byte_to_char(&self.buffer, start);
+        self.completions = None;
+    }
+
+    fn move_end(&mut self) {
+        let byte = char_to_byte(&self.buffer, self.cursor);
+        let rest = &self.buffer[byte..];
+        let end = match rest.find('\n') {
+            Some(off) => byte + off,
+            None => self.buffer.len(),
+        };
+        self.cursor = byte_to_char(&self.buffer, end);
+        self.completions = None;
+    }
+
+    fn cancel_line(&mut self) {
+        self.buffer.clear();
+        self.cursor = 0;
+        self.hist_pos = None;
+        self.completions = None;
+    }
+
+    // --- history navigation ------------------------------------------------
+
+    fn history_prev(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        if self.hist_pos.is_none() {
+            self.draft = self.buffer.clone();
+            self.hist_pos = Some(self.history.len() - 1);
+        } else {
+            let p = self.hist_pos.unwrap();
+            if p > 0 {
+                self.hist_pos = Some(p - 1);
+            }
+        }
+        self.buffer = self.history[self.hist_pos.unwrap()].clone();
+        self.cursor = self.char_count();
+        self.completions = None;
+    }
+
+    fn history_next(&mut self) {
+        if let Some(p) = self.hist_pos {
+            if p + 1 < self.history.len() {
+                self.hist_pos = Some(p + 1);
+                self.buffer = self.history[p + 1].clone();
+            } else {
+                self.hist_pos = None;
+                self.buffer = std::mem::take(&mut self.draft);
+            }
+            self.cursor = self.char_count();
+            self.completions = None;
+        }
+    }
+
+    // --- ghost (history autosuggestion) ------------------------------------
+
+    fn ghost_suggestion(&self) -> String {
+        let buf = self.buffer.as_str();
+        if buf.is_empty() {
+            return String::new();
+        }
+        // Search most-recent first for a line that starts with the current input.
+        for h in self.history.iter().rev() {
+            if h.starts_with(buf) && h.len() > buf.len() {
+                return h[buf.len()..].to_string();
+            }
+        }
+        String::new()
+    }
+
+    fn accept_ghost(&mut self) {
+        let g = self.ghost_suggestion();
+        if !g.is_empty() {
+            self.buffer.push_str(&g);
+            self.cursor = self.char_count();
+            self.completions = None;
+        }
+    }
+
+    // --- completion --------------------------------------------------------
+
+    fn current_word(&self) -> (usize, String) {
+        let cur_byte = char_to_byte(&self.buffer, self.cursor);
+        let bytes = self.buffer.as_bytes();
+        let mut start = cur_byte;
+        while start > 0 {
+            let b = bytes[start - 1];
+            if b == b' ' || b == b'\t' || matches!(b, b'|' | b'&' | b';' | b'<' | b'>') {
+                break;
+            }
+            start -= 1;
+        }
+        let word_start = byte_to_char(&self.buffer, start);
+        (word_start, self.buffer[start..cur_byte].to_string())
+    }
+
+    fn complete(&mut self) {
+        // Only complete at end-of-line for simplicity.
+        if self.cursor != self.char_count() {
+            self.completions = None;
+            return;
+        }
+        let (word_start, word) = self.current_word();
+        let prefix = &self.buffer[..char_to_byte(&self.buffer, word_start)];
+        let is_cmd = word_start == 0 || is_command_position(prefix);
+        let candidates = if is_cmd && !word.contains('/') {
+            complete_command(&word)
+        } else {
+            complete_file(&word)
+        };
+        if candidates.is_empty() {
+            self.completions = None;
+            return;
+        }
+        if candidates.len() == 1 {
+            let mut rep = candidates[0].clone();
+            if !rep.ends_with('/') {
+                rep.push(' ');
+            }
+            self.apply_replacement(word_start, &word, &rep);
+            self.completions = None;
+        } else {
+            let cp = common_prefix(&candidates);
+            if cp.len() > word.len() {
+                self.apply_replacement(word_start, &word, &cp);
+            }
+            self.completions = Some(vec![candidates.join("  ")]);
+        }
+    }
+
+    fn apply_replacement(&mut self, word_start: usize, word: &str, rep: &str) {
+        let ws_byte = char_to_byte(&self.buffer, word_start);
+        let we_byte = char_to_byte(&self.buffer, word_start + word.chars().count());
+        self.buffer.replace_range(ws_byte..we_byte, rep);
+        self.cursor = byte_to_char(&self.buffer, ws_byte + rep.len());
+        self.completions = None;
+    }
+
+    // --- rendering ---------------------------------------------------------
+
+    fn render(&mut self) {
+        let lines: Vec<&str> = self.buffer.split('\n').collect();
+        let total_phys = lines.len();
+        let (cur_line, cur_col) = self.cursor_pos(&lines);
+        let ghost = if self.cursor == self.char_count() && self.hist_pos.is_none() {
+            self.ghost_suggestion()
+        } else {
+            String::new()
+        };
+
+        // Clear the previously rendered block.
+        if self.last_total > 1 {
+            print!("\x1b[{}A", self.last_total - 1);
+        }
+        for k in 0..self.last_total {
+            print!("\r\x1b[K");
+            if k + 1 < self.last_total {
+                print!("\x1b[1B");
+            }
+        }
+        if self.last_total > 1 {
+            print!("\x1b[{}A", self.last_total - 1);
+        }
+
+        // Draw the input block.
+        let last_idx = total_phys - 1;
+        for (idx, line) in lines.iter().enumerate() {
+            let prompt = if idx == 0 { PRIMARY_PROMPT } else { CONT_PROMPT };
+            print!("\r\x1b[K{}", prompt);
+            self.print_highlighted(line);
+            if idx == last_idx && !ghost.is_empty() {
+                print!("{}{}{}", C_GHOST, ghost, C_RST);
+            }
+            if idx != last_idx {
+                print!("\r\n");
+            }
+        }
+
+        // Draw the completion candidate list (counts as extra lines).
+        let cand_lines = match &self.completions {
+            Some(c) => {
+                for cl in c {
+                    print!("\r\n\x1b[K{}", cl);
+                }
+                c.len()
+            }
+            None => 0,
+        };
+
+        // Reposition the cursor into the input block.
+        let lines_from_end = (total_phys - 1 - cur_line) + cand_lines;
+        if lines_from_end > 0 {
+            print!("\x1b[{}A", lines_from_end);
+        }
+        let abs_col = self.prompt_width(cur_line) + cur_col;
+        print!("\r\x1b[{}G", abs_col + 1);
+
+        io::stdout().flush().ok();
+        self.last_total = total_phys + cand_lines;
+    }
+
+    fn clear_screen(&mut self) {
+        print!("\x1b[2J\x1b[H");
+        io::stdout().flush().ok();
+        self.last_total = 0;
+    }
+
+    fn cursor_pos(&self, lines: &[&str]) -> (usize, usize) {
+        let mut line_idx = 0;
+        let mut line_start = 0;
+        for (i, ch) in self.buffer.char_indices() {
+            if i >= self.cursor {
+                break;
+            }
+            if ch == '\n' {
+                line_idx += 1;
+                line_start = i + 1;
+            }
+        }
+        let line = lines.get(line_idx).copied().unwrap_or("");
+        let offset = self.cursor - line_start;
+        let mut col = 0;
+        for (j, ch) in line.char_indices() {
+            if j >= offset {
+                break;
+            }
+            col += UnicodeWidthChar::width(ch).unwrap_or(0);
+        }
+        (line_idx, col)
+    }
+
+    fn prompt_width(&self, line_idx: usize) -> usize {
+        if line_idx == 0 {
+            PRIMARY_PROMPT.chars().count()
+        } else {
+            CONT_PROMPT.chars().count()
+        }
+    }
+
+    fn print_highlighted(&self, line: &str) {
+        let spans = classify(line);
+        let chars: Vec<char> = line.chars().collect();
+        for (start, end, color) in spans {
+            let seg: String = chars[start..end].iter().collect();
+            match color {
+                Some(c) => print!("{}{}{}", c, seg, C_RST),
+                None => print!("{}", seg),
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Char-index <-> byte-index helpers (the buffer is UTF-8; cursor is char-based)
+// ---------------------------------------------------------------------------
+
+fn char_to_byte(s: &str, char_idx: usize) -> usize {
+    s.char_indices()
+        .nth(char_idx)
+        .map(|(b, _)| b)
+        .unwrap_or(s.len())
+}
+
+fn byte_to_char(s: &str, byte_idx: usize) -> usize {
+    s.char_indices()
+        .take_while(|(b, _)| *b < byte_idx)
+        .count()
+}
+
+// ---------------------------------------------------------------------------
+// Syntax highlighting classifier
+//
+// Mirrors the token categories used by `lexer.rs` (command word, option/flag,
+// quoted string, variable, operator/redirect) but is a *streaming* classifier
+// so it works on partial, not-yet-valid input. Returns contiguous,
+// non-overlapping spans over the whole line. `None` color = default.
+// ---------------------------------------------------------------------------
+
+fn classify(line: &str) -> Vec<(usize, usize, Option<&'static str>)> {
+    let chars: Vec<char> = line.chars().collect();
+    let n = chars.len();
+    let mut spans: Vec<(usize, usize, Option<&'static str>)> = Vec::new();
+    let mut i = 0usize;
+    let mut expecting_cmd = true;
+
+    while i < n {
+        let c = chars[i];
+        match c {
+            '\'' => {
+                let start = i;
+                i += 1;
+                while i < n && chars[i] != '\'' {
+                    i += 1;
+                }
+                let end = if i < n { i + 1 } else { n };
+                spans.push((start, end, Some(C_STR)));
+                if i < n {
+                    i += 1;
+                }
+            }
+            '"' => {
+                let open = i;
+                spans.push((open, open + 1, Some(C_STR)));
+                i += 1;
+                let mut bodys = i;
+                while i < n && chars[i] != '"' {
+                    if chars[i] == '$' {
+                        if i > bodys {
+                            spans.push((bodys, i, Some(C_STR)));
+                        }
+                        let (vend, _) = read_var(&chars, i);
+                        spans.push((i, vend, Some(C_VAR)));
+                        i = vend;
+                        bodys = i;
+                        continue;
+                    }
+                    i += 1;
+                }
+                if i > bodys {
+                    spans.push((bodys, i, Some(C_STR)));
+                }
+                if i < n {
+                    spans.push((i, i + 1, Some(C_STR)));
+                    i += 1;
+                }
+            }
+            '$' => {
+                let (end, _) = read_var(&chars, i);
+                spans.push((i, end, Some(C_VAR)));
+                i = end;
+                expecting_cmd = false;
+            }
+            '|' | ';' | '&' | '>' | '<' => {
+                let start = i;
+                if (c == '&' || c == '|') && i + 1 < n && chars[i + 1] == c {
+                    i += 2;
+                } else if c == '|' && i + 1 < n && chars[i + 1] == '&' {
+                    i += 2;
+                } else if (c == '>' || c == '<') && i + 1 < n && chars[i + 1] == c {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+                spans.push((start, i, Some(C_OP)));
+                expecting_cmd = matches!(c, '|' | ';' | '&');
+            }
+            ' ' | '\t' => {
+                let start = i;
+                while i < n && (chars[i] == ' ' || chars[i] == '\t') {
+                    i += 1;
+                }
+                spans.push((start, i, None));
+            }
+            _ => {
+                let start = i;
+                while i < n
+                    && !matches!(
+                        chars[i],
+                        ' ' | '\t' | '\'' | '"' | '$' | '|' | ';' | '&' | '>' | '<'
+                    )
+                {
+                    i += 1;
+                }
+                let end = i;
+                let word: String = chars[start..end].iter().collect();
+                let color = if expecting_cmd {
+                    Some(C_CMD)
+                } else if word.starts_with('-') {
+                    Some(C_OPT)
+                } else {
+                    None
+                };
+                spans.push((start, end, color));
+                expecting_cmd = false;
+            }
+        }
+    }
+    spans
+}
+
+// Returns (byte_end, var_name) for a `$...` starting at `i` (i points at '$').
+fn read_var(chars: &[char], i: usize) -> (usize, String) {
+    let mut j = i + 1;
+    if j < chars.len() && chars[j] == '(' {
+        if j + 1 < chars.len() && chars[j + 1] == '(' {
+            // $(( ... ))
+            let mut depth = 1;
+            j += 2;
+            while j < chars.len() {
+                if chars[j] == '(' {
+                    depth += 1;
+                } else if chars[j] == ')' {
+                    depth -= 1;
+                    if depth == 0 {
+                        j += 1;
+                        if j < chars.len() && chars[j] == ')' {
+                            j += 1;
+                        }
+                        break;
+                    }
+                }
+                j += 1;
+            }
+            (j, String::new())
+        } else {
+            // $( ... )
+            let mut depth = 1;
+            j += 1;
+            while j < chars.len() {
+                if chars[j] == '(' {
+                    depth += 1;
+                } else if chars[j] == ')' {
+                    depth -= 1;
+                    if depth == 0 {
+                        j += 1;
+                        break;
+                    }
+                }
+                j += 1;
+            }
+            (j, String::new())
+        }
+    } else if j < chars.len() && chars[j] == '{' {
+        let mut j2 = j + 1;
+        while j2 < chars.len() && chars[j2] != '}' {
+            j2 += 1;
+        }
+        if j2 < chars.len() {
+            j2 += 1;
+        }
+        (j2, String::new())
+    } else {
+        let mut name = String::new();
+        if j < chars.len() && (chars[j].is_ascii_alphabetic() || chars[j] == '_') {
+            while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
+                name.push(chars[j]);
+                j += 1;
+            }
+        } else if j < chars.len() {
+            name.push(chars[j]);
+            j += 1;
+        }
+        (j, name)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-line continuation detection
+// ---------------------------------------------------------------------------
+
+fn is_incomplete(line: &str) -> bool {
+    let chars: Vec<char> = line.chars().collect();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut depth = 0i32;
+    for &c in &chars {
+        if in_single {
+            if c == '\'' {
+                in_single = false;
+            }
+        } else if in_double {
+            if c == '"' {
+                in_double = false;
+            }
+        } else {
+            match c {
+                '\'' => in_single = true,
+                '"' => in_double = true,
+                '(' | '{' | '[' => depth += 1,
+                ')' | '}' | ']' => depth -= 1,
+                _ => {}
+            }
+        }
+    }
+    if in_single || in_double || depth > 0 {
+        return true;
+    }
+    let t = line.trim_end();
+    t.ends_with('|') || t.ends_with('&')
+}
+
+// ---------------------------------------------------------------------------
+// Completion helpers
+// ---------------------------------------------------------------------------
+
+fn is_command_position(prefix: &str) -> bool {
+    let t = prefix.trim_end();
+    if t.is_empty() {
+        return true;
+    }
+    t.ends_with('|') || t.ends_with('&') || t.ends_with(';') || t.ends_with('(') || t.ends_with('{')
+}
+
+fn complete_command(word: &str) -> Vec<String> {
+    let mut cands: Vec<String> = Vec::new();
+    const BUILTINS: &[&str] = &[
+        "echo", "printf", "cd", "exit", "export", "set", "unset", "read", "source", ".", "alias",
+        "unalias", "true", "false", "pwd", "test", "[", "kill", "wait", "jobs", "fg", "bg", "eval",
+        "exec", "break", "continue", "return", "local", "declare", "typeset", "mapfile", "readarray",
+        "trap", "shift", "times", "umask", "shopt", "help", "let", "bind", "builtin", "command",
+        "dirs", "popd", "pushd", "fc", "disown", "enable", "history", "complete",
+    ];
+    for b in BUILTINS {
+        if b.starts_with(word) {
+            cands.push((*b).to_string());
+        }
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.starts_with(word) {
+                    if let Some(s) = e.path().to_str() {
+                        if e.path().is_file() && posix::access(s, posix::X_OK) == 0 {
+                            cands.push(name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    cands.sort();
+    cands.dedup();
+    cands
+}
+
+fn complete_file(word: &str) -> Vec<String> {
+    let (dirpath, prefix) = if let Some(slash) = word.rfind('/') {
+        (&word[..slash + 1], &word[slash + 1..])
+    } else {
+        (".", word)
+    };
+    let mut cands: Vec<String> = Vec::new();
+    let Ok(entries) = fs::read_dir(dirpath) else {
+        return cands;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.starts_with(prefix) {
+            let is_dir = e.path().is_dir();
+            let mut rep = if word.contains('/') {
+                format!("{}{}", &word[..word.rfind('/').unwrap() + 1], name)
+            } else {
+                name.clone()
+            };
+            if is_dir {
+                rep.push('/');
+            }
+            cands.push(rep);
+        }
+    }
+    cands.sort();
+    cands
+}
+
+fn common_prefix(words: &[String]) -> String {
+    if words.is_empty() {
+        return String::new();
+    }
+    let first = &words[0];
+    let mut end = first.len();
+    for w in &words[1..] {
+        let max = end.min(w.len());
+        let mut i = 0;
+        for (a, b) in first.bytes().zip(w.bytes()) {
+            if a != b {
+                break;
+            }
+            i += 1;
+        }
+        end = end.min(i).min(max);
+        if end == 0 {
+            break;
+        }
+    }
+    first[..end].to_string()
+}
+
+// ---------------------------------------------------------------------------
+// History persistence
+// ---------------------------------------------------------------------------
+
+fn history_file() -> PathBuf {
+    // Single place to change the history file location.
+    if let Some(home) = std::env::var_os("HOME") {
+        Path::new(&home).join(".wash_history")
+    } else {
+        PathBuf::from(".wash_history")
+    }
+}
+
+fn load_history(p: &Path) -> Vec<String> {
+    let mut v = Vec::new();
+    if let Ok(s) = fs::read_to_string(p) {
+        for line in s.lines() {
+            if !line.is_empty() {
+                v.push(line.to_string());
+            }
+        }
+    }
+    v
+}
+
+fn save_history(p: &Path, hist: &[String]) {
+    // Append only entries not already in the file (so repeated launches don't
+    // duplicate), matching the "~/.wash_history append on exit" requirement.
+    let existing: Vec<String> = fs::read_to_string(p)
+        .map(|s| s.lines().map(|l| l.to_string()).collect())
+        .unwrap_or_default();
+    let existing_set: std::collections::HashSet<&str> = existing.iter().map(|s| s.as_str()).collect();
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(p) {
+        for h in hist {
+            if !existing_set.contains(h.as_str()) {
+                let _ = writeln!(f, "{}", h);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Submit a finished logical line
+// ---------------------------------------------------------------------------
+
+fn submit(editor: &mut Editor, shell: &mut Shell) {
+    let line = std::mem::take(&mut editor.buffer);
+    editor.cursor = 0;
+    editor.hist_pos = None;
+    editor.completions = None;
+    editor.last_total = 0;
+
+    let line = line.trim_end_matches('\n').to_string();
+    if !line.trim().is_empty() {
+        editor.history.push(line.clone());
+    }
+
+    // Run the command in cooked mode so child programs get a normal terminal.
+    posix::disable_raw_mode();
+    println!();
+    io::stdout().flush().ok();
+    shell.run_str(&line);
+    posix::enable_raw_mode();
+}
+
+// ---------------------------------------------------------------------------
+// Fallback for non-TTY input (piped / smoke tests)
+// ---------------------------------------------------------------------------
+
+fn run_piped(shell: &mut Shell) {
+    let stdin = io::stdin();
+    for line in stdin.lock().lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+        let line = line.trim_end_matches(['\n', '\r']);
+        if line.trim().is_empty() {
+            continue;
+        }
+        shell.run_str(line);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public entry point
+// ---------------------------------------------------------------------------
+
+pub fn run(shell: &mut Shell) {
+    let hist_path = history_file();
+    let history = load_history(&hist_path);
+    let mut editor = Editor::new(history);
+
+    // Non-interactive (piped) input: use the plain line reader.
+    if !posix::isatty(0) || !posix::enable_raw_mode() {
+        run_piped(shell);
+        return;
+    }
+
+    editor.render();
+    loop {
+        let key = read_key();
+        match key {
+            Key::Eof => break,
+            Key::CtrlC => {
+                editor.cancel_line();
+                print!("\r\x1b[K^C\n");
+                io::stdout().flush().ok();
+                editor.last_total = 0;
+            }
+            Key::CtrlD => {
+                if editor.buffer.is_empty() {
+                    break;
+                } else {
+                    editor.delete_forward();
+                }
+            }
+            Key::CtrlL => editor.clear_screen(),
+            Key::Enter => {
+                let trimmed_empty = editor.buffer.trim().is_empty();
+                if !editor.buffer.contains('\n') && trimmed_empty {
+                    // Empty line: just reprint the prompt.
+                } else {
+                    let cur_empty = {
+                        let after = match editor.buffer.rfind('\n') {
+                            Some(p) => p + 1,
+                            None => 0,
+                        };
+                        editor.buffer[after..].trim().is_empty()
+                    };
+                    if editor.buffer.contains('\n') && cur_empty && !is_incomplete(&editor.buffer) {
+                        submit(&mut editor, shell);
+                    } else if is_incomplete(&editor.buffer) {
+                        editor.buffer.push('\n');
+                        editor.cursor = editor.char_count();
+                        editor.completions = None;
+                    } else {
+                        submit(&mut editor, shell);
+                    }
+                }
+            }
+            Key::Char(ch) => editor.insert(ch),
+            Key::Backspace => editor.backspace(),
+            Key::Tab => editor.complete(),
+            Key::Left => editor.move_left(),
+            Key::Right => {
+                if editor.cursor == editor.char_count() {
+                    editor.accept_ghost();
+                } else {
+                    editor.move_right();
+                }
+            }
+            Key::Home => editor.move_home(),
+            Key::End => {
+                if editor.cursor == editor.char_count() {
+                    editor.accept_ghost();
+                } else {
+                    editor.move_end();
+                }
+            }
+            Key::Up => editor.history_prev(),
+            Key::Down => editor.history_next(),
+            Key::Esc | Key::Unknown => {}
+        }
+
+        editor.render();
+    }
+
+    posix::disable_raw_mode();
+    save_history(&hist_path, &editor.history);
+}

@@ -1,12 +1,12 @@
-// Shell state + REPL driver (Phase 1).
+// Shell state + REPL driver.
 //
 // Holds the environment, positional parameters, last exit status, and the
-// current directory. Parses `-c` / interactive input and dispatches to the
-// executor. The fish-like interactive layer is a later phase; for now the
-// REPL is a plain line reader so the executor is verifiable.
+// current directory. `run_str` is the single command-execution entry point
+// shared by `-c` and the interactive REPL (in `repl.rs`). The interactive
+// fish-style line editor lives entirely in `repl.rs`; this module only owns
+// the persistent shell state and dispatches to the executor.
 
 use std::collections::HashMap;
-use std::io::{self, BufRead, Write};
 
 use crate::executor;
 use crate::lexer;
@@ -77,25 +77,6 @@ impl Shell {
     }
 
     pub fn run_interactive(&mut self) {
-        let stdin = io::stdin();
-        loop {
-            print!("wash$ ");
-            io::stdout().flush().ok();
-            let mut line = String::new();
-            match stdin.lock().read_line(&mut line) {
-                Ok(0) => {
-                    println!();
-                    break;
-                }
-                Ok(_) => {
-                    let line = line.trim_end_matches(['\n', '\r']);
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-                    self.run_str(line);
-                }
-                Err(_) => break,
-            }
-        }
+        crate::repl::run(self);
     }
 }
