@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::ffi::{c_char, CString};
+use std::io::Write;
 
 use crate::expand::{expand_argv, expand_scalar, expand_word, ExpandCtx};
 use crate::lexer::WordPart;
@@ -94,6 +95,269 @@ fn try_builtin(argv: &[String], sh: Option<&mut Shell>) -> Option<i32> {
         "exit" => Some(0),
         _ => None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Output builtins: echo / printf
+//
+// These run in the forked child AFTER redirections have been applied, so that
+// `echo out > file` and `printf ... > file` actually write the file. Only the
+// STATE builtins (`cd`, `exit`) run in the parent process.
+// ---------------------------------------------------------------------------
+
+/// Output builtins that must execute in the child (with redirections applied).
+/// Returns `Some(exit_code)` if `argv[0]` is one of these builtins.
+fn run_output_builtin(argv: &[String]) -> Option<i32> {
+    match argv.first().map(|s| s.as_str()) {
+        Some("echo") => Some(builtin_echo(argv)),
+        Some("printf") => Some(builtin_printf(argv)),
+        _ => None,
+    }
+}
+
+fn builtin_echo(argv: &[String]) -> i32 {
+    let s = argv[1..].join(" ");
+    let _ = std::io::stdout().write_all(s.as_bytes());
+    let _ = std::io::stdout().write_all(b"\n");
+    let _ = std::io::stdout().flush();
+    0
+}
+
+fn builtin_printf(argv: &[String]) -> i32 {
+    if argv.len() < 2 {
+        let _ = std::io::stdout().flush();
+        return 0;
+    }
+    let format = &argv[1];
+    let args = &argv[2..];
+    let bytes = format.as_bytes();
+    let mut out: Vec<u8> = Vec::new();
+    let mut ai: usize = 0;
+
+    // Does the format contain at least one conversion? bash only cycles the
+    // format when there are conversions; an operand-less format is printed
+    // once and extra arguments are ignored.
+    let has_conv = {
+        let mut i = 0;
+        let mut found = false;
+        while i < bytes.len() {
+            if bytes[i] == b'%' && i + 1 < bytes.len() && bytes[i + 1] != b'%' {
+                found = true;
+                break;
+            }
+            i += 1;
+        }
+        found
+    };
+
+    loop {
+        let mut i = 0;
+        while i < bytes.len() {
+            let c = bytes[i];
+            if c == b'%' {
+                if i + 1 >= bytes.len() {
+                    out.push(b'%');
+                    i += 1;
+                    continue;
+                }
+                let nxt = bytes[i + 1];
+                if nxt == b'%' {
+                    out.push(b'%');
+                    i += 2;
+                    continue;
+                }
+                let new_i = parse_printf_spec(bytes, i, &mut out, args, &mut ai);
+                i = new_i;
+            } else if c == b'\\' {
+                let (esc, ni) = parse_printf_escape(bytes, i);
+                out.extend_from_slice(&esc);
+                i = ni;
+            } else {
+                out.push(c);
+                i += 1;
+            }
+        }
+        if !has_conv {
+            break;
+        }
+        if ai >= args.len() {
+            break;
+        }
+    }
+
+    let _ = std::io::stdout().write_all(&out);
+    let _ = std::io::stdout().flush();
+    0
+}
+
+/// Parse a printf conversion spec starting at `start` (which points at `%`).
+/// Advances `ai` for consumed arguments (including `*` width/precision) and
+/// appends formatted output to `out`. Returns the new byte index.
+fn parse_printf_spec(
+    bytes: &[u8],
+    start: usize,
+    out: &mut Vec<u8>,
+    args: &[String],
+    ai: &mut usize,
+) -> usize {
+    let mut i = start + 1; // skip '%'
+    // flags
+    while i < bytes.len() && matches!(bytes[i], b'-' | b'+' | b' ' | b'#' | b'0') {
+        i += 1;
+    }
+    // width (possibly '*', which consumes an argument)
+    if i < bytes.len() && bytes[i] == b'*' {
+        *ai += 1;
+        i += 1;
+    } else {
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+    }
+    // precision
+    if i < bytes.len() && bytes[i] == b'.' {
+        i += 1;
+        if i < bytes.len() && bytes[i] == b'*' {
+            *ai += 1;
+            i += 1;
+        } else {
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+        }
+    }
+    // length modifiers
+    while i < bytes.len() && matches!(bytes[i], b'l' | b'h' | b'L' | b'j' | b'z' | b't' | b'q') {
+        i += 1;
+    }
+    if i >= bytes.len() {
+        out.push(b'%');
+        return start + 1;
+    }
+    let conv = bytes[i];
+    i += 1;
+
+    let arg: &str = if *ai < args.len() {
+        args[*ai].as_str()
+    } else {
+        match conv {
+            b's' | b'b' | b'c' => "",
+            _ => "0",
+        }
+    };
+
+    match conv {
+        b's' => out.extend_from_slice(arg.as_bytes()),
+        b'b' => {
+            let un = unescape_percent_b(arg);
+            out.extend_from_slice(un.as_bytes());
+        }
+        b'c' => {
+            if let Some(ch) = arg.chars().next() {
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+            }
+        }
+        b'd' | b'i' => {
+            let n: i64 = arg.trim().parse().unwrap_or(0);
+            out.extend_from_slice(n.to_string().as_bytes());
+        }
+        b'u' => {
+            let n: i64 = arg.trim().parse().unwrap_or(0);
+            let u = if n < 0 { 0 } else { n } as u64;
+            out.extend_from_slice(u.to_string().as_bytes());
+        }
+        b'o' => {
+            let n: i64 = arg.trim().parse().unwrap_or(0);
+            out.extend_from_slice(format!("{:o}", n).as_bytes());
+        }
+        b'x' => {
+            let n: i64 = arg.trim().parse().unwrap_or(0);
+            out.extend_from_slice(format!("{:x}", n).as_bytes());
+        }
+        b'X' => {
+            let n: i64 = arg.trim().parse().unwrap_or(0);
+            out.extend_from_slice(format!("{:X}", n).as_bytes());
+        }
+        b'f' | b'e' | b'E' | b'g' | b'G' => {
+            let n: f64 = arg.trim().parse().unwrap_or(0.0);
+            out.extend_from_slice(format!("{}", n).as_bytes());
+        }
+        _ => {
+            out.push(b'%');
+            out.push(conv);
+        }
+    }
+    *ai += 1;
+    i
+}
+
+/// Interpret backslash escapes in a printf format string (or `%b` argument):
+/// `\n \t \\ \" \' \a \b \f \r \v \0`, octal `\nnn`, and hex `\xHH`. Returns
+/// the rendered bytes and the next index after the escape.
+fn parse_printf_escape(bytes: &[u8], start: usize) -> (Vec<u8>, usize) {
+    if start + 1 >= bytes.len() {
+        return (vec![b'\\'], start + 1);
+    }
+    let c = bytes[start + 1];
+    let mut out = Vec::new();
+    let i = start + 2;
+    match c {
+        b'n' => out.push(b'\n'),
+        b't' => out.push(b'\t'),
+        b'\\' => out.push(b'\\'),
+        b'"' => out.push(b'"'),
+        b'\'' => out.push(b'\''),
+        b'a' => out.push(0x07),
+        b'b' => out.push(0x08),
+        b'f' => out.push(0x0c),
+        b'r' => out.push(b'\r'),
+        b'v' => out.push(0x0b),
+        b'0' => {
+            let mut val: u32 = 0;
+            let mut count = 0;
+            let mut j = start + 1;
+            while count < 3 && j < bytes.len() && (bytes[j] as char).is_digit(8) {
+                val = val * 8 + (bytes[j] - b'0') as u32;
+                j += 1;
+                count += 1;
+            }
+            out.push(val as u8);
+            return (out, j);
+        }
+        b'x' | b'X' => {
+            let mut val: u32 = 0;
+            let mut j = start + 2;
+            let mut count = 0;
+            while count < 2 && j < bytes.len() && (bytes[j] as char).is_digit(16) {
+                val = val * 16 + (bytes[j] as char).to_digit(16).unwrap();
+                j += 1;
+                count += 1;
+            }
+            out.push(val as u8);
+            return (out, j);
+        }
+        _ => out.push(c),
+    }
+    (out, i)
+}
+
+/// Interpret common backslash escapes inside a `%b` argument.
+fn unescape_percent_b(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            let (esc, ni) = parse_printf_escape(bytes, i);
+            out.push_str(&String::from_utf8_lossy(&esc));
+            i = ni;
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -208,8 +472,20 @@ pub fn capture_command(cmd: &str, env: &HashMap<String, String>) -> String {
 // ---------------------------------------------------------------------------
 
 fn child_run_exp(argv: &[String], path: &str, env_ptrs: &[*const c_char]) -> ! {
-    if try_builtin(argv, None).is_some() {
+    if argv.is_empty() {
         posix::exit(0);
+    }
+    // Output builtins (echo/printf) run here, in the child, AFTER the caller
+    // has applied redirections. This keeps `echo x > file` / `printf ... > file`
+    // working. (State builtins cd/exit are handled in the parent instead.)
+    if let Some(code) = run_output_builtin(argv) {
+        let _ = std::io::stdout().flush();
+        posix::exit(code);
+    }
+    // Defensive: state builtins should normally be handled in the parent, but
+    // honour them here too.
+    if let Some(code) = try_builtin(argv, None) {
+        posix::exit(code);
     }
     let argvec = ArgVec::from(argv);
     match find_executable(&argv[0], path) {

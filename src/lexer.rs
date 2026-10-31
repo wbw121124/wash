@@ -206,12 +206,17 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
 
     let mut parts: Vec<WordPart> = Vec::new();
     let mut pending = String::new();
+    let mut pending_quoted = false;
     let mut in_single = false;
     let mut in_double = false;
 
-    let flush_text = |pending: &mut String, parts: &mut Vec<WordPart>| {
+    // Flush the current `pending` literal buffer into a `Text` part. `quoted`
+    // must reflect whether the buffered characters came from a quoted context
+    // (single or double quotes) — only unquoted text is subject to word
+    // splitting and globbing downstream.
+    let flush_text = |pending: &mut String, parts: &mut Vec<WordPart>, quoted: bool| {
         if !pending.is_empty() {
-            parts.push(WordPart::Text(std::mem::take(pending), false));
+            parts.push(WordPart::Text(std::mem::take(pending), quoted));
         }
     };
 
@@ -220,6 +225,8 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
 
         if in_single {
             if c == '\'' {
+                flush_text(&mut pending, &mut parts, pending_quoted);
+                pending_quoted = false;
                 in_single = false;
             } else {
                 pending.push(c);
@@ -229,9 +236,13 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
         }
         if in_double {
             match c {
-                '"' => in_double = false,
+                '"' => {
+                    flush_text(&mut pending, &mut parts, pending_quoted);
+                    pending_quoted = false;
+                    in_double = false;
+                }
                 '$' => {
-                    flush_text(&mut pending, &mut parts);
+                    flush_text(&mut pending, &mut parts, pending_quoted);
                     i += 1;
                     if i < n && chars[i] == '(' {
                         if i + 1 < n && chars[i + 1] == '(' {
@@ -271,7 +282,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                     }
                 }
                 '`' => {
-                    flush_text(&mut pending, &mut parts);
+                    flush_text(&mut pending, &mut parts, pending_quoted);
                     let mut body = String::new();
                     i += 1;
                     while i < n && chars[i] != '`' {
@@ -299,10 +310,14 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
         // unquoted context
         match c {
             '\'' => {
+                flush_text(&mut pending, &mut parts, pending_quoted);
+                pending_quoted = true;
                 in_single = true;
                 i += 1;
             }
             '"' => {
+                flush_text(&mut pending, &mut parts, pending_quoted);
+                pending_quoted = true;
                 in_double = true;
                 i += 1;
             }
@@ -315,14 +330,14 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                 }
             }
             ' ' | '\t' => {
-                flush_text(&mut pending, &mut parts);
+                flush_text(&mut pending, &mut parts, pending_quoted);
                 if !parts.is_empty() {
                     tokens.push(Token::Word(std::mem::take(&mut parts)));
                 }
                 i += 1;
             }
             '|' => {
-                flush_text(&mut pending, &mut parts);
+                flush_text(&mut pending, &mut parts, pending_quoted);
                 if !parts.is_empty() {
                     tokens.push(Token::Word(std::mem::take(&mut parts)));
                 }
@@ -330,7 +345,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                 i += 1;
             }
             ';' => {
-                flush_text(&mut pending, &mut parts);
+                flush_text(&mut pending, &mut parts, pending_quoted);
                 if !parts.is_empty() {
                     tokens.push(Token::Word(std::mem::take(&mut parts)));
                 }
@@ -338,7 +353,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                 i += 1;
             }
             '<' => {
-                flush_text(&mut pending, &mut parts);
+                flush_text(&mut pending, &mut parts, pending_quoted);
                 if !parts.is_empty() {
                     tokens.push(Token::Word(std::mem::take(&mut parts)));
                 }
@@ -350,7 +365,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                 i += 1;
             }
             '>' => {
-                flush_text(&mut pending, &mut parts);
+                flush_text(&mut pending, &mut parts, pending_quoted);
                 if !parts.is_empty() {
                     tokens.push(Token::Word(std::mem::take(&mut parts)));
                 }
@@ -365,7 +380,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                 i += if is_append { 2 } else { 1 };
             }
             '&' => {
-                flush_text(&mut pending, &mut parts);
+                flush_text(&mut pending, &mut parts, pending_quoted);
                 if !parts.is_empty() {
                     tokens.push(Token::Word(std::mem::take(&mut parts)));
                 }
@@ -381,7 +396,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                 }
             }
             '$' => {
-                flush_text(&mut pending, &mut parts);
+                flush_text(&mut pending, &mut parts, pending_quoted);
                 i += 1;
                 if i < n && chars[i] == '(' {
                     if i + 1 < n && chars[i + 1] == '(' {
@@ -421,7 +436,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                 }
             }
             '`' => {
-                flush_text(&mut pending, &mut parts);
+                flush_text(&mut pending, &mut parts, pending_quoted);
                 let mut body = String::new();
                 i += 1;
                 while i < n && chars[i] != '`' {
@@ -434,7 +449,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
             '{' => {
                 if let Some((inner, ni)) = read_brace(&chars, i + 1) {
                     if let Some(alts) = brace_alternatives(&inner) {
-                        flush_text(&mut pending, &mut parts);
+                        flush_text(&mut pending, &mut parts, pending_quoted);
                         parts.push(WordPart::Brace(alts));
                         i = ni;
                         continue;
@@ -459,7 +474,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
         }
     }
 
-    flush_text(&mut pending, &mut parts);
+    flush_text(&mut pending, &mut parts, pending_quoted);
     if !parts.is_empty() {
         tokens.push(Token::Word(parts));
     }

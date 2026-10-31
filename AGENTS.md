@@ -43,7 +43,7 @@ MSYSTEM=MSYS "/d/msys2/usr/bin/bash.exe" -lc 'cd /d/project/WorkBuddy/wash && ca
 # Phase 0 oracle（外部命令/管道/重定向，9 项）
 ./tests/oracle.sh
 
-# Phase 1 oracle（展开系统，21 项）
+# Phase 1 oracle（展开系统，20 项）
 ./tests/oracle_phase1.sh
 ```
 
@@ -85,19 +85,28 @@ build.rs       编译 posix_shim.c 为 washposix 静态库；从 rustc --print s
 | 阶段 | 内容 | 状态 |
 |------|------|------|
 | 0 | 引导：exec / 管道 / 重定向 / FFI 垫片 / msys 工具链 | 已提交（v0.0.1），oracle 9/9 |
-| 1 | 展开系统：变量、花括号、命令替换、算术、波浪号、brace、range、glob、分词、参数运算 `:- := :+ :? # ## % %% / // ^ ^^ , ,,` | 进行中，oracle 18/20（未提交） |
+| 1 | 展开系统：变量、花括号、命令替换、算术、波浪号、brace、range、glob、分词、参数运算 `:- := :+ :? # ## % %% / // ^ ^^ , ,,`（含 echo/printf 内建） | 已完成，oracle 20/20（已提交） |
 | 2 | 作业控制：`&`、`jobs`、`fg`、`bg`、`wait`、Ctrl-C/Ctrl-Z 信号处理 | 待开始 |
 | 3 | 控制流 `if/for/while/until/case/select`、函数、更多内建 | 待开始 |
 | 4 | 高级内建/数组/`[[ ]]`/`(( ))`/`declare`/`mapfile`/`trap`/`eval` 等 | 待开始 |
 | 5 | 长尾 100% 兼容：边缘语义、locale、shopt 等 | 待开始 |
 
-### Phase 1 当前残余问题（2 项失败）
+### Phase 1 残余问题（已解决）
 
-`split unquoted` / `split quoted`：`printf '[%s]' $X` 在 bash 用内建 printf
-（格式串对多余参数循环复用，输出 `[a][b][c]`），而 wash 当前调用外部
-`/usr/bin/printf`（遇多余参数告警并忽略）。需在 `executor.rs` 增加 `printf`、
-`echo` 等内建命令（在 fork 出的子进程内运行以自然隔离重定向），这是 Phase 4
-“内建命令”的前置工作。
+`split unquoted` / `split quoted`（`printf '[%s]' $X`）原为 2 项失败，现已通过
+在 `executor.rs` 实现 `echo` / `printf` 内建命令修复：
+
+- 二者在 **fork 出的子进程内**运行（重定向先应用），因此 `echo x > file`、
+  `printf ... > file` 能正确写文件，不会退化到父进程导致重定向失效。
+- `printf` 正确处理格式串循环复用、反斜杠转义（`\n \t \\ \" \' \a \b \f \r \v \0`、
+  八进制 `\nnn`、十六进制 `\xHH`）、以及参数少于转换说明符时使用空串/`0`。
+- 同时修正了 `lexer.rs`：`flush_text` 原始终把字面量标记 `quoted=false`，导致
+  单/双引号内的字面量被错误地 glob；现按引号上下文设置 `quoted` 标志。
+- 修正了 `expand.rs` 的 `glob`：含通配元字符但无匹配时返回字面量（bash 默认，
+  nullglob 关闭），而非空结果。
+
+oracle 由 18/20 提升至 **20/20**，Phase 0 维持 **9/9**。这也是 Phase 4
+“内建命令” 的前置工作，已提前完成。
 
 ## 参考源码
 
@@ -110,4 +119,4 @@ build.rs       编译 posix_shim.c 为 washposix 静态库；从 rustc --print s
 
 - 按阶段提交，commit message 用 `feat: Phase N ...` 风格（英文，简洁）。
 - 已提交：`40caffc feat: Phase 0 bootstrap ...`。
-- Phase 1 工作目前在工作区未提交（WIP），恢复后应先提交再继续。
+- Phase 1 已提交（含展开系统与 echo/printf 内建，oracle 9/9 + 20/20）。

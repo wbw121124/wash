@@ -17,10 +17,10 @@ bash 的交互体验长期落后于 fish/zsh，而 fish 又有自己的非 POSIX
 | 阶段 | 内容 | 状态 |
 |------|------|------|
 | 0 | 引导：外部命令执行、管道、重定向、POSIX FFI 垫片、msys 工具链 | 已完成（oracle 9/9） |
-| 1 | 展开系统：变量、花括号展开、命令替换、算术、波浪号、brace/range、glob、分词、参数运算 | 进行中（oracle 18/20） |
+| 1 | 展开系统：变量、花括号展开、命令替换、算术、波浪号、brace/range、glob、分词、参数运算（含 echo/printf 内建） | 已完成（oracle 20/20） |
 | 2 | 作业控制：`&` / `jobs` / `fg` / `bg` / `wait` / 信号 | 待开始 |
 | 3 | 控制流与函数：`if` / `for` / `while` / `until` / `case` / `select`、函数 | 待开始 |
-| 4 | 高级内建与特性：数组、`[[ ]]`、`(( ))`、`declare`、`mapfile`、`trap`、`eval`、内建 `printf`/`echo` 等 | 待开始 |
+| 4 | 高级内建与特性：数组、`[[ ]]`、`(( ))`、`declare`、`mapfile`、`trap`、`eval` 等（内建 `printf`/`echo` 已在 Phase 1 提前实现） | 待开始 |
 | 5 | 长尾 100% 兼容：边缘语义、locale、shopt 等 | 待开始 |
 
 验证方式（oracle 测试）：同一条命令分别跑 MSYS2 bash 与 wash，逐字节比对

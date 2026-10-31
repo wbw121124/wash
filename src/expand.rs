@@ -456,6 +456,11 @@ pub fn glob(pattern: &str) -> Vec<String> {
         }
     }
     out.sort();
+    // bash default (nullglob off): a pattern with glob metacharacters that
+    // matches nothing yields the literal pattern, not an empty result.
+    if out.is_empty() {
+        return vec![pattern.to_string()];
+    }
     out
 }
 
