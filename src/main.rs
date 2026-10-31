@@ -3,6 +3,7 @@
 
 mod error;
 mod executor;
+mod expand;
 mod lexer;
 mod parser;
 mod posix;

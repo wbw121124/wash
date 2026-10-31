@@ -14,6 +14,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/wait.h>
+#include <sys/types.h>
 #include <stdlib.h>
 #include <signal.h>
 
@@ -56,6 +57,8 @@ int wash_open_write(const char *path, int append) {
 int wash_open_read(const char *path) { return open(path, O_RDONLY); }
 
 int wash_access(const char *path, int mode) { return access(path, mode); }
+
+ssize_t wash_read(int fd, void *buf, size_t count) { return read(fd, buf, count); }
 
 int wash_wif_exited(int status) { return WIFEXITED(status); }
 int wash_wexitstatus(int status) { return WEXITSTATUS(status); }

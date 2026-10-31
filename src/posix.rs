@@ -22,6 +22,7 @@ extern "C" {
     fn wash_open_write(path: *const c_char, append: c_int) -> c_int;
     fn wash_open_read(path: *const c_char) -> c_int;
     fn wash_access(path: *const c_char, mode: c_int) -> c_int;
+    fn wash_read(fd: c_int, buf: *mut u8, count: usize) -> isize;
     fn wash_wif_exited(status: c_int) -> c_int;
     fn wash_wexitstatus(status: c_int) -> c_int;
     fn wash_wif_signaled(status: c_int) -> c_int;
@@ -119,4 +120,18 @@ fn decode_status(status: RawCInt) -> i32 {
 
 pub fn to_cstr(s: &str) -> CString {
     CString::new(s).unwrap_or_default()
+}
+
+/// Read all bytes from `fd` until EOF (used for command substitution).
+pub fn read_all(fd: i32) -> String {
+    let mut buf = [0u8; 4096];
+    let mut out = Vec::new();
+    loop {
+        let n = unsafe { wash_read(fd, buf.as_mut_ptr(), buf.len()) };
+        if n <= 0 {
+            break;
+        }
+        out.extend_from_slice(&buf[..n as usize]);
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }

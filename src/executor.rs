@@ -1,12 +1,16 @@
-// Phase 0 executor: run the AST via fork/execve (external commands) and a
-// couple of builtins (cd, exit) that must run in the parent process.
+// Phase 1 executor: expand words, then run the AST via fork/execve. Also
+// provides `capture_command` for command/process substitution (runs the inner
+// command in a forked subshell and returns its stdout).
 //
-// Pipeline plumbing, redirections, and exit-status decoding all go through the
+// Pipeline plumbing, redirections, and exit-status decoding go through the
 // msys POSIX shim in `posix.rs`.
 
+use std::collections::HashMap;
 use std::ffi::{c_char, CString};
 
-use crate::parser::{CommandList, Pipeline, Redir, SimpleCommand};
+use crate::expand::{expand_argv, expand_scalar, expand_word, ExpandCtx};
+use crate::lexer::WordPart;
+use crate::parser::{CommandList, Pipeline, Redir};
 use crate::posix;
 use crate::shell::Shell;
 
@@ -33,7 +37,7 @@ impl ArgVec {
     }
 }
 
-fn build_env_ptrs(env: &std::collections::HashMap<String, String>) -> (Vec<CString>, Vec<*const c_char>) {
+fn build_env_ptrs(env: &HashMap<String, String>) -> (Vec<CString>, Vec<*const c_char>) {
     let cstrings: Vec<CString> = env
         .iter()
         .map(|(k, v)| CString::new(format!("{}={}", k, v)).unwrap_or_default())
@@ -43,7 +47,6 @@ fn build_env_ptrs(env: &std::collections::HashMap<String, String>) -> (Vec<CStri
     (cstrings, ptrs)
 }
 
-/// Search $PATH (msys uses ':'). Try the name as-is, then with `.exe`.
 fn find_executable(name: &str, path: &str) -> Option<CString> {
     if name.contains('/') || name.contains('\\') {
         if posix::access(name, posix::X_OK) == 0 {
@@ -71,14 +74,11 @@ fn find_executable(name: &str, path: &str) -> Option<CString> {
     None
 }
 
-/// Run a builtin in the current process. `sh` is None in a forked child
-/// (state changes are meaningless there); Some in the parent for standalone
-/// builtins so they can mutate shell state.
-fn try_builtin(cmd: &SimpleCommand, sh: Option<&mut Shell>) -> Option<i32> {
-    let name = cmd.argv.first()?;
+fn try_builtin(argv: &[String], sh: Option<&mut Shell>) -> Option<i32> {
+    let name = argv.first()?;
     match name.as_str() {
         "cd" => {
-            let target = cmd.argv.get(1).map(|s| s.as_str()).unwrap_or("");
+            let target = argv.get(1).map(|s| s.as_str()).unwrap_or("");
             let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
             let dest: &str = if target.is_empty() { &home } else { target };
             if posix::chdir(dest) != 0 {
@@ -96,20 +96,46 @@ fn try_builtin(cmd: &SimpleCommand, sh: Option<&mut Shell>) -> Option<i32> {
     }
 }
 
-fn apply_redirs(redirs: &[Redir]) {
+// ---------------------------------------------------------------------------
+// Redirections (post-expansion)
+// ---------------------------------------------------------------------------
+
+enum ExpRedir {
+    In(i32, String),
+    Out(i32, String, bool),
+    Both(String),
+}
+
+fn expand_file(file: &[WordPart], ctx: &ExpandCtx) -> String {
+    let words = expand_word(file, ctx);
+    words.into_iter().next().unwrap_or_default()
+}
+
+fn expand_redirs(redirs: &[Redir], ctx: &ExpandCtx) -> Vec<ExpRedir> {
+    redirs
+        .iter()
+        .map(|r| match r {
+            Redir::In { fd, file } => ExpRedir::In(*fd, expand_file(file, ctx)),
+            Redir::Out { fd, file, append } => ExpRedir::Out(*fd, expand_file(file, ctx), *append),
+            Redir::Both { file } => ExpRedir::Both(expand_file(file, ctx)),
+        })
+        .collect()
+}
+
+fn apply_exp_redirs(redirs: &[ExpRedir]) {
     for r in redirs {
         match r {
-            Redir::In { fd, file } => {
+            ExpRedir::In(fd, file) => {
                 let f = posix::open_read(file);
                 posix::dup2(f, *fd);
                 posix::close(f);
             }
-            Redir::Out { fd, file, append } => {
+            ExpRedir::Out(fd, file, append) => {
                 let f = posix::open_write(file, *append);
                 posix::dup2(f, *fd);
                 posix::close(f);
             }
-            Redir::Both { file } => {
+            ExpRedir::Both(file) => {
                 let f = posix::open_write(file, false);
                 posix::dup2(f, 1);
                 posix::dup2(f, 2);
@@ -119,54 +145,183 @@ fn apply_redirs(redirs: &[Redir]) {
     }
 }
 
-/// In a forked child: run builtin or exec the external command, then exit.
-fn child_run(cmd: &SimpleCommand, path: &str, env_ptrs: &[*const c_char]) -> ! {
-    if let Some(code) = try_builtin(cmd, None) {
-        posix::exit(code);
+// ---------------------------------------------------------------------------
+// Command substitution capture
+// ---------------------------------------------------------------------------
+
+/// Apply a command's variable assignments on top of `base` to build its
+/// (non-persistent) environment.
+fn build_cmd_env(
+    base: &HashMap<String, String>,
+    assigns: &[(String, Vec<WordPart>, bool)],
+    ctx: &ExpandCtx,
+) -> HashMap<String, String> {
+    let mut env = base.clone();
+    for (name, valparts, append) in assigns {
+        let val = expand_scalar(valparts, ctx);
+        if *append {
+            let cur = env.get(name).cloned().unwrap_or_default();
+            env.insert(name.clone(), cur + &val);
+        } else {
+            env.insert(name.clone(), val);
+        }
     }
-    let argv = ArgVec::from(&cmd.argv);
-    match find_executable(&cmd.argv[0], path) {
+    env
+}
+
+/// Run `cmd` in a forked subshell, capturing its stdout (with one trailing
+/// newline stripped, matching bash).
+pub fn capture_command(cmd: &str, env: &HashMap<String, String>) -> String {
+    let tokens = match crate::lexer::tokenize(cmd) {
+        Ok(t) => t,
+        Err(_) => return String::new(),
+    };
+    let list = match crate::parser::parse_command_list(&tokens) {
+        Ok(l) => l,
+        Err(_) => return String::new(),
+    };
+    let fds = posix::pipe();
+    let r = fds[0];
+    let w = fds[1];
+    let pid = posix::fork();
+    if pid == 0 {
+        posix::dup2(w, 1);
+        posix::close(w);
+        posix::close(r);
+        let mut sh = Shell::from_env(env.clone());
+        crate::executor::execute(&list, &mut sh);
+        posix::exit(0);
+    }
+    posix::close(w);
+    let s = posix::read_all(r);
+    posix::close(r);
+    posix::wait_pid(pid);
+    if let Some(stripped) = s.strip_suffix('\n') {
+        stripped.to_string()
+    } else {
+        s
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Execution
+// ---------------------------------------------------------------------------
+
+fn child_run_exp(argv: &[String], path: &str, env_ptrs: &[*const c_char]) -> ! {
+    if try_builtin(argv, None).is_some() {
+        posix::exit(0);
+    }
+    let argvec = ArgVec::from(argv);
+    match find_executable(&argv[0], path) {
         Some(exe) => {
-            posix::execve(&exe, &argv.ptrs, env_ptrs);
+            posix::execve(&exe, &argvec.ptrs, env_ptrs);
         }
         None => {
-            eprintln!("wash: {}: command not found", cmd.argv[0]);
+            eprintln!("wash: {}: command not found", argv[0]);
         }
     }
     posix::exit(127);
 }
 
-fn run_standalone(cmd: &SimpleCommand, sh: &mut Shell, path: &str, env_ptrs: &[*const c_char]) -> i32 {
-    if let Some(code) = try_builtin(cmd, Some(sh)) {
+fn run_standalone_exp(
+    argv: &[String],
+    redirs: &[ExpRedir],
+    assigns: &[(String, Vec<WordPart>, bool)],
+    env_ptrs: &[*const c_char],
+    sh: &mut Shell,
+    path: &str,
+) -> i32 {
+    if argv.is_empty() {
+        // Standalone assignment(s): persist to the shell environment.
+        if !assigns.is_empty() {
+            let ctx = ExpandCtx {
+                env: &sh.env,
+                positional: &sh.positional,
+                last_status: sh.last_status,
+                self_pid: sh.self_pid,
+            };
+            // Expand all RHS values first (immutable borrow of sh.env), then
+            // mutate sh.env once the borrow is released.
+            let applied: Vec<(String, String, bool)> = assigns
+                .iter()
+                .map(|(n, vp, ap)| (n.clone(), expand_scalar(vp, &ctx), *ap))
+                .collect();
+            for (name, val, append) in applied {
+                if append {
+                    let cur = sh.env.get(&name).cloned().unwrap_or_default();
+                    sh.env.insert(name, cur + &val);
+                } else {
+                    sh.env.insert(name, val);
+                }
+            }
+        }
+        apply_exp_redirs(redirs);
+        return 0;
+    }
+    if let Some(code) = try_builtin(argv, Some(sh)) {
         return code;
     }
     let pid = posix::fork();
     if pid == 0 {
-        apply_redirs(&cmd.redirs);
-        child_run(cmd, path, env_ptrs);
+        apply_exp_redirs(redirs);
+        child_run_exp(argv, path, env_ptrs);
     } else {
         posix::wait_pid(pid)
     }
 }
 
-fn execute_pipeline(
-    p: &Pipeline,
-    sh: &mut Shell,
-    path: &str,
-    env_ptrs: &[*const c_char],
-) -> i32 {
-    let n = p.commands.len();
-    if n == 0 {
-        return 0;
-    }
+/// A fully prepared (expanded) command: argv, redirections, the assignments
+/// it carried, and its private environment pointer array.
+struct Prepared {
+    argv: Vec<String>,
+    redirs: Vec<ExpRedir>,
+    assigns: Vec<(String, Vec<WordPart>, bool)>,
+    env_ptrs: Vec<*const c_char>,
+}
+
+fn prepare(p: &Pipeline, sh: &Shell) -> Vec<Prepared> {
+    let ctx = ExpandCtx {
+        env: &sh.env,
+        positional: &sh.positional,
+        last_status: sh.last_status,
+        self_pid: sh.self_pid,
+    };
+    p.commands
+        .iter()
+        .map(|c| {
+            let argv = expand_argv(&c.argv, &ctx);
+            let redirs = expand_redirs(&c.redirs, &ctx);
+            let cmd_env = build_cmd_env(&sh.env, &c.assignments, &ctx);
+            let (_ec, env_ptrs) = build_env_ptrs(&cmd_env);
+            Prepared {
+                argv,
+                redirs,
+                assigns: c.assignments.clone(),
+                env_ptrs,
+            }
+        })
+        .collect()
+}
+
+fn execute_pipeline(p: &Pipeline, sh: &mut Shell, path: &str) -> i32 {
+    let prepared = prepare(p, sh);
+    let n = prepared.len();
     if n == 1 {
-        return run_standalone(&p.commands[0], sh, path, env_ptrs);
+        let pr = &prepared[0];
+        return run_standalone_exp(
+            &pr.argv,
+            &pr.redirs,
+            &pr.assigns,
+            &pr.env_ptrs,
+            sh,
+            path,
+        );
     }
 
     let mut prev_read: Option<i32> = None;
     let mut pids: Vec<i32> = Vec::new();
 
-    for (idx, cmd) in p.commands.iter().enumerate() {
+    for (idx, pr) in prepared.iter().enumerate() {
         let make_pipe = idx < n - 1;
         let (this_read, this_write) = if make_pipe {
             let fds = posix::pipe();
@@ -177,7 +332,6 @@ fn execute_pipeline(
 
         let pid = posix::fork();
         if pid == 0 {
-            // child
             if let Some(fd) = prev_read {
                 posix::dup2(fd, 0);
                 posix::close(fd);
@@ -189,10 +343,12 @@ fn execute_pipeline(
             if let Some(fd) = this_read {
                 posix::close(fd);
             }
-            apply_redirs(&cmd.redirs);
-            child_run(cmd, path, env_ptrs);
+            apply_exp_redirs(&pr.redirs);
+            if pr.argv.is_empty() {
+                posix::exit(0);
+            }
+            child_run_exp(&pr.argv, path, &pr.env_ptrs);
         } else {
-            // parent
             if let Some(fd) = prev_read {
                 posix::close(fd);
             }
@@ -219,11 +375,12 @@ fn execute_pipeline(
 
 pub fn execute(list: &CommandList, sh: &mut Shell) -> i32 {
     let path = sh.env.get("PATH").cloned().unwrap_or_default();
-    let (_env_cstrings, env_ptrs) = build_env_ptrs(&sh.env);
 
     let mut last = 0;
     for p in &list.pipelines {
-        last = execute_pipeline(p, sh, &path, &env_ptrs);
+        last = execute_pipeline(p, sh, &path);
+        // Propagate exit status so `$?` reflects the previous command.
+        sh.last_status = last;
     }
     last
 }
