@@ -22,9 +22,16 @@ bash 的交互体验长期落后于 fish/zsh，而 fish 又有自己的非 POSIX
 | 3 | 控制流与函数：`if` / `for` / `while` / `until` / `case` / `select`、函数 | 待开始 |
 | 4 | 高级内建与特性：数组、`[[ ]]`、`(( ))`、`declare`、`mapfile`、`trap`、`eval` 等（内建 `printf`/`echo` 已在 Phase 1 提前实现） | 待开始 |
 | 5 | 长尾 100% 兼容：边缘语义、locale、shopt 等 | 待开始 |
+| 6 | 交互式 REPL（fish 风格）：语法高亮、历史命令自动建议、Tab 补全、多行编辑 | 待开始 |
 
 验证方式（oracle 测试）：同一条命令分别跑 MSYS2 bash 与 wash，逐字节比对
 stdout 与退出码。
+
+> **内建命令同样要求 100% 对齐 bash 手册**（含 `echo`/`printf` 的完整转义与
+> `%b/%q/%d` 等转换），不允许“够用就行”的 minimal 实现；每个内建都要有逐字节
+> 对齐真实 bash 的测试。其中 `echo` / `printf` 已完成：由 `tests/bash_diff_echo_printf.sh`
+> 对 MSYS2 bash 与 wash 逐字节比对 stdout + 退出码，**100/100 全通过**。交互式 REPL
+> 则借鉴 fish 的手感（语法高亮、历史自动建议、Tab 补全、多行编辑），但语义仍归 bash。
 
 ## 平台与工具链（重要）
 

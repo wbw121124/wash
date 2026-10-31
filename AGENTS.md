@@ -23,7 +23,11 @@
    crate 不可用。通过 `src/posix_shim.c` 的 C FFI 把 fork/execve/pipe/dup2/
    open/waitpid 等路由到真实 msys libc，保证 `O_*` 等常量取 Cygwin 值。
 4. `WSL`（`wsl.exe`）仅用于最终人工 POSIX 校验（沙箱网络受限，CI 跑不了）。
-5. 必须使用 git，按阶段提交。
+   用完后执行 `wsl --shutdown` 释放资源（WSL 启动慢、占用大，不要长期挂着）。
+5. **内建命令必须 100% 对齐 GNU bash 手册，严禁“够用就行”的 minimal 实现。**
+   凡已实现的内建（`echo` / `printf` / `cd` / `exit` …）都必须配有「逐字节对齐真实
+   bash」的测试（见 `tests/bash_diff_*.sh`），否则视为未完成。
+6. 必须使用 git，按阶段提交。
 
 ### 正确设置 MSYS 环境的方式
 
@@ -90,6 +94,7 @@ build.rs       编译 posix_shim.c 为 washposix 静态库；从 rustc --print s
 | 3 | 控制流 `if/for/while/until/case/select`、函数、更多内建 | 待开始 |
 | 4 | 高级内建/数组/`[[ ]]`/`(( ))`/`declare`/`mapfile`/`trap`/`eval` 等 | 待开始 |
 | 5 | 长尾 100% 兼容：边缘语义、locale、shopt 等 | 待开始 |
+| 6 | 交互式 REPL（fish 风格）：语法高亮、历史命令自动建议（ghost text）、Tab 补全、多行编辑、友好报错 | 待开始 |
 
 ### Phase 1 残余问题（已解决）
 
@@ -107,6 +112,25 @@ build.rs       编译 posix_shim.c 为 washposix 静态库；从 rustc --print s
 
 oracle 由 18/20 提升至 **20/20**，Phase 0 维持 **9/9**。这也是 Phase 4
 “内建命令” 的前置工作，已提前完成。
+
+### 内建命令：100% bash 兼容（已落地）
+
+用户明确要求：凡实现的内建必须 **100% 对齐 GNU bash 手册**，不可以“够用就行”。
+
+`echo` / `printf` 已升级为完整 bash 兼容实现：
+
+- `echo`:`-n` / `-e` / `-E` 仅识别为前导选项（`--` 在 echo 中是字面量）；`-e` 下的
+  `\a \b \c \e \f \n \r \t \v \0NNN`（八进制要求前导 0、`\xHH`、`\uHHHH`、`\UHHHHHHHH`；
+  未知 `\X` 保留反斜杠）；默认（无 `-e`）不解释转义、原样输出反斜杠。
+- `printf`：`[-v var]` + 格式串转义；`%s %d %i %o %u %x %X %e %E %f %g %G
+  %a %A %c %b %q %%`；字段宽度/精度（含 `*`）；标志 `- + 空格 # 0`；整数 base-0
+  解析（`010`→8、`0x10`→16，溢出截断到目标宽度）；浮点经 C FFI 用 `long double`
+  格式化（与 MSYS2 bash 同一 libc，逐字节一致）；`%b` 解释参数转义、`%q` 可重入引用、
+  `-v` 在父进程写入变量；格式串循环复用；参数不足时数值→0、字符串→空。
+- **架构约束**：不带 `-v` 的 `echo` / `printf` 在 fork 后的子进程、重定向生效之后
+  执行（`echo x > file` 正确落盘）；只有 `cd` / `exit` / `printf -v` 在父进程执行。
+- 验证：`tests/bash_diff_echo_printf.sh` 对 MSYS2 bash 与 wash 逐字节比对
+  stdout + 退出码，**100/100 全通过**；回归 oracle 维持 **9/9 + 20/20**。
 
 ## 参考源码
 

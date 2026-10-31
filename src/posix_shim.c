@@ -17,6 +17,10 @@
 #include <sys/types.h>
 #include <stdlib.h>
 #include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <ctype.h>
+#include <errno.h>
 
 int wash_fork(void) { return fork(); }
 
@@ -64,3 +68,63 @@ int wash_wif_exited(int status) { return WIFEXITED(status); }
 int wash_wexitstatus(int status) { return WEXITSTATUS(status); }
 int wash_wif_signaled(int status) { return WIFSIGNALED(status); }
 int wash_wtermsig(int status) { return WTERMSIG(status); }
+
+// --- bash-compatible printf / number parsing helpers -----------------------
+//
+// These delegate to the SAME msys C library (msys-2.0.dll) that MSYS2 bash
+// 5.3 links against, so float formatting and integer parsing match bash
+// byte-for-byte. bash's printf uses `long double` for float conversions and
+// base-0 `strtoll`/`strtoull` for integer conversions; we replicate that.
+
+// Parse a base-0 integer (signed). Returns the (clamped) value, sets
+// *fully (1 iff the whole string was consumed and at least one digit was
+// parsed) and *overflow (1 iff ERANGE). Used to decide bash's conv_error.
+long long wash_parse_ll(const char *s, int *fully, int *overflow) {
+    const char *p = s;
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (*p == '+' || *p == '-') p++;
+    int parsed_digit = (*p >= '0' && *p <= '9');
+    errno = 0;
+    char *end;
+    long long r = strtoll(s, &end, 0);
+    *fully = parsed_digit && (*end == '\0');
+    *overflow = (errno == ERANGE);
+    return r;
+}
+
+unsigned long long wash_parse_ull(const char *s, int *fully, int *overflow) {
+    const char *p = s;
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (*p == '+' || *p == '-') p++;
+    int parsed_digit = (*p >= '0' && *p <= '9');
+    errno = 0;
+    char *end;
+    unsigned long long r = strtoull(s, &end, 0);
+    *fully = parsed_digit && (*end == '\0');
+    *overflow = (errno == ERANGE);
+    return r;
+}
+
+// Parse a `long double` (base 0) and format it with `fmt` (which must contain
+// an `L` length modifier before the conversion letter). Sets *valid (1 iff the
+// whole string was consumed and at least one digit was parsed). This keeps the
+// `long double` value inside C so we never cross the long-double ABI to Rust.
+int wash_printf_ld(char *buf, size_t n, const char *fmt, const char *arg, int *valid) {
+    const char *p = arg;
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (*p == '+' || *p == '-') p++;
+    int parsed_digit = (*p >= '0' && *p <= '9');
+    errno = 0;
+    char *end;
+    long double v = strtold(arg, &end);
+    *valid = parsed_digit && (*end == '\0');
+    return snprintf(buf, n, fmt, v);
+}
+
+int wash_snprintf_ll_d(char *buf, size_t n, const char *fmt, long long v) {
+    return snprintf(buf, n, fmt, v);
+}
+
+int wash_snprintf_ll_u(char *buf, size_t n, const char *fmt, unsigned long long v) {
+    return snprintf(buf, n, fmt, v);
+}

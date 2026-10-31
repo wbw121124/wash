@@ -294,12 +294,25 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                     continue;
                 }
                 '\\' => {
+                    // Inside double quotes bash only strips the backslash when it
+                    // precedes one of `"` `` ` `` `$` `\`; a backslash-newline is a
+                    // line continuation (both dropped); every other char keeps the
+                    // backslash. The outer `i += 1` consumes the backslash itself,
+                    // so here we consume only the escaped character.
                     if i + 1 < n {
-                        pending.push(chars[i + 1]);
-                        i += 2;
-                    } else {
+                        let nxt = chars[i + 1];
+                        if matches!(nxt, '"' | '`' | '$' | '\\') {
+                            pending.push(nxt);
+                        } else if nxt == '\n' {
+                            // line continuation: drop both
+                        } else {
+                            pending.push('\\');
+                            pending.push(nxt);
+                        }
                         i += 1;
                     }
+                    // Else: trailing backslash → the quote is unterminated and the
+                    // caller reports the EOF error.
                 }
                 _ => pending.push(c),
             }
