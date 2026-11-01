@@ -723,11 +723,13 @@ fn builtin_shift(argv: &[String], sh: &mut Shell) -> i32 {
     let count: i64 = match args.first() {
         None => 1,
         Some(arg) => {
-            let (value, fully, overflow) = posix::parse_long_long(arg);
-            if !fully || overflow {
-                eprintln!("wash: shift: {}: numeric argument required", arg);
-                return 2;
-            }
+            let value = match parse_bash_number(arg) {
+                None => {
+                    eprintln!("wash: shift: {}: numeric argument required", arg);
+                    return 2;
+                }
+                Some(v) => v,
+            };
             if value < 0 {
                 eprintln!("wash: shift: {}: shift count out of range", arg);
                 return 1;
