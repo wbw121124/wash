@@ -837,6 +837,13 @@ fn builtin_unalias(argv: &[String], sh: &mut Shell) -> i32 {
         return 0;
     }
 
+    if i >= argv.len() {
+        // bash prints the usage line (with the builtin name as prefix, no
+        // shell prefix) and exits with 2.
+        eprintln!("wash: unalias: usage: unalias [-a] name [name ...]");
+        return 2;
+    }
+
     let mut status = 0;
     for name in &argv[i..] {
         if sh.aliases.remove(name).is_none() {
