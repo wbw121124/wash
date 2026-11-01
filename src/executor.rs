@@ -25,7 +25,7 @@ use std::io::Write;
 use crate::builtins;
 use crate::expand::{expand_argv, expand_scalar, expand_word, ExpandCtx};
 use crate::lexer::WordPart;
-use crate::parser::{AndOr, AndOrOp, CommandList, Pipeline, Redir};
+use crate::parser::{AndOr, AndOrOp, CommandList, Compound, Pipeline, Redir};
 use crate::posix;
 use crate::shell::{SetOptions, Shell};
 
@@ -302,6 +302,43 @@ pub fn capture_command(
 }
 
 // ---------------------------------------------------------------------------
+// Compound commands
+// ---------------------------------------------------------------------------
+
+/// Run a compound command (`if ... fi`) and return its exit status.
+///
+/// The branches are tried in order: the first condition that succeeds runs
+/// its body, and the status of that body becomes the status of the whole
+/// construct.  When no condition succeeds the `else` body runs; without an
+/// `else` branch the status is zero (POSIX).
+fn execute_compound(compound: &Compound, sh: &mut Shell) -> i32 {
+    match compound {
+        Compound::If { branches, else_body } => {
+            for (condition, body) in branches {
+                let status = execute(condition, sh);
+                sh.last_status = status;
+                if sh.exit_requested.is_some() {
+                    return status;
+                }
+                if status == 0 {
+                    let body_status = execute(body, sh);
+                    sh.last_status = body_status;
+                    return body_status;
+                }
+            }
+            match else_body {
+                Some(body) => {
+                    let status = execute(body, sh);
+                    sh.last_status = status;
+                    status
+                }
+                None => 0,
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Execution
 // ---------------------------------------------------------------------------
 
@@ -317,12 +354,26 @@ struct ChildContext<'a> {
     positional: &'a [String],
     dollar_zero: &'a str,
     attrs: &'a crate::shell::VarAttrs,
+    /// The compound command (`if ... fi`) the child has to run, if any.
+    compound: Option<&'a Compound>,
 }
 
 /// Run a command inside the forked child: either a builtin (whose state
 /// changes are lost with the child) or an external program.
 fn child_run_exp(argv: &[String], path: &str, ctx: &ChildContext) -> ! {
     if argv.is_empty() {
+        // A compound command (`if ... fi`) has no words of its own: it runs
+        // inside the child.
+        if let Some(compound) = ctx.compound {
+            let mut sub = Shell::from_env(ctx.shell_env.clone());
+            sub.apply_attrs(ctx.attrs);
+            sub.positional = ctx.positional.to_vec();
+            sub.options = ctx.options.clone();
+            sub.dollar_zero = ctx.dollar_zero.to_string();
+            let code = execute_compound(compound, &mut sub);
+            let _ = std::io::stdout().flush();
+            posix::exit(code);
+        }
         posix::exit(0);
     }
     // The redirections have already been applied by the caller (pipes and the
@@ -355,11 +406,28 @@ fn run_standalone_exp(
     argv: &[String],
     redirs: &[ExpRedir],
     assigns: &[(String, Vec<WordPart>, bool)],
+    compound: Option<&Compound>,
     env: &HashMap<String, String>,
     sh: &mut Shell,
     path: &str,
 ) -> i32 {
     if argv.is_empty() {
+        // A compound command (`if ... fi`): its redirections apply to the
+        // whole construct, exactly like in bash.
+        if let Some(compound) = compound {
+            let saved = match apply_redirs_in_parent(redirs, sh.options.noclobber) {
+                Ok(saved) => saved,
+                Err(message) => {
+                    eprintln!("{}", message);
+                    return 1;
+                }
+            };
+            let code = execute_compound(compound, sh);
+            if !sh.persistent_redirs {
+                restore_fds(&saved);
+            }
+            return code;
+        }
         // Standalone assignment(s): persist to the shell environment.
         if !assigns.is_empty() {
             let attrs = sh.attrs();
@@ -441,6 +509,7 @@ fn run_standalone_exp(
             positional: &sh.positional,
             dollar_zero: &sh.dollar_zero,
             attrs: &attrs,
+            compound: None,
         };
         child_run_exp(argv, path, &ctx);
     } else {
@@ -454,6 +523,8 @@ struct Prepared {
     argv: Vec<String>,
     redirs: Vec<ExpRedir>,
     assigns: Vec<(String, Vec<WordPart>, bool)>,
+    /// The compound command (`if ... fi`) this command stands for.
+    compound: Option<Compound>,
     /// The environment the command's program receives.
     env: HashMap<String, String>,
     /// The variable table a forked child shell starts with.
@@ -657,6 +728,7 @@ fn prepare(p: &Pipeline, sh: &mut Shell) -> Vec<Prepared> {
                 argv,
                 redirs,
                 assigns: c.assignments.clone(),
+                compound: c.compound.clone(),
                 env: cmd_env,
                 shell_env,
             });
@@ -677,7 +749,15 @@ fn execute_pipeline(p: &Pipeline, sh: &mut Shell, path: &str) -> i32 {
     let n = prepared.len();
     if n == 1 {
         let pr = &prepared[0];
-        return run_standalone_exp(&pr.argv, &pr.redirs, &pr.assigns, &pr.env, sh, path);
+        return run_standalone_exp(
+            &pr.argv,
+            &pr.redirs,
+            &pr.assigns,
+            pr.compound.as_ref(),
+            &pr.env,
+            sh,
+            path,
+        );
     }
 
     let mut prev_read: Option<i32> = None;
@@ -706,9 +786,6 @@ fn execute_pipeline(p: &Pipeline, sh: &mut Shell, path: &str) -> i32 {
                 posix::close(fd);
             }
             apply_exp_redirs(&pr.redirs, noclobber);
-            if pr.argv.is_empty() {
-                posix::exit(0);
-            }
             let attrs = sh.attrs();
             let ctx = ChildContext {
                 env: &pr.env,
@@ -717,6 +794,7 @@ fn execute_pipeline(p: &Pipeline, sh: &mut Shell, path: &str) -> i32 {
                 positional: &sh.positional,
                 dollar_zero: &sh.dollar_zero,
                 attrs: &attrs,
+                compound: pr.compound.as_ref(),
             };
             child_run_exp(&pr.argv, path, &ctx);
         } else {

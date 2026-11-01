@@ -35,6 +35,12 @@ pub enum RedirKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Token {
     Word(Vec<WordPart>),
+    /// A reserved word in command position (`if`, `then`, `elif`, `else`,
+    /// `fi`).  Bash only recognises a reserved word where a command may
+    /// start, so `echo fi` still passes "fi" as an ordinary argument.
+    Reserved(String),
+    /// A compound command (`if ... fi`) that has already been parsed.
+    Compound(crate::parser::Compound),
     Pipe,
     /// The `&&` operator: run the next pipeline only when the previous one
     /// succeeded.
@@ -45,6 +51,47 @@ pub enum Token {
     Semicolon,
     Background,
     Redirect { kind: RedirKind, fd: Option<i32> },
+}
+
+/// The reserved words wash recognises.  A reserved word is only special
+/// where a command may start; everywhere else it is an ordinary word.
+pub const RESERVED_WORDS: &[&str] = &["elif", "else", "fi", "if", "then"];
+
+/// Push a word token.  A word that starts a command and spells a reserved
+/// word becomes a `Reserved` token; every other word stays a `Word`.
+///
+/// `at_command_start` tells whether a command may start at this position
+/// and `redirect_target` tells whether the word is the target of a
+/// redirection (such a word is neither a command word nor a reserved word).
+fn push_word(
+    tokens: &mut Vec<Token>,
+    parts: Vec<WordPart>,
+    at_command_start: &mut bool,
+    redirect_target: &mut bool,
+) {
+    if *redirect_target {
+        // The word is the target of a redirection: it is not a command word
+        // and it does not change the command position.
+        *redirect_target = false;
+        tokens.push(Token::Word(parts));
+        return;
+    }
+    let reserved = match parts.as_slice() {
+        [WordPart::Text(text, false)] => RESERVED_WORDS.contains(&text.as_str()),
+        _ => false,
+    };
+    if reserved && *at_command_start {
+        let name = match &parts[0] {
+            WordPart::Text(text, _) => text.clone(),
+            _ => String::new(),
+        };
+        tokens.push(Token::Reserved(name));
+        // A reserved word is followed by a command again.
+        *at_command_start = true;
+        return;
+    }
+    tokens.push(Token::Word(parts));
+    *at_command_start = false;
 }
 
 fn take_digit_prefix(word: &mut String) -> Option<i32> {
@@ -216,6 +263,13 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
     let mut in_single = false;
     let mut in_double = false;
 
+    // Whether a command may start at the current position.  Reserved words
+    // are only recognised there.
+    let mut at_command_start = true;
+    // Set right after a redirection: the next word is the redirection's
+    // target, not a command word.
+    let mut redirect_target = false;
+
     // Flush the current `pending` literal buffer into a `Text` part. `quoted`
     // must reflect whether the buffered characters came from a quoted context
     // (single or double quotes) — only unquoted text is subject to word
@@ -363,7 +417,12 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
             ' ' | '\t' => {
                 flush_text(&mut pending, &mut parts, pending_quoted);
                 if !parts.is_empty() {
-                    tokens.push(Token::Word(std::mem::take(&mut parts)));
+                    push_word(
+                        &mut tokens,
+                        std::mem::take(&mut parts),
+                        &mut at_command_start,
+                        &mut redirect_target,
+                    );
                 }
                 i += 1;
             }
@@ -371,15 +430,26 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                 // A newline terminates the current command, exactly like `;`.
                 flush_text(&mut pending, &mut parts, pending_quoted);
                 if !parts.is_empty() {
-                    tokens.push(Token::Word(std::mem::take(&mut parts)));
+                    push_word(
+                        &mut tokens,
+                        std::mem::take(&mut parts),
+                        &mut at_command_start,
+                        &mut redirect_target,
+                    );
                 }
                 tokens.push(Token::Semicolon);
+                at_command_start = true;
                 i += 1;
             }
             '|' => {
                 flush_text(&mut pending, &mut parts, pending_quoted);
                 if !parts.is_empty() {
-                    tokens.push(Token::Word(std::mem::take(&mut parts)));
+                    push_word(
+                        &mut tokens,
+                        std::mem::take(&mut parts),
+                        &mut at_command_start,
+                        &mut redirect_target,
+                    );
                 }
                 // `||` is the OR operator; a single `|` still starts a
                 // pipeline.
@@ -390,31 +460,49 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                     tokens.push(Token::Pipe);
                     i += 1;
                 }
+                at_command_start = true;
             }
             ';' => {
                 flush_text(&mut pending, &mut parts, pending_quoted);
                 if !parts.is_empty() {
-                    tokens.push(Token::Word(std::mem::take(&mut parts)));
+                    push_word(
+                        &mut tokens,
+                        std::mem::take(&mut parts),
+                        &mut at_command_start,
+                        &mut redirect_target,
+                    );
                 }
                 tokens.push(Token::Semicolon);
+                at_command_start = true;
                 i += 1;
             }
             '<' => {
                 flush_text(&mut pending, &mut parts, pending_quoted);
                 if !parts.is_empty() {
-                    tokens.push(Token::Word(std::mem::take(&mut parts)));
+                    push_word(
+                        &mut tokens,
+                        std::mem::take(&mut parts),
+                        &mut at_command_start,
+                        &mut redirect_target,
+                    );
                 }
                 let fd = take_digit_prefix(&mut pending);
                 tokens.push(Token::Redirect {
                     kind: RedirKind::In,
                     fd,
                 });
+                redirect_target = true;
                 i += 1;
             }
             '>' => {
                 flush_text(&mut pending, &mut parts, pending_quoted);
                 if !parts.is_empty() {
-                    tokens.push(Token::Word(std::mem::take(&mut parts)));
+                    push_word(
+                        &mut tokens,
+                        std::mem::take(&mut parts),
+                        &mut at_command_start,
+                        &mut redirect_target,
+                    );
                 }
                 let is_append = i + 1 < n && chars[i + 1] == '>';
                 let fd = take_digit_prefix(&mut pending);
@@ -424,12 +512,18 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                     RedirKind::Out
                 };
                 tokens.push(Token::Redirect { kind, fd });
+                redirect_target = true;
                 i += if is_append { 2 } else { 1 };
             }
             '&' => {
                 flush_text(&mut pending, &mut parts, pending_quoted);
                 if !parts.is_empty() {
-                    tokens.push(Token::Word(std::mem::take(&mut parts)));
+                    push_word(
+                        &mut tokens,
+                        std::mem::take(&mut parts),
+                        &mut at_command_start,
+                        &mut redirect_target,
+                    );
                 }
                 if i + 1 < n && chars[i + 1] == '&' {
                     // `&&` is the AND operator.
@@ -440,11 +534,13 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                         kind: RedirKind::Both,
                         fd: None,
                     });
+                    redirect_target = true;
                     i += 2;
                 } else {
                     tokens.push(Token::Background);
                     i += 1;
                 }
+                at_command_start = true;
             }
             '$' => {
                 flush_text(&mut pending, &mut parts, pending_quoted);
@@ -538,7 +634,12 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
 
     flush_text(&mut pending, &mut parts, pending_quoted);
     if !parts.is_empty() {
-        tokens.push(Token::Word(parts));
+        push_word(
+            &mut tokens,
+            std::mem::take(&mut parts),
+            &mut at_command_start,
+            &mut redirect_target,
+        );
     }
 
     if in_single || in_double {
