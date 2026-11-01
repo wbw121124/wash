@@ -198,6 +198,32 @@ pub struct VarAttrs {
     pub integer_vars: HashSet<String>,
 }
 
+/// The `shopt` options wash understands, in bash's display order
+/// (alphabetical).  These are the shell options that are NOT reachable
+/// through `set -o`.
+pub const SHOPT_ORDER: &[&str] = &["expand_aliases", "sourcepath"];
+
+impl Shell {
+    /// Look up a `shopt` option by its name.
+    pub fn shopt_get(&self, name: &str) -> Option<bool> {
+        Some(match name {
+            "expand_aliases" => self.expand_aliases,
+            "sourcepath" => self.sourcepath,
+            _ => return None,
+        })
+    }
+
+    /// Set a `shopt` option by its name.  Returns false for unknown names.
+    pub fn shopt_set(&mut self, name: &str, value: bool) -> bool {
+        match name {
+            "expand_aliases" => self.expand_aliases = value,
+            "sourcepath" => self.sourcepath = value,
+            _ => return false,
+        }
+        true
+    }
+}
+
 pub struct Shell {
     pub env: HashMap<String, String>,
     pub cwd: String,
@@ -237,6 +263,12 @@ pub struct Shell {
     /// The `expand_aliases` shell option (bash's `shopt -s expand_aliases`).
     /// When it is on, aliases are expanded even in non-interactive shells.
     pub expand_aliases: bool,
+
+    /// The `sourcepath` shell option (bash's `shopt -u sourcepath`).  It is
+    /// ON by default: `source` then looks for a file without a slash in
+    /// `$PATH` FIRST and in the current directory afterwards.  With
+    /// `shopt -u sourcepath` the current directory comes first.
+    pub sourcepath: bool,
 
     /// Set by `return` so the enclosing `source`/function can stop.
     pub return_requested: Option<i32>,
@@ -297,6 +329,7 @@ impl Shell {
             persistent_redirs: false,
             interactive: false,
             expand_aliases: false,
+            sourcepath: true,
             return_requested: None,
             break_requested: None,
             continue_requested: None,

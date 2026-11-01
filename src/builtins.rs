@@ -20,7 +20,7 @@
 use std::io::Write;
 
 use crate::posix;
-use crate::shell::{Shell, SET_O_ORDER};
+use crate::shell::{Shell, SET_O_ORDER, SHOPT_ORDER};
 
 // ---------------------------------------------------------------------------
 // Dispatch
@@ -39,6 +39,7 @@ const BUILTINS: &[&str] = &[
     "printf",
     "set",
     "shift",
+    "shopt",
     "source",
     "unalias",
     "unset",
@@ -61,6 +62,7 @@ pub fn run_builtin(argv: &[String], sh: &mut Shell) -> Option<i32> {
         "unset" => builtin_unset(argv, sh),
         "set" => builtin_set(argv, sh),
         "shift" => builtin_shift(argv, sh),
+        "shopt" => builtin_shopt(argv, sh),
         "alias" => builtin_alias(argv, sh),
         "unalias" => builtin_unalias(argv, sh),
         "source" | "." => builtin_source(argv, sh),
@@ -748,6 +750,141 @@ fn builtin_shift(argv: &[String], sh: &mut Shell) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
+// shopt
+// ---------------------------------------------------------------------------
+
+/// The `shopt` builtin: list or change the shell options that are not
+/// reachable through `set -o`.
+///
+/// Supported forms (bash 5.3):
+///   * `shopt` — print every option and its state.
+///   * `shopt -p [name ...]` — print the options in the `shopt -s NAME` /
+///     `shopt -u NAME` form.
+///   * `shopt -s name ...` / `shopt -u name ...` — switch options on / off.
+///   * `shopt -o` — print the `set -o` table instead.
+fn builtin_shopt(argv: &[String], sh: &mut Shell) -> i32 {
+    let mut print = false;
+    let mut enable = false;
+    let mut disable = false;
+    let mut show_set_options = false;
+    let mut i = 1usize;
+
+    while i < argv.len() {
+        let a = &argv[i];
+        if a == "--" {
+            i += 1;
+            break;
+        }
+        if a.len() > 1 && a.starts_with('-') {
+            match a.as_str() {
+                "-p" => print = true,
+                "-s" => enable = true,
+                "-u" => disable = true,
+                "-o" => show_set_options = true,
+                _ => {
+                    eprintln!("wash: shopt: {}: invalid option", a);
+                    eprintln!("shopt: usage: shopt [-psu] [-o] [option ...]");
+                    return 2;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        break;
+    }
+
+    // `shopt -o` shows the options of the `set -o` table.
+    if show_set_options {
+        if print {
+            print_option_list(sh);
+        } else {
+            print_option_table(sh);
+        }
+        return 0;
+    }
+
+    let names: Vec<String> = argv[i..].to_vec();
+
+    if enable || disable {
+        if names.is_empty() {
+            eprintln!("wash: shopt: usage: shopt [-psu] [-o] [option ...]");
+            return 2;
+        }
+        let mut status = 0;
+        for name in &names {
+            if !sh.shopt_set(name, enable) {
+                eprintln!("wash: shopt: {}: invalid shell option name", name);
+                status = 1;
+            }
+        }
+        return status;
+    }
+
+    // Listing mode.
+    if names.is_empty() {
+        if print {
+            print_shopt_listing(sh);
+        } else {
+            print_shopt_table(sh);
+        }
+    } else {
+        for name in &names {
+            match sh.shopt_get(name) {
+                None => {
+                    eprintln!("wash: shopt: {}: invalid shell option name", name);
+                    return 1;
+                }
+                Some(value) => {
+                    if print {
+                        println!("shopt {} {}", if value { "-s" } else { "-u" }, name);
+                    } else {
+                        println!(
+                            "{:<width$}\t{}",
+                            name,
+                            if value { "on" } else { "off" },
+                            width = shopt_name_width()
+                        );
+                    }
+                }
+            }
+        }
+    }
+    0
+}
+
+/// The width of the option-name column in the `shopt` listing: bash pads
+/// the names to the length of the longest one plus two columns.
+fn shopt_name_width() -> usize {
+    SHOPT_ORDER.iter().map(|n| n.len()).max().unwrap_or(0) + 2
+}
+
+/// Print every `shopt` option and its state, the way bash's `shopt` does.
+fn print_shopt_table(sh: &Shell) {
+    let width = shopt_name_width();
+    for name in SHOPT_ORDER {
+        let state = if sh.shopt_get(name).unwrap_or(false) {
+            "on"
+        } else {
+            "off"
+        };
+        println!("{:<width$}\t{}", name, state, width = width);
+    }
+}
+
+/// Print every `shopt` option in the `shopt -s NAME` / `shopt -u NAME` form,
+/// the way bash's `shopt -p` does.
+fn print_shopt_listing(sh: &Shell) {
+    for name in SHOPT_ORDER {
+        let state = if sh.shopt_get(name).unwrap_or(false) {
+            "-s"
+        } else {
+            "-u"
+        };
+        println!("shopt {} {}", state, name);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // alias / unalias
 // ---------------------------------------------------------------------------
 
@@ -891,8 +1028,12 @@ fn builtin_source(argv: &[String], sh: &mut Shell) -> i32 {
     code
 }
 
-/// Locate a script: an explicit path is used as given, otherwise the current
-/// directory is searched first and `$PATH` afterwards.
+/// Locate a script: an explicit path is used as given, otherwise the
+/// lookup order is controlled by the `sourcepath` shell option.
+///
+/// bash has `sourcepath` ON by default: a name without a slash is looked
+/// up in `$PATH` first and in the current directory afterwards.  With
+/// `shopt -u sourcepath` the current directory comes first.
 fn find_source_file(name: &str, sh: &Shell) -> Option<String> {
     if name.contains('/') {
         if posix::access(name, posix::R_OK) == 0 {
@@ -900,10 +1041,25 @@ fn find_source_file(name: &str, sh: &Shell) -> Option<String> {
         }
         return None;
     }
-    if posix::access(name, posix::R_OK) == 0 {
-        return Some(name.to_string());
+
+    let from_path = || search_path(&sh.env.get("PATH").cloned().unwrap_or_default(), name);
+    let from_cwd = || {
+        if posix::access(name, posix::R_OK) == 0 {
+            Some(name.to_string())
+        } else {
+            None
+        }
+    };
+
+    if sh.sourcepath {
+        from_path().or_else(from_cwd)
+    } else {
+        from_cwd().or_else(from_path)
     }
-    let path = sh.env.get("PATH").cloned().unwrap_or_default();
+}
+
+/// Search the colon-separated `$PATH` for a readable file called `name`.
+fn search_path(path: &str, name: &str) -> Option<String> {
     for dir in path.split(':') {
         if dir.is_empty() {
             continue;
