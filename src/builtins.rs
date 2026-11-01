@@ -83,37 +83,52 @@ pub fn run_builtin(argv: &[String], sh: &mut Shell) -> Option<i32> {
 /// Supported forms (bash 5.3):
 ///   * `cd [-L|-P] [dir]` — `dir` defaults to `$HOME`.
 ///   * `cd -` — go back to `$OLDPWD` and print the new directory.
+///   * `cd -- [dir]` — `--` ends the option list.
 ///   * `$CDPATH` is searched for relative directory names.
+///
+/// bash refuses to change directory when more than one operand is given:
+/// it reports "cd: too many arguments" and exits with status 2, leaving
+/// `$PWD` untouched.
 fn builtin_cd(argv: &[String], sh: &mut Shell) -> i32 {
     let mut physical = false;
     let mut i = 1usize;
-    let mut target: Option<String> = None;
+    let mut operands: Vec<String> = Vec::new();
+    let mut end_of_options = false;
 
     while i < argv.len() {
-        let a = argv[i].clone();
-        if a == "--" {
-            i += 1;
-            break;
-        }
-        // "-" is the "previous directory" operand, not an option.
-        if a.len() > 1 && a.starts_with('-') {
-            match a.as_str() {
-                "-L" => physical = false,
-                "-P" => physical = true,
-                _ => {
-                    eprintln!("wash: cd: {}: invalid option", a);
-                    eprintln!("cd: usage: cd [-L|[-P [-e]]] [-@] [dir]");
-                    return 2;
-                }
+        let a = &argv[i];
+        if !end_of_options {
+            if a == "--" {
+                // `--` ends the option list; the next argument is the
+                // directory, not an option.
+                end_of_options = true;
+                i += 1;
+                continue;
             }
-            i += 1;
-            continue;
+            // "-" is the "previous directory" operand, not an option.
+            if a.len() > 1 && a.starts_with('-') {
+                match a.as_str() {
+                    "-L" => physical = false,
+                    "-P" => physical = true,
+                    _ => {
+                        eprintln!("wash: cd: {}: invalid option", a);
+                        eprintln!("cd: usage: cd [-L|[-P [-e]]] [-@] [dir]");
+                        return 2;
+                    }
+                }
+                i += 1;
+                continue;
+            }
         }
-        target = Some(a);
+        operands.push(a.clone());
         i += 1;
-        break;
     }
-    let _ = i;
+
+    if operands.len() > 1 {
+        eprintln!("wash: cd: too many arguments");
+        return 2;
+    }
+    let target: Option<String> = operands.into_iter().next();
 
     // Resolve the destination directory.
     let mut print_result = false;
