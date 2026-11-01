@@ -36,6 +36,12 @@ pub enum RedirKind {
 pub enum Token {
     Word(Vec<WordPart>),
     Pipe,
+    /// The `&&` operator: run the next pipeline only when the previous one
+    /// succeeded.
+    AndAnd,
+    /// The `||` operator: run the next pipeline only when the previous one
+    /// failed.
+    OrOr,
     Semicolon,
     Background,
     Redirect { kind: RedirKind, fd: Option<i32> },
@@ -375,8 +381,15 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                 if !parts.is_empty() {
                     tokens.push(Token::Word(std::mem::take(&mut parts)));
                 }
-                tokens.push(Token::Pipe);
-                i += 1;
+                // `||` is the OR operator; a single `|` still starts a
+                // pipeline.
+                if i + 1 < n && chars[i + 1] == '|' {
+                    tokens.push(Token::OrOr);
+                    i += 2;
+                } else {
+                    tokens.push(Token::Pipe);
+                    i += 1;
+                }
             }
             ';' => {
                 flush_text(&mut pending, &mut parts, pending_quoted);
@@ -418,7 +431,11 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                 if !parts.is_empty() {
                     tokens.push(Token::Word(std::mem::take(&mut parts)));
                 }
-                if i + 1 < n && chars[i + 1] == '>' {
+                if i + 1 < n && chars[i + 1] == '&' {
+                    // `&&` is the AND operator.
+                    tokens.push(Token::AndAnd);
+                    i += 2;
+                } else if i + 1 < n && chars[i + 1] == '>' {
                     tokens.push(Token::Redirect {
                         kind: RedirKind::Both,
                         fd: None,

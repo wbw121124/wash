@@ -234,6 +234,10 @@ pub struct Shell {
     /// in interactive shells unless the `expand_aliases` shell option is set.
     pub interactive: bool,
 
+    /// The `expand_aliases` shell option (bash's `shopt -s expand_aliases`).
+    /// When it is on, aliases are expanded even in non-interactive shells.
+    pub expand_aliases: bool,
+
     /// Set by `return` so the enclosing `source`/function can stop.
     pub return_requested: Option<i32>,
     /// Set by `break`/`continue` (loop context owned by Phase 3).
@@ -292,6 +296,7 @@ impl Shell {
             dollar_zero: "wash".to_string(),
             persistent_redirs: false,
             interactive: false,
+            expand_aliases: false,
             return_requested: None,
             break_requested: None,
             continue_requested: None,

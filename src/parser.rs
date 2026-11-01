@@ -1,6 +1,15 @@
-// Phase 1 parser: flat token stream -> AST (CommandList of Pipelines of
-// SimpleCommands). Words now carry raw `WordPart`s; expansion happens in the
-// executor via `expand.rs`.
+// Parser: flat token stream -> AST.
+//
+// The AST mirrors bash's grammar:
+//
+//   CommandList  := AndOr (';' AndOr)*        -- `;` separated AND-OR lists
+//   AndOr        := Pipeline (('&&'|'||') Pipeline)*
+//   Pipeline     := SimpleCommand ('|' SimpleCommand)*
+//   SimpleCommand:= word* (redirection word*)*
+//
+// `&&` and `||` have the same precedence and are left-associative, which is
+// why an AND-OR list keeps the operator that precedes every pipeline after
+// the first one (`AndOr::ops`).
 
 use crate::error::{Result, WashError};
 use crate::lexer::{RedirKind, Token, WordPart};
@@ -26,13 +35,46 @@ pub struct Pipeline {
     pub commands: Vec<SimpleCommand>,
 }
 
+/// The operator that joins two pipelines of an AND-OR list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AndOrOp {
+    /// `&&` — the next pipeline runs only when the previous one succeeded.
+    And,
+    /// `||` — the next pipeline runs only when the previous one failed.
+    Or,
+}
+
+/// One AND-OR list: the pipelines joined by `&&` / `||`.
+///
+/// `ops[i]` is the operator that precedes `pipelines[i + 1]`, so
+/// `ops.len() == pipelines.len() - 1` for every list with at least one
+/// pipeline.
+#[derive(Debug, Clone)]
+pub struct AndOr {
+    pub pipelines: Vec<Pipeline>,
+    pub ops: Vec<AndOrOp>,
+}
+
 #[derive(Debug, Clone)]
 pub struct CommandList {
-    pub pipelines: Vec<Pipeline>,
+    /// The AND-OR lists, separated by `;`.
+    pub andors: Vec<AndOr>,
+}
+
+impl AndOr {
+    /// An AND-OR list that consists of a single pipeline.
+    pub fn single(pipeline: Pipeline) -> Self {
+        AndOr {
+            pipelines: vec![pipeline],
+            ops: Vec::new(),
+        }
+    }
 }
 
 pub fn parse_command_list(tokens: &[Token]) -> Result<CommandList> {
+    let mut andors: Vec<AndOr> = Vec::new();
     let mut pipelines: Vec<Pipeline> = Vec::new();
+    let mut ops: Vec<AndOrOp> = Vec::new();
     let mut current_cmds: Vec<SimpleCommand> = Vec::new();
     let mut stage: Vec<Token> = Vec::new();
 
@@ -41,6 +83,23 @@ pub fn parse_command_list(tokens: &[Token]) -> Result<CommandList> {
             Token::Pipe => {
                 current_cmds.push(parse_simple(&stage)?);
                 stage.clear();
+            }
+            Token::AndAnd | Token::OrOr => {
+                // The operator closes the current pipeline and starts the
+                // next one.
+                if !stage.is_empty() {
+                    current_cmds.push(parse_simple(&stage)?);
+                    stage.clear();
+                }
+                if !current_cmds.is_empty() {
+                    pipelines.push(Pipeline {
+                        commands: std::mem::take(&mut current_cmds),
+                    });
+                }
+                ops.push(match t {
+                    Token::AndAnd => AndOrOp::And,
+                    _ => AndOrOp::Or,
+                });
             }
             Token::Semicolon => {
                 // An empty command (e.g. two consecutive separators) is not a
@@ -54,6 +113,8 @@ pub fn parse_command_list(tokens: &[Token]) -> Result<CommandList> {
                         commands: std::mem::take(&mut current_cmds),
                     });
                 }
+                // `;` terminates the AND-OR list.
+                flush_andor(&mut andors, &mut pipelines, &mut ops)?;
             }
             Token::Background => {
                 return Err(WashError::syntax("background jobs not supported yet (Phase 2)"));
@@ -70,8 +131,32 @@ pub fn parse_command_list(tokens: &[Token]) -> Result<CommandList> {
             commands: current_cmds,
         });
     }
+    flush_andor(&mut andors, &mut pipelines, &mut ops)?;
 
-    Ok(CommandList { pipelines })
+    Ok(CommandList { andors })
+}
+
+/// Move the collected pipelines into the command list as one AND-OR list.
+fn flush_andor(
+    andors: &mut Vec<AndOr>,
+    pipelines: &mut Vec<Pipeline>,
+    ops: &mut Vec<AndOrOp>,
+) -> Result<()> {
+    if pipelines.is_empty() {
+        if !ops.is_empty() {
+            // An operator without a command on either side (`a && ; b`).
+            return Err(WashError::syntax("syntax error near unexpected token"));
+        }
+        return Ok(());
+    }
+    if ops.len() + 1 != pipelines.len() {
+        return Err(WashError::syntax("syntax error near unexpected token"));
+    }
+    andors.push(AndOr {
+        pipelines: std::mem::take(pipelines),
+        ops: std::mem::take(ops),
+    });
+    Ok(())
 }
 
 fn is_valid_ident(s: &str) -> bool {
@@ -154,7 +239,7 @@ fn parse_simple(tokens: &[Token]) -> Result<SimpleCommand> {
                 i += 2;
                 continue;
             }
-            Token::Pipe | Token::Semicolon | Token::Background => {
+            Token::Pipe | Token::Semicolon | Token::Background | Token::AndAnd | Token::OrOr => {
                 return Err(WashError::syntax("syntax error: unexpected token in command"));
             }
         }

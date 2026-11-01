@@ -24,7 +24,7 @@ use std::io::Write;
 use crate::builtins;
 use crate::expand::{expand_argv, expand_scalar, expand_word, ExpandCtx};
 use crate::lexer::WordPart;
-use crate::parser::{CommandList, Pipeline, Redir};
+use crate::parser::{AndOr, AndOrOp, CommandList, Pipeline, Redir};
 use crate::posix;
 use crate::shell::{SetOptions, Shell};
 
@@ -471,25 +471,84 @@ fn alias_name(word: &[WordPart]) -> Option<String> {
 /// Bash expands aliases only in interactive shells (the `expand_aliases`
 /// shell option is off by default in non-interactive shells), so the
 /// expansion is skipped for `wash -c` and for scripts.
-fn expand_aliases(list: &CommandList, sh: &Shell, depth: usize) -> Vec<Pipeline> {
-    if !sh.interactive {
-        return list.pipelines.clone();
+fn expand_aliases(list: &CommandList, sh: &Shell, depth: usize) -> CommandList {
+    if !(sh.interactive || sh.expand_aliases) {
+        return list.clone();
     }
-    let mut out = Vec::new();
-    for pipeline in &list.pipelines {
-        if depth < MAX_ALIAS_DEPTH {
-            if let Some(expanded) = expand_alias_in_pipeline(pipeline, sh, depth) {
-                out.extend(expanded);
-                continue;
-            }
-        }
-        out.push(pipeline.clone());
+    let mut out = CommandList { andors: Vec::new() };
+    for andor in &list.andors {
+        expand_andor_aliases(andor, sh, depth, &mut out);
     }
     out
 }
 
+/// Expand the aliases of one AND-OR list, appending the resulting lists to
+/// `out`.
+///
+/// Bash replaces the command word with the alias text and parses the result
+/// again, so an alias body may contain complete commands, pipes or `&&`/`||`
+/// operators. The alias text takes the place of the command it replaces; an
+/// alias body with several `;`-separated commands therefore splits the
+/// AND-OR list it appears in.
+fn expand_andor_aliases(andor: &AndOr, sh: &Shell, depth: usize, out: &mut CommandList) {
+    // The AND-OR list under construction.
+    let mut pipelines: Vec<Pipeline> = Vec::new();
+    let mut ops: Vec<AndOrOp> = Vec::new();
+
+    for (i, pipeline) in andor.pipelines.iter().enumerate() {
+        // The operator that precedes this pipeline (`None` for the first).
+        let op_before: Option<AndOrOp> = if i == 0 { None } else { Some(andor.ops[i - 1]) };
+        let expansion = if depth < MAX_ALIAS_DEPTH {
+            expand_alias_in_pipeline(pipeline, sh, depth)
+        } else {
+            None
+        };
+        match expansion {
+            None => {
+                pipelines.push(pipeline.clone());
+                if let Some(op) = op_before {
+                    ops.push(op);
+                }
+            }
+            Some(groups) => {
+                for (gi, group) in groups.iter().enumerate() {
+                    if gi > 0 {
+                        // The alias body contained a `;`: the commands that
+                        // follow it start a new AND-OR list.
+                        flush_andor_list(out, &mut pipelines, &mut ops);
+                    }
+                    for (j, p) in group.pipelines.iter().enumerate() {
+                        pipelines.push(p.clone());
+                        let op = match (gi, j) {
+                            (0, 0) => op_before,
+                            (0, _) => Some(group.ops[j - 1]),
+                            (_, 0) => None,
+                            (_, _) => Some(group.ops[j - 1]),
+                        };
+                        if let Some(op) = op {
+                            ops.push(op);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    flush_andor_list(out, &mut pipelines, &mut ops);
+}
+
+/// Append the AND-OR list under construction to `out`.
+fn flush_andor_list(out: &mut CommandList, pipelines: &mut Vec<Pipeline>, ops: &mut Vec<AndOrOp>) {
+    if pipelines.is_empty() {
+        return;
+    }
+    out.andors.push(AndOr {
+        pipelines: std::mem::take(pipelines),
+        ops: std::mem::take(ops),
+    });
+}
+
 /// If the first command of `pipeline` starts with an alias, return the
-/// pipelines the alias expands to.
+/// AND-OR lists the alias expands to.
 ///
 /// Bash replaces the command word with the alias text and parses the result
 /// again, so an alias body may contain complete commands, pipes or
@@ -499,29 +558,33 @@ fn expand_alias_in_pipeline(
     pipeline: &Pipeline,
     sh: &Shell,
     depth: usize,
-) -> Option<Vec<Pipeline>> {
+) -> Option<Vec<AndOr>> {
     let first = pipeline.commands.first()?;
     let name = alias_name(first.argv.first()?)?;
     let value = sh.aliases.get(&name)?.clone();
     let tokens = crate::lexer::tokenize(&value).ok()?;
     let list = crate::parser::parse_command_list(&tokens).ok()?;
-    if list.pipelines.is_empty() {
+    if list.andors.is_empty() {
         return None;
     }
-    let mut pipelines = list.pipelines;
+    let mut groups = list.andors;
     let extra: Vec<Vec<WordPart>> = first.argv[1..].to_vec();
     if !extra.is_empty() {
-        if let Some(last) = pipelines.last_mut().and_then(|pl| pl.commands.last_mut()) {
+        if let Some(last) = groups
+            .last_mut()
+            .and_then(|g| g.pipelines.last_mut())
+            .and_then(|pl| pl.commands.last_mut())
+        {
             last.argv.extend(extra);
         }
     }
     // The alias body may itself start with an alias.
     let mut out = Vec::new();
-    for pipeline in &pipelines {
+    for group in &groups {
         let single = CommandList {
-            pipelines: vec![pipeline.clone()],
+            andors: vec![group.clone()],
         };
-        out.extend(expand_aliases(&single, sh, depth + 1));
+        out.extend(expand_aliases(&single, sh, depth + 1).andors);
     }
     Some(out)
 }
@@ -643,20 +706,63 @@ fn execute_pipeline(p: &Pipeline, sh: &mut Shell, path: &str) -> i32 {
     }
 }
 
+/// Run one AND-OR list: the pipelines joined by `&&` / `||`, evaluated from
+/// left to right with short-circuiting.
+///
+/// `last` carries the exit status of the last command that actually ran; it
+/// is updated in place so that `$?` reflects it inside the next pipeline.
+///
+/// Returns `true` when `set -e` aborted the list; the caller then stops
+/// executing the remaining lists as well.
+fn execute_andor(andor: &AndOr, sh: &mut Shell, path: &str, last: &mut i32) -> bool {
+    let count = andor.pipelines.len();
+    for (i, pipeline) in andor.pipelines.iter().enumerate() {
+        if i > 0 {
+            // Short-circuit: `&&` continues only after a success, `||` only
+            // after a failure. A skipped pipeline leaves `$?` untouched.
+            let skip = match andor.ops[i - 1] {
+                AndOrOp::And => *last != 0,
+                AndOrOp::Or => *last == 0,
+            };
+            if skip {
+                continue;
+            }
+        }
+        // `set -n` (noexec): the command is read but neither expanded nor
+        // executed, exactly like in bash.
+        if sh.options.noexec {
+            continue;
+        }
+        *last = execute_pipeline(pipeline, sh, path);
+        // Propagate exit status so `$?` reflects the previous command.
+        sh.last_status = *last;
+        // `exit` stops the shell, `set -e` stops it on a failure.
+        if sh.exit_requested.is_some() {
+            return false;
+        }
+        // With `set -e` the shell only aborts when the failing command is the
+        // last one of the AND-OR list: a command that is part of a `&&`/`||`
+        // list (but not the one following the final operator) never triggers
+        // the exit.
+        if sh.options.errexit && *last != 0 && i + 1 == count {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn execute(list: &CommandList, sh: &mut Shell) -> i32 {
     let path = sh.env.get("PATH").cloned().unwrap_or_default();
 
     let mut last = 0;
     // Aliases are expanded before the commands run.
-    for p in expand_aliases(list, sh, 0) {
-        last = execute_pipeline(&p, sh, &path);
-        // Propagate exit status so `$?` reflects the previous command.
-        sh.last_status = last;
-        // `exit` stops the shell, `set -e` stops it on a failure.
+    let expanded = expand_aliases(list, sh, 0);
+    for andor in &expanded.andors {
+        let aborted = execute_andor(andor, sh, &path, &mut last);
         if sh.exit_requested.is_some() {
             break;
         }
-        if sh.options.errexit && last != 0 {
+        if aborted {
             break;
         }
     }
