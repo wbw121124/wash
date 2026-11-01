@@ -248,8 +248,9 @@ pub struct Shell {
     /// `declare -x NAME=""`.
     pub null_exported: HashSet<String>,
 
-    /// The value of `$0`. `source` replaces it with the script path while the
-    /// script runs.
+    /// The value of `$0`: the path the shell itself was invoked with.
+    /// `source` does NOT change it -- bash keeps the shell's own name
+    /// while a file is sourced.
     pub dollar_zero: String,
 
     /// Set by `exec` when it is used with redirections only: the redirections

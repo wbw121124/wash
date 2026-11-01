@@ -17,6 +17,10 @@ use std::process::exit;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut sh = shell::Shell::new();
+    // `$0` is the path the shell was invoked with, exactly like in bash.
+    if let Some(argv0) = args.first() {
+        sh.dollar_zero = argv0.clone();
+    }
 
     if args.len() >= 2 && (args[1] == "-c" || args[1] == "--command") {
         if args.len() < 3 {

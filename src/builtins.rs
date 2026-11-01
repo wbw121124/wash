@@ -1019,12 +1019,12 @@ fn builtin_source(argv: &[String], sh: &mut Shell) -> i32 {
         }
     };
 
-    // The script gets its own positional parameters and `$0`.
+    // The script gets its own positional parameters.  bash does NOT change
+    // `$0` while a file is sourced: it keeps the name the shell itself was
+    // invoked with, both in the default mode and in --posix mode.
     let saved_positional = std::mem::replace(&mut sh.positional, argv[2..].to_vec());
-    let saved_zero = std::mem::replace(&mut sh.dollar_zero, path.clone());
     let code = sh.run_str(&content);
     sh.positional = saved_positional;
-    sh.dollar_zero = saved_zero;
     code
 }
 
