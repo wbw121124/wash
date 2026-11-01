@@ -20,14 +20,28 @@
 use std::io::Write;
 
 use crate::posix;
-use crate::shell::Shell;
+use crate::shell::{Shell, SET_O_ORDER};
 
 // ---------------------------------------------------------------------------
 // Dispatch
 // ---------------------------------------------------------------------------
 
 /// Every builtin name understood by `run_builtin`.
-const BUILTINS: &[&str] = &["echo", "printf"];
+const BUILTINS: &[&str] = &[
+    ".",
+    "alias",
+    "cd",
+    "echo",
+    "eval",
+    "exec",
+    "exit",
+    "export",
+    "printf",
+    "set",
+    "source",
+    "unalias",
+    "unset",
+];
 
 /// True when `name` is the name of a builtin command.
 pub fn is_builtin(name: &str) -> bool {
@@ -40,11 +54,845 @@ pub fn is_builtin(name: &str) -> bool {
 pub fn run_builtin(argv: &[String], sh: &mut Shell) -> Option<i32> {
     let name = argv.first()?.as_str();
     let code = match name {
+        "cd" => builtin_cd(argv, sh),
+        "exit" => builtin_exit(argv, sh),
+        "export" => builtin_export(argv, sh),
+        "unset" => builtin_unset(argv, sh),
+        "set" => builtin_set(argv, sh),
+        "alias" => builtin_alias(argv, sh),
+        "unalias" => builtin_unalias(argv, sh),
+        "source" | "." => builtin_source(argv, sh),
+        "eval" => builtin_eval(argv, sh),
+        "exec" => builtin_exec(argv, sh),
         "echo" => builtin_echo(argv),
         "printf" => builtin_printf(argv, Some(sh)),
         _ => return None,
     };
     Some(code)
+}
+
+// ---------------------------------------------------------------------------
+// cd
+// ---------------------------------------------------------------------------
+
+/// The `cd` builtin: change the working directory and keep `$PWD`/`$OLDPWD`
+/// in sync with it.
+///
+/// Supported forms (bash 5.3):
+///   * `cd [-L|-P] [dir]` — `dir` defaults to `$HOME`.
+///   * `cd -` — go back to `$OLDPWD` and print the new directory.
+///   * `$CDPATH` is searched for relative directory names.
+fn builtin_cd(argv: &[String], sh: &mut Shell) -> i32 {
+    let mut physical = false;
+    let mut i = 1usize;
+    let mut target: Option<String> = None;
+
+    while i < argv.len() {
+        let a = argv[i].clone();
+        if a == "--" {
+            i += 1;
+            break;
+        }
+        // "-" is the "previous directory" operand, not an option.
+        if a.len() > 1 && a.starts_with('-') {
+            match a.as_str() {
+                "-L" => physical = false,
+                "-P" => physical = true,
+                _ => {
+                    eprintln!("wash: cd: {}: invalid option", a);
+                    eprintln!("cd: usage: cd [-L|[-P [-e]]] [-@] [dir]");
+                    return 2;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        target = Some(a);
+        i += 1;
+        break;
+    }
+    let _ = i;
+
+    // Resolve the destination directory.
+    let mut print_result = false;
+    let dir: String = match target {
+        None => match sh.env.get("HOME") {
+            None => {
+                eprintln!("wash: cd: HOME not set");
+                return 1;
+            }
+            // An empty $HOME is a successful no-op in bash.
+            Some(h) if h.is_empty() => return 0,
+            Some(h) => h.clone(),
+        },
+        Some(d) if d == "-" => match sh.env.get("OLDPWD").or(sh.oldpwd.as_ref()) {
+            None => {
+                eprintln!("wash: cd: OLDPWD not set");
+                return 1;
+            }
+            Some(p) if p.is_empty() => {
+                eprintln!("wash: cd: OLDPWD not set");
+                return 1;
+            }
+            Some(p) => {
+                print_result = true;
+                p.clone()
+            }
+        },
+        Some(d) if d.is_empty() => {
+            eprintln!("wash: cd: null directory");
+            return 1;
+        }
+        Some(d) => d,
+    };
+
+    // `$CDPATH` is consulted for relative directory names. The current
+    // directory is used when nothing matches.
+    let mut candidates: Vec<String> = Vec::new();
+    let is_plain_relative = !dir.starts_with('/')
+        && !dir.starts_with("./")
+        && !dir.starts_with("../")
+        && dir != "."
+        && dir != "..";
+    if is_plain_relative {
+        if let Some(cdpath) = sh.env.get("CDPATH") {
+            for elem in cdpath.split(':') {
+                if elem.is_empty() {
+                    continue;
+                }
+                candidates.push(format!("{}/{}", elem, dir));
+            }
+        }
+    }
+    candidates.push(dir.clone());
+
+    let mut chosen: Option<String> = None;
+    let mut last_errno = 0;
+    for cand in &candidates {
+        if posix::chdir(cand) == 0 {
+            chosen = Some(cand.clone());
+            break;
+        }
+        last_errno = posix::errno();
+    }
+
+    let chosen = match chosen {
+        Some(c) => c,
+        None => {
+            eprintln!(
+                "wash: cd: {}: {}",
+                dir,
+                posix::errno_message(last_errno)
+            );
+            return 1;
+        }
+    };
+    // bash prints the new directory when it was found through $CDPATH.
+    if candidates.len() > 1 && chosen != dir {
+        print_result = true;
+    }
+
+    let old_pwd = sh.cwd.clone();
+    let new_pwd = if physical {
+        posix::getcwd()
+    } else {
+        normalize_logical(&old_pwd, &chosen)
+    };
+
+    sh.cwd = new_pwd.clone();
+    sh.oldpwd = Some(old_pwd.clone());
+    sh.env.insert("PWD".to_string(), new_pwd.clone());
+    sh.env.insert("OLDPWD".to_string(), old_pwd);
+    sh.exported.insert("PWD".to_string());
+    sh.exported.insert("OLDPWD".to_string());
+
+    if print_result {
+        println!("{}", new_pwd);
+    }
+    0
+}
+
+/// Make `path` absolute relative to `base` and collapse `.`, `..` and
+/// duplicate separators *without* resolving symbolic links — bash's logical
+/// (`cd -L`) path computation.
+fn normalize_logical(base: &str, path: &str) -> String {
+    let full = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("{}/{}", base, path)
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in full.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            s => parts.push(s),
+        }
+    }
+    let mut out = String::from("/");
+    out.push_str(&parts.join("/"));
+    out
+}
+
+// ---------------------------------------------------------------------------
+// exit
+// ---------------------------------------------------------------------------
+
+/// The `exit` builtin: terminate the shell with the given status (or the
+/// status of the last command when no argument is given).
+fn builtin_exit(argv: &[String], sh: &mut Shell) -> i32 {
+    let code = if argv.len() > 1 {
+        let arg = &argv[1];
+        let (value, fully, _overflow) = posix::parse_long_long(arg);
+        if !fully {
+            eprintln!("wash: exit: {}: numeric argument required", arg);
+            2
+        } else {
+            (value & 0xff) as i32
+        }
+    } else {
+        sh.last_status
+    };
+    sh.exit_requested = Some(code);
+    code
+}
+
+// ---------------------------------------------------------------------------
+// export
+// ---------------------------------------------------------------------------
+
+/// The `export` builtin: mark variables for export, set their values or list
+/// the exported variables (`declare -x NAME="value"`).
+fn builtin_export(argv: &[String], sh: &mut Shell) -> i32 {
+    let mut print = false;
+    let mut unexport = false;
+    let mut i = 1usize;
+
+    while i < argv.len() {
+        let a = &argv[i];
+        if a == "--" {
+            i += 1;
+            break;
+        }
+        if a.len() > 1 && a.starts_with('-') {
+            match a.as_str() {
+                "-p" => print = true,
+                "-n" => unexport = true,
+                "-f" => {
+                    eprintln!("wash: export: -f: not supported");
+                    eprintln!("export: usage: export [-fn] [name[=value] ...] or export -p [-f]");
+                    return 2;
+                }
+                _ => {
+                    eprintln!("wash: export: {}: invalid option", a);
+                    eprintln!("export: usage: export [-fn] [name[=value] ...] or export -p [-f]");
+                    return 2;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        break;
+    }
+
+    if print || i >= argv.len() {
+        print_exported_variables(sh);
+        return 0;
+    }
+
+    for arg in &argv[i..] {
+        match arg.find('=') {
+            Some(eq) => {
+                let name = &arg[..eq];
+                let value = &arg[eq + 1..];
+                if !is_valid_ident(name) {
+                    eprintln!("wash: export: `{}': not a valid identifier", arg);
+                    return 1;
+                }
+                if unexport {
+                    sh.env.remove(name);
+                    sh.exported.remove(name);
+                    sh.null_exported.remove(name);
+                } else {
+                    sh.env.insert(name.to_string(), value.to_string());
+                    sh.exported.insert(name.to_string());
+                    sh.null_exported.remove(name);
+                }
+            }
+            None => {
+                if !is_valid_ident(arg) {
+                    eprintln!("wash: export: `{}': not a valid identifier", arg);
+                    return 1;
+                }
+                if unexport {
+                    sh.exported.remove(arg);
+                    sh.null_exported.remove(arg);
+                } else {
+                    sh.exported.insert(arg.to_string());
+                    if !sh.env.contains_key(arg) {
+                        // A variable that is exported without ever being
+                        // assigned has no value; bash prints it as
+                        // `declare -x NAME` (without `="..."`).
+                        sh.env.insert(arg.to_string(), String::new());
+                        sh.null_exported.insert(arg.to_string());
+                    }
+                }
+            }
+        }
+    }
+    0
+}
+
+/// Print the exported variables the way bash's `export -p` does.
+fn print_exported_variables(sh: &Shell) {
+    let mut names: Vec<&String> = sh.exported.iter().collect();
+    names.sort();
+    for name in names {
+        let attrs = export_attributes(sh, name);
+        let value = sh.env.get(name);
+        match value {
+            Some(v) if !sh.null_exported.contains(name) => {
+                println!("declare -{} {}={}", attrs, name, quote_double(v))
+            }
+            _ => println!("declare -{} {}", attrs, name),
+        }
+    }
+}
+
+/// The attribute letters bash prints in front of an exported variable
+/// (`declare -rx NAME=...`).
+fn export_attributes(sh: &Shell, name: &str) -> String {
+    let mut attrs = String::new();
+    if sh.integer_vars.contains(name) {
+        attrs.push('i');
+    }
+    if sh.readonly.contains(name) {
+        attrs.push('r');
+    }
+    attrs.push('x');
+    attrs
+}
+
+// ---------------------------------------------------------------------------
+// unset
+// ---------------------------------------------------------------------------
+
+/// The `unset` builtin: remove variables (`-v`, the default) or functions
+/// (`-f`).
+fn builtin_unset(argv: &[String], sh: &mut Shell) -> i32 {
+    let mut functions = false;
+    let mut i = 1usize;
+
+    while i < argv.len() {
+        let a = &argv[i];
+        if a == "--" {
+            i += 1;
+            break;
+        }
+        if a.len() > 1 && a.starts_with('-') {
+            match a.as_str() {
+                "-f" => functions = true,
+                "-v" => functions = false,
+                // `-n` names a nameref; nothing to do for us.
+                "-n" => {}
+                _ => {
+                    eprintln!("wash: unset: {}: invalid option", a);
+                    eprintln!("unset: usage: unset [-f] [-v] [-n] [name ...]");
+                    return 2;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        break;
+    }
+
+    for name in &argv[i..] {
+        if functions {
+            sh.functions.remove(name);
+        } else {
+            sh.env.remove(name);
+            sh.exported.remove(name);
+            sh.null_exported.remove(name);
+            sh.readonly.remove(name);
+            sh.integer_vars.remove(name);
+        }
+    }
+    0
+}
+
+// ---------------------------------------------------------------------------
+// set
+// ---------------------------------------------------------------------------
+
+/// The `set` builtin: toggle shell options, set the positional parameters or
+/// list the shell variables.
+fn builtin_set(argv: &[String], sh: &mut Shell) -> i32 {
+    if argv.len() == 1 {
+        print_all_variables(sh);
+        return 0;
+    }
+
+    let mut i = 1usize;
+    let mut positional_args = false;
+    // The option changes are collected first and applied at the end: bash does
+    // not apply anything when the command line contains an invalid option.
+    let mut changes: Vec<(char, bool)> = Vec::new();
+    let mut named: Vec<(String, bool)> = Vec::new();
+    // bash prints the option table (or the `set +o` listing) while parsing and
+    // reports a different exit status when it did so.
+    let mut printed_table = false;
+
+    while i < argv.len() {
+        let a = argv[i].clone();
+        if a == "--" {
+            i += 1;
+            positional_args = true;
+            break;
+        }
+        if a == "-" {
+            // `set -` clears the positional parameters and turns off -v/-x.
+            sh.options.verbose = false;
+            sh.options.xtrace = false;
+            sh.positional.clear();
+            return 0;
+        }
+        if a.len() > 1 && (a.starts_with('-') || a.starts_with('+')) {
+            let enable = a.starts_with('-');
+            let cluster: Vec<char> = a.chars().skip(1).collect();
+            let mut k = 0usize;
+            while k < cluster.len() {
+                let ch = cluster[k];
+                if ch == 'o' {
+                    if k + 1 == cluster.len() {
+                        // `set -o NAME` / `set -o`: the option name is the next
+                        // argument; without one the option table is printed.
+                        if i + 1 < argv.len() && !is_option_argument(&argv[i + 1]) {
+                            named.push((argv[i + 1].clone(), enable));
+                            i += 1;
+                        } else {
+                            if enable {
+                                print_option_table(sh);
+                            } else {
+                                print_option_list(sh);
+                            }
+                            printed_table = true;
+                        }
+                    } else {
+                        // bash keeps parsing the rest of the cluster as short
+                        // options and prints the table for the `o`.
+                        if enable {
+                            print_option_table(sh);
+                        } else {
+                            print_option_list(sh);
+                        }
+                        printed_table = true;
+                    }
+                    k += 1;
+                    continue;
+                }
+                if !is_valid_short_option(ch) {
+                    let sign = if enable { '-' } else { '+' };
+                    eprintln!("wash: set: {}{}: invalid option", sign, ch);
+                    eprintln!(
+                        "set: usage: set [-abefhkmnptuvxBCEHPT] [-o option-name] [--] [-] [arg ...]"
+                    );
+                    return if printed_table { 1 } else { 2 };
+                }
+                changes.push((ch, enable));
+                k += 1;
+            }
+            i += 1;
+            continue;
+        }
+        break;
+    }
+
+    for (ch, enable) in changes {
+        if enable {
+            apply_short_option(ch, sh);
+        } else {
+            unset_short_option(ch, sh);
+        }
+    }
+    for (name, enable) in named {
+        if !set_named_option(sh, &name, enable) {
+            return 2;
+        }
+    }
+
+    // Everything that is left over becomes the positional parameters.
+    if positional_args || i < argv.len() {
+        sh.positional = argv[i..].to_vec();
+    }
+    0
+}
+
+/// True when `arg` looks like an option rather than an option name.
+fn is_option_argument(arg: &str) -> bool {
+    arg.len() > 1 && (arg.starts_with('-') || arg.starts_with('+'))
+}
+
+/// True for the single-letter options bash's `set` accepts.
+fn is_valid_short_option(ch: char) -> bool {
+    matches!(
+        ch,
+        'a' | 'b' | 'e' | 'f' | 'h' | 'k' | 'm' | 'n' | 'p' | 't' | 'u' | 'v' | 'x' | 'B' | 'C'
+            | 'E' | 'H' | 'P' | 'T'
+    )
+}
+
+/// Enable or disable the option with the given `set -o` name.
+fn set_named_option(sh: &mut Shell, name: &str, enable: bool) -> bool {
+    if sh.options.set(name, enable) {
+        true
+    } else {
+        eprintln!("wash: set: {}: invalid option name", name);
+        false
+    }
+}
+
+/// Apply a `set -X` short option. Returns false for an unknown option.
+fn apply_short_option(ch: char, sh: &mut Shell) -> bool {
+    match ch {
+        'a' => sh.options.allexport = true,
+        'b' => sh.options.notify = true,
+        'e' => sh.options.errexit = true,
+        'f' => sh.options.noglob = true,
+        'h' => sh.options.hashall = true,
+        'k' => sh.options.keyword = true,
+        'm' => sh.options.monitor = true,
+        'n' => sh.options.noexec = true,
+        'p' => sh.options.privileged = true,
+        // `set -t` is a one-shot xtrace in bash; the option is accepted but
+        // the one-shot behaviour is not implemented.
+        't' => {}
+        'u' => sh.options.nounset = true,
+        'v' => sh.options.verbose = true,
+        'x' => sh.options.xtrace = true,
+        'B' => sh.options.braceexpand = true,
+        'C' => sh.options.noclobber = true,
+        'E' => sh.options.errtrace = true,
+        'H' => sh.options.histexpand = true,
+        'P' => sh.options.physical = true,
+        'T' => sh.options.functrace = true,
+        _ => return false,
+    }
+    true
+}
+
+/// Turn off a `set +X` short option. Returns false for an unknown option.
+fn unset_short_option(ch: char, sh: &mut Shell) -> bool {
+    match ch {
+        'a' => sh.options.allexport = false,
+        'b' => sh.options.notify = false,
+        'e' => sh.options.errexit = false,
+        'f' => sh.options.noglob = false,
+        'h' => sh.options.hashall = false,
+        'k' => sh.options.keyword = false,
+        'm' => sh.options.monitor = false,
+        'n' => sh.options.noexec = false,
+        'p' => sh.options.privileged = false,
+        't' => {}
+        'u' => sh.options.nounset = false,
+        'v' => sh.options.verbose = false,
+        'x' => sh.options.xtrace = false,
+        'B' => sh.options.braceexpand = false,
+        'C' => sh.options.noclobber = false,
+        'E' => sh.options.errtrace = false,
+        'H' => sh.options.histexpand = false,
+        'P' => sh.options.physical = false,
+        'T' => sh.options.functrace = false,
+        _ => return false,
+    }
+    true
+}
+
+/// Print the `set -o` table: the option name padded to 15 columns, a tab and
+/// its state.
+fn print_option_table(sh: &Shell) {
+    for name in SET_O_ORDER {
+        let state = if sh.options.get(name).unwrap_or(false) {
+            "on"
+        } else {
+            "off"
+        };
+        println!("{:<15}\t{}", name, state);
+    }
+}
+
+/// Print the `set +o` listing: one `set -o name` / `set +o name` line per
+/// option.
+fn print_option_list(sh: &Shell) {
+    for name in SET_O_ORDER {
+        let flag = if sh.options.get(name).unwrap_or(false) {
+            '-'
+        } else {
+            '+'
+        };
+        println!("set {}o {}", flag, name);
+    }
+}
+
+/// Print every shell variable the way bash's `set` (without arguments) does.
+fn print_all_variables(sh: &Shell) {
+    let mut names: Vec<&String> = sh.env.keys().collect();
+    names.sort();
+    for name in names {
+        let value = sh.env.get(name).cloned().unwrap_or_default();
+        println!("{}={}", name, quote_for_set(&value));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// alias / unalias
+// ---------------------------------------------------------------------------
+
+/// The `alias` builtin: define, query or list aliases.
+fn builtin_alias(argv: &[String], sh: &mut Shell) -> i32 {
+    let mut print = false;
+    let mut i = 1usize;
+
+    while i < argv.len() {
+        let a = &argv[i];
+        if a == "--" {
+            i += 1;
+            break;
+        }
+        if a.len() > 1 && a.starts_with('-') {
+            match a.as_str() {
+                "-p" => print = true,
+                _ => {
+                    eprintln!("wash: alias: {}: invalid option", a);
+                    eprintln!("alias: usage: alias [-p] [name[=value] ... ]");
+                    return 2;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        break;
+    }
+
+    if print || i >= argv.len() {
+        let mut names: Vec<&String> = sh.aliases.keys().collect();
+        names.sort();
+        for name in names {
+            println!("alias {}={}", name, quote_single(sh.aliases.get(name).unwrap()));
+        }
+        return 0;
+    }
+
+    let mut status = 0;
+    for arg in &argv[i..] {
+        match arg.find('=') {
+            Some(eq) => {
+                let name = arg[..eq].to_string();
+                let value = arg[eq + 1..].to_string();
+                sh.aliases.insert(name, value);
+            }
+            None => match sh.aliases.get(arg) {
+                Some(value) => println!("alias {}={}", arg, quote_single(value)),
+                None => {
+                    eprintln!("wash: alias: {}: not found", arg);
+                    status = 1;
+                }
+            },
+        }
+    }
+    status
+}
+
+/// The `unalias` builtin: remove one or all aliases.
+fn builtin_unalias(argv: &[String], sh: &mut Shell) -> i32 {
+    let mut all = false;
+    let mut i = 1usize;
+
+    while i < argv.len() {
+        let a = &argv[i];
+        if a == "--" {
+            i += 1;
+            break;
+        }
+        if a.len() > 1 && a.starts_with('-') {
+            match a.as_str() {
+                "-a" => all = true,
+                _ => {
+                    eprintln!("wash: unalias: {}: invalid option", a);
+                    eprintln!("unalias: usage: unalias [-a] name [name ...]");
+                    return 2;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        break;
+    }
+
+    if all {
+        sh.aliases.clear();
+        return 0;
+    }
+
+    let mut status = 0;
+    for name in &argv[i..] {
+        if sh.aliases.remove(name).is_none() {
+            eprintln!("wash: unalias: {}: not found", name);
+            status = 1;
+        }
+    }
+    status
+}
+
+// ---------------------------------------------------------------------------
+// source / .
+// ---------------------------------------------------------------------------
+
+/// The `source` builtin (also spelled `.`): run a script in the current
+/// shell.
+fn builtin_source(argv: &[String], sh: &mut Shell) -> i32 {
+    if argv.len() < 2 {
+        eprintln!("wash: source: filename argument required");
+        eprintln!("source: usage: source [-p path] filename [arguments]");
+        return 2;
+    }
+    let name = argv[1].clone();
+    let path = match find_source_file(&name, sh) {
+        Some(p) => p,
+        None => {
+            eprintln!("wash: {}: {}", name, posix::errno_message(posix::errno()));
+            return 1;
+        }
+    };
+    let content = match posix::read_file(&path) {
+        Some(c) => c,
+        None => {
+            eprintln!("wash: {}: {}", path, posix::errno_message(posix::errno()));
+            return 1;
+        }
+    };
+
+    // The script gets its own positional parameters and `$0`.
+    let saved_positional = std::mem::replace(&mut sh.positional, argv[2..].to_vec());
+    let saved_zero = std::mem::replace(&mut sh.dollar_zero, path.clone());
+    let code = sh.run_str(&content);
+    sh.positional = saved_positional;
+    sh.dollar_zero = saved_zero;
+    code
+}
+
+/// Locate a script: an explicit path is used as given, otherwise the current
+/// directory is searched first and `$PATH` afterwards.
+fn find_source_file(name: &str, sh: &Shell) -> Option<String> {
+    if name.contains('/') {
+        if posix::access(name, posix::R_OK) == 0 {
+            return Some(name.to_string());
+        }
+        return None;
+    }
+    if posix::access(name, posix::R_OK) == 0 {
+        return Some(name.to_string());
+    }
+    let path = sh.env.get("PATH").cloned().unwrap_or_default();
+    for dir in path.split(':') {
+        if dir.is_empty() {
+            continue;
+        }
+        let candidate = format!("{}/{}", dir, name);
+        if posix::access(&candidate, posix::R_OK) == 0 {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// eval
+// ---------------------------------------------------------------------------
+
+/// The `eval` builtin: concatenate the arguments and run them as a command
+/// in the current shell.
+fn builtin_eval(argv: &[String], sh: &mut Shell) -> i32 {
+    let command = argv[1..].join(" ");
+    if command.trim().is_empty() {
+        return 0;
+    }
+    sh.run_str(&command)
+}
+
+// ---------------------------------------------------------------------------
+// exec
+// ---------------------------------------------------------------------------
+
+/// The `exec` builtin: replace the shell with the given command, or apply
+/// the redirections permanently when no command is given.
+fn builtin_exec(argv: &[String], sh: &mut Shell) -> i32 {
+    let mut i = 1usize;
+    let mut argv0: Option<String> = None;
+
+    while i < argv.len() {
+        let a = &argv[i];
+        if a == "--" {
+            i += 1;
+            break;
+        }
+        if a == "-a" {
+            if i + 1 >= argv.len() {
+                eprintln!("wash: exec: -a: option requires an argument");
+                eprintln!("exec: usage: exec [-a name] [command [arguments ...]] [redirection ...]");
+                return 2;
+            }
+            argv0 = Some(argv[i + 1].clone());
+            i += 2;
+            continue;
+        }
+        if a.len() > 1 && a.starts_with('-') {
+            eprintln!("wash: exec: {}: invalid option", a);
+            eprintln!("exec: usage: exec [-a name] [command [arguments ...]] [redirection ...]");
+            return 2;
+        }
+        break;
+    }
+
+    if i >= argv.len() {
+        // `exec` with redirections only: the redirections have already been
+        // applied to the shell and must not be undone.
+        sh.persistent_redirs = true;
+        return 0;
+    }
+
+    let mut command = argv[i..].to_vec();
+    let program = command[0].clone();
+    if let Some(name) = argv0 {
+        // `-a name` replaces argv[0] of the new program, not the program name.
+        command[0] = name;
+    }
+    let path = sh.env.get("PATH").cloned().unwrap_or_default();
+    let env = sh.child_env();
+    let (_cstrings, env_ptrs) = crate::executor::build_env_ptrs(&env);
+    match crate::executor::find_executable(&program, &path) {
+        Some(exe) => {
+            let argvec = crate::executor::ArgVec::from(&command);
+            crate::executor::execve(&exe, &argvec.ptrs, &env_ptrs);
+            let code = posix::errno();
+            eprintln!(
+                "wash: exec: {}: {}",
+                program,
+                posix::errno_message(code)
+            );
+            // A failed `exec` terminates a non-interactive shell.
+            sh.exit_requested = Some(127);
+            127
+        }
+        None => {
+            eprintln!("wash: exec: {}: not found", program);
+            // A failed `exec` terminates a non-interactive shell.
+            sh.exit_requested = Some(127);
+            127
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
