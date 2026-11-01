@@ -38,6 +38,7 @@ const BUILTINS: &[&str] = &[
     "export",
     "printf",
     "set",
+    "shift",
     "source",
     "unalias",
     "unset",
@@ -59,6 +60,7 @@ pub fn run_builtin(argv: &[String], sh: &mut Shell) -> Option<i32> {
         "export" => builtin_export(argv, sh),
         "unset" => builtin_unset(argv, sh),
         "set" => builtin_set(argv, sh),
+        "shift" => builtin_shift(argv, sh),
         "alias" => builtin_alias(argv, sh),
         "unalias" => builtin_unalias(argv, sh),
         "source" | "." => builtin_source(argv, sh),
@@ -644,6 +646,61 @@ fn print_all_variables(sh: &Shell) {
         let value = sh.env.get(name).cloned().unwrap_or_default();
         println!("{}={}", name, quote_for_set(&value));
     }
+}
+
+// ---------------------------------------------------------------------------
+// shift
+// ---------------------------------------------------------------------------
+
+/// The `shift` builtin: drop the first positional parameters.
+///
+/// `shift [n]` removes the first `n` positional parameters (`n` defaults to
+/// 1).  bash's error handling is reproduced exactly:
+///
+///   * a non-numeric argument   -> "shift: <arg>: numeric argument required",
+///                                 exit status 2;
+///   * a negative count         -> "shift: <arg>: shift count out of range",
+///                                 exit status 1;
+///   * a count larger than `$#` -> no message at all, exit status 1;
+///   * more than one argument   -> "shift: too many arguments", exit status 1;
+///                                 this error terminates the shell.
+fn builtin_shift(argv: &[String], sh: &mut Shell) -> i32 {
+    // `--` ends the option list and is removed; the count may follow it.
+    let mut args: Vec<&str> = argv[1..].iter().map(|s| s.as_str()).collect();
+    if args.first() == Some(&"--") {
+        args.remove(0);
+    }
+
+    if args.len() > 1 {
+        eprintln!("wash: shift: too many arguments");
+        // bash aborts the shell on this usage error.
+        sh.exit_requested = Some(1);
+        return 1;
+    }
+
+    let count: i64 = match args.first() {
+        None => 1,
+        Some(arg) => {
+            let (value, fully, overflow) = posix::parse_long_long(arg);
+            if !fully || overflow {
+                eprintln!("wash: shift: {}: numeric argument required", arg);
+                return 2;
+            }
+            if value < 0 {
+                eprintln!("wash: shift: {}: shift count out of range", arg);
+                return 1;
+            }
+            value
+        }
+    };
+
+    let count = count as usize;
+    if count > sh.positional.len() {
+        // bash stays silent when the count exceeds the number of parameters.
+        return 1;
+    }
+    sh.positional.drain(0..count);
+    0
 }
 
 // ---------------------------------------------------------------------------
