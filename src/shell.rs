@@ -230,6 +230,10 @@ pub struct Shell {
     /// must survive the builtin instead of being undone.
     pub persistent_redirs: bool,
 
+    /// True while the interactive REPL is running. Bash only expands aliases
+    /// in interactive shells unless the `expand_aliases` shell option is set.
+    pub interactive: bool,
+
     /// Set by `return` so the enclosing `source`/function can stop.
     pub return_requested: Option<i32>,
     /// Set by `break`/`continue` (loop context owned by Phase 3).
@@ -287,6 +291,7 @@ impl Shell {
             null_exported: HashSet::new(),
             dollar_zero: "wash".to_string(),
             persistent_redirs: false,
+            interactive: false,
             return_requested: None,
             break_requested: None,
             continue_requested: None,
@@ -350,6 +355,9 @@ impl Shell {
     }
 
     pub fn run_interactive(&mut self) {
+        // Aliases are only expanded in interactive shells (bash's
+        // `expand_aliases` shell option is off by default elsewhere).
+        self.interactive = true;
         crate::repl::run(self);
     }
 }

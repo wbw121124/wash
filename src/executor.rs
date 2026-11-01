@@ -451,6 +451,81 @@ struct Prepared {
     shell_env: HashMap<String, String>,
 }
 
+/// The maximum alias expansion depth (guards against an alias whose body
+/// expands to itself).
+const MAX_ALIAS_DEPTH: usize = 16;
+
+/// The name of the alias a command word refers to, if any.
+///
+/// Only a plain, unquoted literal word can name an alias; anything else is
+/// left alone (bash behaves the same way).
+fn alias_name(word: &[WordPart]) -> Option<String> {
+    match word {
+        [WordPart::Text(text, false)] => Some(text.clone()),
+        _ => None,
+    }
+}
+
+/// Expand the aliases used by the commands of a command list.
+///
+/// Bash expands aliases only in interactive shells (the `expand_aliases`
+/// shell option is off by default in non-interactive shells), so the
+/// expansion is skipped for `wash -c` and for scripts.
+fn expand_aliases(list: &CommandList, sh: &Shell, depth: usize) -> Vec<Pipeline> {
+    if !sh.interactive {
+        return list.pipelines.clone();
+    }
+    let mut out = Vec::new();
+    for pipeline in &list.pipelines {
+        if depth < MAX_ALIAS_DEPTH {
+            if let Some(expanded) = expand_alias_in_pipeline(pipeline, sh, depth) {
+                out.extend(expanded);
+                continue;
+            }
+        }
+        out.push(pipeline.clone());
+    }
+    out
+}
+
+/// If the first command of `pipeline` starts with an alias, return the
+/// pipelines the alias expands to.
+///
+/// Bash replaces the command word with the alias text and parses the result
+/// again, so an alias body may contain complete commands, pipes or
+/// redirections. The arguments of the original command are appended to the
+/// last command of the alias body.
+fn expand_alias_in_pipeline(
+    pipeline: &Pipeline,
+    sh: &Shell,
+    depth: usize,
+) -> Option<Vec<Pipeline>> {
+    let first = pipeline.commands.first()?;
+    let name = alias_name(first.argv.first()?)?;
+    let value = sh.aliases.get(&name)?.clone();
+    let tokens = crate::lexer::tokenize(&value).ok()?;
+    let list = crate::parser::parse_command_list(&tokens).ok()?;
+    if list.pipelines.is_empty() {
+        return None;
+    }
+    let mut pipelines = list.pipelines;
+    let extra: Vec<Vec<WordPart>> = first.argv[1..].to_vec();
+    if !extra.is_empty() {
+        if let Some(last) = pipelines.last_mut().and_then(|pl| pl.commands.last_mut()) {
+            last.argv.extend(extra);
+        }
+    }
+    // The alias body may itself start with an alias.
+    let mut out = Vec::new();
+    for pipeline in &pipelines {
+        let single = CommandList {
+            pipelines: vec![pipeline.clone()],
+        };
+        out.extend(expand_aliases(&single, sh, depth + 1));
+    }
+    Some(out)
+}
+
 fn prepare(p: &Pipeline, sh: &Shell) -> Vec<Prepared> {
     let attrs = sh.attrs();
     let ctx = ExpandCtx {
@@ -572,8 +647,9 @@ pub fn execute(list: &CommandList, sh: &mut Shell) -> i32 {
     let path = sh.env.get("PATH").cloned().unwrap_or_default();
 
     let mut last = 0;
-    for p in &list.pipelines {
-        last = execute_pipeline(p, sh, &path);
+    // Aliases are expanded before the commands run.
+    for p in expand_aliases(list, sh, 0) {
+        last = execute_pipeline(&p, sh, &path);
         // Propagate exit status so `$?` reflects the previous command.
         sh.last_status = last;
         // `exit` stops the shell, `set -e` stops it on a failure.
