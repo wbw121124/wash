@@ -257,17 +257,44 @@ fn normalize_logical(base: &str, path: &str) -> String {
 // exit
 // ---------------------------------------------------------------------------
 
+/// Parse `s` the way bash's `legal_number` does: an optional sign followed
+/// by decimal digits, surrounded by optional whitespace.
+///
+/// The number is read in BASE 10, so "08" is eight (not an invalid octal
+/// literal) and "0x10" is not a number at all.  A value that does not fit
+/// into a 64-bit integer is rejected, exactly like bash's ERANGE check.
+///
+/// Returns `None` when `s` is not a legal number.
+fn parse_bash_number(s: &str) -> Option<i64> {
+    let t = s.trim();
+    let (sign, digits) = match t.strip_prefix('-') {
+        Some(rest) => (-1i64, rest),
+        None => (1i64, t.strip_prefix('+').unwrap_or(t)),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<i64>().ok().map(|v| sign * v)
+}
+
 /// The `exit` builtin: terminate the shell with the given status (or the
 /// status of the last command when no argument is given).
+///
+/// A non-numeric argument is a *recoverable* error in bash: the builtin
+/// reports it and returns 2, but the shell keeps running and the next
+/// command is executed.  Only a legal number terminates the shell.
 fn builtin_exit(argv: &[String], sh: &mut Shell) -> i32 {
     let code = if argv.len() > 1 {
         let arg = &argv[1];
-        let (value, fully, _overflow) = posix::parse_long_long(arg);
-        if !fully {
-            eprintln!("wash: exit: {}: numeric argument required", arg);
-            2
-        } else {
-            (value & 0xff) as i32
+        match parse_bash_number(arg) {
+            None => {
+                eprintln!("wash: exit: {}: numeric argument required", arg);
+                // bash does NOT terminate the shell here: the error is
+                // reported, the status becomes 2 and the next command
+                // still runs.
+                return 2;
+            }
+            Some(value) => (value & 0xff) as i32,
         }
     } else {
         sh.last_status
