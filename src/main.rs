@@ -1,6 +1,8 @@
 // wash entry point. Phase 0: supports `-c <command>` (non-interactive, used
 // for oracle comparison tests) and a plain interactive REPL.
 
+mod arith;
+mod builtins;
 mod error;
 mod executor;
 mod expand;

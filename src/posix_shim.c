@@ -15,6 +15,9 @@
 #include <fcntl.h>
 #include <sys/wait.h>
 #include <sys/types.h>
+#include <sys/times.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
 #include <stdlib.h>
 #include <signal.h>
 #include <stdio.h>
@@ -23,6 +26,7 @@
 #include <errno.h>
 #include <termios.h>
 #include <poll.h>
+#include <limits.h>
 
 int wash_fork(void) { return fork(); }
 
@@ -52,12 +56,217 @@ int wash_setsid(void) { return setsid(); }
 
 int wash_setpgid(int pid, int pgid) { return setpgid(pid, pgid); }
 
-// Open for writing. `append` selects O_APPEND instead of O_TRUNC.
-int wash_open_write(const char *path, int append) {
+// Open for writing. `append` selects O_APPEND instead of O_TRUNC. When
+// `noclobber` is set, O_TRUNC opens of an existing file fail with EEXIST
+// (bash `set -C` semantics).
+int wash_open_write(const char *path, int append, int noclobber) {
     int flags = O_WRONLY | O_CREAT;
-    flags |= append ? O_APPEND : O_TRUNC;
+    if (append) {
+        flags |= O_APPEND;
+    } else if (noclobber) {
+        flags |= O_EXCL;
+    } else {
+        flags |= O_TRUNC;
+    }
     return open(path, flags, 0644);
 }
+
+// Duplicate a file descriptor (used to save/restore fds around builtins).
+int wash_dup(int fd) { return dup(fd); }
+
+// umask: get and set. `wash_umask_get` returns the current mask without
+// changing it; `wash_umask_set` installs `mode` and returns the previous mask.
+int wash_umask_get(void) {
+    int old = umask(0);
+    umask(old);
+    return old;
+}
+int wash_umask_set(int mode) {
+    return umask(mode);
+}
+
+// Fill the four `times()` fields (self/user, self/system, children/user,
+// children/system) expressed in SECONDS (double). Returns 0 on success.
+int wash_times(double *u, double *s, double *cu, double *cs) {
+    struct tms t;
+    clock_t r = times(&t);
+    if (r == (clock_t)-1) return -1;
+    long clk = sysconf(_SC_CLK_TCK);
+    if (clk <= 0) clk = 100;
+    double tick = 1.0 / (double)clk;
+    *u = (double)t.tms_utime * tick;
+    *s = (double)t.tms_stime * tick;
+    *cu = (double)t.tms_cutime * tick;
+    *cs = (double)t.tms_cstime * tick;
+    return 0;
+}
+
+// setrlimit / getrlimit wrappers. `cur`/`max` are rlim_t values; when
+// `set` is 0 only the current soft limit is retrieved into `*cur`.
+int wash_rlimit(int resource, rlim_t cur, rlim_t max, int set, rlim_t *got) {
+    if (!set) {
+        struct rlimit rl;
+        if (getrlimit(resource, &rl) != 0) return -1;
+        *got = rl.rlim_cur;
+        return 0;
+    }
+    struct rlimit rl;
+    rl.rlim_cur = cur;
+    rl.rlim_max = max;
+    if (setrlimit(resource, &rl) != 0) return -1;
+    *got = cur;
+    return 0;
+}
+
+// Map a bash `ulimit` resource letter to the native RLIMIT_* constant (or -1
+// if unsupported). MSYS2's <sys/resource.h> only defines CPU, FSIZE, DATA,
+// STACK, CORE, NOFILE and AS — RLIMIT_NPROC / RLIMIT_RSS / RLIMIT_MEMLOCK do
+// not exist there, so they are guarded by #ifdef.
+int wash_rlimit_resource(char which) {
+    switch (which) {
+        case 'f': return RLIMIT_FSIZE;
+        case 'c': return RLIMIT_CORE;
+        case 'd': return RLIMIT_DATA;
+        case 's': return RLIMIT_STACK;
+        case 't': return RLIMIT_CPU;
+        case 'n': return RLIMIT_NOFILE;
+        case 'v': return RLIMIT_AS;
+        case 'u':
+#ifdef RLIMIT_NPROC
+            return RLIMIT_NPROC;
+#else
+            return -1;
+#endif
+        case 'm':
+#ifdef RLIMIT_RSS
+            return RLIMIT_RSS;
+#else
+            return -1;
+#endif
+        case 'l':
+#ifdef RLIMIT_MEMLOCK
+            return RLIMIT_MEMLOCK;
+#else
+            return -1;
+#endif
+        default: return -1;
+    }
+}
+
+// getcwd(3): current working directory as an msys-style path ("/d/foo/bar").
+// Needed by `pwd -P` and by `cd -P`.
+char *wash_getcwd(void) {
+    static char buf[4096];
+    if (getcwd(buf, sizeof(buf)) == NULL) {
+        buf[0] = '\0';
+    }
+    return buf;
+}
+
+// chdir + getcwd combined, returning the new absolute path (msys style).
+// `logical` selects whether symbolic links are resolved (physical) or kept
+// (logical) — mirrors bash's `cd -L` / `cd -P`.
+char *wash_chdir_getcwd(const char *path, int physical) {
+    static char buf[4096];
+    if (chdir(path) != 0) {
+        buf[0] = '\0';
+        return buf;
+    }
+    if (physical) {
+        if (getcwd(buf, sizeof(buf)) == NULL) {
+            buf[0] = '\0';
+        }
+    } else {
+        /* Logical: keep the user-supplied path, just make it absolute. */
+        if (path[0] == '/') {
+            strncpy(buf, path, sizeof(buf) - 1);
+            buf[sizeof(buf) - 1] = '\0';
+        } else {
+            char cwdbuf[4096];
+            if (getcwd(cwdbuf, sizeof(cwdbuf)) == NULL) {
+                buf[0] = '\0';
+                return buf;
+            }
+            snprintf(buf, sizeof(buf), "%s/%s", cwdbuf, path);
+        }
+    }
+    return buf;
+}
+
+// Realpath(3): resolve symbolic links in PATH and return the canonical path.
+char *wash_realpath(const char *path) {
+    static char buf[4096];
+    char *r = realpath(path, buf);
+    if (r == NULL) {
+        buf[0] = '\0';
+    }
+    return buf;
+}
+
+// The current value of errno. Rust reads this right after a failing shim
+// call to produce bash-style diagnostics ("No such file or directory", ...).
+int wash_errno(void) { return errno; }
+
+// Read an entire file into the caller's buffer. When `buf` is NULL only the
+// file size is reported. Returns the number of bytes read, or -1 on error
+// (errno is set by the underlying stdio call).
+long wash_read_file(const char *path, char *buf, size_t n) {
+    FILE *fp;
+    size_t got;
+    long size;
+
+    fp = fopen (path, "rb");
+    if (fp == NULL)
+        return -1;
+    if (fseek (fp, 0, SEEK_END) != 0) {
+        fclose (fp);
+        return -1;
+    }
+    size = ftell (fp);
+    if (size < 0) {
+        fclose (fp);
+        return -1;
+    }
+    rewind (fp);
+    if (buf == NULL) {
+        fclose (fp);
+        return size;
+    }
+    if ((size_t) size >= n) {
+        fclose (fp);
+        errno = ENOMEM;
+        return -1;
+    }
+    got = fread (buf, 1, (size_t) size, fp);
+    fclose (fp);
+    buf[got] = '\0';
+    return (long) got;
+}
+
+// kill(3) wrapper already present; also expose the signal number for a name.
+int wash_signal_number(const char *name) {
+    static const struct { const char *name; int num; } sigs[] = {
+        { "HUP", 1 }, { "INT", 2 }, { "QUIT", 3 }, { "ILL", 4 }, { "TRAP", 5 },
+        { "ABRT", 6 }, { "IOT", 6 }, { "EMT", 7 }, { "FPE", 8 }, { "KILL", 9 },
+        { "BUS", 10 }, { "SEGV", 11 }, { "SYS", 12 }, { "PIPE", 13 },
+        { "ALRM", 14 }, { "TERM", 15 }, { "URG", 16 }, { "STOP", 17 },
+        { "TSTP", 18 }, { "CONT", 19 }, { "CHLD", 20 }, { "TTIN", 21 },
+        { "TTOU", 22 }, { "IO", 23 }, { "XCPU", 24 }, { "XFSZ", 25 },
+        { "VTALRM", 26 }, { "PROF", 27 }, { "WINCH", 28 }, { "PWR", 29 },
+        { "USR1", 30 }, { "USR2", 31 }, { "RTMIN", 32 }, { "RTMAX", 64 },
+        { NULL, 0 }
+    };
+    int i;
+    for (i = 0; sigs[i].name; i++) {
+        if (strcmp(name, sigs[i].name) == 0) {
+            return sigs[i].num;
+        }
+    }
+    return -1;
+}
+
+// Number of the highest signal bash knows about (64 on this platform).
+int wash_nsig(void) { return 64; }
 
 // Open for reading.
 int wash_open_read(const char *path) { return open(path, O_RDONLY); }

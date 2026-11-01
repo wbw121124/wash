@@ -43,11 +43,17 @@ pub fn parse_command_list(tokens: &[Token]) -> Result<CommandList> {
                 stage.clear();
             }
             Token::Semicolon => {
-                current_cmds.push(parse_simple(&stage)?);
-                stage.clear();
-                pipelines.push(Pipeline {
-                    commands: std::mem::take(&mut current_cmds),
-                });
+                // An empty command (e.g. two consecutive separators) is not a
+                // command at all and must not change `$?`.
+                if !stage.is_empty() {
+                    current_cmds.push(parse_simple(&stage)?);
+                    stage.clear();
+                }
+                if !current_cmds.is_empty() {
+                    pipelines.push(Pipeline {
+                        commands: std::mem::take(&mut current_cmds),
+                    });
+                }
             }
             Token::Background => {
                 return Err(WashError::syntax("background jobs not supported yet (Phase 2)"));

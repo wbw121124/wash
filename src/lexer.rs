@@ -228,6 +228,10 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                 flush_text(&mut pending, &mut parts, pending_quoted);
                 pending_quoted = false;
                 in_single = false;
+                // An empty quoted string is still a word (`""`).
+                if parts.is_empty() {
+                    parts.push(WordPart::Text(String::new(), true));
+                }
             } else {
                 pending.push(c);
             }
@@ -240,6 +244,10 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                     flush_text(&mut pending, &mut parts, pending_quoted);
                     pending_quoted = false;
                     in_double = false;
+                    // An empty quoted string is still a word (`""`).
+                    if parts.is_empty() {
+                        parts.push(WordPart::Text(String::new(), true));
+                    }
                 }
                 '$' => {
                     flush_text(&mut pending, &mut parts, pending_quoted);
@@ -336,7 +344,11 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
             }
             '\\' => {
                 if i + 1 < n {
-                    pending.push(chars[i + 1]);
+                    // A backslash-newline is a line continuation: both
+                    // characters are dropped.
+                    if chars[i + 1] != '\n' {
+                        pending.push(chars[i + 1]);
+                    }
                     i += 2;
                 } else {
                     i += 1;
@@ -347,6 +359,15 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                 if !parts.is_empty() {
                     tokens.push(Token::Word(std::mem::take(&mut parts)));
                 }
+                i += 1;
+            }
+            '\n' => {
+                // A newline terminates the current command, exactly like `;`.
+                flush_text(&mut pending, &mut parts, pending_quoted);
+                if !parts.is_empty() {
+                    tokens.push(Token::Word(std::mem::take(&mut parts)));
+                }
+                tokens.push(Token::Semicolon);
                 i += 1;
             }
             '|' => {
@@ -441,6 +462,17 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                     parts.push(WordPart::Text("${".to_string(), false));
                     i += 1;
                     continue;
+                } else if i < n && chars[i] == '\'' {
+                    // ANSI-C quoted string: $'...'
+                    if let Some((text, ni)) = read_ansi_c(&chars, i - 1) {
+                        flush_text(&mut pending, &mut parts, pending_quoted);
+                        parts.push(WordPart::Text(text, true));
+                        i = ni;
+                        continue;
+                    }
+                    parts.push(WordPart::Text("$".to_string(), false));
+                    i += 1;
+                    continue;
                 } else {
                     let name = read_var_name(&chars, i);
                     i += name.chars().count();
@@ -505,6 +537,86 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
     }
 
     Ok(tokens)
+}
+
+/// Decode a bash ANSI-C quoted string (`$'...'`). `chars[i]` must be the `$`
+/// and `chars[i + 1]` the opening quote. Returns the decoded text and the
+/// index just after the closing quote.
+fn read_ansi_c(chars: &[char], i: usize) -> Option<(String, usize)> {
+    let mut out = String::new();
+    let mut j = i + 2;
+    while j < chars.len() {
+        let c = chars[j];
+        if c == '\'' {
+            return Some((out, j + 1));
+        }
+        if c != '\\' || j + 1 >= chars.len() {
+            out.push(c);
+            j += 1;
+            continue;
+        }
+        let n = chars[j + 1];
+        j += 2;
+        match n {
+            'a' => out.push('\u{07}'),
+            'b' => out.push('\u{08}'),
+            'e' | 'E' => out.push('\u{1b}'),
+            'f' => out.push('\u{0c}'),
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            'v' => out.push('\u{0b}'),
+            '\\' => out.push('\\'),
+            '\'' => out.push('\''),
+            '"' => out.push('"'),
+            '?' => out.push('?'),
+            '0'..='7' => {
+                let mut val = n.to_digit(8).unwrap();
+                let mut cnt = 1;
+                while cnt < 3 && j < chars.len() && chars[j].is_digit(8) {
+                    val = val * 8 + chars[j].to_digit(8).unwrap();
+                    j += 1;
+                    cnt += 1;
+                }
+                out.push((val & 0xff) as u8 as char);
+            }
+            'x' => {
+                let mut val = 0u32;
+                let mut cnt = 0;
+                while cnt < 2 && j < chars.len() && chars[j].is_ascii_hexdigit() {
+                    val = val * 16 + chars[j].to_digit(16).unwrap();
+                    j += 1;
+                    cnt += 1;
+                }
+                if cnt == 0 {
+                    out.push_str("\\x");
+                } else {
+                    out.push((val & 0xff) as u8 as char);
+                }
+            }
+            'u' | 'U' => {
+                let max = if n == 'u' { 4 } else { 8 };
+                let mut val = 0u32;
+                let mut cnt = 0;
+                while cnt < max && j < chars.len() && chars[j].is_ascii_hexdigit() {
+                    val = val * 16 + chars[j].to_digit(16).unwrap();
+                    j += 1;
+                    cnt += 1;
+                }
+                if cnt == 0 {
+                    out.push('\\');
+                    out.push(n);
+                } else {
+                    out.push(char::from_u32(val).unwrap_or('\u{fffd}'));
+                }
+            }
+            other => {
+                out.push('\\');
+                out.push(other);
+            }
+        }
+    }
+    None
 }
 
 fn read_var_name(chars: &[char], i: usize) -> String {

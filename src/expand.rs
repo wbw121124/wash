@@ -8,12 +8,27 @@
 use std::collections::HashMap;
 
 use crate::lexer::WordPart;
+use crate::shell::VarAttrs;
 
 pub struct ExpandCtx<'a> {
     pub env: &'a HashMap<String, String>,
     pub positional: &'a [String],
     pub last_status: i32,
     pub self_pid: i32,
+    pub noglob: bool,
+    pub nounset: bool,
+    /// The value of `$0` (the shell name, or the script path while a script
+    /// is being sourced).
+    pub dollar_zero: &'a str,
+    /// The variable attributes a command substitution inherits.
+    pub attrs: &'a VarAttrs,
+}
+
+/// Report an unbound variable the way bash does under `set -u` and abort the
+/// shell: a non-interactive bash prints the diagnostic and exits with 127.
+fn unbound_variable(name: &str) -> ! {
+    eprintln!("wash: {}: unbound variable", name);
+    std::process::exit(127);
 }
 
 /// Expand a command's raw argv (list of words) into the final argv strings.
@@ -35,7 +50,7 @@ pub fn expand_scalar(parts: &[WordPart], ctx: &ExpandCtx) -> String {
             WordPart::Var(name, _) => out.push_str(&eval_var(name, ctx)),
             WordPart::Braced(body, _) => out.push_str(&eval_braced(body, ctx)),
             WordPart::CmdSub(body, _) | WordPart::Backtick(body, _) => {
-                out.push_str(&crate::executor::capture_command(body, ctx.env));
+                out.push_str(&crate::executor::capture_command(body, ctx.env, ctx.attrs));
             }
             WordPart::Arith(body, _) => out.push_str(&eval_arith(body, ctx)),
             WordPart::Tilde => {
@@ -57,12 +72,16 @@ pub fn expand_word(parts: &[WordPart], ctx: &ExpandCtx) -> Vec<String> {
                 let mut next: Vec<String> =
                     candidates.iter().map(|c| format!("{}{}", c, s)).collect();
                 if !*quoted {
-                    // Unquoted literal text is still subject to globbing.
-                    let mut globbed = Vec::new();
-                    for w in next.drain(..) {
-                        globbed.extend(glob(&w));
+                    if ctx.noglob {
+                        // `set -f` / `set -o noglob`: literal, no globbing.
+                    } else {
+                        // Unquoted literal text is still subject to globbing.
+                        let mut globbed = Vec::new();
+                        for w in next.drain(..) {
+                            globbed.extend(glob(&w));
+                        }
+                        next = globbed;
                     }
-                    next = globbed;
                 }
                 candidates = next;
             }
@@ -75,15 +94,15 @@ pub fn expand_word(parts: &[WordPart], ctx: &ExpandCtx) -> Vec<String> {
             }
             WordPart::Var(name, quoted) => {
                 let val = eval_var(name, ctx);
-                candidates = apply_value(candidates, &val, *quoted);
+                candidates = apply_value(candidates, &val, *quoted, ctx);
             }
             WordPart::Braced(body, quoted) => {
                 let val = eval_braced(body, ctx);
-                candidates = apply_value(candidates, &val, *quoted);
+                candidates = apply_value(candidates, &val, *quoted, ctx);
             }
             WordPart::CmdSub(body, quoted) | WordPart::Backtick(body, quoted) => {
-                let val = crate::executor::capture_command(body, ctx.env);
-                candidates = apply_value(candidates, &val, *quoted);
+                let val = crate::executor::capture_command(body, ctx.env, ctx.attrs);
+                candidates = apply_value(candidates, &val, *quoted, ctx);
             }
             WordPart::Arith(body, _) => {
                 let val = eval_arith(body, ctx);
@@ -105,7 +124,7 @@ pub fn expand_word(parts: &[WordPart], ctx: &ExpandCtx) -> Vec<String> {
 
 /// Append `val` to each candidate, applying word-splitting + globbing unless
 /// `quoted`.
-fn apply_value(candidates: Vec<String>, val: &str, quoted: bool) -> Vec<String> {
+fn apply_value(candidates: Vec<String>, val: &str, quoted: bool, ctx: &ExpandCtx) -> Vec<String> {
     if quoted {
         return candidates.iter().map(|c| format!("{}{}", c, val)).collect();
     }
@@ -116,7 +135,11 @@ fn apply_value(candidates: Vec<String>, val: &str, quoted: bool) -> Vec<String> 
             next.push(c.clone());
         } else {
             for f in &fields {
-                next.push(format!("{}{}", c, glob_one(f)));
+                if ctx.noglob {
+                    next.push(format!("{}{}", c, f));
+                } else {
+                    next.push(format!("{}{}", c, glob_one(f)));
+                }
             }
         }
     }
@@ -151,8 +174,16 @@ fn eval_var(name: &str, ctx: &ExpandCtx) -> String {
         "?" => ctx.last_status.to_string(),
         "$" => ctx.self_pid.to_string(),
         "#" => ctx.positional.len().to_string(),
-        "@" | "*" => ctx.positional.join(" "),
-        "0" => "wash".to_string(),
+        "@" => ctx.positional.join(" "),
+        "*" => {
+            // `$*` is an error under `set -u` when there are no positional
+            // parameters (`$@` never is).
+            if ctx.nounset && ctx.positional.is_empty() {
+                unbound_variable("$*");
+            }
+            ctx.positional.join(" ")
+        }
+        "0" => ctx.dollar_zero.to_string(),
         "!" => String::new(), // last background pid (Phase 2)
         "-" => String::new(), // shell options (Phase 4+)
         _ => {
@@ -160,9 +191,20 @@ fn eval_var(name: &str, ctx: &ExpandCtx) -> String {
                 if idx >= 1 && idx <= ctx.positional.len() {
                     return ctx.positional[idx - 1].clone();
                 }
+                if ctx.nounset {
+                    unbound_variable(&format!("${}", idx));
+                }
                 return String::new();
             }
-            ctx.env.get(name).cloned().unwrap_or_default()
+            match ctx.env.get(name) {
+                Some(value) => value.clone(),
+                None => {
+                    if ctx.nounset {
+                        unbound_variable(name);
+                    }
+                    String::new()
+                }
+            }
         }
     }
 }
@@ -176,6 +218,12 @@ fn eval_braced(body: &str, ctx: &ExpandCtx) -> String {
         let name = &body[1..];
         if name.is_empty() {
             return ctx.positional.len().to_string();
+        }
+        if !ctx.env.contains_key(name) {
+            if ctx.nounset {
+                unbound_variable(name);
+            }
+            return "0".to_string();
         }
         return ctx.env.get(name).map(|v| v.len().to_string()).unwrap_or_else(|| "0".to_string());
     }
@@ -248,7 +296,14 @@ fn eval_braced(body: &str, ctx: &ExpandCtx) -> String {
             }
         }
         ",," => value.to_lowercase(),
-        "" => value,
+        "" => {
+            // A plain `${NAME}` reference: `set -u` makes an unset variable
+            // an error.
+            if !ctx.env.contains_key(name) && ctx.nounset {
+                unbound_variable(name);
+            }
+            value
+        }
         _ => value,
     }
 }

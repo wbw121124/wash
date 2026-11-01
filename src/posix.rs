@@ -19,7 +19,18 @@ extern "C" {
     fn wash_exit(code: c_int) -> !;
     fn wash_chdir(path: *const c_char) -> c_int;
     fn wash_kill(pid: c_int, sig: c_int) -> c_int;
-    fn wash_open_write(path: *const c_char, append: c_int) -> c_int;
+    fn wash_open_write(path: *const c_char, append: c_int, noclobber: c_int) -> c_int;
+    fn wash_dup(fd: c_int) -> c_int;
+    fn wash_umask_get() -> c_int;
+    fn wash_umask_set(mode: c_int) -> c_int;
+    fn wash_times(u: *mut f64, s: *mut f64, cu: *mut f64, cs: *mut f64) -> c_int;
+    fn wash_rlimit(resource: c_int, cur: u64, max: u64, set: c_int, got: *mut u64) -> c_int;
+    fn wash_rlimit_resource(which: c_char) -> c_int;
+    fn wash_getcwd() -> *const c_char;
+    fn wash_chdir_getcwd(path: *const c_char, physical: c_int) -> *const c_char;
+    fn wash_realpath(path: *const c_char) -> *const c_char;
+    fn wash_signal_number(name: *const c_char) -> c_int;
+    fn wash_nsig() -> c_int;
     fn wash_open_read(path: *const c_char) -> c_int;
     fn wash_access(path: *const c_char, mode: c_int) -> c_int;
     fn wash_read(fd: c_int, buf: *mut u8, count: usize) -> isize;
@@ -27,6 +38,8 @@ extern "C" {
     fn wash_wexitstatus(status: c_int) -> c_int;
     fn wash_wif_signaled(status: c_int) -> c_int;
     fn wash_wtermsig(status: c_int) -> c_int;
+    fn wash_errno() -> c_int;
+    fn wash_read_file(path: *const c_char, buf: *mut c_char, n: usize) -> isize;
 
     // bash-compatible numeric parsing / formatting (msys C library)
     fn wash_parse_ll(s: *const c_char, fully: *mut c_int, overflow: *mut c_int) -> i64;
@@ -50,6 +63,12 @@ extern "C" {
 
 pub const X_OK: c_int = 1;
 pub const WNOHANG: c_int = 1;
+/// `access(2)` modes.
+pub const F_OK: c_int = 0;
+pub const W_OK: c_int = 2;
+pub const R_OK: c_int = 4;
+/// `errno` values used by the shell diagnostics.
+pub const EEXIST: i32 = 17;
 
 pub fn fork() -> i32 {
     unsafe { wash_fork() }
@@ -77,9 +96,60 @@ pub fn chdir(path: &str) -> i32 {
     unsafe { wash_chdir(c.as_ptr()) }
 }
 
-pub fn open_write(path: &str, append: bool) -> i32 {
+pub fn open_write(path: &str, append: bool, noclobber: bool) -> i32 {
     let c = CString::new(path).unwrap_or_default();
-    unsafe { wash_open_write(c.as_ptr(), if append { 1 } else { 0 }) }
+    unsafe { wash_open_write(c.as_ptr(), if append { 1 } else { 0 }, if noclobber { 1 } else { 0 }) }
+}
+
+/// Duplicate a file descriptor (save before redirecting a builtin's output).
+pub fn dup(fd: i32) -> i32 {
+    unsafe { wash_dup(fd) }
+}
+
+/// Get the current file-mode creation mask (octal).
+pub fn umask_get() -> i32 {
+    unsafe { wash_umask_get() }
+}
+
+/// Set the file-mode creation mask, returning the previous value.
+pub fn umask_set(mode: i32) -> i32 {
+    unsafe { wash_umask_set(mode) }
+}
+
+/// Fill (self_user, self_sys, child_user, child_sys) CPU times in seconds.
+pub fn get_times() -> (f64, f64, f64, f64) {
+    let mut u = 0f64;
+    let mut s = 0f64;
+    let mut cu = 0f64;
+    let mut cs = 0f64;
+    unsafe {
+        wash_times(&mut u, &mut s, &mut cu, &mut cs);
+    }
+    (u, s, cu, cs)
+}
+
+/// Map a bash `ulimit` resource letter to the native rlimit constant and
+/// get/set the limit. `set=false` retrieves the current soft limit.
+pub fn rlimit(which: u8, cur: u64, max: u64, set: bool) -> Option<u64> {
+    let res = unsafe { wash_rlimit_resource(which as c_char) };
+    if res < 0 {
+        return None;
+    }
+    let mut got: u64 = 0;
+    let r = unsafe {
+        wash_rlimit(
+            res,
+            cur,
+            max,
+            if set { 1 } else { 0 },
+            &mut got,
+        )
+    };
+    if r != 0 {
+        None
+    } else {
+        Some(got)
+    }
 }
 
 pub fn open_read(path: &str) -> i32 {
@@ -87,9 +157,106 @@ pub fn open_read(path: &str) -> i32 {
     unsafe { wash_open_read(c.as_ptr()) }
 }
 
+/// Current working directory as an msys-style absolute path ("/d/foo/bar").
+/// Returns an empty string when `getcwd` fails.
+pub fn getcwd() -> String {
+    unsafe {
+        let p = wash_getcwd();
+        if p.is_null() {
+            String::new()
+        } else {
+            std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+        }
+    }
+}
+
+/// Change directory and return the resulting absolute path. `physical`
+/// resolves symbolic links (bash's `cd -P`); otherwise the logical path is
+/// returned (bash's `cd -L`, the default).
+pub fn chdir_getcwd(path: &str, physical: bool) -> String {
+    let c = CString::new(path).unwrap_or_default();
+    unsafe {
+        let p = wash_chdir_getcwd(c.as_ptr(), if physical { 1 } else { 0 });
+        if p.is_null() {
+            String::new()
+        } else {
+            std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+        }
+    }
+}
+
+/// Resolve symbolic links in `path`, returning the canonical absolute path.
+pub fn realpath(path: &str) -> String {
+    let c = CString::new(path).unwrap_or_default();
+    unsafe {
+        let p = wash_realpath(c.as_ptr());
+        if p.is_null() {
+            String::new()
+        } else {
+            std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+        }
+    }
+}
+
+/// Map a signal name ("INT", "SIGINT", "TERM", ...) to its number, or -1.
+pub fn signal_number(name: &str) -> i32 {
+    let c = CString::new(name).unwrap_or_default();
+    unsafe { wash_signal_number(c.as_ptr()) }
+}
+
+/// The number of signals the platform knows about.
+pub fn nsig() -> i32 {
+    unsafe { wash_nsig() }
+}
+
 pub fn access(path: &str, mode: i32) -> i32 {
     let c = CString::new(path).unwrap_or_default();
     unsafe { wash_access(c.as_ptr(), mode) }
+}
+
+/// The current value of `errno`. Read it immediately after a failing shim
+/// call to build accurate diagnostics.
+pub fn errno() -> i32 {
+    unsafe { wash_errno() }
+}
+
+/// A bash-style message for an `errno` value.
+pub fn errno_message(code: i32) -> String {
+    match code {
+        1 => "Operation not permitted".to_string(),
+        2 => "No such file or directory".to_string(),
+        13 => "Permission denied".to_string(),
+        17 => "File exists".to_string(),
+        20 => "Not a directory".to_string(),
+        21 => "Is a directory".to_string(),
+        22 => "Invalid argument".to_string(),
+        36 => "File name too long".to_string(),
+        40 => "Too many levels of symbolic links".to_string(),
+        _ => format!("Unknown error {}", code),
+    }
+}
+
+/// Read a whole file into memory. Returns `None` when the file cannot be
+/// read (the caller can then inspect `errno()`).
+pub fn read_file(path: &str) -> Option<String> {
+    let c = CString::new(path).unwrap_or_default();
+    let size = unsafe { wash_read_file(c.as_ptr(), std::ptr::null_mut(), 0) };
+    if size < 0 {
+        return None;
+    }
+    let mut buf: Vec<u8> = vec![0u8; size as usize + 1];
+    let n = unsafe {
+        wash_read_file(
+            c.as_ptr(),
+            buf.as_mut_ptr() as *mut c_char,
+            buf.len(),
+        )
+    };
+    if n < 0 {
+        return None;
+    }
+    buf.truncate(n as usize);
+    Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
 pub fn execve(path: &CString, argv: &[*const c_char], envp: &[*const c_char]) -> i32 {
