@@ -5,6 +5,7 @@
 // Quoted parts (originating inside double quotes) are NOT word-split or
 // globbed. Arithmetic results are never split/globbed.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use crate::lexer::WordPart;
@@ -22,6 +23,13 @@ pub struct ExpandCtx<'a> {
     pub dollar_zero: &'a str,
     /// The variable attributes a command substitution inherits.
     pub attrs: &'a VarAttrs,
+    /// The assignments requested by the `${var=word}` / `${var:=word}`
+    /// expansions.
+    ///
+    /// The expander only has a read-only view of the shell environment, so
+    /// the assignments are collected here and written back to the shell by
+    /// the executor once the expansion is done.
+    pub pending_assign: Option<&'a RefCell<Vec<(String, String)>>>,
 }
 
 /// Report an unbound variable the way bash does under `set -u` and abort the
@@ -214,6 +222,10 @@ fn eval_braced(body: &str, ctx: &ExpandCtx) -> String {
     // name:off:len, name#pat, name##pat, name%pat, name%%pat,
     // name/pat/repl, name//pat/repl, name^, name^^, name,, name,,
     // !name (indirect)
+    //
+    // The "bare" operators (`-`, `=`, `+`, `?`) differ from their colon
+    // variants: they only look at whether the variable is *set*, not at
+    // whether it is empty.
     if body.starts_with('#') {
         let name = &body[1..];
         if name.is_empty() {
@@ -238,10 +250,21 @@ fn eval_braced(body: &str, ctx: &ExpandCtx) -> String {
 
     let (name, op, arg) = split_braced(body);
 
+    // Whether the variable exists at all — the bare operators only care
+    // about this, the colon variants also look at the value being empty.
+    let is_set = ctx.env.contains_key(name);
     let value = ctx.env.get(name).cloned().unwrap_or_default();
-    let unset_or_empty = value.is_empty();
+    let unset_or_empty = !is_set || value.is_empty();
 
     match op {
+        // `${var-word}`: use `word` only when the variable is *unset*.
+        "-" => {
+            if is_set {
+                value
+            } else {
+                arg.to_string()
+            }
+        }
         ":-" => {
             if unset_or_empty {
                 arg.to_string()
@@ -249,12 +272,12 @@ fn eval_braced(body: &str, ctx: &ExpandCtx) -> String {
                 value
             }
         }
-        ":=" => {
-            if unset_or_empty {
-                ctx.env.get(name); // (assignment handled by caller mutably; Phase 1 returns default)
+        // `${var+word}`: use `word` when the variable is set (even if empty).
+        "+" => {
+            if is_set {
                 arg.to_string()
             } else {
-                value
+                String::new()
             }
         }
         ":+" => {
@@ -264,10 +287,35 @@ fn eval_braced(body: &str, ctx: &ExpandCtx) -> String {
                 arg.to_string()
             }
         }
+        // `${var=word}`: assign `word` when the variable is unset.
+        "=" => {
+            if is_set {
+                value
+            } else {
+                assign_default(ctx, name, arg);
+                arg.to_string()
+            }
+        }
+        // `${var:=word}`: assign `word` when the variable is unset or empty.
+        ":=" => {
+            if unset_or_empty {
+                assign_default(ctx, name, arg);
+                arg.to_string()
+            } else {
+                value
+            }
+        }
+        // `${var?word}`: complain when the variable is unset.
+        "?" => {
+            if is_set {
+                value
+            } else {
+                expansion_error(name, arg);
+            }
+        }
         ":?" => {
             if unset_or_empty {
-                eprintln!("wash: {}: {}", name, arg);
-                std::process::exit(1);
+                expansion_error(name, arg);
             }
             value
         }
@@ -302,10 +350,35 @@ fn eval_braced(body: &str, ctx: &ExpandCtx) -> String {
             if !ctx.env.contains_key(name) && ctx.nounset {
                 unbound_variable(name);
             }
+            // The special parameters (`$?`, `$#`, `$@`, ...) are not part of
+            // the variable table.
+            if is_special_param(name) {
+                return eval_var(name, ctx);
+            }
             value
         }
         _ => value,
     }
+}
+
+/// True for the parameters that are not stored in the variable table
+/// (`?`, `$`, `#`, `*`, `@`, `!`, `-`, `0`).
+fn is_special_param(name: &str) -> bool {
+    matches!(name, "?" | "$" | "#" | "*" | "@" | "!" | "-" | "0")
+}
+
+/// Record the assignment requested by `${var=word}` / `${var:=word}`.
+fn assign_default(ctx: &ExpandCtx, name: &str, value: &str) {
+    if let Some(cell) = &ctx.pending_assign {
+        cell.borrow_mut().push((name.to_string(), value.to_string()));
+    }
+}
+
+/// Report a failed parameter expansion (`${var?word}`) and abort the shell
+/// the way a non-interactive bash does.
+fn expansion_error(name: &str, word: &str) -> ! {
+    eprintln!("wash: {}: {}", name, word);
+    std::process::exit(127);
 }
 
 fn split_braced(body: &str) -> (&str, &str, &str) {
@@ -319,6 +392,11 @@ fn split_braced(body: &str) -> (&str, &str, &str) {
                     return (&body[..i], &body[i..i + 2], &body[i + 2..]);
                 }
                 return (&body[..i], ":", &body[i + 1..]);
+            }
+            // The "bare" operators only count as an operator when a variable
+            // name precedes them: `${?}` is the exit status, not an operator.
+            '-' | '=' | '+' | '?' if i > 0 => {
+                return (&body[..i], &body[i..i + 1], &body[i + 1..]);
             }
             '#' => {
                 if b.get(i + 1).copied() == Some(b'#') {

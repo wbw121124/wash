@@ -17,6 +17,7 @@
 //     only changes the child's copy of the state (and is therefore lost, just
 //     like in bash).
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{c_char, CString};
 use std::io::Write;
@@ -362,22 +363,26 @@ fn run_standalone_exp(
         // Standalone assignment(s): persist to the shell environment.
         if !assigns.is_empty() {
             let attrs = sh.attrs();
-            let ctx = ExpandCtx {
-                env: &sh.env,
-                positional: &sh.positional,
-                last_status: sh.last_status,
-                self_pid: sh.self_pid,
-                noglob: sh.options.noglob,
-                nounset: sh.options.nounset,
-                dollar_zero: &sh.dollar_zero,
-                attrs: &attrs,
-            };
+            let pending: RefCell<Vec<(String, String)>> = RefCell::new(Vec::new());
             // Expand all RHS values first (immutable borrow of sh.env), then
             // mutate sh.env once the borrow is released.
-            let applied: Vec<(String, String, bool)> = assigns
-                .iter()
-                .map(|(n, vp, ap)| (n.clone(), expand_scalar(vp, &ctx), *ap))
-                .collect();
+            let applied: Vec<(String, String, bool)> = {
+                let ctx = ExpandCtx {
+                    env: &sh.env,
+                    positional: &sh.positional,
+                    last_status: sh.last_status,
+                    self_pid: sh.self_pid,
+                    noglob: sh.options.noglob,
+                    nounset: sh.options.nounset,
+                    dollar_zero: &sh.dollar_zero,
+                    attrs: &attrs,
+                    pending_assign: Some(&pending),
+                };
+                assigns
+                    .iter()
+                    .map(|(n, vp, ap)| (n.clone(), expand_scalar(vp, &ctx), *ap))
+                    .collect()
+            };
             for (name, val, append) in applied {
                 if append {
                     let cur = sh.env.get(&name).cloned().unwrap_or_default();
@@ -385,6 +390,10 @@ fn run_standalone_exp(
                 } else {
                     sh.env.insert(name, val);
                 }
+            }
+            // Apply the assignments the expansion requested (`${var=word}`).
+            for (name, value) in pending.borrow_mut().drain(..) {
+                sh.env.insert(name, value);
             }
         }
         // A redirection without a command applies to the shell itself, but
@@ -589,36 +598,76 @@ fn expand_alias_in_pipeline(
     Some(out)
 }
 
-fn prepare(p: &Pipeline, sh: &Shell) -> Vec<Prepared> {
+/// Expand the words of every command of a pipeline.
+///
+/// The expansion happens in two steps: first the words are expanded (the
+/// expander only reads the environment), then the assignments the expansion
+/// requested (`${var=word}`) are written back to the shell and the
+/// environments of the commands are built.
+fn prepare(p: &Pipeline, sh: &mut Shell) -> Vec<Prepared> {
     let attrs = sh.attrs();
-    let ctx = ExpandCtx {
-        env: &sh.env,
-        positional: &sh.positional,
-        last_status: sh.last_status,
-        self_pid: sh.self_pid,
-        noglob: sh.options.noglob,
-        nounset: sh.options.nounset,
-        dollar_zero: &sh.dollar_zero,
-        attrs: &attrs,
-    };
-    p.commands
-        .iter()
-        .map(|c| {
+    let pending: RefCell<Vec<(String, String)>> = RefCell::new(Vec::new());
+
+    // Step 1: expand the words of every command.
+    let mut expanded: Vec<(Vec<String>, Vec<ExpRedir>)> = Vec::new();
+    {
+        let ctx = ExpandCtx {
+            env: &sh.env,
+            positional: &sh.positional,
+            last_status: sh.last_status,
+            self_pid: sh.self_pid,
+            noglob: sh.options.noglob,
+            nounset: sh.options.nounset,
+            dollar_zero: &sh.dollar_zero,
+            attrs: &attrs,
+            pending_assign: Some(&pending),
+        };
+        for c in &p.commands {
             let argv = expand_argv(&c.argv, &ctx);
             let redirs = expand_redirs(&c.redirs, &ctx);
+            expanded.push((argv, redirs));
+        }
+    }
+
+    // Step 2: apply the assignments the expansion requested.
+    for (name, value) in pending.borrow_mut().drain(..) {
+        sh.env.insert(name, value);
+    }
+
+    // Step 3: build the environment of every command.
+    let mut out = Vec::new();
+    {
+        let ctx = ExpandCtx {
+            env: &sh.env,
+            positional: &sh.positional,
+            last_status: sh.last_status,
+            self_pid: sh.self_pid,
+            noglob: sh.options.noglob,
+            nounset: sh.options.nounset,
+            dollar_zero: &sh.dollar_zero,
+            attrs: &attrs,
+            pending_assign: Some(&pending),
+        };
+        for (c, (argv, redirs)) in p.commands.iter().zip(expanded.into_iter()) {
             // Only the exported variables are passed on to the program ...
             let cmd_env = build_cmd_env(&sh.child_env(), &c.assignments, &ctx);
             // ... but a forked child shell inherits every shell variable.
             let shell_env = build_cmd_env(&sh.env, &c.assignments, &ctx);
-            Prepared {
+            out.push(Prepared {
                 argv,
                 redirs,
                 assigns: c.assignments.clone(),
                 env: cmd_env,
                 shell_env,
-            }
-        })
-        .collect()
+            });
+        }
+    }
+    // The expansion of the assignments themselves may have requested further
+    // assignments; they are applied to the shell as well.
+    for (name, value) in pending.borrow_mut().drain(..) {
+        sh.env.insert(name, value);
+    }
+    out
 }
 
 fn execute_pipeline(p: &Pipeline, sh: &mut Shell, path: &str) -> i32 {
