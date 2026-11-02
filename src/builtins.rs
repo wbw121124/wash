@@ -909,10 +909,6 @@ enum TestError {
     Integer(String),
     /// `argument expected`
     ArgumentExpected,
-    /// `too many arguments`
-    TooManyArguments,
-    /// `syntax error: `<arg>' unexpected`
-    Unexpected(String),
     /// `` `)' expected ``
     ExpectedCloseParen,
     /// `` `)' expected, found <arg> ``
@@ -927,8 +923,6 @@ impl TestError {
             TestError::BinaryOperator(arg) => format!("{}: binary operator expected", arg),
             TestError::Integer(arg) => format!("{}: integer expected", arg),
             TestError::ArgumentExpected => "argument expected".to_string(),
-            TestError::TooManyArguments => "too many arguments".to_string(),
-            TestError::Unexpected(arg) => format!("syntax error: `{}' unexpected", arg),
             TestError::ExpectedCloseParen => "`)' expected".to_string(),
             TestError::ExpectedCloseParenFound(arg) => format!("`)' expected, found {}", arg),
         }
