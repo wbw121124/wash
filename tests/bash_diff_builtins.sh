@@ -65,6 +65,10 @@ printf 'echo "1=$1 2=$2 n=$#"\n'  > "$SANDBOX/args.sh"
 printf 'exit 7\n'                 > "$SANDBOX/exit7.sh"
 printf 'false\n'                  > "$SANDBOX/false.sh"
 printf 'line1\nline2\n'           > "$SANDBOX/in.txt"
+# Fixtures for the `read` field-splitting cases: one line separated by
+# SPACES, one by COLONS.  `IFS` decides which separator counts.
+printf 'a b c\n'                   > "$SANDBOX/spaced.txt"
+printf 'a:b:c\n'                   > "$SANDBOX/colons.txt"
 # Fixture for the `return` cases: `return` is only legal inside a function or
 # a SOURCED script, and a sourced script needs no function support -- so this
 # is the cheapest precondition that makes `return` observable.
@@ -508,6 +512,19 @@ run_case C read-n            'read -n 3 v < @SANDBOX@/in.txt; echo "[$v]"'
 run_case C read-d            'read -d x v < @SANDBOX@/in.txt; echo "[$v]"'
 run_case C read-p            'read -p prompt v < @SANDBOX@/in.txt; echo "[$v]"'
 run_case C read-eof          'read v < /dev/null; echo "rc=$?"'
+# --- read: field splitting driven by IFS -----------------------------------
+# `IFS` decides which characters separate fields.  With IFS=":" the input
+# "a b c" contains no separator at all, so the WHOLE line is one field and
+# the second variable stays empty.  These cases pin that down.
+# `IFS` set as a plain statement (not a prefix assignment) -- the path that
+# already works, kept as a regression fence.
+run_case C read-ifs-global   'IFS=:; read a b < @SANDBOX@/colons.txt; echo "a=[$a] b=[$b]"'
+# `IFS` as a PREFIX assignment to `read` -- bash applies it to the split,
+# so "a b c" (no colon in it) is ONE field.
+run_case C read-ifs-prefix   'IFS=: read a b < @SANDBOX@/spaced.txt; echo "a=[$a] b=[$b]"'
+# An EMPTY `IFS` disables field splitting entirely -- again the whole line
+# is one field.
+run_case C read-ifs-empty    'IFS= read a b < @SANDBOX@/spaced.txt; echo "a=[$a] b=[$b]"'
 
 # --- pwd --------------------------------------------------------------------
 run_case C pwd-plain         'pwd'
