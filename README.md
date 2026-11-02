@@ -113,7 +113,7 @@ stderr + 退出码）跑出来，或由针对该内建的定向探针实测得�
 | `type` | full | 无参 / `-t` / `-a` / `-f` / `-P`，全部逐字节一致 |
 | `command` | full | `-v` / `-V` / `-p` / `-a`（非法选项 rc=2）/ 无参直接执行，全部逐字节一致 |
 | `builtin` | full | 执行内建 / 非内建报错（rc=1）/ 无参列出内建清单，逐字节一致 |
-| `hash` | deferred | 未实现（rc=127）。Phase 3 批次内补齐 |
+| `hash` | full | 无参 / `-t <name>` / `-l` / `-r` / `-p <path> <name>` 五种用法逐字节一致 |
 | `read` | deferred | 未实现（rc=127）。Phase 3 批次内补齐 |
 | `pwd` | full | `pwd` / `-L` / `-P` 三种形式逐字节一致 |
 | `shift` | full | 基本位移 / 连续位移 / 计数按**十进制**解析（`shift 2`）/ 越界 rc=1，一致 |

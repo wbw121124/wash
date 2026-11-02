@@ -172,7 +172,7 @@ stderr + 退出码）跑出来，或由针对该内建的定向探针实测得�
 | `type` | full | 无参（`echo is a shell builtin`）、`-t`（`builtin`/`file`/无输出+rc=1）、`-a`（列出全部同名路径）、`-f`（`ls is /usr/bin/ls`）、`-P`（只给路径），全部逐字节一致 |
 | `command` | full | `-v`（内建名 / 不存在时 rc=1）、`-V`（`echo is a shell builtin`）、`-p`（清 PATH 后执行）、`-a`（非法选项 rc=2 + `command: -a: invalid option`）、无参直接执行命令，全部逐字节一致 |
 | `builtin` | full | 执行内建（`builtin echo hi`）、非内建（`builtin: nosuchbuiltin: not a shell builtin`，rc=1）、无参列出内建清单，全部逐字节一致 |
-| `hash` | deferred | 未实现（rc=127）。Phase 3 批次内补齐 |
+| `hash` | full | 无参（列出已缓存的命令路径）、`-t <name>`（打印缓存路径）、`-l`（列出全部）、`-r`（清空缓存）、`-p <path> <name>`（指定路径并缓存），5 条用例逐字节一致（GROUP C `hash-plain` / `hash-t` / `hash-l` / `hash-r` / `hash-p` 全通过） |
 | `read` | deferred | 未实现（rc=127）。Phase 3 批次内补齐 |
 | `pwd` | full | `pwd` / `-L` / `-P` 三种形式逐字节一致 |
 | `shift` | full | 基本位移 / 连续位移 / 计数按**十进制**解析（`shift 2`）/ 越界返回 rc=1，一致 |
