@@ -2200,10 +2200,23 @@ fn printf_format(format: &str, args: &[String]) -> (Vec<u8>, bool) {
     let mut ai: usize = 0;
 
     let has_conv = {
+        // The scan has to skip the escaped percent signs exactly like the
+        // real parser does: `%%` is a literal percent and not the start of
+        // a conversion.  Otherwise a format like `%%. ' would look like it
+        // had a conversion, while the parser consumes no argument for it --
+        // and the format would be repeated forever.
         let mut f = false;
         let mut k = 0;
         while k < bytes.len() {
-            if bytes[k] == b'%' && k + 1 < bytes.len() && bytes[k + 1] != b'%' {
+            if bytes[k] == b'%' {
+                if k + 1 >= bytes.len() {
+                    // A trailing '%' is not a conversion.
+                    break;
+                }
+                if bytes[k + 1] == b'%' {
+                    k += 2;
+                    continue;
+                }
                 f = true;
                 break;
             }
@@ -2213,15 +2226,17 @@ fn printf_format(format: &str, args: &[String]) -> (Vec<u8>, bool) {
     };
 
     loop {
+        let consumed_before = ai;
         let mut i = 0;
         while i < bytes.len() {
             let c = bytes[i];
             if c == b'%' {
                 if i + 1 >= bytes.len() {
-                    // Trailing '%' (no conversion): bash → no output, error.
+                    // A trailing '%' (no conversion): bash reports a missing
+                    // format character and stops.
                     conv_error = true;
-                    i += 1;
-                    continue;
+                    eprintln!("wash: printf: `%': missing format character");
+                    return (out, conv_error);
                 }
                 let nxt = bytes[i + 1];
                 if nxt == b'%' {
@@ -2250,6 +2265,11 @@ fn printf_format(format: &str, args: &[String]) -> (Vec<u8>, bool) {
             break;
         }
         if ai >= args.len() {
+            break;
+        }
+        if ai == consumed_before {
+            // The format did not consume an argument, so repeating it would
+            // never end.  bash stops here as well.
             break;
         }
     }
@@ -2327,9 +2347,12 @@ fn parse_printf_spec(
     }
 
     if i >= bytes.len() {
-        // Incomplete conversion (e.g. trailing "%5"): bash → error, no output.
+        // Incomplete conversion (e.g. a trailing "%5"): bash quotes the whole
+        // specification, reports it and stops.
         *conv_error = true;
-        return (start + 1, false);
+        let spec = String::from_utf8_lossy(&bytes[start..]).into_owned();
+        eprintln!("wash: printf: `{}': missing format character", spec);
+        return (bytes.len(), true);
     }
 
     let conv = bytes[i];
@@ -2403,6 +2426,7 @@ fn parse_printf_spec(
             };
             if !valid {
                 *conv_error = true;
+                report_invalid_number(arg);
             }
             let mut cf = String::from("%");
             cf.push_str(&flags);
@@ -2454,19 +2478,31 @@ fn parse_printf_spec(
             let (rendered, valid) = posix::printf_long_double(&cf, arg_for_c);
             if !valid {
                 *conv_error = true;
+                if !arg_missing {
+                    report_invalid_number(arg);
+                }
             }
             out.extend_from_slice(&rendered);
             *ai += 1;
         }
         _ => {
-            // Unknown conversion → bash: error, no output, but the argument is
-            // still consumed.
+            // An unknown conversion character: bash quotes the character,
+            // reports it and stops.
             *conv_error = true;
-            *ai += 1;
+            eprintln!(
+                "wash: printf: `{}': invalid format character",
+                conv as char
+            );
+            return (i, true);
         }
     }
 
     (i, false)
+}
+
+/// Report a numeric conversion that failed, the way bash does.
+fn report_invalid_number(arg: &str) {
+    eprintln!("wash: printf: {}: invalid number", arg);
 }
 
 /// Read a `*` field-width / precision argument as a base-0 integer.
@@ -2478,6 +2514,7 @@ fn get_star_arg(args: &[String], ai: &mut usize, conv_error: &mut bool) -> i64 {
     let (v, fully, overflow) = posix::parse_long_long(a);
     if !fully || overflow {
         *conv_error = true;
+        report_invalid_number(a);
     }
     v
 }
