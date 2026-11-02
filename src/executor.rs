@@ -69,14 +69,18 @@ pub(crate) fn execve(path: &CString, argv: &[*const c_char], envp: &[*const c_ch
 }
 
 /// Look `name` up in `path` (or directly, when it contains a slash).
-pub(crate) fn find_executable(name: &str, path: &str) -> Option<CString> {
+///
+/// Returns the path to execute and the path as the `$PATH` search reports
+/// it: Cygwin falls back to the `.exe` suffix when it executes a program,
+/// but it reports the name as it stands in the `$PATH`.
+pub(crate) fn find_program(name: &str, path: &str) -> Option<(CString, String)> {
     if name.contains('/') || name.contains('\\') {
         if posix::access(name, posix::X_OK) == 0 {
-            return Some(posix::to_cstr(name));
+            return Some((posix::to_cstr(name), name.to_string()));
         }
         let exe = format!("{}.exe", name);
         if posix::access(&exe, posix::X_OK) == 0 {
-            return Some(posix::to_cstr(&exe));
+            return Some((posix::to_cstr(&exe), name.to_string()));
         }
         return None;
     }
@@ -86,14 +90,50 @@ pub(crate) fn find_executable(name: &str, path: &str) -> Option<CString> {
         }
         let cand = format!("{}/{}", dir, name);
         if posix::access(&cand, posix::X_OK) == 0 {
-            return Some(posix::to_cstr(&cand));
+            return Some((posix::to_cstr(&cand), cand.clone()));
         }
         let cand_exe = format!("{}.exe", cand);
         if posix::access(&cand_exe, posix::X_OK) == 0 {
-            return Some(posix::to_cstr(&cand_exe));
+            return Some((posix::to_cstr(&cand_exe), cand));
         }
     }
     None
+}
+
+/// Look `name` up in `path` (or directly, when it contains a slash).
+pub(crate) fn find_executable(name: &str, path: &str) -> Option<CString> {
+    find_program(name, path).map(|(exe, _)| exe)
+}
+
+/// The executables named `name` in the colon-separated `$PATH`.
+///
+/// Like Cygwin's `find_user_command`, the `.exe` suffix is tried as a
+/// fallback but it is not reported: bash prints the path exactly as it
+/// stands in the `$PATH`.
+pub fn path_matches(name: &str, path: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if name.contains('/') || name.contains('\\') {
+        // An explicit path is used as it is.
+        if posix::access(name, posix::X_OK) == 0 {
+            out.push(name.to_string());
+        }
+        return out;
+    }
+    for dir in path.split(':') {
+        if dir.is_empty() {
+            continue;
+        }
+        let candidate = format!("{}/{}", dir, name);
+        if posix::access(&candidate, posix::X_OK) == 0 {
+            out.push(candidate);
+            continue;
+        }
+        let candidate_exe = format!("{}.exe", candidate);
+        if posix::access(&candidate_exe, posix::X_OK) == 0 {
+            out.push(candidate);
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -383,6 +423,15 @@ struct ChildContext<'a> {
     attrs: &'a crate::shell::VarAttrs,
     /// The compound command (`if ... fi`) the child has to run, if any.
     compound: Option<&'a Compound>,
+    /// The program the child has to execute, already resolved by the
+    /// parent.
+    program: Option<&'a CString>,
+}
+
+/// Record an executed program in the shell's hash table.
+fn record_hash_entry(sh: &mut Shell, name: &str, path: &str) {
+    sh.hash_table.insert(name.to_string(), path.to_string());
+    *sh.hash_hits.entry(name.to_string()).or_insert(0) += 1;
 }
 
 /// Run a command inside the forked child: either a builtin (whose state
@@ -417,14 +466,17 @@ fn child_run_exp(argv: &[String], path: &str, ctx: &ChildContext) -> ! {
     // Not a builtin: look it up in $PATH and replace the child process.
     let (_cstrings, env_ptrs) = build_env_ptrs(ctx.env);
     let argvec = ArgVec::from(argv);
-    match find_executable(&argv[0], path) {
-        Some(exe) => {
-            posix::execve(&exe, &argvec.ptrs, &env_ptrs);
-        }
-        None => {
-            eprintln!("wash: {}: command not found", argv[0]);
-        }
-    }
+    let exe = match ctx.program {
+        Some(exe) => exe.clone(),
+        None => match find_executable(&argv[0], path) {
+            Some(exe) => exe,
+            None => {
+                eprintln!("wash: {}: command not found", argv[0]);
+                posix::exit(127);
+            }
+        },
+    };
+    posix::execve(&exe, &argvec.ptrs, &env_ptrs);
     posix::exit(127);
 }
 
@@ -524,7 +576,10 @@ fn run_standalone_exp(
         return code;
     }
 
-    // External command: fork and apply the redirections in the child.
+    // External command: fork and apply the redirections in the child.  The
+    // program is resolved in the parent, so that the hash table can record
+    // it (bash does the same when the `hashall' option is on).
+    let program = find_program(&argv[0], path);
     let pid = posix::fork();
     if pid == 0 {
         apply_exp_redirs(redirs, sh.options.noclobber);
@@ -537,9 +592,13 @@ fn run_standalone_exp(
             dollar_zero: &sh.dollar_zero,
             attrs: &attrs,
             compound: None,
+            program: program.as_ref().map(|(exe, _)| exe),
         };
         child_run_exp(argv, path, &ctx);
     } else {
+        if let Some((_, reported)) = &program {
+            record_hash_entry(sh, &argv[0], reported);
+        }
         posix::wait_pid(pid)
     }
 }
@@ -799,13 +858,20 @@ fn execute_pipeline(p: &Pipeline, sh: &mut Shell, path: &str) -> i32 {
             (None, None)
         };
 
+        // Resolve the program of the stage in the parent, so that the hash
+        // table can record it.
+        let program = if pr.argv.is_empty() || builtins::is_builtin(&pr.argv[0]) {
+            None
+        } else {
+            find_program(&pr.argv[0], path)
+        };
+
         let pid = posix::fork();
         if pid == 0 {
             if let Some(fd) = prev_read {
                 posix::dup2(fd, 0);
                 posix::close(fd);
-            }
-            if let Some(fd) = this_write {
+            }            if let Some(fd) = this_write {
                 posix::dup2(fd, 1);
                 posix::close(fd);
             }
@@ -822,9 +888,12 @@ fn execute_pipeline(p: &Pipeline, sh: &mut Shell, path: &str) -> i32 {
                 dollar_zero: &sh.dollar_zero,
                 attrs: &attrs,
                 compound: pr.compound.as_ref(),
+                program: program.as_ref().map(|(exe, _)| exe),
             };
             child_run_exp(&pr.argv, path, &ctx);
         } else {
+            // The stage runs in a subshell, so its hash entry is lost --
+            // exactly like in bash.
             if let Some(fd) = prev_read {
                 posix::close(fd);
             }

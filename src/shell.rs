@@ -241,6 +241,9 @@ pub struct Shell {
     pub dir_stack: Vec<String>,
     pub traps: HashMap<String, String>,
     pub hash_table: HashMap<String, String>,
+    /// How often every hashed command was executed (the `hits' column of
+    /// the `hash' listing).
+    pub hash_hits: HashMap<String, u32>,
     pub disabled_builtins: HashSet<String>,
 
     /// Exported variables that have no value at all (`export NAME` without an
@@ -324,6 +327,7 @@ impl Shell {
             dir_stack: vec![cwd.clone()],
             traps: HashMap::new(),
             hash_table: HashMap::new(),
+            hash_hits: HashMap::new(),
             disabled_builtins: HashSet::new(),
             null_exported: HashSet::new(),
             dollar_zero: "wash".to_string(),

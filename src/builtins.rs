@@ -39,6 +39,7 @@ const BUILTINS: &[&str] = &[
     "exec",
     "exit",
     "export",
+    "hash",
     "printf",
     "set",
     "shift",
@@ -77,6 +78,7 @@ pub fn run_builtin(argv: &[String], sh: &mut Shell) -> Option<i32> {
         "printf" => builtin_printf(argv, Some(sh)),
         "test" | "[" => builtin_test(argv, sh),
         "type" => builtin_type(argv, sh),
+        "hash" => builtin_hash(argv, sh),
         "command" => builtin_command(argv, sh),
         "builtin" => builtin_builtin(argv, sh),
         _ => return None,
@@ -1715,6 +1717,170 @@ fn builtin_builtin(argv: &[String], sh: &mut Shell) -> i32 {
     }
 
     run_builtin(&argv[i..], sh).unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// hash
+// ---------------------------------------------------------------------------
+
+/// Print the hashed commands the way bash's `hash` does.
+fn print_hashed_commands(sh: &Shell, portable: bool) {
+    let mut names: Vec<&String> = sh.hash_table.keys().collect();
+    names.sort();
+    if portable {
+        // The portable form can be fed back to `hash'.
+        for name in names {
+            let path = &sh.hash_table[name];
+            println!("builtin hash -p {} {}", path, name);
+        }
+    } else {
+        println!("hits\tcommand");
+        for name in names {
+            let hits = sh.hash_hits.get(name).copied().unwrap_or(0);
+            let path = &sh.hash_table[name];
+            println!("{:>4}\t{}", hits, path);
+        }
+    }
+}
+
+/// The `hash` builtin: manage the table of the hashed commands.
+///
+///   * `hash` — print the table (the hits and the path of every command).
+///   * `hash -l` — print the table in a form that can be fed back.
+///   * `hash -r` — empty the table.
+///   * `hash -t name ...` — print the hashed path of every name.
+///   * `hash -d name ...` — remove the names from the table.
+///   * `hash -p path name ...` — hash the names to the given path.
+///   * `hash name ...` — look the names up in the `$PATH` and hash them.
+fn builtin_hash(argv: &[String], sh: &mut Shell) -> i32 {
+    const USAGE: &str = "hash: usage: hash [-lr] [-p pathname] [-dt] [name ...]";
+
+    let mut list_portably = false; // -l
+    let mut list_targets = false; // -t
+    let mut delete = false; // -d
+    let mut expunge = false; // -r
+    let mut pathname: Option<String> = None; // -p
+    let mut i = 1usize;
+
+    while i < argv.len() {
+        let a = &argv[i];
+        if a == "--" {
+            i += 1;
+            break;
+        }
+        if a.len() > 1 && a.starts_with('-') {
+            match a.as_str() {
+                "-l" => list_portably = true,
+                "-t" => list_targets = true,
+                "-d" => delete = true,
+                "-r" => expunge = true,
+                "-p" => {
+                    // `-p' takes the pathname as its argument.
+                    i += 1;
+                    match argv.get(i) {
+                        Some(p) => pathname = Some(p.clone()),
+                        None => {
+                            eprintln!("{}", USAGE);
+                            return 2;
+                        }
+                    }
+                }
+                _ => {
+                    eprintln!("wash: hash: {}: invalid option", a);
+                    eprintln!("{}", USAGE);
+                    return 2;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    let names: Vec<String> = argv[i..].to_vec();
+
+    // `hash -t' and `hash -d' need at least one name.
+    if names.is_empty() && (delete || list_targets) {
+        eprintln!(
+            "wash: hash: {}: option requires an argument",
+            if delete { "-d" } else { "-t" }
+        );
+        return 1;
+    }
+
+    // A pathname without a name is a usage error.
+    if pathname.is_some() && names.is_empty() {
+        eprintln!("{}", USAGE);
+        return 2;
+    }
+
+    // Without an option and without a name the table itself is printed.
+    if names.is_empty() && !expunge {
+        if sh.hash_table.is_empty() {
+            // bash only reports the empty table for the default listing.
+            if !list_portably {
+                println!("hash: hash table empty");
+            }
+        } else {
+            print_hashed_commands(sh, list_portably);
+        }
+        return 0;
+    }
+
+    if expunge {
+        sh.hash_table.clear();
+        sh.hash_hits.clear();
+    }
+
+    if list_targets {
+        let mut status = 0;
+        for name in &names {
+            match sh.hash_table.get(name) {
+                Some(path) => println!("{}", path),
+                None => {
+                    eprintln!("wash: hash: {}: not found", name);
+                    status = 1;
+                }
+            }
+        }
+        return status;
+    }
+
+    let path_env = sh.env.get("PATH").cloned().unwrap_or_default();
+    let mut status = 0;
+    for name in &names {
+        // A name with a slash is not hashed.
+        if name.contains('/') {
+            continue;
+        }
+        if let Some(path) = &pathname {
+            // `hash -p' stores the given path for the name.
+            sh.hash_table.insert(name.clone(), path.clone());
+            sh.hash_hits.entry(name.clone()).or_insert(0);
+            continue;
+        }
+        if delete {
+            if sh.hash_table.remove(name).is_none() {
+                eprintln!("wash: hash: {}: not found", name);
+                status = 1;
+            } else {
+                sh.hash_hits.remove(name);
+            }
+            continue;
+        }
+        // Look the name up in the `$PATH' and cache it.
+        match crate::executor::path_matches(name, &path_env).into_iter().next() {
+            Some(path) => {
+                sh.hash_table.insert(name.clone(), path);
+                sh.hash_hits.entry(name.clone()).or_insert(0);
+            }
+            None => {
+                eprintln!("wash: hash: {}: not found", name);
+                status = 1;
+            }
+        }
+    }
+
+    status
 }
 
 // ---------------------------------------------------------------------------
