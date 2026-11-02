@@ -40,6 +40,7 @@ const BUILTINS: &[&str] = &[
     "exec",
     "exit",
     "export",
+    "false",
     "hash",
     "printf",
     "read",
@@ -48,9 +49,11 @@ const BUILTINS: &[&str] = &[
     "shopt",
     "source",
     "test",
+    "true",
     "type",
     "unalias",
     "unset",
+    "pwd",
 ];
 
 /// True when `name` is the name of a builtin command.
@@ -80,10 +83,13 @@ pub fn run_builtin(argv: &[String], sh: &mut Shell) -> Option<i32> {
         "printf" => builtin_printf(argv, Some(sh)),
         "test" | "[" => builtin_test(argv, sh),
         "type" => builtin_type(argv, sh),
+        "true" => builtin_true(argv, sh),
+        "false" => builtin_false(argv, sh),
         "hash" => builtin_hash(argv, sh),
         "read" => builtin_read(argv, sh),
         ":" => builtin_colon(argv, sh),
         "command" => builtin_command(argv, sh),
+        "pwd" => builtin_pwd(argv, sh),
         "builtin" => builtin_builtin(argv, sh),
         _ => return None,
     };
@@ -2121,6 +2127,76 @@ fn builtin_read(argv: &[String], sh: &mut Shell) -> i32 {
 ///
 /// It always returns 0 and never writes anything.
 fn builtin_colon(_argv: &[String], _sh: &mut Shell) -> i32 {
+    0
+}
+
+// ---------------------------------------------------------------------------
+// true / false
+// ---------------------------------------------------------------------------
+
+/// The `true` builtin: a no-op that always succeeds (exit status 0).
+///
+/// Like bash, every argument is ignored (POSIX `true` accepts none, but bash
+/// silently discards them).
+fn builtin_true(_argv: &[String], _sh: &mut Shell) -> i32 {
+    0
+}
+
+/// The `false` builtin: a no-op that always fails (exit status 1).
+fn builtin_false(_argv: &[String], _sh: &mut Shell) -> i32 {
+    1
+}
+
+// ---------------------------------------------------------------------------
+// pwd
+// ---------------------------------------------------------------------------
+
+/// The `pwd` builtin: print the current working directory.
+///
+///   * `-L` (the default) prints the *logical* directory — the value of
+///     `sh.cwd`, which tracks `$PWD` across `cd`.
+///   * `-P` resolves symbolic links and prints the *physical* directory.
+///   * `-W` is accepted (Win32 physical form) but behaves like `-P` here.
+///
+/// Unknown options produce bash's usage diagnostic on stderr and exit 2.
+fn builtin_pwd(argv: &[String], sh: &mut Shell) -> i32 {
+    let mut logical = true;
+    let mut i = 1usize;
+    while i < argv.len() {
+        let a = &argv[i];
+        if a == "--" {
+            i += 1;
+            break;
+        }
+        if a.len() > 1 && a.starts_with('-') {
+            for c in a.chars().skip(1) {
+                match c {
+                    'L' => logical = true,
+                    'P' | 'W' => logical = false,
+                    _ => {
+                        eprintln!("wash: pwd: {}: invalid option", a);
+                        eprintln!("pwd: usage: pwd [-LPW]");
+                        return 2;
+                    }
+                }
+            }
+            i += 1;
+            continue;
+        }
+        break;
+    }
+
+    let path = if logical {
+        sh.cwd.clone()
+    } else {
+        let p = posix::realpath(&sh.cwd);
+        if p.is_empty() {
+            sh.cwd.clone()
+        } else {
+            p
+        }
+    };
+    println!("{}", path);
     0
 }
 
