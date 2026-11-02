@@ -95,7 +95,7 @@ stderr + 退出码）跑出来，或由针对该内建的定向探针实测得�
 
 | 内建 | 状态 | 备注（实测依据） |
 |------|------|------------------|
-| `:` | deferred | 未实现（rc=127）。计划在 Phase 3 批次内补齐（`true` / `false` 已完成并判定为 `full`，本项是仅剩的遗漏） |
+| `:` | full | 无参与带参数（`: foo`）均与 bash 一致 |
 | `true` / `false` | full | 退出码与 stdout 均一致 |
 | `echo` | full | `-n` / `-e` / `-E` / `--` 字面量 / 全部转义序列逐字节一致（`tests/bash_diff_echo_printf.sh` 100/100） |
 | `printf` | full | 全部转换说明符逐字节一致（`%s %d %i %o %u %x %X %e %E %f %g %G %a %A %c %b %q %%`、字段宽度/精度/`*`、`-v`），25 条定向探针全通过。两个历史缺陷（`%%` 死循环、非法数字静默）已修复并复测 |
@@ -114,7 +114,7 @@ stderr + 退出码）跑出来，或由针对该内建的定向探针实测得�
 | `command` | full | `-v` / `-V` / `-p` / `-a`（非法选项 rc=2）/ 无参直接执行，全部逐字节一致 |
 | `builtin` | full | 执行内建 / 非内建报错（rc=1）/ 无参列出内建清单，逐字节一致 |
 | `hash` | full | 无参 / `-t <name>` / `-l` / `-r` / `-p <path> <name>` 五种用法逐字节一致 |
-| `read` | deferred | 未实现（rc=127）。Phase 3 批次内补齐 |
+| `read` | partial | 基础读取、`-r`、`-n`、`-d`、`-p`、`REPLY`、EOF rc=1、多变量、`IFS` 作为普通语句时按 `IFS` 分隔，均逐字节一致。**一处差异**：`IFS` 作为**前缀赋值**时（`IFS=: read a b`）bash 会把它应用到本次分词（输入无 `:` 则整行是一个字段 `a=[a b c] b=[]`），wash 仍按全局 `IFS` 分词（`a=[a] b=[b c]`）——wash 的 `read` 看不到前缀赋值的临时 `IFS` |
 | `pwd` | full | `pwd` / `-L` / `-P` 三种形式逐字节一致 |
 | `shift` | full | 基本位移 / 连续位移 / 计数按**十进制**解析（`shift 2`）/ 越界 rc=1，一致 |
 | `return` | deferred | 未实现（rc=127）。需配合函数（Phase 3）落地 |
