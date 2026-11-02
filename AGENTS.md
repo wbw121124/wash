@@ -154,7 +154,7 @@ stderr + 退出码）跑出来，或由针对该内建的定向探针实测得�
 
 | 内建 | 状态 | 备注（实测依据） |
 |------|------|------------------|
-| `:` | deferred | 未实现，`wash: ::: command not found`（rc=127）。Phase 3 批次内补齐（与 `true`/`false` 同批） |
+| `:` | deferred | 未实现，报 `wash: :: command not found`（rc=127）。Phase 3 批次内补齐（与 `true`/`false` 同批） |
 | `true` / `false` | full | 退出码与 stdout 均一致（GROUP C `true` / `false` 通过） |
 | `echo` | full | `-n` / `-e` / `-E` / `--` 字面量 / 全部转义序列逐字节一致（`tests/bash_diff_echo_printf.sh` 100/100） |
 | `printf` | partial | 绝大多数转换说明符一致（`%s %d %i %o %u %x %X %e %E %f %g %G %a %A %c %b %q %%`、字段宽度/精度、`-v` 均通过）。**实测两处缺陷**：①**死循环**：`printf %%. a`、`printf x%%y z`（格式串含 `%%` **且后面还有格式字符**，同时**带多余参数**）在 wash **永不返回**（bash 正常输出 `%.` / `x%y` 后退出）——挂起级缺陷，根因见「已知缺陷」一节；②`printf %x ff` 这类非法数字，bash 会在 stderr 报 `printf: ff: invalid number`，wash 静默输出 `0` 且**不报任何消息** |
@@ -162,7 +162,7 @@ stderr + 退出码）跑出来，或由针对该内建的定向探针实测得�
 | `exit` | full | 无参/`42`/`300`/`-1`/被 source 的脚本内 `exit` 一致；非法参数 `exit abc` 时 bash 报 `exit: abc: numeric argument required`、置 `$?=2`、**继续执行后续命令**，wash 已照此对齐 |
 | `export` | partial | `-p` / 无参 / `NAME=val` / `-n` / 赋值 / 非法标识符报错，格式与 bash 一致（GROUP A `export-p`/`export-noarg`/`export-no-name` 逐字节通过）。**差异**：①`export -f`（导出函数）wash 报 rc=2，bash 是 rc=1；②wash 不维护 bash 的 `BASH_*` / `BASHOPTS` / `BASH_VERSINFO` 等内部变量（这是 shell 内部变量集合差异，不是 `export` 本身的缺陷）；③`$_` 的导出属性处理与 bash 不同（bash 在命令执行后取消 `$_` 的导出属性，wash 保留） |
 | `unset` | full | `-v` / 裸变量 / 多变量 / 不存在变量 / `-f` / 无参，rc 与报错一致 |
-| `set` | partial | 选项处理（`-o` / `+o` / `-e` / `-f` / `--` / 位置参数 / 非法选项报错）与 bash **逐字节一致**（`set -o`、`set +o` 全表比对通过）。**差异**：`set` 无参时 bash 打印**整个变量表**，含 `BASH` / `BASHOPTS` / `BASH_ARGC` / `BASH_ARGV` / `BASH_CMDS` / `BASH_LINENO` / `BASH_SOURCE` / `BASH_VERSINFO` / `BASH_VERSION` / `DIRSTACK` / `EUID` / `GROUPS` / `HOSTTYPE` / `MACHTYPE` / `OSTYPE` / `PIPESTATUS` / `PPID` / `RANDOM` / `SECONDS` / `SHELLOPTS` / `UID` 等内部变量，wash 只有自己的变量表，**变量集合必然不同**，无法逐字节全等（已隔离到 GROUP K `set-noargs`） |
+| `set` | partial | 选项处理（`-o` / `+o` / `-e` / `-f` / **`-n`（noexec）** / `--` / 位置参数 / 非法选项报错）与 bash **逐字节一致**（`set -o`、`set +o` 全表比对通过；`set -n` 的 4 条 GROUP A 用例通过）。**差异**：`set` 无参时 bash 打印**整个变量表**，含 `BASH` / `BASHOPTS` / `BASH_ARGC` / `BASH_ARGV` / `BASH_CMDS` / `BASH_LINENO` / `BASH_SOURCE` / `BASH_VERSINFO` / `BASH_VERSION` / `DIRSTACK` / `EUID` / `GROUPS` / `HOSTTYPE` / `MACHTYPE` / `OSTYPE` / `PIPESTATUS` / `PPID` / `RANDOM` / `SECONDS` / `SHELLOPTS` / `UID` 等内部变量，wash 只有自己的变量表，**变量集合必然不同**，无法逐字节全等（已隔离到 GROUP K `set-noargs`） |
 | `alias` | full | 无参列出 / `-p` / 定义 / 未定义别名报错 / 非法名报错 / 别名展开，一致 |
 | `unalias` | full | `-a` / 删单个 / 不存在 / **无参打印用法行**（`unalias: usage: unalias [-a] name [name ...]`，rc=2），一致。注意：`unalias` 无参**不是**列出全部别名（那是 `alias` 无参的行为） |
 | `source` / `.` | full | 基本 / `.` 形式 / 带参数 / 不存在 / 无参 / 退出码透传 / `$0` 语义（被 source 的文件里 `$0` 仍是 shell 自己的调用路径，bash 默认模式与 `--posix` 模式均如此）/ 查找顺序（无斜杠时**先查 `PATH`** 再回落当前目录），一致。差异仅在 `$0` 的**字面值**（两个二进制路径不同，见 GROUP K `source-zero-raw`） |
