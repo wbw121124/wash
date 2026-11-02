@@ -2120,7 +2120,7 @@ fn builtin_read(argv: &[String], sh: &mut Shell) -> i32 {
 /// The `:` builtin: a no-op that ignores all its arguments.
 ///
 /// It always returns 0 and never writes anything.
-fn builtin_colon(argv: &[String], sh: &mut Shell) -> i32 {
+fn builtin_colon(_argv: &[String], _sh: &mut Shell) -> i32 {
     0
 }
 
