@@ -29,6 +29,7 @@ use crate::shell::{Shell, SET_O_ORDER, SHOPT_ORDER};
 /// Every builtin name understood by `run_builtin`.
 const BUILTINS: &[&str] = &[
     ".",
+    ":",
     "[",
     "alias",
     "builtin",
@@ -81,6 +82,7 @@ pub fn run_builtin(argv: &[String], sh: &mut Shell) -> Option<i32> {
         "type" => builtin_type(argv, sh),
         "hash" => builtin_hash(argv, sh),
         "read" => builtin_read(argv, sh),
+        ":" => builtin_colon(argv, sh),
         "command" => builtin_command(argv, sh),
         "builtin" => builtin_builtin(argv, sh),
         _ => return None,
@@ -2109,6 +2111,17 @@ fn builtin_read(argv: &[String], sh: &mut Shell) -> i32 {
     }
 
     status
+}
+
+// ---------------------------------------------------------------------------
+// :
+// ---------------------------------------------------------------------------
+
+/// The `:` builtin: a no-op that ignores all its arguments.
+///
+/// It always returns 0 and never writes anything.
+fn builtin_colon(argv: &[String], sh: &mut Shell) -> i32 {
+    0
 }
 
 // ---------------------------------------------------------------------------
