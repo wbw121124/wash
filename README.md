@@ -78,7 +78,73 @@ Win32 控制台 API、也不使用带 Win32 后端的行编辑器 crate（如 ru
 ```bash
 ./tests/oracle.sh          # Phase 0：外部命令 / 管道 / 重定向
 ./tests/oracle_phase1.sh   # Phase 1：展开系统
+./tests/bash_diff_echo_printf.sh   # echo / printf 逐字节对齐 bash
+./tests/bash_diff_builtins.sh      # 全部内建逐字节对齐 bash（见下方矩阵）
 ```
+
+## 内建兼容性矩阵
+
+**这份矩阵是实测结论，不是设计意图。** 每一行的状态都由
+`tests/bash_diff_builtins.sh`（MSYS2 bash 5.3 ↔ wash 逐字节比对 stdout +
+stderr + 退出码）跑出来，或由针对该内建的定向探针实测得到。**没实测过的一律
+不写 `full`。**
+
+状态定义：`full` = 与 bash 5.3 逐字节一致（实测通过）；`partial` = 已实现但
+存在可观测差异（备注写明差在哪）；`deferred` = 尚未实现（备注写明为什么延后 +
+计划在哪个 Phase 落地）。
+
+| 内建 | 状态 | 备注（实测依据） |
+|------|------|------------------|
+| `:` | deferred | 未实现（rc=127）。Phase 3 批次内补齐 |
+| `true` / `false` | full | 退出码与 stdout 均一致 |
+| `echo` | full | `-n` / `-e` / `-E` / `--` 字面量 / 全部转义序列逐字节一致（`tests/bash_diff_echo_printf.sh` 100/100） |
+| `printf` | partial | 绝大多数转换说明符一致（`%s %d %i %o %u %x %X %e %E %f %g %G %a %A %c %b %q %%`、字段宽度/精度、`-v`）。**两处缺陷**：①**死循环**：`printf %%. a`（`%%` 在格式串中间 + 多余参数）在 wash 永不返回；②`printf %x ff` 非法数字时 bash 报 `printf: ff: invalid number`，wash 静默输出 `0` |
+| `cd` | full | 绝对/相对/逻辑(`/L`)/物理(`/P`)/`CDPATH`/`-`/`--`/空串/不存在/失败后 `PWD` 不变，全部一致（含 bash 的 `cd: too many arguments`，rc=2） |
+| `exit` | full | 无参/`42`/`300`/`-1`/被 source 的脚本内 `exit` 一致；`exit abc` 时 bash 报 `exit: abc: numeric argument required`、置 `$?=2`、**继续执行后续命令**，wash 已对齐 |
+| `export` | partial | `-p` / 无参 / `NAME=val` / `-n` / 非法标识符报错，格式逐字节一致。**差异**：①`export -f`（导出函数）wash 报 `export: -f: not supported`（rc=2），bash 是 `export: f: not a function`（rc=1）；②wash 不维护 bash 的 `BASH_*` / `BASHOPTS` / `BASH_VERSINFO` 等内部变量（shell 内部变量集合差异）；③`$_` 的导出属性处理与 bash 不同 |
+| `unset` | full | `-v` / 裸变量 / 多变量 / 不存在变量 / `-f` / 无参，rc 与报错一致 |
+| `set` | partial | 选项处理（`-o` / `+o` / `-e` / `-f` / `-n` / `--` / 位置参数 / 非法选项报错）与 bash **逐字节一致**（`set -o`、`set +o` 全表比对通过）。**差异**：`set` 无参时 bash 打印**整个变量表**（含 `BASH` / `BASHOPTS` / `BASH_ARGC` / `BASH_ARGV` / `BASH_CMDS` / `BASH_LINENO` / `BASH_SOURCE` / `BASH_VERSINFO` / `BASH_VERSION` / `DIRSTACK` / `EUID` / `GROUPS` / `HOSTTYPE` / `MACHTYPE` / `OSTYPE` / `PIPESTATUS` / `PPID` / `RANDOM` / `SECONDS` / `SHELLOPTS` / `UID` 等内部变量），wash 只有自己的变量表，**变量集合必然不同**，无法逐字节全等 |
+| `alias` | full | 无参列出 / `-p` / 定义 / 未定义别名报错 / 非法名报错 / 别名展开，一致 |
+| `unalias` | full | `-a` / 删单个 / 不存在 / **无参打印用法行**（`unalias: usage: unalias [-a] name [name ...]`，rc=2），一致。注意 `unalias` 无参**不是**列出全部别名（那是 `alias` 无参的行为） |
+| `source` / `.` | full | 基本 / `.` 形式 / 带参数 / 不存在 / 无参 / 退出码透传 / `$0` 语义（被 source 的文件里 `$0` 仍是 shell 自己的调用路径，bash 默认与 `--posix` 模式均如此）/ 查找顺序（无斜杠时**先查 `PATH`** 再回落当前目录），一致。差异仅在 `$0` 的**字面值**（两个二进制路径不同） |
+| `eval` | full | 副作用 / 执行命令 / 空串 / 无参 / `eval 'exit 3'` 退出整 shell / 多词，一致 |
+| `exec` | full | `-a name` / 替换当前进程 / 命令不存在 / 无参，一致 |
+| `test` / `[` | full | 数值比较、字符串比较、`-z -n -f -d -e -r -w -x -s -L -h -b -c -p -S`、`!`、`-a`、`-o`、`-nt -ot -ef`、`[` `]` 形式、参数个数错误、缺右括号、`-ef` 语法错误信息、八进制数值，全部逐字节一致 |
+| `type` | full | 无参 / `-t` / `-a` / `-f` / `-P`，全部逐字节一致 |
+| `command` | full | `-v` / `-V` / `-p` / `-a`（非法选项 rc=2）/ 无参直接执行，全部逐字节一致 |
+| `builtin` | full | 执行内建 / 非内建报错（rc=1）/ 无参列出内建清单，逐字节一致 |
+| `hash` | deferred | 未实现（rc=127）。Phase 3 批次内补齐 |
+| `read` | deferred | 未实现（rc=127）。Phase 3 批次内补齐 |
+| `pwd` | full | `pwd` / `-L` / `-P` 三种形式逐字节一致 |
+| `shift` | full | 基本位移 / 连续位移 / 计数按**十进制**解析（`shift 2`）/ 越界 rc=1，一致 |
+| `return` | deferred | 未实现（rc=127）。需配合函数（Phase 3）落地 |
+| `break` / `continue` | deferred | 未实现（rc=127）。需配合循环（Phase 3）落地 |
+| `local` | deferred | 未实现（rc=127）。需配合函数（Phase 3）落地 |
+| `declare` / `typeset` / `readonly` | deferred | 未实现（rc=127）。Phase 4 落地 |
+| `let` | deferred | 未实现（rc=127）。Phase 4 落地（算术展开已在 Phase 1 完成，`let` 只是语法糖） |
+| `ulimit` / `umask` / `times` | deferred | 未实现（rc=127）。Phase 4 落地 |
+| `kill` | partial | `kill -l 1`（`HUP`）、`kill -l TERM`（`15`）一致；**`kill -l` 全量清单格式不同**：bash 打印 ` 1) SIGHUP\t 2) SIGINT\t...`（带序号 + `SIG` 前缀），wash 打印 `HUP INT QUIT ...` |
+| `trap` | deferred | 未实现（rc=127）。Phase 4 落地 |
+| `dirs` / `pushd` / `popd` | deferred | 未实现（rc=127）。Phase 4 落地 |
+| `help` / `enable` | deferred | 未实现（rc=127）。Phase 4 落地 |
+
+### 本阶段显式延后的内建（有意排期，不是「忘记做」）
+
+| 内建 | 延后原因 | 计划 Phase |
+|------|----------|-----------|
+| `jobs` / `fg` / `bg` / `wait` / `disown` | 需要完整的作业控制：后台进程组、`SIGTSTP`/`SIGCONT` 处理、`$!` 与 `jobs` 表。wash 当前的执行模型是「每条命令 fork/exec」，尚无作业表与进程组管理 | **Phase 2**（作业控制） |
+| `mapfile` / `readarray` / `coproc` / 数组 `-a` / `-A` | 需要真正的数组类型（`declare -a` 语义、数组下标展开、`${arr[@]}`）与协进程双向管道。wash 目前只有标量变量，也没有协进程管道机制 | **Phase 4**（高级内建 / 数组） |
+| `compgen` / `complete` / `bind` | 补全与键绑定属于交互式 REPL 层。Phase 6 REPL 已有自研 Tab 补全（命令名查 `PATH` + 文件路径补全），但尚未暴露成 bash 风格的 `complete` / `bind` 内建 | **Phase 4** 之后（与 REPL 补全对接） |
+| `fc` / `history` | 命令历史由 REPL 持久化到 `~/.wash_history`，但 `history` 内建需把历史列表以 bash 格式暴露，`fc` 还需历史范围展开与编辑——两者都与 REPL 的历史存储格式强耦合 | **Phase 4** 之后（与 REPL 历史对接） |
+
+### 已知缺陷（实测复现，待修）
+
+| 缺陷 | 复现 | bash 的行为 | wash 的行为 |
+|------|------|-------------|------------|
+| `printf` 死循环 | `wash -c 'printf %%. a'` | 输出 `%.` 后正常退出（rc=0） | **永不返回**（进程挂起，需 `timeout` 强杀）。触发条件：格式串含 `%%` 且其后还有格式字符，同时命令行带了多余参数 |
+| `printf` 非法数字不报错 | `wash -c 'printf %x ff'` | stderr 报 `printf: ff: invalid number`，stdout 输出 `0`，rc=1 | stdout 输出 `0`，rc=1，**stderr 无任何消息** |
+
+详细的根因分析见 `AGENTS.md` 的「内建兼容性矩阵 → 已知缺陷」一节。
 
 ## 架构概览
 
