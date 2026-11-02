@@ -173,7 +173,7 @@ stderr + 退出码）跑出来，或由针对该内建的定向探针实测得�
 | `command` | full | `-v`（内建名 / 不存在时 rc=1）、`-V`（`echo is a shell builtin`）、`-p`（清 PATH 后执行）、`-a`（非法选项 rc=2 + `command: -a: invalid option`）、无参直接执行命令，全部逐字节一致 |
 | `builtin` | full | 执行内建（`builtin echo hi`）、非内建（`builtin: nosuchbuiltin: not a shell builtin`，rc=1）、无参列出内建清单，全部逐字节一致 |
 | `hash` | full | 无参（列出已缓存的命令路径）、`-t <name>`（打印缓存路径）、`-l`（列出全部）、`-r`（清空缓存）、`-p <path> <name>`（指定路径并缓存），5 条用例逐字节一致（GROUP C `hash-plain` / `hash-t` / `hash-l` / `hash-r` / `hash-p` 全通过） |
-| `read` | partial | 基础读取、`-r`、`-n`、`-d`、`-p`、无变量时写入 `REPLY`、EOF 时 rc=1、多变量赋值、`IFS` 作为普通语句时按 `IFS` 分隔（`IFS=:; read a b` → `a=[a] b=[b:c]`），全部逐字节一致。**一处差异**：`IFS` 作为**前缀赋值**时（`IFS=: read a b` / `IFS= read a b`），bash 会把它应用到本次分词——输入 `a b c` 里没有 `:`，于是**整行是一个字段**（`a=[a b c] b=[]`）；wash 仍按全局 `IFS`（默认空白）分词，得到 `a=[a] b=[b c]`。即 wash 的 `read` **看不到前缀赋值带来的临时 `IFS`** |
+| `read` | full | 基础读取、`-r`、`-n`、`-d`、`-p`、无变量时写入 `REPLY`、EOF 时 rc=1、多变量赋值、`IFS` 作为**普通语句**（`IFS=:; read a b` → `a=[a] b=[b:c]`）与**前缀赋值**（`IFS=: read a b` / `IFS= read a b` → 整行一个字段 `a=[a b c] b=[]`）均逐字节一致（GROUP C `read-*` 全通过；`read-ifs-prefix` / `read-ifs-empty` 现通过，前缀赋值 `IFS` 已生效，此前矩阵误记为 `partial`） |
 | `pwd` | full | `pwd` / `-L` / `-P` 三种形式逐字节一致 |
 | `shift` | full | 基本位移 / 连续位移 / 计数按**十进制**解析（`shift 2`）/ 越界返回 rc=1，一致 |
 
