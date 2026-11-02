@@ -154,10 +154,10 @@ stderr + 退出码）跑出来，或由针对该内建的定向探针实测得�
 
 | 内建 | 状态 | 备注（实测依据） |
 |------|------|------------------|
-| `:` | deferred | 未实现，报 `wash: :: command not found`（rc=127）。Phase 3 批次内补齐（与 `true`/`false` 同批） |
+| `:` | deferred | 未实现，报 `wash: :: command not found`（rc=127）。计划在 Phase 3 批次内补齐（`true` / `false` 已在更早的批次完成并判定为 `full`，本项是仅剩的遗漏） |
 | `true` / `false` | full | 退出码与 stdout 均一致（GROUP C `true` / `false` 通过） |
 | `echo` | full | `-n` / `-e` / `-E` / `--` 字面量 / 全部转义序列逐字节一致（`tests/bash_diff_echo_printf.sh` 100/100） |
-| `printf` | partial | 绝大多数转换说明符一致（`%s %d %i %o %u %x %X %e %E %f %g %G %a %A %c %b %q %%`、字段宽度/精度、`-v` 均通过）。**实测两处缺陷**：①**死循环**：`printf %%. a`、`printf x%%y z`（格式串含 `%%` **且后面还有格式字符**，同时**带多余参数**）在 wash **永不返回**（bash 正常输出 `%.` / `x%y` 后退出）——挂起级缺陷，根因见「已知缺陷」一节；②`printf %x ff` 这类非法数字，bash 会在 stderr 报 `printf: ff: invalid number`，wash 静默输出 `0` 且**不报任何消息** |
+| `printf` | full | 全部转换说明符逐字节一致（`%s %d %i %o %u %x %X %e %E %f %g %G %a %A %c %b %q %%`、字段宽度/精度/`*`、`-v`），**25 条定向探针全通过**。两个历史缺陷已由 `f59ea30` 修复并复测：①`printf %%. a`（`%%` 在格式串中间 + 多余参数）不再挂起，输出 `%.` 与 bash 一致；②`printf %x ff` 非法数字现在会在 stderr 报 `printf: ff: invalid number`（stdout 仍为 `0`，rc=1），与 bash 一致 |
 | `cd` | full | 绝对/相对/逻辑(`/L`)/物理(`/P`)/`CDPATH`/`-`/`--`/空串/不存在/失败后 `PWD` 不变，全部一致。含 bash 的 `cd: too many arguments`（rc=2，`PWD` 不变） |
 | `exit` | full | 无参/`42`/`300`/`-1`/被 source 的脚本内 `exit` 一致；非法参数 `exit abc` 时 bash 报 `exit: abc: numeric argument required`、置 `$?=2`、**继续执行后续命令**，wash 已照此对齐 |
 | `export` | partial | `-p` / 无参 / `NAME=val` / `-n` / 赋值 / 非法标识符报错，格式与 bash 一致（GROUP A `export-p`/`export-noarg`/`export-no-name` 逐字节通过）。**差异**：①`export -f`（导出函数）wash 报 rc=2，bash 是 rc=1；②wash 不维护 bash 的 `BASH_*` / `BASHOPTS` / `BASH_VERSINFO` 等内部变量（这是 shell 内部变量集合差异，不是 `export` 本身的缺陷）；③`$_` 的导出属性处理与 bash 不同（bash 在命令执行后取消 `$_` 的导出属性，wash 保留） |
@@ -190,7 +190,7 @@ stderr + 退出码）跑出来，或由针对该内建的定向探针实测得�
 | `ulimit` | deferred | 未实现（rc=127）。Phase 4 落地 |
 | `umask` | deferred | 未实现（rc=127）。Phase 4 落地 |
 | `times` | deferred | 未实现（rc=127）。Phase 4 落地 |
-| `kill` | partial | `kill -l 1`（`HUP`）、`kill -l TERM`（`15`）一致；**`kill -l` 全量清单格式与 bash 不同**：bash 打印 ` 1) SIGHUP\t 2) SIGINT\t...`（带序号 + `SIG` 前缀，64 行），wash 打印 `HUP INT QUIT ILL ...`（无序号、无前缀）。其余 `kill` 用法（发信号）未验证 |
+| `kill` | partial | 已实现，且**发信号路径已覆盖**：`kill -0 $$`（存在性检查）rc=0、`kill -TERM $$`（真发信号，shell 被 SIGTERM 终止）rc=143、`kill -TERM <子进程>` 后 `wait` 报 143，与 bash 一致；`kill -l 9`（`KILL`）、`kill -l KILL`（`9`）也一致。**三处差异**：①`kill -l` 全量清单格式不同（bash ` 1) SIGHUP\t 2) SIGINT\t...` 带序号 + `SIG` 前缀 vs wash `HUP INT QUIT ...`）；②`kill` 无参时 bash 打印自己的用法行 `kill: usage: kill [-s sigspec \| -n signum \| -sigspec] pid \| jobspec ... or kill -l [sigspec]`（rc=2），wash 转发给了 Cygwin 外部 `/usr/bin/kill`，打印的是外部工具的帮助文本（rc=1）；③`kill -NOSUCHSIG 12345` bash 报 `kill: NOSUCHSIG: invalid signal specification`，wash 报 `kill: unknown signal: NOSUCHSIG` + `Try \`kill --help' ...`；`kill -TERM 999999` bash 报 `kill: (999999) - No such process`（带括号），wash 报 `kill: 999999: No such process`（缺括号） |
 | `trap` | deferred | 未实现（rc=127）。Phase 4 落地 |
 | `dirs` / `pushd` / `popd` | deferred | 未实现（rc=127）。Phase 4 落地 |
 | `help` | deferred | 未实现（rc=127）。Phase 4 落地 |
@@ -207,15 +207,25 @@ stderr + 退出码）跑出来，或由针对该内建的定向探针实测得�
 
 ### 已知缺陷（实测复现，待修）
 
-| 缺陷 | 复现 | bash 的行为 | wash 的行为 |
-|------|------|-------------|------------|
-| `printf` 死循环 | `wash -c 'printf %%. a'` | 输出 `%.` 后正常退出（rc=0） | **永不返回**（进程挂起，需 `timeout` 强杀）。<br>**触发条件（已定位）**：格式串含 `%%` **且其后还有格式字符**（如 `%%.`、`x%%y`），**同时**命令行带了多余参数。<br>**根因**：`src/builtins.rs` 的 `printf_format()` 用 `has_conv` 预扫描判断格式串是否含转换说明符，扫描时把 `%%` 后面的字符也当成了转换说明符起点 → `has_conv=true`；而真正消费参数的 `parse_printf_spec()` 对 `%%` 不消费参数 → `ai` 永不前进 → `loop` 里 `ai < args.len()` 恒成立 → **无限循环**。<br>**旁证**：`printf %%%% a`（`%%` 在末尾）不挂起，`printf x%%y`（无多余参数）也不挂起，`printf %s %%. a`（`%s` 已消费掉参数）也不挂起——与上述根因完全吻合。 |
-| `printf` 非法数字不报错 | `wash -c 'printf %x ff'` | stderr 报 `printf: ff: invalid number`，stdout 输出 `0`，rc=1 | stdout 输出 `0`，rc=1，**stderr 无任何消息**（`parse_printf_spec` 置了 `conv_error` 但没往 stderr 写诊断） |
+**当前无已复现待修的缺陷。** 上一轮记录的 `printf` 两处缺陷（`%%` 死循环、
+非法数字静默）已由 `f59ea30` 修复并复测通过，现已从本表移除；对应的回归
+用例保留在 `tests/bash_diff_builtins.sh` 的 GROUP D（`printf-pct-mid-extra` /
+`printf-pct-mid-extra2` / `printf-hex-invalid` / `printf-dec-invalid`），
+一旦缺陷复发会立刻变红。
 
-> **为什么这两个缺陷一直没被发现**：`tests/bash_diff_echo_printf.sh` 的 100/100 用例里，
-> 唯一涉及 `%%` 的用例是 `printf "100%%\n"`——**格式串以 `%%` 结尾且没有多余参数**，
-> 恰好落在死循环触发条件之外。补上 `%%` 位于格式串中间 + 带多余参数的用例即可暴露。
-> 本次新增的 `tests/bash_diff_builtins.sh` 已把这两条作为 GROUP D 用例纳入回归。
+> **这两个缺陷当初为什么没被发现**：`tests/bash_diff_echo_printf.sh` 的 100/100
+> 用例里，唯一涉及 `%%` 的用例是 `printf "100%%\n"`——**格式串以 `%%` 结尾且
+> 没有多余参数**，恰好落在死循环触发条件之外。补上「`%%` 位于格式串中间 +
+> 带多余参数」的用例即可暴露。
+
+### 已修复缺陷的根因存档（供回归参考）
+
+`printf` 死循环的根因（`src/builtins.rs` 的 `printf_format()`）：`has_conv`
+预扫描判断格式串是否含转换说明符时，把 `%%` 之后的字符也当成了转换说明符
+起点 → `has_conv=true`；而真正消费参数的 `parse_printf_spec()` 对 `%%` 不消费
+参数 → `ai` 永不前进 → `loop` 里 `ai < args.len()` 恒成立 → 无限循环。
+**旁证**：`printf %%%% a`（`%%` 在末尾）不挂起，`printf x%%y`（无多余参数）
+也不挂起，`printf %s %%. a`（`%s` 已消费掉参数）同样不挂起——与该根因完全吻合。
 
 ## 参考源码
 

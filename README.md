@@ -95,10 +95,10 @@ stderr + 退出码）跑出来，或由针对该内建的定向探针实测得�
 
 | 内建 | 状态 | 备注（实测依据） |
 |------|------|------------------|
-| `:` | deferred | 未实现（rc=127）。Phase 3 批次内补齐 |
+| `:` | deferred | 未实现（rc=127）。计划在 Phase 3 批次内补齐（`true` / `false` 已完成并判定为 `full`，本项是仅剩的遗漏） |
 | `true` / `false` | full | 退出码与 stdout 均一致 |
 | `echo` | full | `-n` / `-e` / `-E` / `--` 字面量 / 全部转义序列逐字节一致（`tests/bash_diff_echo_printf.sh` 100/100） |
-| `printf` | partial | 绝大多数转换说明符一致（`%s %d %i %o %u %x %X %e %E %f %g %G %a %A %c %b %q %%`、字段宽度/精度、`-v`）。**两处缺陷**：①**死循环**：`printf %%. a`（`%%` 在格式串中间 + 多余参数）在 wash 永不返回；②`printf %x ff` 非法数字时 bash 报 `printf: ff: invalid number`，wash 静默输出 `0` |
+| `printf` | full | 全部转换说明符逐字节一致（`%s %d %i %o %u %x %X %e %E %f %g %G %a %A %c %b %q %%`、字段宽度/精度/`*`、`-v`），25 条定向探针全通过。两个历史缺陷（`%%` 死循环、非法数字静默）已修复并复测 |
 | `cd` | full | 绝对/相对/逻辑(`/L`)/物理(`/P`)/`CDPATH`/`-`/`--`/空串/不存在/失败后 `PWD` 不变，全部一致（含 bash 的 `cd: too many arguments`，rc=2） |
 | `exit` | full | 无参/`42`/`300`/`-1`/被 source 的脚本内 `exit` 一致；`exit abc` 时 bash 报 `exit: abc: numeric argument required`、置 `$?=2`、**继续执行后续命令**，wash 已对齐 |
 | `export` | partial | `-p` / 无参 / `NAME=val` / `-n` / 非法标识符报错，格式逐字节一致。**差异**：①`export -f`（导出函数）wash 报 `export: -f: not supported`（rc=2），bash 是 `export: f: not a function`（rc=1）；②wash 不维护 bash 的 `BASH_*` / `BASHOPTS` / `BASH_VERSINFO` 等内部变量（shell 内部变量集合差异）；③`$_` 的导出属性处理与 bash 不同 |
@@ -123,7 +123,7 @@ stderr + 退出码）跑出来，或由针对该内建的定向探针实测得�
 | `declare` / `typeset` / `readonly` | deferred | 未实现（rc=127）。Phase 4 落地 |
 | `let` | deferred | 未实现（rc=127）。Phase 4 落地（算术展开已在 Phase 1 完成，`let` 只是语法糖） |
 | `ulimit` / `umask` / `times` | deferred | 未实现（rc=127）。Phase 4 落地 |
-| `kill` | partial | `kill -l 1`（`HUP`）、`kill -l TERM`（`15`）一致；**`kill -l` 全量清单格式不同**：bash 打印 ` 1) SIGHUP\t 2) SIGINT\t...`（带序号 + `SIG` 前缀），wash 打印 `HUP INT QUIT ...` |
+| `kill` | partial | **发信号路径已覆盖**：`kill -0 $$` rc=0、`kill -TERM $$` rc=143、`kill -TERM <子进程>` 后 `wait` 报 143，均与 bash 一致；`kill -l 9` / `kill -l KILL` 一致。**三处差异**：①`kill -l` 全量清单格式不同（bash ` 1) SIGHUP\t...` 带序号 + `SIG` 前缀 vs wash `HUP INT ...`）；②`kill` 无参时 bash 打印自己的用法行（rc=2），wash 转发给 Cygwin 外部 `/usr/bin/kill` 打印其帮助文本（rc=1）；③非法信号名 / 不存在进程的错误文案与 bash 不同（`kill: unknown signal: NOSUCHSIG` vs `kill: NOSUCHSIG: invalid signal specification`；`kill: 999999: No such process` 缺 bash 的括号） |
 | `trap` | deferred | 未实现（rc=127）。Phase 4 落地 |
 | `dirs` / `pushd` / `popd` | deferred | 未实现（rc=127）。Phase 4 落地 |
 | `help` / `enable` | deferred | 未实现（rc=127）。Phase 4 落地 |
@@ -139,12 +139,11 @@ stderr + 退出码）跑出来，或由针对该内建的定向探针实测得�
 
 ### 已知缺陷（实测复现，待修）
 
-| 缺陷 | 复现 | bash 的行为 | wash 的行为 |
-|------|------|-------------|------------|
-| `printf` 死循环 | `wash -c 'printf %%. a'` | 输出 `%.` 后正常退出（rc=0） | **永不返回**（进程挂起，需 `timeout` 强杀）。触发条件：格式串含 `%%` 且其后还有格式字符，同时命令行带了多余参数 |
-| `printf` 非法数字不报错 | `wash -c 'printf %x ff'` | stderr 报 `printf: ff: invalid number`，stdout 输出 `0`，rc=1 | stdout 输出 `0`，rc=1，**stderr 无任何消息** |
+**当前无已复现待修的缺陷。** 上一轮记录的 `printf` 两处缺陷（`%%` 死循环、
+非法数字静默）已修复并复测通过，已从本表移除；对应回归用例保留在
+`tests/bash_diff_builtins.sh` 的 GROUP D，缺陷复发会立刻变红。
 
-详细的根因分析见 `AGENTS.md` 的「内建兼容性矩阵 → 已知缺陷」一节。
+详细的根因分析见 `AGENTS.md` 的「内建兼容性矩阵 → 已修复缺陷的根因存档」一节。
 
 ## 架构概览
 
