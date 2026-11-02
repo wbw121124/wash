@@ -542,6 +542,18 @@ run_case D return            'return 0; echo "rc=$?"'
 run_case D break             'break; echo "rc=$?"'
 run_case D continue          'continue; echo "rc=$?"'
 
+# --- printf: known defects (see AGENTS.md "已知缺陷") ----------------------
+# `%%` in the MIDDLE of the format string, together with a surplus
+# argument, makes wash loop forever (bash prints `%.` and exits).  The
+# `timeout` guard in the runner keeps the suite from hanging forever; the
+# case still fails because wash's rc (124) differs from bash's rc (0).
+run_case D printf-pct-mid-extra 'printf %%. a'
+run_case D printf-pct-mid-extra2 'printf x%%y z'
+# A numeric conversion with a non-numeric argument: bash reports
+# "printf: ff: invalid number" on stderr, wash stays silent.
+run_case D printf-hex-invalid 'printf %x ff'
+run_case D printf-dec-invalid 'printf %d zz'
+
 # --- job control (Phase 2) --------------------------------------------------
 run_case D jobs              'jobs; echo "rc=$?"'
 run_case D fg                'fg; echo "rc=$?"'
