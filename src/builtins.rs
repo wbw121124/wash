@@ -41,6 +41,7 @@ const BUILTINS: &[&str] = &[
     "export",
     "hash",
     "printf",
+    "read",
     "set",
     "shift",
     "shopt",
@@ -79,6 +80,7 @@ pub fn run_builtin(argv: &[String], sh: &mut Shell) -> Option<i32> {
         "test" | "[" => builtin_test(argv, sh),
         "type" => builtin_type(argv, sh),
         "hash" => builtin_hash(argv, sh),
+        "read" => builtin_read(argv, sh),
         "command" => builtin_command(argv, sh),
         "builtin" => builtin_builtin(argv, sh),
         _ => return None,
@@ -1878,6 +1880,232 @@ fn builtin_hash(argv: &[String], sh: &mut Shell) -> i32 {
                 status = 1;
             }
         }
+    }
+
+    status
+}
+
+// ---------------------------------------------------------------------------
+// read
+// ---------------------------------------------------------------------------
+
+/// The IFS characters that are white space (space, tab and newline).
+///
+/// A white space IFS character is skipped in front of a field and at the
+/// end of the line, while any other IFS character ends a field.
+fn is_ifs_whitespace(c: char, ifs: &[char]) -> bool {
+    ifs.contains(&c) && matches!(c, ' ' | '\t' | '\n')
+}
+
+/// Split the input of `read` into the fields of its variables.
+///
+/// The variables before the last one get a single field each; the last one
+/// gets the rest of the line (without the trailing IFS white space).
+fn read_fields(input: &str, ifs: &[char], nvars: usize) -> Vec<String> {
+    let chars: Vec<char> = input.chars().collect();
+    let mut pos = 0usize;
+    let mut fields: Vec<String> = Vec::new();
+
+    for index in 0..nvars {
+        // Remove the IFS white space at the beginning of the field.
+        while pos < chars.len() && is_ifs_whitespace(chars[pos], ifs) {
+            pos += 1;
+        }
+        if index + 1 == nvars {
+            // The last variable gets the rest of the line.
+            let mut end = chars.len();
+            while end > pos && is_ifs_whitespace(chars[end - 1], ifs) {
+                end -= 1;
+            }
+            fields.push(chars[pos..end].iter().collect());
+            pos = end;
+            break;
+        }
+        // One field: everything up to the next IFS character.
+        let mut field = String::new();
+        while pos < chars.len() && !ifs.contains(&chars[pos]) {
+            field.push(chars[pos]);
+            pos += 1;
+        }
+        // A non-white-space IFS character ends the field and is consumed.
+        if pos < chars.len() && ifs.contains(&chars[pos]) && !is_ifs_whitespace(chars[pos], ifs) {
+            pos += 1;
+        }
+        fields.push(field);
+    }
+
+    fields
+}
+
+/// The `read` builtin: read a line from the standard input and split it
+/// into the given variables.
+///
+///   * `read [-r] [-p prompt] [-d delim] [-n nchars] [-N nchars] [-s] [-e]
+///     [-u fd] [name ...]`
+///
+/// Without a variable name the line is stored in `$REPLY`.  The exit status
+/// is 1 when the end of the file was reached.
+fn builtin_read(argv: &[String], sh: &mut Shell) -> i32 {
+    const USAGE: &str = "read: usage: read [-Eers] [-a array] [-d delim] [-i text] \
+                         [-n nchars] [-N nchars] [-p prompt] [-t timeout] [-u fd] [name ...]";
+
+    let mut raw = false;
+    let mut prompt: Option<String> = None;
+    let mut delim: u8 = b'\n';
+    let mut nchars: usize = 0;
+    let mut exact = false; // -N: read exactly NCHARS characters
+    let mut fd = 0i32;
+    let mut i = 1usize;
+
+    while i < argv.len() {
+        let a = &argv[i];
+        if a == "--" {
+            i += 1;
+            break;
+        }
+        if a.len() > 1 && a.starts_with('-') {
+            // The options may be bundled, like in `read -rp prompt'.
+            let opts: Vec<char> = a.chars().skip(1).collect();
+            let mut k = 0usize;
+            while k < opts.len() {
+                let c = opts[k];
+                match c {
+                    'r' => raw = true,
+                    // `-s' (silent) and `-e' (readline) only matter on a
+                    // terminal.
+                    's' | 'e' => {}
+                    'p' | 'd' | 'n' | 'N' | 'u' | 'a' | 'i' | 't' => {
+                        // The option takes an argument: the rest of the
+                        // bundle or the next word.
+                        let value: Option<String> = if k + 1 < opts.len() {
+                            let rest: String = opts[k + 1..].iter().collect();
+                            k = opts.len();
+                            Some(rest)
+                        } else {
+                            i += 1;
+                            argv.get(i).cloned()
+                        };
+                        match c {
+                            'p' => prompt = value,
+                            'd' => {
+                                delim = value
+                                    .as_ref()
+                                    .and_then(|s| s.as_bytes().first().copied())
+                                    .unwrap_or(0);
+                            }
+                            'n' | 'N' => {
+                                exact = c == 'N';
+                                nchars = value
+                                    .as_ref()
+                                    .and_then(|s| s.trim().parse::<usize>().ok())
+                                    .unwrap_or(0);
+                            }
+                            'u' => {
+                                fd = value
+                                    .as_ref()
+                                    .and_then(|s| s.trim().parse::<i32>().ok())
+                                    .unwrap_or(0);
+                            }
+                            'a' => {
+                                eprintln!("wash: read: -a: array assignment is not supported");
+                                return 1;
+                            }
+                            _ => {
+                                eprintln!("wash: read: -{}: not supported", c);
+                                return 1;
+                            }
+                        }
+                    }
+                    _ => {
+                        eprintln!("wash: read: -{}: invalid option", c);
+                        eprintln!("{}", USAGE);
+                        return 2;
+                    }
+                }
+                k += 1;
+            }
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    let names: Vec<String> = argv[i..].to_vec();
+
+    // The prompt is only shown when the input comes from a terminal.
+    if let Some(p) = &prompt {
+        if posix::isatty(fd) {
+            eprint!("{}", p);
+            let _ = std::io::stderr().flush();
+        }
+    }
+
+    // Read the input up to the delimiter.
+    let mut input = String::new();
+    let mut eof = false;
+    let mut count = 0usize;
+    let mut pass_next = false;
+    loop {
+        if nchars > 0 && count >= nchars {
+            break;
+        }
+        let c = match posix::read_byte_from(fd) {
+            Some(c) => c,
+            None => {
+                eof = true;
+                break;
+            }
+        };
+        if pass_next {
+            pass_next = false;
+            if c == b'\n' {
+                // A backslash-newline pair disappears from the input.
+                continue;
+            }
+            input.push(c as char);
+            count += 1;
+            continue;
+        }
+        if c == b'\\' && !raw {
+            pass_next = true;
+            continue;
+        }
+        if c == delim && !exact {
+            break;
+        }
+        input.push(c as char);
+        count += 1;
+    }
+    if pass_next {
+        // The input ended with a lone backslash: it is dropped.
+        input.pop();
+    }
+
+    // bash returns 1 when the end of the file was reached.
+    let status = if eof { 1 } else { 0 };
+
+    if names.is_empty() {
+        // Without a variable the whole line goes into $REPLY.
+        sh.env.insert("REPLY".to_string(), input);
+        return status;
+    }
+
+    for name in &names {
+        if !is_valid_ident(name) {
+            eprintln!("wash: read: `{}': not a valid identifier", name);
+            return 1;
+        }
+    }
+
+    // The default IFS is the space, the tab and the newline; an empty IFS
+    // disables the field splitting.
+    let ifs_value = sh.env.get("IFS").cloned();
+    let ifs_chars: Vec<char> = match &ifs_value {
+        Some(value) => value.chars().collect(),
+        None => vec![' ', '\t', '\n'],
+    };
+    let fields = read_fields(&input, &ifs_chars, names.len());
+    for (name, value) in names.iter().zip(fields.iter()) {
+        sh.env.insert(name.clone(), value.clone());
     }
 
     status

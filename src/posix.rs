@@ -485,6 +485,18 @@ pub fn snprintf_ll_u(fmt: &str, v: u64) -> Vec<u8> {
 }
 
 /// Read all bytes from `fd` until EOF (used for command substitution).
+/// Read one byte from `fd`.  Returns `None` at the end of the file.
+pub fn read_byte_from(fd: i32) -> Option<u8> {
+    let mut buf = [0u8; 1];
+    let n = unsafe { wash_read(fd, buf.as_mut_ptr(), 1) };
+    if n == 1 {
+        Some(buf[0])
+    } else {
+        None
+    }
+}
+
+/// Read all of `fd` into a string.
 pub fn read_all(fd: i32) -> String {
     let mut buf = [0u8; 4096];
     let mut out = Vec::new();
