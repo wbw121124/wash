@@ -284,6 +284,12 @@ run_case A set-invalid       'set -Z; echo "rc=$?"'
 run_case A set-invalid-o     'set -o nosuchopt; echo "rc=$?"'
 run_case A set-errexit       'set -e; set -o | grep errexit'
 run_case A set-noglob        'set -f; set -o | grep noglob'
+# `set -n` (noexec): the shell reads commands but does not EXECUTE them.
+# Implemented on purpose (src/executor.rs), so it is a regression fence.
+run_case A set-noexec        'set -n; echo hi'
+run_case A set-noexec-table  'set -n; set -o | grep noexec'
+run_case A set-noexec-cmd    'set -n; /bin/echo hi'
+run_case A set-noexec-cmdsubst 'set -n; echo $(echo hi)'
 
 # --- alias ------------------------------------------------------------------
 run_case A alias-noarg       'alias; echo "rc=$?"'
@@ -314,18 +320,17 @@ run_case A source-status     'source @SANDBOX@/false.sh; echo "rc=$?"'
 # to match is the SEMANTIC: sourcing a file must NOT change `$0` (bash keeps
 # the shell's own path, in default mode as well as in --posix mode).
 #
-# WHY THIS CASE USES `&&`/`||` AND NOT `if`/`then`/`else`/`fi`
-#   The `if` compound command is a Phase 3 feature that wash does not
-#   implement yet.  With `if` the case fails with "if: command not found",
-#   i.e. it measures the ABSENCE of control flow instead of the `$0`
-#   semantics it is supposed to measure -- and, worse, a permanently red
-#   GROUP A case would mask real regressions in the builtins it covers.
-#   The `&&`/`||` form below states the EXACT SAME predicate and prints the
-#   EXACT SAME output vocabulary ("0=CHANGED" / "0=UNCHANGED"); only the
-#   control-flow spelling differs, so a failure here now means a real
-#   `$0`/`source` defect.  The original `if` spelling is kept as the GROUP D
-#   case `source-zero-semantics-if` and becomes active once Phase 3 lands.
-run_case A source-zero-semantics 'source @SANDBOX@/args.sh; [ "$0" = "@SANDBOX@/args.sh" ] && echo "0=CHANGED" || echo "0=UNCHANGED"'
+# TWO SPELLINGS OF THE SAME PREDICATE
+#   `source-zero-semantics`     uses `if`/`then`/`else`/`fi` -- the natural
+#                                bash spelling, and the one that would break
+#                                the moment `if` regressed.
+#   `source-zero-semantics-cond` uses `&&`/`||` only -- no dependency on
+#                                control flow, so it isolates the `$0`
+#                                semantics even if the parser regresses.
+#   Both print the SAME vocabulary ("0=CHANGED" / "0=UNCHANGED"), so a
+#   divergence between them points straight at the control-flow layer.
+run_case A source-zero-semantics 'source @SANDBOX@/args.sh; if [ "$0" = "@SANDBOX@/args.sh" ]; then echo "0=CHANGED"; else echo "0=UNCHANGED"; fi'
+run_case A source-zero-semantics-cond 'source @SANDBOX@/args.sh; [ "$0" = "@SANDBOX@/args.sh" ] && echo "0=CHANGED" || echo "0=UNCHANGED"'
 # Stronger form of the same semantic: `$0` must be IDENTICAL before and
 # after sourcing (not merely "different from the sourced file's path").
 run_case A source-zero-unchanged 'BEFORE="$0"; source @SANDBOX@/args.sh; [ "$BEFORE" = "$0" ] && echo "0=UNCHANGED" || echo "0=CHANGED"'
@@ -367,6 +372,16 @@ run_case A or-true           'true || echo not-reached'
 run_case A expand-dash       'unset -v ZZZ; echo "[${ZZZ-unset}]"'
 run_case A expand-empty      'A=; echo "[${A-empty}]"'
 run_case A expand-plus       'SET=1; echo "[${SET+plus}]"'
+
+# --- if / then / elif / else / fi (Phase 3 compound command) ---------------
+run_case A if-true           'if true; then echo YES; fi'
+run_case A if-false          'if false; then echo YES; else echo NO; fi'
+run_case A if-elif           'if false; then echo A; elif true; then echo B; else echo C; fi'
+run_case A if-nested         'if true; then if false; then echo X; else echo Y; fi; fi'
+run_case A if-status         'if false; then echo A; fi; echo "rc=$?"'
+run_case A if-assign         'if true; then X=1; fi; echo "X=$X"'
+run_case A if-test           'if [ 1 -eq 1 ]; then echo EQ; fi'
+run_case A if-test-false     'if [ 1 -eq 2 ]; then echo EQ; else echo NE; fi'
 
 ###############################################################################
 # GROUP B -- KNOWN-DEFECT.
@@ -526,13 +541,6 @@ run_case D enable            'enable -a; echo "rc=$?"'
 run_case D return            'return 0; echo "rc=$?"'
 run_case D break             'break; echo "rc=$?"'
 run_case D continue          'continue; echo "rc=$?"'
-
-# --- the `if`/`then`/`else`/`fi` spelling of the source `$0` semantics -----
-# Same predicate as GROUP A `source-zero-semantics`, written with the `if`
-# compound command.  `if` is a Phase 3 feature (control flow), so this case
-# stays red until Phase 3 lands; keeping it here makes that dependency
-# explicit instead of hiding it inside GROUP A.
-run_case D source-zero-semantics-if 'source @SANDBOX@/args.sh; if [ "$0" = "@SANDBOX@/args.sh" ]; then echo "0=CHANGED"; else echo "0=UNCHANGED"; fi'
 
 # --- job control (Phase 2) --------------------------------------------------
 run_case D jobs              'jobs; echo "rc=$?"'
