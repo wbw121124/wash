@@ -826,6 +826,65 @@ run_case C local-in-func      'f() { local x=1; echo "in=$x"; }; f; echo "out=[$
 # `local` shadows an outer variable for the duration of the function only.
 run_case C local-shadow       'x=outer; f() { local x=inner; echo $x; }; f; echo $x'
 
+# ---------------------------------------------------------------------------
+# control flow: loops and functions (Phase 3)
+#
+# These are regression fences for the engineer's Phase 3 work (loops +
+# functions).  wash does NOT implement them yet, so every case below FAILS
+# today (a syntax error, or `for`/`while`/.../`f` reported as "command not
+# found").  They are kept here -- rather than skipped -- because they are
+# the ONLY way to observe what the loop and function constructs actually
+# DO, and they turn green the moment Phase 3 lands.  The case text is valid
+# bash; the harness runs it under real bash as the oracle and compares
+# wash's (currently broken) output against it.
+#
+# NOTE on top-level errors: `return` / `break` / `continue` / `local` are
+# only legal inside a function or a loop, so their top-level forms are
+# diagnostic errors (covered above: `return-toplevel` / `break-toplevel` /
+# `continue-toplevel` / `local-toplevel`).  `for` / `while` / `until` /
+# `case` / a function definition, by contrast, ARE legal at the top level
+# in bash -- so they get happy-path coverage below, not error coverage.
+# ---------------------------------------------------------------------------
+
+# --- for --------------------------------------------------------------------
+# The happy path: every item is visited, in order.
+run_case C for-list           'for i in a b c; do echo "[$i]"; done'
+run_case C for-numeric        'for i in 1 2 3; do echo "$i"; done'
+# `break` leaves the loop after the second item; `continue` skips it.
+run_case C break-in-for-2     'for i in 1 2 3 4; do echo $i; [ $i -eq 2 ] && break; done'
+run_case C continue-in-for-2  'for i in 1 2 3; do [ $i -eq 2 ] && continue; echo $i; done'
+
+# --- while ------------------------------------------------------------------
+run_case C while-list         'i=0; while [ $i -lt 3 ]; do echo $i; i=$((i+1)); done'
+run_case C break-in-while     'i=0; while [ $i -lt 5 ]; do echo $i; i=$((i+1)); [ $i -eq 2 ] && break; done'
+run_case C continue-in-while-2 'i=0; while [ $i -lt 3 ]; do i=$((i+1)); [ $i -eq 2 ] && continue; echo $i; done'
+
+# --- until ------------------------------------------------------------------
+run_case C until-list         'i=0; until [ $i -ge 3 ]; do echo $i; i=$((i+1)); done'
+run_case C until-break        'until false; do echo once; break; done'
+run_case C break-in-until     'i=0; until [ $i -ge 5 ]; do echo $i; i=$((i+1)); [ $i -eq 2 ] && break; done'
+run_case C continue-in-until  'i=0; until [ $i -ge 3 ]; do i=$((i+1)); [ $i -eq 2 ] && continue; echo $i; done'
+
+# --- case -------------------------------------------------------------------
+run_case C case-default       'case foo in a) echo A;; b) echo B;; *) echo STAR;; esac'
+run_case C case-match         'x=foo; case $x in foo) echo FOO;; *) echo OTHER;; esac'
+run_case C case-or-pattern    'case bar in a|b) echo AB;; c) echo C;; esac'
+# No pattern matches and there is no `*)`: the case runs nothing, rc=0.
+run_case C case-no-match      'case zzz in a) echo A;; esac; echo "rc=$?"'
+
+# --- function definition ----------------------------------------------------
+run_case C func-def           'f() { echo hi; }; f'
+run_case C func-keyword       'function g { echo ghi; }; g'
+run_case C func-arg           'f() { echo "1=$1"; }; f hello'
+# `return` inside a function returns the given status to the caller.
+run_case C return-in-func     'f() { return 3; }; f; echo "rc=$?"'
+# `return` with no argument returns the status of the LAST command in the
+# function (here `true` -> 0).
+run_case C return-in-func-noarg 'f() { true; return; }; f; echo "rc=$?"'
+# `local` inside a function scopes the variable to that function (the
+# caller's `x` is untouched).
+run_case C local-in-func-2    'x=outer; f() { local x=inner; echo "in=$x"; }; f; echo "out=$x"'
+
 ###############################################################################
 # GROUP D -- extra builtins, measured so that the compatibility matrix
 #            (AGENTS.md / README.md) is backed by real observations.
