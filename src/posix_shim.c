@@ -207,6 +207,102 @@ char *wash_realpath(const char *path) {
 // call to produce bash-style diagnostics ("No such file or directory", ...).
 int wash_errno(void) { return errno; }
 
+/* The file types `test` distinguishes. */
+#define WASH_FT_UNKNOWN 0
+#define WASH_FT_REG     1
+#define WASH_FT_DIR     2
+#define WASH_FT_LNK     3
+#define WASH_FT_BLK     4
+#define WASH_FT_CHR     5
+#define WASH_FT_FIFO    6
+#define WASH_FT_SOCK    7
+
+/* The information `test` needs about a file.  The layout matches the Rust
+   `StatBuf` struct (all members are fixed-width, so there is no padding). */
+struct wash_stat {
+  int64_t size;
+  int64_t mtime;
+  int64_t atime;
+  int64_t dev;
+  int64_t ino;
+  int64_t uid;
+  int64_t gid;
+  int32_t mtime_nsec;
+  int32_t atime_nsec;
+  int32_t file_type;
+  int32_t mode;
+};
+
+/* Fill `out` with the metadata of `path`.  With `follow` set the symbolic
+   link is resolved (stat), otherwise the link itself is described (lstat).
+   Returns 0 on success and -1 with errno set on failure. */
+int wash_stat(const char *path, int follow, struct wash_stat *out) {
+  struct stat st;
+  int r;
+
+  if (follow)
+    r = stat(path, &st);
+  else
+    r = lstat(path, &st);
+
+  if (r < 0)
+    return -1;
+
+  out->size = (int64_t)st.st_size;
+  out->mtime = (int64_t)st.st_mtime;
+  out->atime = (int64_t)st.st_atime;
+  out->dev = (int64_t)st.st_dev;
+  out->ino = (int64_t)st.st_ino;
+  out->uid = (int64_t)st.st_uid;
+  out->gid = (int64_t)st.st_gid;
+#ifdef st_mtime
+  /* glibc: st_mtime is a macro, st_mtim holds the real members. */
+  out->mtime_nsec = (int32_t)st.st_mtim.tv_nsec;
+  out->atime_nsec = (int32_t)st.st_atim.tv_nsec;
+#elif defined(__CYGWIN__)
+  out->mtime_nsec = (int32_t)st.st_mtim.tv_nsec;
+  out->atime_nsec = (int32_t)st.st_atim.tv_nsec;
+#else
+  out->mtime_nsec = 0;
+  out->atime_nsec = 0;
+#endif
+  out->mode = (int32_t)st.st_mode;
+
+  switch (st.st_mode & S_IFMT)
+    {
+    case S_IFREG:
+      out->file_type = WASH_FT_REG;
+      break;
+    case S_IFDIR:
+      out->file_type = WASH_FT_DIR;
+      break;
+    case S_IFLNK:
+      out->file_type = WASH_FT_LNK;
+      break;
+    case S_IFBLK:
+      out->file_type = WASH_FT_BLK;
+      break;
+    case S_IFCHR:
+      out->file_type = WASH_FT_CHR;
+      break;
+    case S_IFIFO:
+      out->file_type = WASH_FT_FIFO;
+      break;
+    case S_IFSOCK:
+      out->file_type = WASH_FT_SOCK;
+      break;
+    default:
+      out->file_type = WASH_FT_UNKNOWN;
+      break;
+    }
+
+  return 0;
+}
+
+/* The effective user and group of the calling process (`test -O` / `-G`). */
+unsigned int wash_geteuid(void) { return (unsigned int)geteuid(); }
+unsigned int wash_getegid(void) { return (unsigned int)getegid(); }
+
 // Read an entire file into the caller's buffer. When `buf` is NULL only the
 // file size is reported. Returns the number of bytes read, or -1 on error
 // (errno is set by the underlying stdio call).

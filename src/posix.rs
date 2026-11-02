@@ -40,6 +40,9 @@ extern "C" {
     fn wash_wtermsig(status: c_int) -> c_int;
     fn wash_errno() -> c_int;
     fn wash_read_file(path: *const c_char, buf: *mut c_char, n: usize) -> isize;
+    fn wash_stat(path: *const c_char, follow: c_int, out: *mut StatBuf) -> c_int;
+    fn wash_geteuid() -> u32;
+    fn wash_getegid() -> u32;
 
     // bash-compatible numeric parsing / formatting (msys C library)
     fn wash_parse_ll(s: *const c_char, fully: *mut c_int, overflow: *mut c_int) -> i64;
@@ -69,6 +72,80 @@ pub const W_OK: c_int = 2;
 pub const R_OK: c_int = 4;
 /// `errno` values used by the shell diagnostics.
 pub const EEXIST: i32 = 17;
+
+/// The file types `test` distinguishes (mirrors the `WASH_FT_*` constants of
+/// the C shim).
+pub const FT_UNKNOWN: i32 = 0;
+pub const FT_REG: i32 = 1;
+pub const FT_DIR: i32 = 2;
+pub const FT_LNK: i32 = 3;
+pub const FT_BLK: i32 = 4;
+pub const FT_CHR: i32 = 5;
+pub const FT_FIFO: i32 = 6;
+pub const FT_SOCK: i32 = 7;
+
+/// The metadata of a file, as filled in by the C shim's `wash_stat`.
+///
+/// The field order matches the C struct exactly (all members are fixed
+/// width, so the two layouts agree without any padding).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct StatBuf {
+    pub size: i64,
+    pub mtime: i64,
+    pub atime: i64,
+    pub dev: i64,
+    pub ino: i64,
+    pub uid: i64,
+    pub gid: i64,
+    pub mtime_nsec: i32,
+    pub atime_nsec: i32,
+    pub file_type: i32,
+    pub mode: i32,
+}
+
+/// The setuid / setgid / sticky bits of a file mode.
+pub const S_ISUID: i32 = 0o4000;
+pub const S_ISGID: i32 = 0o2000;
+pub const S_ISVTX: i32 = 0o1000;
+
+/// The metadata of `path`.
+///
+/// With `follow` set a symbolic link is resolved (like `stat(2)`), otherwise
+/// the link itself is described (like `lstat(2)`).  Returns `None` when the
+/// file does not exist or cannot be examined.
+pub fn stat_path(path: &str, follow: bool) -> Option<StatBuf> {
+    let c = CString::new(path).unwrap_or_default();
+    let mut out = StatBuf {
+        size: 0,
+        mtime: 0,
+        atime: 0,
+        dev: 0,
+        ino: 0,
+        uid: 0,
+        gid: 0,
+        mtime_nsec: 0,
+        atime_nsec: 0,
+        file_type: FT_UNKNOWN,
+        mode: 0,
+    };
+    let r = unsafe { wash_stat(c.as_ptr(), if follow { 1 } else { 0 }, &mut out) };
+    if r < 0 {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// The effective user id of the calling process (`test -O`).
+pub fn effective_uid() -> u32 {
+    unsafe { wash_geteuid() }
+}
+
+/// The effective group id of the calling process (`test -G`).
+pub fn effective_gid() -> u32 {
+    unsafe { wash_getegid() }
+}
 
 pub fn fork() -> i32 {
     unsafe { wash_fork() }

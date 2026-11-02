@@ -29,6 +29,7 @@ use crate::shell::{Shell, SET_O_ORDER, SHOPT_ORDER};
 /// Every builtin name understood by `run_builtin`.
 const BUILTINS: &[&str] = &[
     ".",
+    "[",
     "alias",
     "cd",
     "echo",
@@ -41,6 +42,7 @@ const BUILTINS: &[&str] = &[
     "shift",
     "shopt",
     "source",
+    "test",
     "unalias",
     "unset",
 ];
@@ -70,6 +72,7 @@ pub fn run_builtin(argv: &[String], sh: &mut Shell) -> Option<i32> {
         "exec" => builtin_exec(argv, sh),
         "echo" => builtin_echo(argv),
         "printf" => builtin_printf(argv, Some(sh)),
+        "test" | "[" => builtin_test(argv, sh),
         _ => return None,
     };
     Some(code)
@@ -881,6 +884,515 @@ fn print_shopt_listing(sh: &Shell) {
             "-u"
         };
         println!("shopt {} {}", state, name);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// test / [
+// ---------------------------------------------------------------------------
+
+/// The error of a malformed `test` expression.
+///
+/// The text is what bash prints after the `test: ` / `[: ` prefix.
+enum TestError {
+    /// `<arg>: unary operator expected`
+    UnaryOperator(String),
+    /// `<arg>: binary operator expected`
+    BinaryOperator(String),
+    /// `<arg>: integer expected`
+    Integer(String),
+    /// `argument expected`
+    ArgumentExpected,
+    /// `too many arguments`
+    TooManyArguments,
+    /// `syntax error: `<arg>' unexpected`
+    Unexpected(String),
+    /// `` `)' expected ``
+    ExpectedCloseParen,
+    /// `` `)' expected, found <arg> ``
+    ExpectedCloseParenFound(String),
+}
+
+impl TestError {
+    /// The message bash prints for this error.
+    fn message(&self) -> String {
+        match self {
+            TestError::UnaryOperator(arg) => format!("{}: unary operator expected", arg),
+            TestError::BinaryOperator(arg) => format!("{}: binary operator expected", arg),
+            TestError::Integer(arg) => format!("{}: integer expected", arg),
+            TestError::ArgumentExpected => "argument expected".to_string(),
+            TestError::TooManyArguments => "too many arguments".to_string(),
+            TestError::Unexpected(arg) => format!("syntax error: `{}' unexpected", arg),
+            TestError::ExpectedCloseParen => "`)' expected".to_string(),
+            TestError::ExpectedCloseParenFound(arg) => format!("`)' expected, found {}", arg),
+        }
+    }
+}
+
+/// True when `op` is one of the unary operators of `test`.
+///
+/// The list is bash's own (see `test_unop` in bash's `test.c`): a single
+/// dash followed by exactly one letter.
+fn is_unary_op(op: &str) -> bool {
+    let bytes = op.as_bytes();
+    if bytes.first() != Some(&b'-') || bytes.get(1).is_none() || bytes.get(2).is_some() {
+        return false;
+    }
+    matches!(
+        bytes[1],
+        b'a' | b'b'
+            | b'c'
+            | b'd'
+            | b'e'
+            | b'f'
+            | b'g'
+            | b'h'
+            | b'k'
+            | b'n'
+            | b'o'
+            | b'p'
+            | b'r'
+            | b's'
+            | b't'
+            | b'u'
+            | b'v'
+            | b'w'
+            | b'x'
+            | b'z'
+            | b'G'
+            | b'L'
+            | b'O'
+            | b'S'
+            | b'N'
+            | b'R'
+    )
+}
+
+/// True when `op` is one of the binary operators of `test`.
+fn is_binary_op(op: &str) -> bool {
+    match op {
+        "=" | "==" | "!=" | "<" | ">" => true,
+        "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge" | "-nt" | "-ot" | "-ef" => true,
+        _ => false,
+    }
+}
+
+/// True when `op` is the logical operator `-a` or `-o`.
+fn is_andor(op: &str) -> bool {
+    op == "-a" || op == "-o"
+}
+
+/// The evaluator of a `test` expression.
+///
+/// This is a port of bash 5.3's `test.c`: the same recursive-descent
+/// grammar, the same argument-count dispatch and the same error messages.
+struct TestEvaluator<'a> {
+    /// The operands of the expression (without the command name and,
+    /// for `[`, without the closing bracket).
+    args: &'a [String],
+    /// The index of the next operand to look at.
+    pos: usize,
+    /// The shell the expression is evaluated in (for `-v` and `-o`).
+    sh: &'a Shell,
+}
+
+impl<'a> TestEvaluator<'a> {
+    /// The operand at `index`, or the empty string when it is missing.
+    fn arg(&self, index: usize) -> &'a str {
+        self.args.get(index).map(|s| s.as_str()).unwrap_or("")
+    }
+
+    /// Move to the next operand.  With `check` the expression must not end
+    /// here (bash's `advance(1)`).
+    fn advance(&mut self, check: bool) -> Result<(), TestError> {
+        self.pos += 1;
+        if check && self.pos >= self.args.len() {
+            return Err(TestError::ArgumentExpected);
+        }
+        Ok(())
+    }
+
+    /// Evaluate the expression; the number of operands decides which rule
+    /// bash applies (bash's `posixtest`).
+    fn posixtest(&mut self) -> Result<bool, TestError> {
+        match self.args.len() {
+            0 => Ok(false),
+            1 => {
+                let value = !self.arg(0).is_empty();
+                self.advance(false)?;
+                Ok(value)
+            }
+            2 => self.two_arguments(),
+            3 => self.three_arguments(),
+            4 => {
+                if self.arg(0) == "!" {
+                    self.advance(true)?;
+                    Ok(!self.three_arguments()?)
+                } else if self.arg(0) == "(" && self.arg(3) == ")" {
+                    self.advance(true)?;
+                    let value = self.two_arguments()?;
+                    self.advance(false)?;
+                    Ok(value)
+                } else {
+                    self.expr()
+                }
+            }
+            _ => self.expr(),
+        }
+    }
+
+    /// Two operands: either `! ARG` or a unary operator with its argument.
+    fn two_arguments(&mut self) -> Result<bool, TestError> {
+        let first = self.arg(self.pos);
+        if first == "!" {
+            self.advance(false)?;
+            let value = self.arg(self.pos).is_empty();
+            self.pos += 1;
+            return Ok(value);
+        }
+        if first.starts_with('-') && first.len() == 2 && is_unary_op(first) {
+            return self.unary_operator();
+        }
+        Err(TestError::UnaryOperator(first.to_string()))
+    }
+
+    /// Three operands: a binary operator, a logical operator, `!` or a
+    /// parenthesised expression.
+    fn three_arguments(&mut self) -> Result<bool, TestError> {
+        let second = self.arg(self.pos + 1).to_string();
+        if is_binary_op(&second) {
+            return self.binary_operator();
+        }
+        if is_andor(&second) {
+            let left = !self.arg(self.pos).is_empty();
+            let right = !self.arg(self.pos + 2).is_empty();
+            let value = if second == "-a" { left && right } else { left || right };
+            self.pos += 3;
+            return Ok(value);
+        }
+        if self.arg(self.pos) == "!" {
+            self.advance(true)?;
+            return Ok(!self.two_arguments()?);
+        }
+        if self.arg(self.pos) == "(" && self.arg(self.pos + 2) == ")" {
+            self.advance(false)?;
+            let value = !self.arg(self.pos).is_empty();
+            self.pos += 2;
+            return Ok(value);
+        }
+        Err(TestError::BinaryOperator(second))
+    }
+
+    /// The full expression grammar (`expr` in bash's `test.c`).
+    fn expr(&mut self) -> Result<bool, TestError> {
+        if self.pos >= self.args.len() {
+            return Err(TestError::ArgumentExpected);
+        }
+        self.or_expr()
+    }
+
+    /// `or`: `and ('-o' or)*`.
+    fn or_expr(&mut self) -> Result<bool, TestError> {
+        let mut value = self.and_expr()?;
+        while self.pos < self.args.len() && self.arg(self.pos) == "-o" {
+            self.advance(false)?;
+            let right = self.or_expr()?;
+            value = value || right;
+        }
+        Ok(value)
+    }
+
+    /// `and`: `term ('-a' and)*`.
+    fn and_expr(&mut self) -> Result<bool, TestError> {
+        let mut value = self.term()?;
+        while self.pos < self.args.len() && self.arg(self.pos) == "-a" {
+            self.advance(false)?;
+            let right = self.and_expr()?;
+            value = value && right;
+        }
+        Ok(value)
+    }
+
+    /// `term`: a single test, a negated test or a parenthesised expression.
+    fn term(&mut self) -> Result<bool, TestError> {
+        if self.pos >= self.args.len() {
+            return Err(TestError::ArgumentExpected);
+        }
+
+        // Leading `not's bind tighter than `-a` and `-o`.
+        if self.arg(self.pos) == "!" {
+            let mut negated = false;
+            while self.pos < self.args.len() && self.arg(self.pos) == "!" {
+                self.advance(true)?;
+                negated = !negated;
+            }
+            return if negated {
+                Ok(!self.term()?)
+            } else {
+                self.term()
+            };
+        }
+
+        // A parenthesised expression.
+        if self.arg(self.pos) == "(" {
+            self.advance(true)?;
+            let value = self.expr()?;
+            if self.pos >= self.args.len() {
+                return Err(TestError::ExpectedCloseParen);
+            }
+            if self.arg(self.pos) != ")" {
+                return Err(TestError::ExpectedCloseParenFound(
+                    self.arg(self.pos).to_string(),
+                ));
+            }
+            self.advance(false)?;
+            return Ok(value);
+        }
+
+        // A binary test needs three operands, a unary test two.
+        if self.pos + 3 <= self.args.len() && is_binary_op(self.arg(self.pos + 1)) {
+            return self.binary_operator();
+        }
+        if self.pos + 2 <= self.args.len() && is_unary_op(self.arg(self.pos)) {
+            return self.unary_operator();
+        }
+
+        // A plain word is true when it is not empty.
+        let value = !self.arg(self.pos).is_empty();
+        self.advance(false)?;
+        Ok(value)
+    }
+
+    /// Evaluate a binary test: `ARG1 OP ARG2`.
+    fn binary_operator(&mut self) -> Result<bool, TestError> {
+        let op = self.arg(self.pos + 1).to_string();
+        if !is_binary_op(&op) {
+            return Err(TestError::BinaryOperator(op));
+        }
+        let left = self.arg(self.pos).to_string();
+        let right = self.arg(self.pos + 2).to_string();
+        let value = self.binary_test(&op, &left, &right)?;
+        self.pos += 3;
+        Ok(value)
+    }
+
+    /// Evaluate a unary test: `OP ARG`.
+    fn unary_operator(&mut self) -> Result<bool, TestError> {
+        let op = self.arg(self.pos).to_string();
+        if !is_unary_op(&op) {
+            return Ok(false);
+        }
+
+        // `-t' is special: its argument is a file descriptor and may be
+        // missing.
+        if op == "-t" {
+            self.advance(false)?;
+            if self.pos < self.args.len() {
+                let arg = self.arg(self.pos).to_string();
+                if parse_bash_number(&arg).is_some() {
+                    self.advance(false)?;
+                    return Ok(self.unary_test(&op, &arg));
+                }
+                if self.args.len() >= 5 && is_andor(&arg) {
+                    return Ok(self.unary_test(&op, "1"));
+                }
+                return Err(TestError::Integer(arg));
+            }
+            return Ok(self.unary_test(&op, "1"));
+        }
+
+        // Every other unary operator takes an argument.
+        self.advance(true)?;
+        self.pos += 1;
+        let arg = self.arg(self.pos - 1).to_string();
+        Ok(self.unary_test(&op, &arg))
+    }
+
+    /// The value of a unary test.
+    fn unary_test(&self, op: &str, arg: &str) -> bool {
+        match op {
+            "-e" | "-a" => posix::stat_path(arg, true).is_some(),
+            "-r" => posix::access(arg, posix::R_OK) == 0,
+            "-w" => posix::access(arg, posix::W_OK) == 0,
+            "-x" => posix::access(arg, posix::X_OK) == 0,
+            "-O" => posix::stat_path(arg, true)
+                .map(|st| st.uid == posix::effective_uid() as i64)
+                .unwrap_or(false),
+            "-G" => posix::stat_path(arg, true)
+                .map(|st| st.gid == posix::effective_gid() as i64)
+                .unwrap_or(false),
+            "-N" => posix::stat_path(arg, true)
+                .map(|st| {
+                    st.mtime > st.atime
+                        || (st.mtime == st.atime && st.mtime_nsec > st.atime_nsec)
+                })
+                .unwrap_or(false),
+            "-f" => posix::stat_path(arg, true)
+                .map(|st| st.file_type == posix::FT_REG)
+                .unwrap_or(false),
+            "-d" => posix::stat_path(arg, true)
+                .map(|st| st.file_type == posix::FT_DIR)
+                .unwrap_or(false),
+            "-s" => posix::stat_path(arg, true)
+                .map(|st| st.size > 0)
+                .unwrap_or(false),
+            "-S" => posix::stat_path(arg, true)
+                .map(|st| st.file_type == posix::FT_SOCK)
+                .unwrap_or(false),
+            "-c" => posix::stat_path(arg, true)
+                .map(|st| st.file_type == posix::FT_CHR)
+                .unwrap_or(false),
+            "-b" => posix::stat_path(arg, true)
+                .map(|st| st.file_type == posix::FT_BLK)
+                .unwrap_or(false),
+            "-p" => posix::stat_path(arg, true)
+                .map(|st| st.file_type == posix::FT_FIFO)
+                .unwrap_or(false),
+            "-L" | "-h" => posix::stat_path(arg, false)
+                .map(|st| st.file_type == posix::FT_LNK)
+                .unwrap_or(false),
+            "-u" => posix::stat_path(arg, true)
+                .map(|st| st.mode & posix::S_ISUID != 0)
+                .unwrap_or(false),
+            "-g" => posix::stat_path(arg, true)
+                .map(|st| st.mode & posix::S_ISGID != 0)
+                .unwrap_or(false),
+            "-k" => posix::stat_path(arg, true)
+                .map(|st| st.mode & posix::S_ISVTX != 0)
+                .unwrap_or(false),
+            "-t" => match parse_bash_number(arg) {
+                Some(fd) => (0..=i32::MAX as i64).contains(&fd) && posix::isatty(fd as i32),
+                None => false,
+            },
+            "-n" => !arg.is_empty(),
+            "-z" => arg.is_empty(),
+            "-o" => self.sh.options.get(arg).unwrap_or(false),
+            "-v" => self.variable_is_set(arg),
+            _ => false,
+        }
+    }
+
+    /// True when the variable `name` is set (bash's `test -v`).
+    fn variable_is_set(&self, name: &str) -> bool {
+        // A number refers to a positional parameter.
+        if let Ok(index) = name.parse::<usize>() {
+            return index >= 1 && index <= self.sh.positional.len();
+        }
+        self.sh.env.contains_key(name)
+    }
+
+    /// The value of a binary test.
+    fn binary_test(&self, op: &str, left: &str, right: &str) -> Result<bool, TestError> {
+        match op {
+            "=" | "==" => Ok(left == right),
+            "!=" => Ok(left != right),
+            "<" => Ok(left < right),
+            ">" => Ok(left > right),
+            "-eq" | "-ne" | "-lt" | "-gt" | "-le" | "-ge" => {
+                let l = parse_bash_number(left)
+                    .ok_or_else(|| TestError::Integer(left.to_string()))?;
+                let r = parse_bash_number(right)
+                    .ok_or_else(|| TestError::Integer(right.to_string()))?;
+                Ok(match op {
+                    "-eq" => l == r,
+                    "-ne" => l != r,
+                    "-lt" => l < r,
+                    "-gt" => l > r,
+                    "-le" => l <= r,
+                    "-ge" => l >= r,
+                    _ => false,
+                })
+            }
+            "-nt" | "-ot" | "-ef" => Ok(self.file_comp(op, left, right)),
+            _ => Ok(false),
+        }
+    }
+
+    /// Compare two files by their modification time or their identity.
+    fn file_comp(&self, op: &str, left: &str, right: &str) -> bool {
+        let l = posix::stat_path(left, true);
+        let r = posix::stat_path(right, true);
+        match op {
+            "-ef" => match (&l, &r) {
+                (Some(a), Some(b)) => a.dev == b.dev && a.ino == b.ino,
+                _ => false,
+            },
+            "-nt" => match (&l, &r) {
+                (Some(a), Some(b)) => {
+                    a.mtime > b.mtime
+                        || (a.mtime == b.mtime && a.mtime_nsec > b.mtime_nsec)
+                }
+                (Some(_), None) => true,
+                _ => false,
+            },
+            "-ot" => match (&l, &r) {
+                (Some(a), Some(b)) => {
+                    a.mtime < b.mtime
+                        || (a.mtime == b.mtime && a.mtime_nsec < b.mtime_nsec)
+                }
+                (None, Some(_)) => true,
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+}
+
+/// The `test` builtin and its `[` form.
+///
+/// `test EXPRESSION` evaluates the expression and returns 0 when it is
+/// true, 1 when it is false and 2 when it is malformed.  `[ EXPRESSION ]`
+/// behaves the same, but the closing bracket is mandatory.
+fn builtin_test(argv: &[String], sh: &mut Shell) -> i32 {
+    let name = argv.first().map(|s| s.as_str()).unwrap_or("test");
+    let mut operands: &[String] = &argv[1..];
+
+    if name == "[" {
+        // The last argument has to be the closing bracket.
+        match operands.last() {
+            Some(last) if last == "]" => {
+                operands = &operands[..operands.len() - 1];
+            }
+            _ => {
+                eprintln!("wash: [: missing `]'");
+                return 2;
+            }
+        }
+        if operands.is_empty() {
+            return 1;
+        }
+    }
+
+    let mut evaluator = TestEvaluator {
+        args: operands,
+        pos: 0,
+        sh,
+    };
+    let value = match evaluator.posixtest() {
+        Ok(value) => value,
+        Err(e) => {
+            eprintln!("wash: {}: {}", name, e.message());
+            return 2;
+        }
+    };
+
+    // Everything has to be consumed, otherwise the expression was longer
+    // than bash could make sense of.
+    if evaluator.pos != operands.len() {
+        let leftover = operands[evaluator.pos].as_str();
+        let message = if leftover.starts_with('-') {
+            format!("syntax error: `{}' unexpected", leftover)
+        } else {
+            "too many arguments".to_string()
+        };
+        eprintln!("wash: {}: {}", name, message);
+        return 2;
+    }
+
+    if value {
+        0
+    } else {
+        1
     }
 }
 
