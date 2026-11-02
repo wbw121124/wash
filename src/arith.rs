@@ -12,15 +12,33 @@ use std::collections::HashMap;
 /// Errors produced while evaluating an arithmetic expression.
 #[derive(Debug, Clone)]
 pub struct ArithError {
-    /// The text bash prints after "arithmetic syntax error: ".
+    /// The base message bash prints (without the error token).
     pub message: String,
+    /// The token bash appends as `(error token is "...")`; empty when none.
+    pub token: String,
 }
 
 impl ArithError {
     fn new(msg: &str) -> Self {
         ArithError {
             message: msg.to_string(),
+            token: String::new(),
         }
+    }
+}
+
+/// Render a token the way bash's error reporting does (`"0"`, `"x"`, ...`).
+fn token_text(t: &Option<Tok>) -> String {
+    match t {
+        Some(Tok::Num(v)) => v.to_string(),
+        Some(Tok::Ident(s)) => s.clone(),
+        Some(Tok::Op(o)) => o.to_string(),
+        Some(Tok::LParen) => "(".to_string(),
+        Some(Tok::RParen) => ")".to_string(),
+        Some(Tok::Comma) => ",".to_string(),
+        Some(Tok::Question) => "?".to_string(),
+        Some(Tok::Colon) => ":".to_string(),
+        None => String::new(),
     }
 }
 
@@ -307,10 +325,10 @@ impl Lexer {
 }
 
 fn operand_expected(lex: &Lexer) -> ArithError {
-    ArithError::new(&format!(
-        "operand expected (error token is \"{}\")",
-        lex.error_token()
-    ))
+    ArithError {
+        message: "operand expected".to_string(),
+        token: lex.error_token(),
+    }
 }
 
 /// Evaluate an arithmetic expression.
@@ -321,10 +339,10 @@ pub fn eval(src: &str, env: &mut dyn ArithEnv) -> Result<i64, ArithError> {
     }
     let v = parse_comma(&mut lex, env)?;
     if lex.pos < lex.toks.len() {
-        return Err(ArithError::new(&format!(
-            "syntax error in expression (error token is \"{}\")",
-            lex.error_token()
-        )));
+        return Err(ArithError {
+            message: "syntax error in expression".to_string(),
+            token: lex.error_token(),
+        });
     }
     Ok(v)
 }
@@ -348,6 +366,7 @@ fn parse_assign(lex: &mut Lexer, env: &mut dyn ArithEnv) -> Result<i64, ArithErr
             };
             if let Some(aop) = assign_op {
                 lex.pos += 2;
+                let divisor_tok = lex.peek().cloned();
                 let rhs = parse_assign(lex, env)?;
                 let cur = env.get(&name).unwrap_or(0);
                 let newv = match aop {
@@ -357,13 +376,19 @@ fn parse_assign(lex: &mut Lexer, env: &mut dyn ArithEnv) -> Result<i64, ArithErr
                     "*=" => cur.wrapping_mul(rhs),
                     "/=" => {
                         if rhs == 0 {
-                            return Err(ArithError::new("division by 0"));
+                            return Err(ArithError {
+                                message: "division by 0".to_string(),
+                                token: token_text(&divisor_tok),
+                            });
                         }
                         cur.wrapping_div(rhs)
                     }
                     "%=" => {
                         if rhs == 0 {
-                            return Err(ArithError::new("division by 0"));
+                            return Err(ArithError {
+                                message: "division by 0".to_string(),
+                                token: token_text(&divisor_tok),
+                            });
                         }
                         cur.wrapping_rem(rhs)
                     }
@@ -527,16 +552,24 @@ fn parse_multiplicative(lex: &mut Lexer, env: &mut dyn ArithEnv) -> Result<i64, 
             v = v.wrapping_mul(rhs);
         } else if lex.peek_op("/") {
             lex.pos += 1;
+            let divisor_tok = lex.peek().cloned();
             let rhs = parse_unary(lex, env)?;
             if rhs == 0 {
-                return Err(ArithError::new("division by 0"));
+                return Err(ArithError {
+                    message: "division by 0".to_string(),
+                    token: token_text(&divisor_tok),
+                });
             }
             v = v.wrapping_div(rhs);
         } else if lex.peek_op("%") {
             lex.pos += 1;
+            let divisor_tok = lex.peek().cloned();
             let rhs = parse_unary(lex, env)?;
             if rhs == 0 {
-                return Err(ArithError::new("division by 0"));
+                return Err(ArithError {
+                    message: "division by 0".to_string(),
+                    token: token_text(&divisor_tok),
+                });
             }
             v = v.wrapping_rem(rhs);
         } else {

@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::ffi::{c_char, CString};
 use std::io::Write;
 
+use crate::arith;
 use crate::builtins;
 use crate::expand::{expand_argv, expand_scalar, expand_word, ExpandCtx};
 use crate::lexer::WordPart;
@@ -384,7 +385,7 @@ fn execute_compound(compound: &Compound, sh: &mut Shell) -> i32 {
             for (condition, body) in branches {
                 let status = execute(condition, sh);
                 sh.last_status = status;
-                if sh.exit_requested.is_some() {
+                if sh.exit_requested.is_some() || sh.return_requested.is_some() {
                     return status;
                 }
                 if status == 0 {
@@ -480,6 +481,38 @@ fn child_run_exp(argv: &[String], path: &str, ctx: &ChildContext) -> ! {
     posix::exit(127);
 }
 
+/// Apply a single assignment to the shell, honouring the `readonly` and
+/// integer (`declare -i`) attributes the way bash does.
+///
+/// * A `readonly` variable cannot be assigned to (the command prints an error
+///   and is left unchanged).
+/// * An integer-attributed variable is reassigned by evaluating the value as an
+///   arithmetic expression (so `N=N+1` increments `N`).
+///
+/// Returns `false` when the assignment was refused (a `readonly` variable);
+/// the caller turns that into a non-zero exit status the way bash does.
+fn assign_var(sh: &mut Shell, name: &str, value: String, append: bool) -> bool {
+    if sh.readonly.contains(name) {
+        eprintln!("wash: {}: readonly variable", name);
+        return false;
+    }
+    let final_value = if sh.integer_vars.contains(name) {
+        match arith::eval(&value, &mut arith::MapEnv { vars: &mut sh.env }) {
+            Ok(v) => v.to_string(),
+            Err(_) => value,
+        }
+    } else {
+        value
+    };
+    if append {
+        let cur = sh.env.get(name).cloned().unwrap_or_default();
+        sh.env.insert(name.to_string(), cur + &final_value);
+    } else {
+        sh.env.insert(name.to_string(), final_value);
+    }
+    true
+}
+
 /// Apply the assignments of a command (e.g. `IFS=: read x') and return the
 /// previous values, so that they can be restored afterwards.
 fn apply_command_assignments(
@@ -511,12 +544,7 @@ fn apply_command_assignments(
     let mut saved: Vec<(String, Option<String>)> = Vec::new();
     for (name, value, append) in applied {
         saved.push((name.clone(), sh.env.get(&name).cloned()));
-        if append {
-            let cur = sh.env.get(&name).cloned().unwrap_or_default();
-            sh.env.insert(name, cur + &value);
-        } else {
-            sh.env.insert(name, value);
-        }
+        let _ = assign_var(sh, &name, value, append);
     }
     saved
 }
@@ -564,6 +592,7 @@ fn run_standalone_exp(
         }
         // Standalone assignment(s): persist to the shell environment.
         if !assigns.is_empty() {
+            let mut assign_failed = false;
             let attrs = sh.attrs();
             let pending: RefCell<Vec<(String, String)>> = RefCell::new(Vec::new());
             // Expand all RHS values first (immutable borrow of sh.env), then
@@ -586,16 +615,20 @@ fn run_standalone_exp(
                     .collect()
             };
             for (name, val, append) in applied {
-                if append {
-                    let cur = sh.env.get(&name).cloned().unwrap_or_default();
-                    sh.env.insert(name, cur + &val);
-                } else {
-                    sh.env.insert(name, val);
+                if !assign_var(sh, &name, val, append) {
+                    assign_failed = true;
                 }
             }
             // Apply the assignments the expansion requested (`${var=word}`).
             for (name, value) in pending.borrow_mut().drain(..) {
                 sh.env.insert(name, value);
+            }
+            if assign_failed {
+                // bash treats a failed assignment to a readonly variable as a
+                // fatal error: the `-c` script stops immediately and the shell
+                // exits with status 1.
+                sh.exit_requested = Some(1);
+                return 1;
             }
         }
         // A redirection without a command applies to the shell itself, but

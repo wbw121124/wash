@@ -302,6 +302,7 @@ pub fn errno_message(code: i32) -> String {
     match code {
         1 => "Operation not permitted".to_string(),
         2 => "No such file or directory".to_string(),
+        3 => "No such process".to_string(),
         13 => "Permission denied".to_string(),
         17 => "File exists".to_string(),
         20 => "Not a directory".to_string(),

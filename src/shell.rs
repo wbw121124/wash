@@ -281,6 +281,17 @@ pub struct Shell {
     pub continue_requested: Option<i32>,
     /// Set by `exit` so the caller can terminate with the right code.
     pub exit_requested: Option<i32>,
+
+    /// How many `source`/`.` invocations are currently active. `return` is
+    /// only legal inside a sourced script (or a function) — the depth lets the
+    /// `return` builtin tell a top-level call from a sourced one.
+    pub sourcing_depth: usize,
+    /// How many `for`/`while`/`until` loop bodies are currently executing.
+    /// `break`/`continue` are only legal inside a loop.
+    pub loop_depth: usize,
+    /// How many shell-function calls are currently active. `local` is only
+    /// legal inside a function.
+    pub function_depth: usize,
 }
 
 impl Shell {
@@ -349,6 +360,9 @@ impl Shell {
             break_requested: None,
             continue_requested: None,
             exit_requested: None,
+            sourcing_depth: 0,
+            loop_depth: 0,
+            function_depth: 0,
         }
     }
 

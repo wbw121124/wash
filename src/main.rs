@@ -28,6 +28,12 @@ fn main() {
             exit(2);
         }
         let code = sh.run_str(&args[2]);
+        // Fire the EXIT trap (bash runs it just before the shell exits).
+        if let Some(action) = sh.traps.get("EXIT").cloned() {
+            if action != "-" {
+                sh.run_str(&action);
+            }
+        }
         exit(code);
     }
 

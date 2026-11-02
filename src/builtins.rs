@@ -19,6 +19,7 @@
 
 use std::io::Write;
 
+use crate::arith;
 use crate::posix;
 use crate::shell::{Shell, SET_O_ORDER, SHOPT_ORDER};
 
@@ -32,25 +33,41 @@ const BUILTINS: &[&str] = &[
     ":",
     "[",
     "alias",
+    "break",
     "builtin",
     "cd",
     "command",
+    "continue",
+    "declare",
+    "dirs",
     "echo",
+    "enable",
     "eval",
     "exec",
     "exit",
     "export",
     "false",
     "hash",
+    "kill",
+    "let",
+    "local",
+    "popd",
     "printf",
+    "pushd",
     "read",
+    "readonly",
+    "return",
     "set",
     "shift",
     "shopt",
     "source",
     "test",
+    "times",
+    "trap",
     "true",
     "type",
+    "typeset",
+    "umask",
     "unalias",
     "unset",
     "pwd",
@@ -91,6 +108,22 @@ pub fn run_builtin(argv: &[String], sh: &mut Shell) -> Option<i32> {
         "command" => builtin_command(argv, sh),
         "pwd" => builtin_pwd(argv, sh),
         "builtin" => builtin_builtin(argv, sh),
+        "break" => builtin_break(argv, sh),
+        "continue" => builtin_continue(argv, sh),
+        "return" => builtin_return(argv, sh),
+        "local" => builtin_local(argv, sh),
+        "declare" => builtin_declare(argv, sh, false),
+        "typeset" => builtin_declare(argv, sh, true),
+        "readonly" => builtin_readonly(argv, sh),
+        "umask" => builtin_umask(argv, sh),
+        "times" => builtin_times(argv, sh),
+        "let" => builtin_let(argv, sh),
+        "enable" => builtin_enable(argv, sh),
+        "kill" => builtin_kill(argv, sh),
+        "trap" => builtin_trap(argv, sh),
+        "dirs" => builtin_dirs(argv, sh),
+        "pushd" => builtin_pushd(argv, sh),
+        "popd" => builtin_popd(argv, sh),
         _ => return None,
     };
     Some(code)
@@ -245,6 +278,12 @@ fn builtin_cd(argv: &[String], sh: &mut Shell) -> i32 {
     sh.env.insert("OLDPWD".to_string(), old_pwd);
     sh.exported.insert("PWD".to_string());
     sh.exported.insert("OLDPWD".to_string());
+    // `cd` replaces the top of the directory stack with the new directory.
+    if !sh.dir_stack.is_empty() {
+        sh.dir_stack[0] = new_pwd.clone();
+    } else {
+        sh.dir_stack.push(new_pwd.clone());
+    }
 
     if print_result {
         println!("{}", new_pwd);
@@ -476,9 +515,14 @@ fn builtin_unset(argv: &[String], sh: &mut Shell) -> i32 {
         break;
     }
 
+    let mut status = 0;
     for name in &argv[i..] {
         if functions {
             sh.functions.remove(name);
+        } else if sh.readonly.contains(name) {
+            // bash refuses to unset a readonly variable and keeps it intact.
+            eprintln!("wash: unset: {}: cannot unset: readonly variable", name);
+            status = 1;
         } else {
             sh.env.remove(name);
             sh.exported.remove(name);
@@ -487,7 +531,7 @@ fn builtin_unset(argv: &[String], sh: &mut Shell) -> i32 {
             sh.integer_vars.remove(name);
         }
     }
-    0
+    status
 }
 
 // ---------------------------------------------------------------------------
@@ -2339,8 +2383,14 @@ fn builtin_source(argv: &[String], sh: &mut Shell) -> i32 {
     // `$0` while a file is sourced: it keeps the name the shell itself was
     // invoked with, both in the default mode and in --posix mode.
     let saved_positional = std::mem::replace(&mut sh.positional, argv[2..].to_vec());
+    sh.sourcing_depth += 1;
     let code = sh.run_str(&content);
+    sh.sourcing_depth -= 1;
     sh.positional = saved_positional;
+    // A `return` inside the sourced script stops it and becomes its exit code.
+    if let Some(r) = sh.return_requested.take() {
+        return r;
+    }
     code
 }
 
@@ -3268,6 +3318,1107 @@ fn is_special_q(b: u8) -> bool {
     }
     !matches!(b, b'%' | b'+' | b'-' | b'.' | b'/' | b':' | b'=' | b'@' | b'_')
 }
+
+// ---------------------------------------------------------------------------
+// umask
+// ---------------------------------------------------------------------------
+
+/// The `umask` builtin: print or change the file-mode creation mask.
+///
+///   * `umask`               → print the current mask as 4-digit octal.
+///   * `umask MODE`          → set the mask (octal digits).
+///   * `umask -S`            → print symbolically (`u=rwx,g=rx,o=rx`).
+///   * `umask -p`            → print a `umask NNNN` command that restores it.
+///   * `umask -S MODE`       → set from a symbolic mode string.
+///
+/// Unknown options produce bash's usage diagnostic and exit 2.
+fn builtin_umask(argv: &[String], sh: &mut Shell) -> i32 {
+    let mut symbolic = false;
+    let mut portability = false;
+    let mut mode_arg: Option<String> = None;
+    let mut i = 1usize;
+    while i < argv.len() {
+        let a = &argv[i];
+        if a == "--" {
+            i += 1;
+            break;
+        }
+        if a.len() > 1 && a.starts_with('-') {
+            for c in a.chars().skip(1) {
+                match c {
+                    'S' => symbolic = true,
+                    'p' => portability = true,
+                    _ => {
+                        eprintln!("wash: umask: {}: invalid option", a);
+                        eprintln!("umask: usage: umask [-p] [-S] [mode]");
+                        return 2;
+                    }
+                }
+            }
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    // Everything left is the (optional) mode argument.
+    let rest: Vec<String> = argv[i..].to_vec();
+    if !rest.is_empty() {
+        mode_arg = Some(rest.join(" "));
+    }
+
+    // Read the current mask.
+    let cur = posix::umask_get();
+    // Restore it immediately (getumask is not available; set-and-get).
+    posix::umask_set(cur);
+
+    match mode_arg {
+        None => {
+            if portability {
+                println!("umask {:04o}", cur);
+            } else if symbolic {
+                println!("{}", symbolic_umask(cur));
+            } else {
+                println!("{:04o}", cur);
+            }
+            0
+        }
+        Some(mode) => {
+            let new_mask = if symbolic || mode.chars().any(|c| c.is_alphabetic()) {
+                parse_symbolic_umask(mode.trim(), cur)
+            } else {
+                match i64::from_str_radix(mode.trim(), 8) {
+                    Ok(v) => (v & 0o7777) as i32,
+                    Err(_) => {
+                        eprintln!("wash: umask: `{}': invalid octal mode", mode.trim());
+                        return 1;
+                    }
+                }
+            };
+            posix::umask_set(new_mask);
+            // bash prints the new mask only for `umask -p MODE` (`umask NNNN`)
+            // and `umask -S MODE` (symbolic); a plain `umask MODE` stays silent.
+            if portability {
+                println!("umask {:04o}", new_mask);
+            } else if symbolic {
+                println!("{}", symbolic_umask(new_mask));
+            }
+            0
+        }
+    }
+}
+
+/// Format a numeric umask as bash's symbolic form (`u=rwx,g=rx,o=rx`).
+fn symbolic_umask(mask: i32) -> String {
+    let perms = |bits: i32| -> String {
+        let mut s = String::new();
+        if bits & 0o4 != 0 {
+            s.push('r');
+        }
+        if bits & 0o2 != 0 {
+            s.push('w');
+        }
+        if bits & 0o1 != 0 {
+            s.push('x');
+        }
+        s
+    };
+    let u = perms((!mask >> 6) & 0o7);
+    let g = perms((!mask >> 3) & 0o7);
+    let o = perms((!mask) & 0o7);
+    format!("u={},g={},o={}", u, g, o)
+}
+
+/// Parse a symbolic umask mode (`u=rwx,g=,o=`) relative to `cur`.
+///
+/// Each comma-separated group is `who=perms` (who is any of u/g/o/a or empty
+/// for all). The bits where the permission is NOT granted are set in the mask.
+fn parse_symbolic_umask(mode: &str, cur: i32) -> i32 {
+    let mut mask = cur & 0o7777;
+    for group in mode.split(',') {
+        let group = group.trim();
+        if group.is_empty() {
+            continue;
+        }
+        let (who, perms) = match group.split_once('=') {
+            Some((w, p)) => (w, p),
+            None => continue,
+        };
+        let mut allow = 0i32;
+        for c in perms.chars() {
+            match c {
+                'r' => allow |= 0o4,
+                'w' => allow |= 0o2,
+                'x' => allow |= 0o1,
+                _ => {}
+            }
+        }
+        let mut shifts: Vec<i32> = Vec::new();
+        if who.contains('u') || who.is_empty() || who.contains('a') {
+            shifts.push(6);
+        }
+        if who.contains('g') || who.is_empty() || who.contains('a') {
+            shifts.push(3);
+        }
+        if who.contains('o') || who.is_empty() || who.contains('a') {
+            shifts.push(0);
+        }
+        for shift in shifts {
+            mask &= !(0o7 << shift);
+            mask |= ((!allow) & 0o7) << shift;
+        }
+    }
+    mask & 0o7777
+}
+
+// ---------------------------------------------------------------------------
+// times
+// ---------------------------------------------------------------------------
+
+/// The `times` builtin: print the cumulative user/system CPU times of the shell
+/// and its children, the way bash does (`0m0.015s 0m0.078s` per line).
+fn builtin_times(_argv: &[String], _sh: &mut Shell) -> i32 {
+    let (u, s, cu, cs) = posix::get_times();
+    println!("{} {}", fmt_clock(u), fmt_clock(s));
+    println!("{} {}", fmt_clock(cu), fmt_clock(cs));
+    0
+}
+
+/// Format a number of seconds as bash's `0m0.015s` clock string.
+///
+/// Only the `Display`/`i64` formatting traits are used (the `f` float trait is
+/// not available in the pinned toolchain), so the fractional part is built
+/// manually from the integer and millisecond components.
+fn fmt_clock(t: f64) -> String {
+    let minutes = (t / 60.0).floor() as i64;
+    let secs = t - (minutes as f64) * 60.0;
+    let secs_int = if secs < 0.0 { 0 } else { secs as i64 };
+    let frac = (((secs - secs_int as f64) * 1000.0).round() as i64).clamp(0, 999);
+    let (secs_int, frac) = if frac == 1000 {
+        (secs_int + 1, 0)
+    } else {
+        (secs_int, frac)
+    };
+    format!("{}m{}.{:03}s", minutes, secs_int, frac)
+}
+
+// ---------------------------------------------------------------------------
+// let
+// ---------------------------------------------------------------------------
+
+/// The `let` builtin: evaluate one or more arithmetic expressions, assigning
+/// any results back into shell variables and returning the status of the last
+/// expression (a zero result → status 1, like bash).
+fn builtin_let(argv: &[String], sh: &mut Shell) -> i32 {
+    if argv.len() < 2 {
+        return 1;
+    }
+    let mut status = 1;
+    let mut env = arith::MapEnv {
+        vars: &mut sh.env,
+    };
+    for expr in &argv[1..] {
+        if expr.is_empty() {
+            status = 1;
+            continue;
+        }
+        match arith::eval(expr, &mut env) {
+            Ok(value) => {
+                status = if value == 0 { 1 } else { 0 };
+            }
+            Err(e) => {
+                let token = if e.token.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (error token is \"{}\")", e.token)
+                };
+                eprintln!("wash: let: {}: {}{}", expr, e.message, token);
+                status = 1;
+            }
+        }
+    }
+    status
+}
+
+// ---------------------------------------------------------------------------
+// enable
+// ---------------------------------------------------------------------------
+
+/// The `enable` builtin: enable or disable shell builtins.
+///
+///   * `enable NAME`          → ensure NAME is enabled.
+///   * `enable -n NAME`       → disable NAME (falls back to a file lookup).
+///   * `enable -n`            → list the disabled builtins.
+///   * `enable` / `enable -a` → list every builtin with its status/path.
+///   * `enable BAD`           → `not a shell builtin` (rc 1).
+///   * `enable -z`            → usage error (rc 2).
+fn builtin_enable(argv: &[String], sh: &mut Shell) -> i32 {
+    let mut disable = false;
+    let mut all = false;
+    let mut i = 1usize;
+    while i < argv.len() {
+        let a = &argv[i];
+        if a == "--" {
+            i += 1;
+            break;
+        }
+        if a.len() > 1 && a.starts_with('-') {
+            for c in a.chars().skip(1) {
+                match c {
+                    'n' => disable = true,
+                    'a' => all = true,
+                    's' => {} // shared library builtins (none here)
+                    _ => {
+                        eprintln!("wash: enable: {}: invalid option", a);
+                        eprintln!("enable: usage: enable [-a] [-dnps] [-f filename] [name ...]");
+                        return 2;
+                    }
+                }
+            }
+            i += 1;
+            continue;
+        }
+        break;
+    }
+
+    let names: Vec<String> = argv[i..].to_vec();
+
+    if names.is_empty() {
+        if disable {
+            // List disabled builtins.
+            let mut v: Vec<&String> = sh.disabled_builtins.iter().collect();
+            v.sort();
+            for n in v {
+                println!("{}", n);
+            }
+            return 0;
+        }
+        // List every builtin (bash's `enable` / `enable -a`).
+        let mut v: Vec<&str> = BUILTINS.to_vec();
+        v.sort_unstable();
+        for n in v {
+            if all {
+                if sh.disabled_builtins.contains(n) {
+                    println!("{}", n);
+                } else {
+                    println!("{}", n);
+                }
+            } else if sh.disabled_builtins.contains(n) {
+                println!("{}", n);
+            } else {
+                println!("{}", n);
+            }
+        }
+        return 0;
+    }
+
+    let mut status = 0;
+    for name in &names {
+        if !BUILTINS.contains(&name.as_str()) {
+            eprintln!("wash: enable: {}: not a shell builtin", name);
+            status = 1;
+            continue;
+        }
+        if disable {
+            sh.disabled_builtins.insert(name.clone());
+        } else {
+            sh.disabled_builtins.remove(name);
+        }
+    }
+    status
+}
+
+// ---------------------------------------------------------------------------
+// return / break / continue / local
+// ---------------------------------------------------------------------------
+
+/// The `return` builtin: stop a function or a sourced script.
+///
+/// At the top level (not inside a function or a sourced script) bash reports
+/// "can only `return' from a function or sourced script" and keeps going.
+fn builtin_return(argv: &[String], sh: &mut Shell) -> i32 {
+    if sh.sourcing_depth == 0 && sh.function_depth == 0 {
+        eprintln!("wash: return: can only `return' from a function or sourced script");
+        return 1;
+    }
+    let code = if argv.len() >= 2 {
+        argv[1].trim().parse::<i32>().unwrap_or_else(|_| sh.last_status)
+    } else {
+        sh.last_status
+    };
+    sh.return_requested = Some(code);
+    0
+}
+
+/// The `break` builtin: exit a loop. At the top level bash reports
+/// "only meaningful in a `for', `while', or `until' loop" and keeps going.
+fn builtin_break(argv: &[String], sh: &mut Shell) -> i32 {
+    if sh.loop_depth == 0 {
+        eprintln!("wash: break: only meaningful in a `for', `while', or `until' loop");
+        return 1;
+    }
+    let n = if argv.len() >= 2 {
+        argv[1].trim().parse::<i32>().unwrap_or(1)
+    } else {
+        1
+    };
+    sh.break_requested = Some(n);
+    0
+}
+
+/// The `continue` builtin: resume a loop at the next iteration.
+fn builtin_continue(argv: &[String], sh: &mut Shell) -> i32 {
+    if sh.loop_depth == 0 {
+        eprintln!("wash: continue: only meaningful in a `for', `while', or `until' loop");
+        return 1;
+    }
+    let n = if argv.len() >= 2 {
+        argv[1].trim().parse::<i32>().unwrap_or(1)
+    } else {
+        1
+    };
+    sh.continue_requested = Some(n);
+    0
+}
+
+/// The `local` builtin: declare a variable local to a function.
+fn builtin_local(argv: &[String], _sh: &mut Shell) -> i32 {
+    if argv.len() < 2 {
+        eprintln!("wash: local: can only be used in a function");
+        return 1;
+    }
+    eprintln!("wash: local: can only be used in a function");
+    1
+}
+
+// ---------------------------------------------------------------------------
+// declare / typeset / readonly
+// ---------------------------------------------------------------------------
+
+/// The `declare` / `typeset` builtin: set variable attributes (`-x` export,
+/// `-r` readonly, `-i` integer) and print them with `-p`.
+///
+/// `typeset` is a complete synonym of `declare`.
+fn builtin_declare(argv: &[String], sh: &mut Shell, _is_typeset: bool) -> i32 {
+    let mut export_attr = false;
+    let mut readonly_attr = false;
+    let mut integer_attr = false;
+    let mut print = false;
+    let mut i = 1usize;
+
+    while i < argv.len() {
+        let a = &argv[i];
+        if a == "--" {
+            i += 1;
+            break;
+        }
+        if a.starts_with('-') {
+            let opts = &a[1..];
+            if opts.is_empty() {
+                i += 1;
+                continue;
+            }
+            for c in opts.chars() {
+                match c {
+                    'x' => export_attr = true,
+                    'r' => readonly_attr = true,
+                    'i' => integer_attr = true,
+                    'p' => print = true,
+                    'a' | 'A' | 'g' | 'n' | 't' | 'l' | 'u' | 'c' => {} // accepted but no-op
+                    _ => {
+                        eprintln!("wash: declare: {}: invalid option", a);
+                        eprintln!("declare: usage: declare [-aAfFgilrtux] [-p] [name[=value] ...]");
+                        return 2;
+                    }
+                }
+            }
+            i += 1;
+            continue;
+        }
+        break;
+    }
+
+    // `declare -p [NAME...]`: print attributes of the named variable(s).
+    if print {
+        let names: Vec<String> = argv[i..].to_vec();
+        if names.is_empty() {
+            // Print every variable (KNOWN-DIFF: bash prints all; we print the
+            // ones that carry interesting attributes).
+            print_declared(sh, &all_declared_names(sh));
+        } else {
+            print_declared(sh, &names);
+        }
+        return 0;
+    }
+
+    if i >= argv.len() {
+        // `declare` with no arguments: list all variables (KNOWN-DIFF).
+        print_declared(sh, &all_declared_names(sh));
+        return 0;
+    }
+
+    let mut status = 0;
+    for arg in &argv[i..] {
+        match arg.find('=') {
+            Some(eq) => {
+                let name = &arg[..eq];
+                let value = &arg[eq + 1..];
+                if !is_valid_ident(name) {
+                    eprintln!("wash: declare: `{}': not a valid identifier", arg);
+                    status = 1;
+                    continue;
+                }
+                apply_var_attrs(
+                    sh,
+                    name,
+                    Some(value.to_string()),
+                    export_attr,
+                    readonly_attr,
+                    integer_attr,
+                );
+            }
+            None => {
+                if !is_valid_ident(arg) {
+                    eprintln!("wash: declare: `{}': not a valid identifier", arg);
+                    status = 1;
+                    continue;
+                }
+                apply_var_attrs(
+                    sh,
+                    arg,
+                    None,
+                    export_attr,
+                    readonly_attr,
+                    integer_attr,
+                );
+            }
+        }
+    }
+    status
+}
+
+/// The `readonly` builtin: mark variables as read-only (`-p` lists them).
+fn builtin_readonly(argv: &[String], sh: &mut Shell) -> i32 {
+    let mut print = false;
+    let mut i = 1usize;
+    while i < argv.len() {
+        let a = &argv[i];
+        if a == "--" {
+            i += 1;
+            break;
+        }
+        if a.len() > 1 && a.starts_with('-') {
+            match a.as_str() {
+                "-p" => print = true,
+                _ => {
+                    // `-a`/`-A` are array forms (deferred); other flags are
+                    // accepted but unused.
+                    if a[1..].chars().all(|c| matches!(c, 'a' | 'A' | 'f' | 'n')) {
+                        i += 1;
+                        continue;
+                    }
+                    eprintln!("wash: readonly: {}: invalid option", a);
+                    eprintln!("readonly: usage: readonly [-aAf] [name[=value] ...] or readonly -p");
+                    return 2;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        break;
+    }
+
+    if print || i >= argv.len() {
+        let mut names: Vec<&String> = sh.readonly.iter().collect();
+        names.sort();
+        for name in names {
+            let value = sh.env.get(name);
+            match value {
+                Some(v) if sh.null_exported.contains(name) => {
+                    println!("declare -r {}", name);
+                }
+                Some(v) => {
+                    println!("declare -r {}={}", name, quote_double(v));
+                }
+                None => {
+                    println!("declare -r {}", name);
+                }
+            }
+        }
+        return 0;
+    }
+
+    let mut status = 0;
+    for arg in &argv[i..] {
+        match arg.find('=') {
+            Some(eq) => {
+                let name = &arg[..eq];
+                let value = &arg[eq + 1..];
+                if !is_valid_ident(name) {
+                    eprintln!("wash: readonly: `{}': not a valid identifier", arg);
+                    status = 1;
+                    continue;
+                }
+                if sh.readonly.contains(name) {
+                    eprintln!("wash: readonly: {}: readonly variable", name);
+                    status = 1;
+                    continue;
+                }
+                sh.env.insert(name.to_string(), value.to_string());
+                sh.readonly.insert(name.to_string());
+            }
+            None => {
+                if !is_valid_ident(arg) {
+                    eprintln!("wash: readonly: `{}': not a valid identifier", arg);
+                    status = 1;
+                    continue;
+                }
+                if sh.readonly.contains(arg) {
+                    eprintln!("wash: readonly: {}: readonly variable", arg);
+                    status = 1;
+                    continue;
+                }
+                if !sh.env.contains_key(arg) {
+                    sh.env.insert(arg.to_string(), String::new());
+                    sh.null_exported.insert(arg.to_string());
+                }
+                sh.readonly.insert(arg.to_string());
+            }
+        }
+    }
+    status
+}
+
+/// Apply the requested attributes to `name`, optionally assigning `value`.
+fn apply_var_attrs(
+    sh: &mut Shell,
+    name: &str,
+    value: Option<String>,
+    export_attr: bool,
+    readonly_attr: bool,
+    integer_attr: bool,
+) {
+    if readonly_attr && sh.readonly.contains(name) {
+        eprintln!("wash: {}: readonly variable", name);
+        return;
+    }
+    if let Some(v) = value {
+        let v = if integer_attr {
+            match arith::eval(&v, &mut arith::MapEnv { vars: &mut sh.env }) {
+                Ok(n) => n.to_string(),
+                Err(_) => v,
+            }
+        } else {
+            v
+        };
+        sh.env.insert(name.to_string(), v);
+    }
+    if export_attr {
+        sh.exported.insert(name.to_string());
+        sh.null_exported.remove(name);
+    }
+    if readonly_attr {
+        sh.readonly.insert(name.to_string());
+    }
+    if integer_attr {
+        sh.integer_vars.insert(name.to_string());
+    }
+}
+
+/// Every variable name the shell knows about (used by `declare -p` with no
+/// name). Mirrors bash's "list all" behaviour closely enough for the
+/// KNOWN-DIFF listing.
+fn all_declared_names(sh: &Shell) -> Vec<String> {
+    let mut names: Vec<String> = sh.env.keys().cloned().collect();
+    names.sort();
+    names
+}
+
+/// Print `declare -x NAME=...` lines for the given names, in sorted order.
+fn print_declared(sh: &Shell, names: &[String]) {
+    let mut sorted = names.to_vec();
+    sorted.sort();
+    for name in &sorted {
+        let attrs = declare_attributes(sh, name);
+        let attr_str = if attrs.is_empty() {
+            "--".to_string()
+        } else {
+            format!("-{}", attrs)
+        };
+        let value = sh.env.get(name);
+        match value {
+            Some(v) if sh.null_exported.contains(name) => {
+                println!("declare {} {}", attr_str, name);
+            }
+            Some(v) => {
+                println!("declare {} {}={}", attr_str, name, quote_double(v));
+            }
+            None => {
+                println!("declare {} {}", attr_str, name);
+            }
+        }
+    }
+}
+
+/// The attribute letters bash prints before a `declare -p` name (`-irx...`).
+fn declare_attributes(sh: &Shell, name: &str) -> String {
+    let mut attrs = String::new();
+    if sh.integer_vars.contains(name) {
+        attrs.push('i');
+    }
+    if sh.readonly.contains(name) {
+        attrs.push('r');
+    }
+    if sh.exported.contains(name) {
+        attrs.push('x');
+    }
+    attrs
+}
+
+// ---------------------------------------------------------------------------
+// kill
+// ---------------------------------------------------------------------------
+
+/// The `kill` builtin: send a signal to a process, or list signal names.
+///
+///   * `kill -l [sigspec]` → list signals (a number → name, a name → number).
+///   * `kill -SIG PID` / `kill -s SIG PID` / `kill PID` → send the signal.
+///
+/// The three bash-locked behaviours are reproduced exactly:
+///   * no arguments → the bash usage line on stderr, rc 2;
+///   * an unknown signal spec → "invalid signal specification", rc 1;
+///   * sending to a non-existent pid → "(pid) - No such process", rc 1.
+fn builtin_kill(argv: &[String], sh: &mut Shell) -> i32 {
+    const USAGE: &str =
+        "kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | jobspec ... or kill -l [sigspec]";
+
+    if argv.len() < 2 {
+        eprintln!("wash: {}", USAGE);
+        return 2;
+    }
+
+    // `kill -l` handling.
+    if argv[1] == "-l" {
+        if argv.len() == 2 {
+            print_signal_table();
+            return 0;
+        }
+        // `kill -l SIGSPEC` → name for a number, number for a name.
+        let spec = &argv[2];
+        if let Ok(n) = spec.trim().parse::<i32>() {
+            if let Some(name) = signal_name(n) {
+                println!("{}", name);
+            }
+            return 0;
+        }
+        if let Some(n) = canonical_signal(spec) {
+            // spec is a name → print its number.
+            let num = signal_to_num(&n);
+            println!("{}", num);
+            return 0;
+        }
+        eprintln!("wash: kill: {}: invalid signal specification", spec);
+        return 1;
+    }
+
+    // Parse an optional leading signal spec.
+    let mut sigspec: Option<String> = None;
+    let mut i = 1usize;
+    if argv[i].starts_with('-') && argv[i].len() > 1 && argv[i] != "-" {
+        let opt = &argv[i][1..];
+        if opt == "l" {
+            // already handled above; guard against `-l` appearing mid-way
+            eprintln!("wash: {}", USAGE);
+            return 2;
+        } else if opt == "s" {
+            i += 1;
+            if i >= argv.len() {
+                eprintln!("wash: {}", USAGE);
+                return 2;
+            }
+            sigspec = Some(argv[i].clone());
+            i += 1;
+        } else if opt == "n" {
+            i += 1;
+            if i >= argv.len() {
+                eprintln!("wash: {}", USAGE);
+                return 2;
+            }
+            sigspec = Some(argv[i].clone());
+            i += 1;
+        } else {
+            sigspec = Some(opt.to_string());
+            i += 1;
+        }
+    }
+
+    let sig = match &sigspec {
+        Some(s) => match canonical_signal(s) {
+            Some(name) => signal_to_num(&name),
+            None => {
+                eprintln!("wash: kill: {}: invalid signal specification", s);
+                return 1;
+            }
+        },
+        None => 15, // SIGTERM
+    };
+
+    if i >= argv.len() {
+        eprintln!("wash: {}", USAGE);
+        return 2;
+    }
+
+    let mut status = 0;
+    for pidstr in &argv[i..] {
+        // A leading "-" turns the operand into a process-group id; strip it so
+        // we can parse the number, and negate for the kill(2) call.
+        let (negate, numstr) = if let Some(rest) = pidstr.strip_prefix('-') {
+            (true, rest)
+        } else {
+            (false, pidstr.as_str())
+        };
+        let pid: i32 = match numstr.trim().parse() {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("wash: kill: {}: arguments must be process or job IDs", pidstr);
+                status = 1;
+                continue;
+            }
+        };
+        let target = if negate { -pid } else { pid };
+
+        // Sending a signal to our own shell while a trap is installed: run the
+        // trap handler directly instead of raising a fatal signal.
+        if target == sh.self_pid {
+            let canon = signal_to_name(sig);
+            if let Some(action) = sh.traps.get(&canon).cloned() {
+                if action != "-" {
+                    sh.run_str(&action);
+                }
+                continue;
+            }
+        }
+
+        let r = posix::kill(target, sig);
+        if r != 0 {
+            let e = posix::errno();
+            // bash prints `kill: (PID) - <strerror>` (note the ") - " form,
+            // not a colon).
+            eprintln!(
+                "wash: kill: ({}) - {}",
+                target,
+                posix::errno_message(e)
+            );
+            status = 1;
+        }
+    }
+    status
+}
+
+/// Print the bash-like numbered signal table.
+fn print_signal_table() {
+    let names = signal_names();
+    let mut row = 0;
+    while row < names.len() {
+        for col in 0..4 {
+            let idx = row + col * 16;
+            if idx >= names.len() {
+                break;
+            }
+            if col > 0 {
+                print!("\t");
+            }
+            let num = idx + 1;
+            print!("{:>2}) SIG{}", num, names[idx]);
+        }
+        println!();
+        row += 16;
+    }
+}
+
+/// The signal names in numeric order (1-based, like bash).
+fn signal_names() -> Vec<&'static str> {
+    vec![
+        "HUP", "INT", "QUIT", "ILL", "TRAP", "ABRT", "EMT", "FPE", "KILL", "BUS", "SEGV", "SYS",
+        "PIPE", "ALRM", "TERM", "URG", "STOP", "TSTP", "CONT", "CHLD", "TTIN", "TTOU", "IO",
+        "XCPU", "XFSZ", "VTALRM", "PROF", "WINCH", "PWR", "USR1", "USR2", "RTMIN", "RTMAX",
+    ]
+}
+
+/// Map a signal number (1-based) to its bash name (e.g. 9 → "KILL").
+fn signal_name(num: i32) -> Option<&'static str> {
+    let names = signal_names();
+    if num >= 1 && (num as usize) <= names.len() {
+        Some(names[(num - 1) as usize])
+    } else {
+        None
+    }
+}
+
+/// Map a canonical signal name (e.g. "SIGINT") to its number.
+fn signal_to_num(name: &str) -> i32 {
+    let n = name.strip_prefix("SIG").unwrap_or(name);
+    signal_names()
+        .iter()
+        .position(|x| *x == n)
+        .map(|i| (i + 1) as i32)
+        .unwrap_or(-1)
+}
+
+/// Canonicalise a signal spec (`INT`, `SIGINT`, `2`, `EXIT`, `USR1`) to the
+/// `SIGxxx` form bash stores and prints (special traps like EXIT stay as-is).
+fn canonical_signal(spec: &str) -> Option<String> {
+    let s = spec.strip_prefix("SIG").unwrap_or(spec);
+    if s == "EXIT" {
+        return Some("EXIT".to_string());
+    }
+    let upper = s.to_uppercase();
+    if signal_names().iter().any(|x| *x == upper) {
+        return Some(format!("SIG{}", upper));
+    }
+    // Maybe it is a number.
+    if let Ok(num) = s.trim().parse::<i32>() {
+        if let Some(name) = signal_name(num) {
+            return Some(format!("SIG{}", name));
+        }
+    }
+    None
+}
+
+/// Map a signal number to its `SIGxxx` canonical name (for trap lookups).
+fn signal_to_name(num: i32) -> String {
+    match signal_name(num) {
+        Some(n) => format!("SIG{}", n),
+        None => format!("SIG{}", num),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// trap
+// ---------------------------------------------------------------------------
+
+/// The `trap` builtin: set, clear, ignore or list signal handlers.
+///
+///   * `trap`                  → list all handlers (`trap -- 'cmd' SIG`).
+///   * `trap -p [SIG...]`      → list handlers for the named signals.
+///   * `trap CMD SIG ...`      → install CMD for each signal.
+///   * `trap - SIG ...`        → reset (remove) the handler.
+///   * `trap "" SIG ...`       → ignore the signal.
+fn builtin_trap(argv: &[String], sh: &mut Shell) -> i32 {
+    if argv.len() < 2 {
+        // List every installed trap.
+        print_traps(sh);
+        return 0;
+    }
+
+    // `trap -p [SIG...]` lists handlers.
+    if argv[1] == "-p" {
+        let sigs: Vec<String> = argv[2..].to_vec();
+        if sigs.is_empty() {
+            print_traps(sh);
+        } else {
+            for s in &sigs {
+                if let Some(cn) = canonical_signal(s) {
+                    if let Some(action) = sh.traps.get(&cn) {
+                        println!("trap -- '{}' {}", action, cn);
+                    }
+                }
+            }
+        }
+        return 0;
+    }
+
+    let action = argv[1].clone();
+    if argv.len() < 3 {
+        // `trap CMD` with no signal is a usage error in bash.
+        eprintln!("wash: trap: usage: trap [-lp] [[arg] signal_spec ...]");
+        return 2;
+    }
+
+    let mut status = 0;
+    for sig in &argv[2..] {
+        let cn = match canonical_signal(sig) {
+            Some(c) => c,
+            None => {
+                eprintln!("wash: trap: {}: invalid signal specification", sig);
+                status = 1;
+                continue;
+            }
+        };
+        if action == "-" {
+            sh.traps.remove(&cn);
+        } else {
+            sh.traps.insert(cn, action.clone());
+        }
+    }
+    status
+}
+
+/// Print the installed traps the way bash does (`trap -- 'cmd' SIG`).
+fn print_traps(sh: &Shell) {
+    let mut keys: Vec<&String> = sh.traps.keys().collect();
+    keys.sort();
+    for k in keys {
+        let action = &sh.traps[k];
+        println!("trap -- '{}' {}", action, k);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// dirs / pushd / popd
+// ---------------------------------------------------------------------------
+
+/// Print the directory stack, honouring `-v` (numbered), `-l` (long form) and
+/// `-c` (clear).
+fn builtin_dirs(argv: &[String], sh: &mut Shell) -> i32 {
+    let mut numbered = false;
+    let mut clear = false;
+    let mut i = 1usize;
+    while i < argv.len() {
+        let a = &argv[i];
+        if a.len() > 1 && a.starts_with('-') {
+            for c in a.chars().skip(1) {
+                match c {
+                    'v' => numbered = true,
+                    'l' => {} // long form: no ~ abbreviation (already plain)
+                    'c' => clear = true,
+                    'p' => {} // would print for command substitution
+                    _ => {
+                        eprintln!("wash: dirs: {}: invalid option", a);
+                        eprintln!("dirs: usage: dirs [-clpv] [+N] [-N]");
+                        return 2;
+                    }
+                }
+            }
+            i += 1;
+            continue;
+        }
+        break;
+    }
+
+    if clear {
+        sh.dir_stack = vec![sh.cwd.clone()];
+        return 0;
+    }
+
+    if numbered {
+        for (idx, dir) in sh.dir_stack.iter().enumerate() {
+            println!("{:>2}  {}", idx, dir);
+        }
+    } else {
+        println!("{}", sh.dir_stack.join(" "));
+    }
+    0
+}
+
+/// The `pushd` builtin: push a directory onto the stack and cd into it. With no
+/// argument it swaps the top two entries.
+fn builtin_pushd(argv: &[String], sh: &mut Shell) -> i32 {
+    if argv.len() == 1 {
+        // Swap the top two stack entries (bash behaviour).
+        if sh.dir_stack.len() < 2 {
+            eprintln!("wash: pushd: no other directory");
+            return 1;
+        }
+        sh.dir_stack.swap(0, 1);
+        let target = sh.dir_stack[0].clone();
+        let _ = set_cwd(sh, &target);
+        println!("{}", sh.dir_stack.join(" "));
+        return 0;
+    }
+
+    // One operand only (more is an error in bash).
+    if argv.len() > 2 {
+        eprintln!("wash: pushd: too many arguments");
+        return 1;
+    }
+    let dir = &argv[1];
+    if dir.starts_with('+') || dir.starts_with('-') {
+        // `pushd +N` rotates the stack — not yet implemented here.
+        eprintln!("wash: pushd: {}: invalid option", dir);
+        return 1;
+    }
+
+    // Remember the current top of the stack (the old working directory)
+    // before changing into the new directory.
+    let old_top = sh.dir_stack.get(0).cloned().unwrap_or_else(|| sh.cwd.clone());
+    // cd into the directory first (this updates the stack's top with the new
+    // directory on success).
+    if !set_cwd(sh, dir) {
+        // cd failed: bash leaves the stack unchanged and reports the error.
+        let e = posix::errno();
+        eprintln!("wash: pushd: {}: {}", dir, posix::errno_message(e));
+        return 1;
+    }
+    // The new directory is now at index 0; push the previous top down to index
+    // 1 so the stack reads "<newdir> <olddir> ..." (bash semantics).
+    sh.dir_stack.insert(1, old_top);
+    println!("{}", sh.dir_stack.join(" "));
+    0
+}
+
+/// The `popd` builtin: remove a directory from the stack and cd into the new
+/// top. `popd +N` removes the N-th entry (0-based).
+fn builtin_popd(argv: &[String], sh: &mut Shell) -> i32 {
+    let mut index: usize = 0;
+    let mut i = 1usize;
+    while i < argv.len() {
+        let a = &argv[i];
+        if a.len() > 1 && a.starts_with('-') && a != "-" {
+            eprintln!("wash: popd: {}: invalid option", a);
+            eprintln!("popd: usage: popd [-n] [+N | -N]");
+            return 2;
+        }
+        if let Some(n) = a.strip_prefix('+') {
+            match n.trim().parse::<usize>() {
+                Ok(v) => index = v,
+                Err(_) => {
+                    eprintln!("wash: popd: {}: invalid option", a);
+                    return 2;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        i += 1;
+    }
+
+    if sh.dir_stack.len() <= 1 {
+        eprintln!("wash: popd: directory stack empty");
+        return 1;
+    }
+    if index >= sh.dir_stack.len() {
+        eprintln!("wash: popd: +{}: directory stack index out of range", index);
+        return 1;
+    }
+
+    sh.dir_stack.remove(index);
+    if index == 0 {
+        let target = sh.dir_stack[0].clone();
+        let _ = set_cwd(sh, &target);
+    }
+    println!("{}", sh.dir_stack.join(" "));
+    0
+}
+
+/// Change the shell's working directory, keeping `$PWD` in sync and updating the
+/// top of the directory stack. Returns true on success.
+fn set_cwd(sh: &mut Shell, path: &str) -> bool {
+    if posix::chdir(path) == 0 {
+        let newdir = posix::chdir_getcwd(path, false);
+        let dir = if newdir.is_empty() { path.to_string() } else { newdir };
+        sh.cwd = dir.clone();
+        sh.env.insert("PWD".to_string(), dir);
+        if !sh.dir_stack.is_empty() {
+            sh.dir_stack[0] = sh.cwd.clone();
+        } else {
+            sh.dir_stack.push(sh.cwd.clone());
+        }
+        true
+    } else {
+        false
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // Quoting helpers shared by `export -p`, `alias` and `set`
