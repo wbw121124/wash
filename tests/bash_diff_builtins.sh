@@ -65,6 +65,10 @@ printf 'echo "1=$1 2=$2 n=$#"\n'  > "$SANDBOX/args.sh"
 printf 'exit 7\n'                 > "$SANDBOX/exit7.sh"
 printf 'false\n'                  > "$SANDBOX/false.sh"
 printf 'line1\nline2\n'           > "$SANDBOX/in.txt"
+# Fixture for the `return` cases: `return` is only legal inside a function or
+# a SOURCED script, and a sourced script needs no function support -- so this
+# is the cheapest precondition that makes `return` observable.
+printf 'return 3\n'                > "$SANDBOX/ret3.sh"
 ln -s sub "$SANDBOX/link" 2>/dev/null || true
 
 # `timeout` guards against a hanging case; degrade gracefully if absent.
@@ -517,30 +521,170 @@ run_case C true              'true; echo "rc=$?"'
 run_case C false             'false; echo "rc=$?"'
 
 ###############################################################################
+# GROUP C -- the Phase 3 builtin group (16 builtins).
+#
+# These builtins need PRECONDITIONS to be observable at all -- a function
+# scope for `local`, a loop for `break`/`continue`, a sourced script for
+# `return`, a live child process for `kill`.  Every case below therefore
+# BUILDS the precondition it needs instead of skipping the case.
+#
+# SAFETY RULES OBSERVED HERE
+#   * `kill` only ever signals a CHILD process this very case started
+#     (`sleep 2 & p=$!`).  No case sends a signal to the shell itself or to
+#     any pre-existing process.
+#   * `trap`'s USR1 case installs a handler for USR1 FIRST and then signals
+#     `$$`; with the handler in place the signal is caught, not fatal.  No
+#     case sends SIGINT/SIGTERM to the shell.
+#   * `ulimit` only ever lowers the SOFT core-file-size limit (`-c`), which
+#     is restored inside the same case.  It never touches `-v`, `-u`, `-t`
+#     or the hard limits, so the test process cannot lock itself up.
+#   * `umask` is process-wide, so every `umask` case restores the original
+#     value inside the same case.
+#   * `enable -n` disables a builtin, so the `enable` case re-enables it
+#     inside the same case before the next one runs.
+###############################################################################
+
+# --- declare / typeset / readonly -------------------------------------------
+# `declare -p NAME` prints the variable WITH its attributes, which is the
+# observable part of `declare`; `declare`/`typeset` with no name would print
+# bash's whole internal variable table (BASHOPTS, BASH_VERSINFO, ...), which
+# is a KNOWN-DIFF and therefore not used here.
+run_case C declare-x          'declare -x Q=1; echo "Q=$Q"'
+run_case C declare-p          'declare -x Q=1; declare -p Q'
+# `-i` makes the variable INTEGER: `N=N+1` must evaluate to 6, not the
+# literal string "N=N+1".
+run_case C declare-i          'declare -i N=5; N=N+1; echo "N=$N"'
+run_case C declare-r          'declare -r R=1; declare -p R'
+run_case C declare-invalid    'declare 1bad=x; echo "rc=$?"'
+# `typeset` is a synonym of `declare`: both must produce the same output.
+run_case C typeset-synonym    'typeset -x Q=1; declare -p Q'
+# Assigning to a readonly variable must fail with bash's exact wording.
+run_case C readonly-assign    'readonly R=1; R=2; echo "rc=$?"'
+# `readonly -p` prints EVERY readonly variable (bash internals included), so
+# the case greps for the one the test created.
+run_case C readonly-p         'readonly R=1; readonly -p | grep "^declare -r R="'
+
+# --- let --------------------------------------------------------------------
+run_case C let-basic          'let x=1+1; echo "x=$x"'
+run_case C let-quoted         'let "x=2*3"; echo "x=$x"'
+run_case C let-aug            'let x=5; let x+=3; echo "x=$x"'
+# Division by zero must fail with bash's exact wording and rc=1.
+run_case C let-div0           'let x=1/0; echo "rc=$?"'
+
+# --- ulimit -----------------------------------------------------------------
+run_case C ulimit-n           'ulimit -n'
+run_case C ulimit-f           'ulimit -f'
+run_case C ulimit-a           'ulimit -a'
+# Set and restore the SOFT core-file-size limit.  `-c` is the only limit
+# that is both settable on this platform and harmless (it caps the size of
+# a core dump, nothing else).  The original value is captured first and
+# restored inside the same case.
+run_case C ulimit-c-set-restore 'orig=$(ulimit -c); ulimit -c 8; echo "now=$(ulimit -c)"; ulimit -c "$orig"; echo "restored=$(ulimit -c)"'
+run_case C ulimit-bad-opt     'ulimit -Z; echo "rc=$?"'
+
+# --- umask ------------------------------------------------------------------
+# `umask` is PROCESS-wide state: every case restores the original value
+# before it ends, so no case can leak a umask into the next one.
+run_case C umask-plain        'umask'
+run_case C umask-set          'umask 022; umask'
+run_case C umask-S            'umask -S'
+run_case C umask-set-restore  'orig=$(umask); umask 022; echo "now=$(umask)"; umask "$orig"; echo "restored=$(umask)"'
+
+# --- times ------------------------------------------------------------------
+# The CPU times themselves differ from run to run, so the case compares the
+# SHAPE of the output (two lines of "<user> <system>" pairs) instead of the
+# numbers -- the point of the builtin is that it prints those two lines.
+run_case C times-shape        'times | sed -E "s/[0-9]+m[0-9]+\.[0-9]+s/<T>/g"'
+
+# --- kill -------------------------------------------------------------------
+run_case C kill-l-num         'kill -l 9'
+run_case C kill-l-name        'kill -l KILL'
+run_case C kill-noargs        'kill; echo "rc=$?"'
+run_case C kill-bad-sig       'kill -NOSUCHSIG 12345; echo "rc=$?"'
+run_case C kill-noexist       'kill -TERM 999999; echo "rc=$?"'
+# THE SIGNAL-SENDING PATH.  The case starts its own `sleep 2` child and
+# signals THAT child only -- never the shell, never another process.  A
+# child killed by SIGTERM makes `wait` report 128+15 = 143.
+run_case C kill-TERM-child    'sleep 2 & p=$!; kill -TERM $p; wait $p; echo "rc=$?"'
+
+# --- trap -------------------------------------------------------------------
+run_case C trap-empty         'trap'
+run_case C trap-set-list      'trap "echo hi" SIGINT; trap'
+run_case C trap-p             'trap "echo hi" SIGINT; trap -p SIGINT'
+run_case C trap-reset         'trap "echo hi" SIGINT; trap - SIGINT; trap -p SIGINT'
+run_case C trap-ignore        'trap "" SIGINT; trap -p SIGINT'
+run_case C trap-invalid-sig   'trap "echo x" NOSUCHSIG; echo "rc=$?"'
+# The EXIT trap runs when the shell exits.
+run_case C trap-exit          'trap "echo EXITING" EXIT; echo body'
+# A trap that actually FIRES.  USR1 has no default action that would
+# interrupt the shell, and the handler is installed BEFORE the signal is
+# sent, so the signal is caught (bash prints CAUGHT and then continues).
+run_case C trap-usr1          'trap "echo CAUGHT" USR1; kill -USR1 $$; echo done'
+
+# --- dirs / pushd / popd ----------------------------------------------------
+run_case C dirs-empty         'dirs'
+run_case C pushd              'cd /tmp; pushd /tmp; dirs'
+run_case C pushd-twice        'cd /tmp; pushd /tmp; pushd /var; dirs'
+run_case C popd               'cd /tmp; pushd /tmp; popd; dirs'
+run_case C popd-empty         'popd; echo "rc=$?"'
+run_case C dirs-v             'cd /tmp; pushd /tmp; dirs -v'
+
+# --- help -------------------------------------------------------------------
+# `help` prints the FULL manual page for a builtin, which is far too long
+# for a byte-diff case and would drown the failure report; the cases keep
+# the first lines, which carry the usage synopsis.
+run_case C help-cd-head       'help cd | head -2'
+run_case C help-read-head     'help read | head -1'
+run_case C help-nosuch        'help nosuchbuiltin; echo "rc=$?"'
+
+# --- enable -----------------------------------------------------------------
+run_case C enable-bad         'enable nosuchbuiltin; echo "rc=$?"'
+# `enable -n` really does disable the builtin: `type -t echo` must report
+# "file" while it is disabled and "builtin" again after re-enabling.  The
+# re-enable happens INSIDE the case, so the next case is unaffected.
+run_case C enable-disable-restore 'enable -n echo; type -t echo; enable echo; type -t echo'
+run_case C enable-already-on  'enable echo; echo "rc=$?"'
+
+# --- return -----------------------------------------------------------------
+# `return` is only legal inside a function or a SOURCED script.  The
+# sourced-script form needs no function support, so it is used here; the
+# top-level form exercises bash's "can only `return' from a function or
+# sourced script" diagnostic.
+run_case C return-toplevel    'return 3; echo "not reached"'
+run_case C return-sourced     'source @SANDBOX@/ret3.sh; echo "rc=$?"'
+
+# --- break / continue -------------------------------------------------------
+# Outside a loop both builtins are an error in bash and the shell KEEPS
+# GOING -- so the case proves that the diagnostic is emitted AND that the
+# following command still runs.
+run_case C break-toplevel     'break 2; echo "not reached"'
+# Inside a loop they control the iteration: `break` leaves after the first
+# item, `continue` visits every item.
+run_case C break-in-for       'for i in 1 2 3; do echo $i; break; done'
+run_case C continue-in-for    'for i in 1 2 3; do echo $i; continue; done'
+run_case C continue-in-while  'i=0; while [ $i -lt 3 ]; do i=$((i+1)); [ $i -eq 2 ] && continue; echo $i; done'
+
+# --- local ------------------------------------------------------------------
+# `local` is only legal inside a function; at the top level bash reports
+# "can only be used in a function" and keeps going.
+run_case C local-toplevel     'local x=1; echo "rc=$?"'
+# Inside a function `local` scopes the variable: the function sees it, the
+# caller does not.
+run_case C local-in-func      'f() { local x=1; echo "in=$x"; }; f; echo "out=[$x]"'
+# `local` shadows an outer variable for the duration of the function only.
+run_case C local-shadow       'x=outer; f() { local x=inner; echo $x; }; f; echo $x'
+
+###############################################################################
 # GROUP D -- extra builtins, measured so that the compatibility matrix
 #            (AGENTS.md / README.md) is backed by real observations.
 #            Failures here mean "not implemented yet" or "differs in a known
 #            way"; they are NOT regressions of the A group.
 ###############################################################################
-run_case D local             'local x; echo "rc=$?"'
-run_case D declare           'declare -x Q=1; echo "rc=$?"'
-run_case D typeset           'typeset -x Q=1; echo "rc=$?"'
-run_case D readonly          'readonly R=1; echo "rc=$?"'
-run_case D let               'let x=1+1; echo "x=$x rc=$?"'
-run_case D ulimit            'ulimit -a; echo "rc=$?"'
-run_case D umask             'umask; echo "rc=$?"'
-run_case D umask-set         'umask 022; echo "rc=$?"; umask'
-run_case D times             'times > /dev/null; echo "rc=$?"'
-run_case D kill-l            'kill -l; echo "rc=$?"'
-run_case D trap              'trap; echo "rc=$?"'
-run_case D dirs              'dirs; echo "rc=$?"'
-run_case D pushd             'pushd /tmp; echo "rc=$?"'
-run_case D popd              'popd; echo "rc=$?"'
-run_case D help              'help; echo "rc=$?"'
-run_case D enable            'enable -a; echo "rc=$?"'
-run_case D return            'return 0; echo "rc=$?"'
-run_case D break             'break; echo "rc=$?"'
-run_case D continue          'continue; echo "rc=$?"'
+# NOTE: the 16 Phase 3 builtins (declare/typeset/readonly, let, ulimit,
+# umask, times, kill, trap, dirs/pushd/popd, help, enable, return, break,
+# continue, local) used to have one thin case each HERE.  They now have
+# comprehensive coverage in GROUP C, so these single cases were removed --
+# keeping both would double-count every failure.
 
 # --- printf: known defects (see AGENTS.md "已知缺陷") ----------------------
 # `%%` in the MIDDLE of the format string, together with a surplus
