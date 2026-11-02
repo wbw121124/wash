@@ -294,7 +294,14 @@ impl Shell {
     /// are considered exported (matching bash, where the startup environment
     /// is exported by default).
     pub fn from_env(env: HashMap<String, String>) -> Self {
-        // bash keeps `$PWD` in sync with the working directory; the logical
+        let mut env = env;
+        // bash pre-sets IFS as a shell variable (space, tab and newline).
+        // It is not exported unless the environment says so.
+        let ifs_defaulted = !env.contains_key("IFS");
+        if ifs_defaulted {
+            env.insert("IFS".to_string(), " \t\n".to_string());
+        }
+        // bash keeps `$PWD' in sync with the working directory; the logical
         // path from the environment wins over the physical one so that
         // symlinked directories survive `cd`.
         let cwd = match env.get("PWD") {
@@ -310,7 +317,10 @@ impl Shell {
                 }
             }
         };
-        let exported: HashSet<String> = env.keys().cloned().collect();
+        let mut exported: HashSet<String> = env.keys().cloned().collect();
+        if ifs_defaulted {
+            exported.remove("IFS");
+        }
         Shell {
             env,
             cwd: cwd.clone(),
