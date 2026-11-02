@@ -537,6 +537,69 @@ run_case C colon-args        ': foo; echo "rc=$?"'
 run_case C true              'true; echo "rc=$?"'
 run_case C false             'false; echo "rc=$?"'
 
+# --- pwd / true / false must be REAL BUILTINS, not external programs ------
+#
+# WHY THIS BLOCK EXISTS
+#   `pwd`, `true` and `false` used to PASS in wash -- but only because wash
+#   fell through to the external programs /usr/bin/pwd, /usr/bin/true and
+#   /usr/bin/false.  Their stdout and exit code happened to agree with
+#   bash's builtins, so the plain output comparison could not tell the
+#   difference.  A shell that runs /usr/bin/pwd has different semantics:
+#   the builtin `pwd` is a shell primitive, it honours $PWD even when the
+#   directory has been deleted, it is not subject to $PATH, and it is
+#   reported as `builtin` by `type`.
+#
+#   These cases therefore assert the BUILTIN-NESS, not just the output:
+#     * `type -t <name>`  -> "builtin" in bash, "file" for an external prog
+#     * `builtin <name>`  -> bash RUNS the builtin; for an external program
+#                            it fails with "not a shell builtin" (rc=1)
+#     * `command -v <n>`  -> bash prints the bare name ("true"); for an
+#                            external program it prints the full path
+#                            ("/usr/bin/true")
+run_case C pwd-is-builtin    'type -t pwd; echo "rc=$?"'
+run_case C true-is-builtin   'type -t true; echo "rc=$?"'
+run_case C false-is-builtin  'type -t false; echo "rc=$?"'
+run_case C builtin-true      'builtin true; echo "rc=$?"'
+run_case C builtin-false     'builtin false; echo "rc=$?"'
+run_case C builtin-pwd       'builtin pwd; echo "rc=$?"'
+run_case C command-v-true    'command -v true; echo "rc=$?"'
+run_case C command-v-pwd     'command -v pwd; echo "rc=$?"'
+# `cd` IS already a real builtin in wash, so `builtin cd` must actually
+# change the PARENT shell's working directory (the point of `builtin`).
+run_case C builtin-cd        'builtin cd /tmp; pwd'
+
+# --- type / command: the distinctions that are easy to get wrong -----------
+# `type -t` reports the KIND of a name: "builtin", "file", "keyword", ...
+run_case C type-t-keyword    'type -t if; echo "rc=$?"'
+# `command -v` prints the BARE name for a builtin ("cd"), not a path.
+run_case C command-v-builtin 'command -v cd; echo "rc=$?"'
+# `type -t` / `type -P` on a name that does not exist are SILENT (rc=1),
+# while plain `type` prints "type: NAME: not found" on stderr.
+run_case C type-t-missing    'type -t nosuchcommand12345; echo "rc=$?"'
+run_case C type-plain-missing 'type nosuchcommand12345; echo "rc=$?"'
+# In a NON-interactive shell aliases are not expanded, so `type` does not
+# report an alias as "x is aliased to ..." -- it says "not found" (rc=1).
+run_case C type-alias        'alias x="echo 1"; type x; echo "rc=$?"'
+run_case C command-v-alias   'alias x="echo 1"; command -v x; echo "rc=$?"'
+
+# --- test: operator details -------------------------------------------------
+# `==` is a legal alias for `=` in bash's `test` (returns 1 for "x" vs "y",
+# with NO error message).
+run_case C test-eq-op        'test x == y; echo "rc=$?"'
+# `=~` is NOT an operator: bash reports "test: =~: binary operator
+# expected" and exits 2.
+run_case C test-tilde-op     'test x =~ y; echo "rc=$?"'
+# `( )` is a SHELL operator, not a `test` one: only the escaped form
+# reaches `test`, where it is just two extra arguments -> "test: too many
+# arguments" (rc=2).
+run_case C test-paren-escaped 'test 1 -eq 1 \( 2 -eq 2 \); echo "rc=$?"'
+# `-nt` / `-ot` compare with NANOSECOND precision, so two files created
+# within the same second still have a defined order.  The files are
+# created by this very case (in the sandbox, never in the repo root), and
+# `touch` processes its arguments in order, so `nt_b` is always newer.
+run_case C test-nt-nano      'touch @SANDBOX@/nt_a @SANDBOX@/nt_b; test @SANDBOX@/nt_b -nt @SANDBOX@/nt_a; echo "rc=$?"'
+run_case C test-ot-nano      'touch @SANDBOX@/nt_a @SANDBOX@/nt_b; test @SANDBOX@/nt_a -ot @SANDBOX@/nt_b; echo "rc=$?"'
+
 ###############################################################################
 # GROUP C -- the Phase 3 builtin group (16 builtins).
 #
@@ -622,6 +685,13 @@ run_case C kill-noexist       'kill -TERM 999999; echo "rc=$?"'
 # THE SIGNAL-SENDING PATH.  The case starts its own `sleep 2` child and
 # signals THAT child only -- never the shell, never another process.  A
 # child killed by SIGTERM makes `wait` report 128+15 = 143.
+#
+# NOTE: `&` (background jobs) and `wait` are Phase 2 features.  Until they
+# exist this case fails with "background jobs (`&`) are not supported yet
+# (Phase 2)" -- that failure measures the MISSING JOB CONTROL, not the
+# `kill` semantics.  It is kept here (rather than skipped) because sending
+# a real signal is the only way to observe `kill` end-to-end, and it
+# turns green as soon as Phase 2 lands.
 run_case C kill-TERM-child    'sleep 2 & p=$!; kill -TERM $p; wait $p; echo "rc=$?"'
 
 # --- trap -------------------------------------------------------------------
@@ -649,7 +719,9 @@ run_case C dirs-v             'cd /tmp; pushd /tmp; dirs -v'
 # --- help -------------------------------------------------------------------
 # `help` prints the FULL manual page for a builtin, which is far too long
 # for a byte-diff case and would drown the failure report; the cases keep
-# the first lines, which carry the usage synopsis.
+# the first lines, which carry the usage synopsis.  The full text is not
+# compared because bash's help pages are prose, not structured output --
+# what is worth pinning down is the SYNOPSIS line and the exit code.
 run_case C help-cd-head       'help cd | head -2'
 run_case C help-read-head     'help read | head -1'
 run_case C help-nosuch        'help nosuchbuiltin; echo "rc=$?"'
@@ -677,6 +749,14 @@ run_case C return-sourced     'source @SANDBOX@/ret3.sh; echo "rc=$?"'
 run_case C break-toplevel     'break 2; echo "not reached"'
 # Inside a loop they control the iteration: `break` leaves after the first
 # item, `continue` visits every item.
+#
+# NOTE: the three cases below need the Phase 3 loop constructs (`for`,
+# `while`, `do`, `done`).  Until those exist they fail with
+# "for: command not found" / "while: command not found" -- that failure
+# measures the MISSING LOOP, not the `break`/`continue` semantics.  They
+# are kept here (rather than skipped) because they are the only way to
+# observe what `break`/`continue` actually DO, and they turn green as
+# soon as the loops land.
 run_case C break-in-for       'for i in 1 2 3; do echo $i; break; done'
 run_case C continue-in-for    'for i in 1 2 3; do echo $i; continue; done'
 run_case C continue-in-while  'i=0; while [ $i -lt 3 ]; do i=$((i+1)); [ $i -eq 2 ] && continue; echo $i; done'
@@ -687,6 +767,14 @@ run_case C continue-in-while  'i=0; while [ $i -lt 3 ]; do i=$((i+1)); [ $i -eq 
 run_case C local-toplevel     'local x=1; echo "rc=$?"'
 # Inside a function `local` scopes the variable: the function sees it, the
 # caller does not.
+#
+# NOTE: unlike `return`, `local` CANNOT be observed through a sourced
+# script -- bash rejects it there too ("local: can only be used in a
+# function"), because a sourced script is not a function scope.  A
+# function DEFINITION is therefore the ONLY precondition that makes
+# `local`'s scoping observable, so these two cases need the Phase 3
+# function syntax (`f() { ...; }`) and fail with "f(): command not
+# found" until it lands.
 run_case C local-in-func      'f() { local x=1; echo "in=$x"; }; f; echo "out=[$x]"'
 # `local` shadows an outer variable for the duration of the function only.
 run_case C local-shadow       'x=outer; f() { local x=inner; echo $x; }; f; echo $x'
