@@ -31,7 +31,9 @@ const BUILTINS: &[&str] = &[
     ".",
     "[",
     "alias",
+    "builtin",
     "cd",
+    "command",
     "echo",
     "eval",
     "exec",
@@ -43,6 +45,7 @@ const BUILTINS: &[&str] = &[
     "shopt",
     "source",
     "test",
+    "type",
     "unalias",
     "unset",
 ];
@@ -73,6 +76,9 @@ pub fn run_builtin(argv: &[String], sh: &mut Shell) -> Option<i32> {
         "echo" => builtin_echo(argv),
         "printf" => builtin_printf(argv, Some(sh)),
         "test" | "[" => builtin_test(argv, sh),
+        "type" => builtin_type(argv, sh),
+        "command" => builtin_command(argv, sh),
+        "builtin" => builtin_builtin(argv, sh),
         _ => return None,
     };
     Some(code)
@@ -1394,6 +1400,327 @@ fn builtin_test(argv: &[String], sh: &mut Shell) -> i32 {
     } else {
         1
     }
+}
+
+// ---------------------------------------------------------------------------
+// type / command / builtin
+// ---------------------------------------------------------------------------
+
+/// How a command is described.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DescMode {
+    /// `-t`: print the type of the command (`file`, `builtin`, ...).
+    Type,
+    /// The default of `type`: `<name> is <description>`.
+    ShortDesc,
+    /// `-v` of `command`: print the reusable form of the command.
+    Reusable,
+    /// `-p` of `type` and `-P`: print only the path of the command.
+    PathOnly,
+}
+
+/// The options of the description functions (`type` and `command`).
+#[derive(Clone, Copy)]
+struct DescFlags {
+    mode: DescMode,
+    /// `-a`: report every candidate, not only the first one.
+    all: bool,
+    /// `-P`: look the command up in the `$PATH` only.
+    force_path: bool,
+    /// `-f`: do not look the command up in the function table.
+    nofuncs: bool,
+}
+
+/// The reserved words of bash.  `type` reports them as `keyword`.
+const RESERVED_WORDS_BASH: &[&str] = &[
+    "!", "{", "}", "case", "do", "done", "elif", "else", "esac", "fi", "for", "function", "if",
+    "in", "select", "then", "time", "until", "while",
+];
+
+/// The executables named `name` in the colon-separated `$PATH`.
+///
+/// Like Cygwin's `find_user_command`, the `.exe` suffix is tried as a
+/// fallback but it is not reported: bash prints the path exactly as it
+/// stands in the `$PATH`.
+fn path_matches(name: &str, path: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if name.contains('/') || name.contains('\\') {
+        // An explicit path is used as it is.
+        if posix::access(name, posix::X_OK) == 0 {
+            out.push(name.to_string());
+        }
+        return out;
+    }
+    for dir in path.split(':') {
+        if dir.is_empty() {
+            continue;
+        }
+        let candidate = format!("{}/{}", dir, name);
+        if posix::access(&candidate, posix::X_OK) == 0 {
+            out.push(candidate);
+            continue;
+        }
+        let candidate_exe = format!("{}.exe", candidate);
+        if posix::access(&candidate_exe, posix::X_OK) == 0 {
+            out.push(candidate);
+        }
+    }
+    out
+}
+
+/// Describe a command the way bash's `describe_command` does.
+///
+/// Returns true when the command was found.
+fn describe_command(name: &str, flags: DescFlags, sh: &Shell) -> bool {
+    let mut found = false;
+
+    // An alias -- but only when the shell expands the aliases.
+    if !flags.force_path && sh.expand_aliases {
+        if let Some(value) = sh.aliases.get(name) {
+            match flags.mode {
+                DescMode::Type => println!("alias"),
+                DescMode::ShortDesc => println!("{} is aliased to `{}'", name, value),
+                DescMode::Reusable => println!("alias {}={}", name, single_quote(value)),
+                DescMode::PathOnly => {}
+            }
+            found = true;
+            if !flags.all {
+                return true;
+            }
+        }
+    }
+
+    // A reserved word.
+    if !flags.force_path && RESERVED_WORDS_BASH.contains(&name) {
+        match flags.mode {
+            DescMode::Type => println!("keyword"),
+            DescMode::ShortDesc => println!("{} is a shell keyword", name),
+            DescMode::Reusable => println!("{}", name),
+            DescMode::PathOnly => {}
+        }
+        found = true;
+        if !flags.all {
+            return true;
+        }
+    }
+
+    // A shell function.
+    if !flags.force_path && !flags.nofuncs {
+        if let Some(body) = sh.functions.get(name) {
+            match flags.mode {
+                DescMode::Type => println!("function"),
+                DescMode::ShortDesc => {
+                    println!("{} is a function", name);
+                    print_function_body(name, body);
+                }
+                DescMode::Reusable => println!("{}", name),
+                DescMode::PathOnly => {}
+            }
+            found = true;
+            if !flags.all {
+                return true;
+            }
+        }
+    }
+
+    // A shell builtin.
+    if !flags.force_path && is_builtin(name) && !sh.disabled_builtins.contains(name) {
+        match flags.mode {
+            DescMode::Type => println!("builtin"),
+            DescMode::ShortDesc => println!("{} is a shell builtin", name),
+            DescMode::Reusable => println!("{}", name),
+            DescMode::PathOnly => {}
+        }
+        found = true;
+        if !flags.all {
+            return true;
+        }
+    }
+
+    // An executable file.
+    let path = sh.env.get("PATH").cloned().unwrap_or_default();
+    for full_path in path_matches(name, &path) {
+        match flags.mode {
+            DescMode::Type => println!("file"),
+            DescMode::ShortDesc => println!("{} is {}", name, full_path),
+            DescMode::Reusable | DescMode::PathOnly => println!("{}", full_path),
+        }
+        found = true;
+        if !flags.all {
+            break;
+        }
+    }
+
+    found
+}
+
+/// Print a shell function the way bash's `type` does.
+fn print_function_body(name: &str, body: &str) {
+    println!("{} () ", name);
+    println!("{{ ");
+    for line in body.lines() {
+        if line.is_empty() {
+            println!();
+        } else {
+            println!("    {}", line);
+        }
+    }
+    println!("}}");
+}
+
+/// Quote `text` the way bash's `sh_single_quote` does.
+fn single_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+/// The `type` builtin: describe the commands the shell knows.
+fn builtin_type(argv: &[String], sh: &mut Shell) -> i32 {
+    let mut flags = DescFlags {
+        mode: DescMode::ShortDesc,
+        all: false,
+        force_path: false,
+        nofuncs: false,
+    };
+    let mut i = 1usize;
+    while i < argv.len() {
+        let a = &argv[i];
+        if a == "--" {
+            i += 1;
+            break;
+        }
+        if a.len() > 1 && a.starts_with('-') {
+            match a.as_str() {
+                "-a" => flags.all = true,
+                "-f" => flags.nofuncs = true,
+                "-p" => flags.mode = DescMode::PathOnly,
+                "-t" => flags.mode = DescMode::Type,
+                "-P" => {
+                    flags.mode = DescMode::PathOnly;
+                    flags.force_path = true;
+                }
+                _ => {
+                    eprintln!("wash: type: {}: invalid option", a);
+                    eprintln!("type: usage: type [-afptP] name [name ...]");
+                    return 2;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        break;
+    }
+
+    let names = &argv[i..];
+    if names.is_empty() {
+        return 0;
+    }
+
+    let mut any_failed = false;
+    for name in names {
+        if !describe_command(name, flags, sh) {
+            // bash only reports the failure when it did not print a type
+            // or a path.
+            if !matches!(flags.mode, DescMode::Type | DescMode::PathOnly) {
+                eprintln!("wash: type: {}: not found", name);
+            }
+            any_failed = true;
+        }
+    }
+
+    if any_failed {
+        1
+    } else {
+        0
+    }
+}
+
+/// The `command` builtin: run a command without looking at the shell
+/// functions and the aliases, or describe it.
+fn builtin_command(argv: &[String], sh: &mut Shell) -> i32 {
+    let mut mode: Option<DescMode> = None;
+    let mut force_path = false;
+    let mut i = 1usize;
+    while i < argv.len() {
+        let a = &argv[i];
+        if a == "--" {
+            i += 1;
+            break;
+        }
+        if a.len() > 1 && a.starts_with('-') {
+            match a.as_str() {
+                "-p" => force_path = true,
+                "-v" => mode = Some(DescMode::Reusable),
+                "-V" => mode = Some(DescMode::ShortDesc),
+                _ => {
+                    eprintln!("wash: command: {}: invalid option", a);
+                    eprintln!("command: usage: command [-pVv] command [arg ...]");
+                    return 2;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        break;
+    }
+
+    let rest = &argv[i..];
+    if rest.is_empty() {
+        return 0;
+    }
+
+    match mode {
+        Some(mode) => {
+            let flags = DescFlags {
+                mode,
+                all: false,
+                force_path,
+                nofuncs: false,
+            };
+            let mut any_found = false;
+            for name in rest {
+                let found = describe_command(name, flags, sh);
+                // `-v` stays silent when the command is unknown.
+                if !found && mode != DescMode::Reusable {
+                    eprintln!("wash: command: {}: not found", name);
+                }
+                any_found |= found;
+            }
+            if any_found {
+                0
+            } else {
+                1
+            }
+        }
+        None => {
+            // Run the command: a builtin first, then the `$PATH`.
+            if is_builtin(&rest[0]) && !sh.disabled_builtins.contains(&rest[0]) {
+                return run_builtin(rest, sh).unwrap_or(0);
+            }
+            crate::executor::exec_external(rest, sh)
+        }
+    }
+}
+
+/// The `builtin` builtin: run a shell builtin, bypassing the functions and
+/// the aliases of the same name.
+fn builtin_builtin(argv: &[String], sh: &mut Shell) -> i32 {
+    let mut i = 1usize;
+    if i < argv.len() && argv[i].starts_with('-') {
+        eprintln!("wash: builtin: {}: invalid option", argv[i]);
+        eprintln!("builtin: usage: builtin [shell-builtin [arg ...]]");
+        return 2;
+    }
+    if i >= argv.len() {
+        return 0;
+    }
+
+    let name = argv[i].clone();
+    if !is_builtin(&name) || sh.disabled_builtins.contains(&name) {
+        eprintln!("wash: builtin: {}: not a shell builtin", name);
+        return 1;
+    }
+
+    run_builtin(&argv[i..], sh).unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------

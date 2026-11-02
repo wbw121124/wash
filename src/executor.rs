@@ -301,6 +301,33 @@ pub fn capture_command(
     }
 }
 
+/// Run an external program, bypassing the shell functions and the aliases.
+///
+/// This is what the `command` builtin uses: the command word is looked up
+/// in `$PATH` and executed, without consulting the function table.
+pub fn exec_external(argv: &[String], sh: &Shell) -> i32 {
+    if argv.is_empty() {
+        return 0;
+    }
+    let path = sh.env.get("PATH").cloned().unwrap_or_default();
+    let pid = posix::fork();
+    if pid == 0 {
+        let env = sh.child_env();
+        let (_cstrings, env_ptrs) = build_env_ptrs(&env);
+        let argvec = ArgVec::from(argv);
+        match find_executable(&argv[0], &path) {
+            Some(exe) => {
+                execve(&exe, &argvec.ptrs, &env_ptrs);
+            }
+            None => {
+                eprintln!("wash: {}: command not found", argv[0]);
+            }
+        }
+        posix::exit(127);
+    }
+    posix::wait_pid(pid)
+}
+
 // ---------------------------------------------------------------------------
 // Compound commands
 // ---------------------------------------------------------------------------
