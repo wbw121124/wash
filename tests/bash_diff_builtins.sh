@@ -73,6 +73,10 @@ printf 'a:b:c\n'                   > "$SANDBOX/colons.txt"
 # a SOURCED script, and a sourced script needs no function support -- so this
 # is the cheapest precondition that makes `return` observable.
 printf 'return 3\n'                > "$SANDBOX/ret3.sh"
+# `return` with no argument returns the status of the last command (`false`
+# -> 1); `return 0` leaves the sourced script successfully.
+printf 'false\nreturn\n'          > "$SANDBOX/retlast.sh"
+printf 'return 0\n'                > "$SANDBOX/ret0.sh"
 ln -s sub "$SANDBOX/link" 2>/dev/null || true
 
 # `timeout` guards against a hanging case; degrade gracefully if absent.
@@ -638,11 +642,21 @@ run_case C declare-r          'declare -r R=1; declare -p R'
 run_case C declare-invalid    'declare 1bad=x; echo "rc=$?"'
 # `typeset` is a synonym of `declare`: both must produce the same output.
 run_case C typeset-synonym    'typeset -x Q=1; declare -p Q'
+# ... and `typeset -p` prints the same attributes as `declare -p`.
+run_case C typeset-p          'typeset -x Q=1; typeset -p Q'
+# `typeset -i` is the integer attribute, exactly like `declare -i`.
+run_case C typeset-i          'typeset -i N=5; N=N+1; echo "N=$N"'
+# `typeset -r` is the readonly attribute, exactly like `declare -r`.
+run_case C typeset-r          'typeset -r R=1; typeset -p R'
 # Assigning to a readonly variable must fail with bash's exact wording.
 run_case C readonly-assign    'readonly R=1; R=2; echo "rc=$?"'
 # `readonly -p` prints EVERY readonly variable (bash internals included), so
 # the case greps for the one the test created.
 run_case C readonly-p         'readonly R=1; readonly -p | grep "^declare -r R="'
+# A readonly variable keeps its attribute when printed by `declare -p`.
+run_case C readonly-declare-p 'readonly R=1; declare -p R'
+# A readonly variable cannot be unset either: bash refuses and keeps it.
+run_case C readonly-unset     'readonly R=1; unset R; echo "rc=$? R=[$R]"'
 
 # --- let --------------------------------------------------------------------
 run_case C let-basic          'let x=1+1; echo "x=$x"'
@@ -675,6 +689,9 @@ run_case C umask-set-restore  'orig=$(umask); umask 022; echo "now=$(umask)"; um
 # SHAPE of the output (two lines of "<user> <system>" pairs) instead of the
 # numbers -- the point of the builtin is that it prints those two lines.
 run_case C times-shape        'times | sed -E "s/[0-9]+m[0-9]+\.[0-9]+s/<T>/g"'
+# The output is exactly two lines (shell times + children times).
+run_case C times-lines        'times | wc -l'
+run_case C times-status       'times > /dev/null; echo "rc=$?"'
 
 # --- kill -------------------------------------------------------------------
 run_case C kill-l-num         'kill -l 9'
@@ -709,12 +726,32 @@ run_case C trap-exit          'trap "echo EXITING" EXIT; echo body'
 run_case C trap-usr1          'trap "echo CAUGHT" USR1; kill -USR1 $$; echo done'
 
 # --- dirs / pushd / popd ----------------------------------------------------
-run_case C dirs-empty         'dirs'
-run_case C pushd              'cd /tmp; pushd /tmp; dirs'
-run_case C pushd-twice        'cd /tmp; pushd /tmp; pushd /var; dirs'
-run_case C popd               'cd /tmp; pushd /tmp; popd; dirs'
+# bash's directory stack has the CURRENT directory on top; `cd` REPLACES
+# that top entry and `pushd` pushes the old one down while swapping the
+# new directory in.  Every case therefore starts with an absolute `cd`
+# so that the expected stack is FIXED and does not depend on the
+# directory the suite happens to be run from.
+#   `cd /tmp`            -> stack: "/tmp"
+#   `pushd /var`         -> stack: "/var /tmp"   (and pushd prints it)
+#   `pushd /etc`         -> stack: "/etc /var /tmp"
+#   `popd`               -> pops the top, stack: "/tmp"
+run_case C dirs-empty         'cd /tmp; dirs'
+run_case C pushd              'cd /tmp; pushd /var; dirs'
+run_case C pushd-twice        'cd /tmp; pushd /var; pushd /etc; dirs'
+run_case C popd               'cd /tmp; pushd /var; popd; dirs'
+# `popd` with no argument on an empty stack is an error.
 run_case C popd-empty         'popd; echo "rc=$?"'
-run_case C dirs-v             'cd /tmp; pushd /tmp; dirs -v'
+# `dirs -v` numbers the entries, `dirs -l` prints the long form, `dirs -c`
+# prints the stack without any abbreviation.
+run_case C dirs-v             'cd /tmp; pushd /var; dirs -v'
+run_case C dirs-l             'cd /tmp; pushd /var; dirs -l'
+run_case C dirs-c             'cd /tmp; pushd /var; dirs -c'
+# `pushd` with no argument swaps the top two entries.
+run_case C pushd-noarg        'cd /tmp; pushd /var; pushd; dirs'
+# `popd +N` pops the N-th entry (0-based) instead of the top one.
+run_case C popd-arg           'cd /tmp; pushd /var; popd +1; dirs'
+# An out-of-range index is an error.
+run_case C popd-bad-index     'cd /tmp; pushd /var; popd +5; echo "rc=$?"'
 
 # --- help -------------------------------------------------------------------
 # `help` prints the FULL manual page for a builtin, which is far too long
@@ -741,12 +778,19 @@ run_case C enable-already-on  'enable echo; echo "rc=$?"'
 # sourced script" diagnostic.
 run_case C return-toplevel    'return 3; echo "not reached"'
 run_case C return-sourced     'source @SANDBOX@/ret3.sh; echo "rc=$?"'
+# `return` with no argument returns the status of the LAST command.
+run_case C return-noarg       'source @SANDBOX@/retlast.sh; echo "rc=$?"'
+# `return 0` from a sourced script exits it successfully.
+run_case C return-zero        'source @SANDBOX@/ret0.sh; echo "rc=$?"'
 
 # --- break / continue -------------------------------------------------------
 # Outside a loop both builtins are an error in bash and the shell KEEPS
 # GOING -- so the case proves that the diagnostic is emitted AND that the
 # following command still runs.
 run_case C break-toplevel     'break 2; echo "not reached"'
+# `break` with no argument defaults to 1.
+run_case C break-noarg        'break; echo "not reached"'
+run_case C break-one          'break 1; echo "not reached"'
 # Inside a loop they control the iteration: `break` leaves after the first
 # item, `continue` visits every item.
 #
@@ -760,6 +804,9 @@ run_case C break-toplevel     'break 2; echo "not reached"'
 run_case C break-in-for       'for i in 1 2 3; do echo $i; break; done'
 run_case C continue-in-for    'for i in 1 2 3; do echo $i; continue; done'
 run_case C continue-in-while  'i=0; while [ $i -lt 3 ]; do i=$((i+1)); [ $i -eq 2 ] && continue; echo $i; done'
+# `continue` with no argument defaults to 1.
+run_case C continue-noarg     'continue; echo "not reached"'
+run_case C continue-one       'continue 1; echo "not reached"'
 
 # --- local ------------------------------------------------------------------
 # `local` is only legal inside a function; at the top level bash reports
