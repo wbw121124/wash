@@ -480,6 +480,61 @@ fn child_run_exp(argv: &[String], path: &str, ctx: &ChildContext) -> ! {
     posix::exit(127);
 }
 
+/// Apply the assignments of a command (e.g. `IFS=: read x') and return the
+/// previous values, so that they can be restored afterwards.
+fn apply_command_assignments(
+    assigns: &[(String, Vec<WordPart>, bool)],
+    sh: &mut Shell,
+) -> Vec<(String, Option<String>)> {
+    if assigns.is_empty() {
+        return Vec::new();
+    }
+    let attrs = sh.attrs();
+    let pending: RefCell<Vec<(String, String)>> = RefCell::new(Vec::new());
+    let applied: Vec<(String, String, bool)> = {
+        let ctx = ExpandCtx {
+            env: &sh.env,
+            positional: &sh.positional,
+            last_status: sh.last_status,
+            self_pid: sh.self_pid,
+            noglob: sh.options.noglob,
+            nounset: sh.options.nounset,
+            dollar_zero: &sh.dollar_zero,
+            attrs: &attrs,
+            pending_assign: Some(&pending),
+        };
+        assigns
+            .iter()
+            .map(|(n, vp, ap)| (n.clone(), expand_scalar(vp, &ctx), *ap))
+            .collect()
+    };
+    let mut saved: Vec<(String, Option<String>)> = Vec::new();
+    for (name, value, append) in applied {
+        saved.push((name.clone(), sh.env.get(&name).cloned()));
+        if append {
+            let cur = sh.env.get(&name).cloned().unwrap_or_default();
+            sh.env.insert(name, cur + &value);
+        } else {
+            sh.env.insert(name, value);
+        }
+    }
+    saved
+}
+
+/// Undo the assignments of a command.
+fn restore_command_assignments(saved: Vec<(String, Option<String>)>, sh: &mut Shell) {
+    for (name, value) in saved {
+        match value {
+            Some(value) => {
+                sh.env.insert(name, value);
+            }
+            None => {
+                sh.env.remove(&name);
+            }
+        }
+    }
+}
+
 /// Run a single (non-pipeline) command in the parent shell.
 fn run_standalone_exp(
     argv: &[String],
@@ -569,7 +624,12 @@ fn run_standalone_exp(
                 return 1;
             }
         };
+        // An assignment in front of the builtin (e.g. `IFS=: read x') is
+        // visible to it.  It is always temporary: bash undoes it after the
+        // command, even for the POSIX special builtins.
+        let assignments = apply_command_assignments(assigns, sh);
         let code = builtins::run_builtin(argv, sh).unwrap_or(0);
+        restore_command_assignments(assignments, sh);
         if !sh.persistent_redirs {
             restore_fds(&saved);
         }
