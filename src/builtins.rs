@@ -1704,7 +1704,7 @@ fn builtin_command(argv: &[String], sh: &mut Shell) -> i32 {
 /// The `builtin` builtin: run a shell builtin, bypassing the functions and
 /// the aliases of the same name.
 fn builtin_builtin(argv: &[String], sh: &mut Shell) -> i32 {
-    let mut i = 1usize;
+    let i = 1usize;
     if i < argv.len() && argv[i].starts_with('-') {
         eprintln!("wash: builtin: {}: invalid option", argv[i]);
         eprintln!("builtin: usage: builtin [shell-builtin [arg ...]]");
