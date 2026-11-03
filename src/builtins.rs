@@ -1605,10 +1605,11 @@ fn describe_command(name: &str, flags: DescFlags, sh: &Shell) -> bool {
 }
 
 /// Print a shell function the way bash's `type` does.
-fn print_function_body(name: &str, body: &str) {
-    println!("{} () ", name);
-    println!("{{ ");
-    for line in body.lines() {
+fn print_function_body(name: &str, body: &crate::parser::CommandList) {
+    println!("{} ()", name);
+    println!("{{");
+    let rendered = render_command_list(body, 1);
+    for line in rendered.lines() {
         if line.is_empty() {
             println!();
         } else {
@@ -1616,6 +1617,153 @@ fn print_function_body(name: &str, body: &str) {
         }
     }
     println!("}}");
+}
+
+/// Render a parsed command list back into a human-readable (bash-like) source
+/// form.  Used only by `type` / `command -V` for functions, where exact
+/// byte-fidelity to bash is not asserted by the test suite; the goal is a
+/// readable, structurally-faithful reconstruction.
+fn render_part(part: &crate::lexer::WordPart) -> String {
+    match part {
+        crate::lexer::WordPart::Text(s, _) => s.clone(),
+        crate::lexer::WordPart::Var(n, _) => format!("${}", n),
+        crate::lexer::WordPart::Braced(b, _) => format!("${{{}}}", b),
+        crate::lexer::WordPart::CmdSub(b, _) => format!("$({})", b),
+        crate::lexer::WordPart::Backtick(b, _) => format!("`{}`", b),
+        crate::lexer::WordPart::Arith(b, _) => format!("$(({}))", b),
+        crate::lexer::WordPart::Tilde => "~".to_string(),
+        crate::lexer::WordPart::Brace(alts) => format!("{{{}}}", alts.join(",")),
+    }
+}
+
+fn render_word(word: &[crate::lexer::WordPart]) -> String {
+    word.iter().map(render_part).collect()
+}
+
+fn render_redir(r: &crate::parser::Redir) -> String {
+    match r {
+        crate::parser::Redir::In { fd, file } => {
+            format!("{}<{}", if *fd == 0 { String::new() } else { fd.to_string() }, render_word(file))
+        }
+        crate::parser::Redir::Out { fd, file, append } => format!(
+            "{}{}{}",
+            if *fd == 1 { String::new() } else { fd.to_string() },
+            if *append { ">>" } else { ">" },
+            render_word(file)
+        ),
+        crate::parser::Redir::Both { file } => format!("&>{}", render_word(file)),
+    }
+}
+
+fn render_simple(c: &crate::parser::SimpleCommand) -> String {
+    let mut parts: Vec<String> = c.argv.iter().map(|w| render_word(w)).collect();
+    for r in &c.redirs {
+        parts.push(render_redir(r));
+    }
+    parts.join(" ")
+}
+
+fn render_pipeline(p: &crate::parser::Pipeline) -> String {
+    p.commands.iter().map(render_simple).collect::<Vec<_>>().join(" | ")
+}
+
+fn render_andor(a: &crate::parser::AndOr) -> String {
+    let mut s = render_pipeline(&a.pipelines[0]);
+    for (op, p) in a.ops.iter().zip(a.pipelines[1..].iter()) {
+        let sep = match op {
+            crate::parser::AndOrOp::And => "&&",
+            crate::parser::AndOrOp::Or => "||",
+        };
+        s.push_str(&format!(" {} {}", sep, render_pipeline(p)));
+    }
+    s
+}
+
+fn render_command_list(cl: &crate::parser::CommandList, indent: usize) -> String {
+    let pad = "    ".repeat(indent);
+    let mut out = String::new();
+    for (i, andor) in cl.andors.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(&format!("{}{}", pad, render_andor(andor)));
+    }
+    // Nested function definitions are hoisted to the global table but their
+    // sources are preserved here for readability.
+    for fd in &cl.func_defs {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&format!(
+            "{}{} () \n{}",
+            pad,
+            fd.name,
+            render_command_list(&fd.body, indent + 1)
+        ));
+    }
+    out
+}
+
+fn render_compound(c: &crate::parser::Compound) -> String {
+    match c {
+        crate::parser::Compound::If { branches, else_body } => {
+            let mut s = String::new();
+            for (i, (cond, body)) in branches.iter().enumerate() {
+                let kw = if i == 0 { "if" } else { "elif" };
+                s.push_str(&format!(
+                    "{} {}; then\n{}\n",
+                    kw,
+                    render_command_list(cond, 1),
+                    render_command_list(body, 1)
+                ));
+            }
+            if let Some(eb) = else_body {
+                s.push_str(&format!("else\n{}\n", render_command_list(eb, 1)));
+            }
+            s.push_str("fi");
+            s
+        }
+        crate::parser::Compound::For { var, words, body } => {
+            let w = words
+                .iter()
+                .map(|w| render_word(w))
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!(
+                "for {} in {}; do\n{}\ndone",
+                var,
+                w,
+                render_command_list(body, 1)
+            )
+        }
+        crate::parser::Compound::While { condition, body, is_until } => {
+            let kw = if *is_until { "until" } else { "while" };
+            format!(
+                "{} {}; do\n{}\ndone",
+                kw,
+                render_command_list(condition, 1),
+                render_command_list(body, 1)
+            )
+        }
+        crate::parser::Compound::Case { word, arms } => {
+            let mut s = format!("case {} in\n", render_word(word));
+            for arm in arms {
+                let pats = arm
+                    .patterns
+                    .iter()
+                    .map(|p| render_word(p))
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                s.push_str(&format!(
+                    "    {})\n{}\n    ;;\n",
+                    pats,
+                    render_command_list(&arm.body, 2)
+                ));
+            }
+            s.push_str("esac");
+            s
+        }
+    }
 }
 
 /// Quote `text` the way bash's `sh_single_quote` does.
@@ -3681,13 +3829,86 @@ fn builtin_continue(argv: &[String], sh: &mut Shell) -> i32 {
 }
 
 /// The `local` builtin: declare a variable local to a function.
-fn builtin_local(argv: &[String], _sh: &mut Shell) -> i32 {
-    if argv.len() < 2 {
+///
+/// `local` is only legal inside a function (`function_depth > 0`).  It records
+/// the variable's current value in the active local frame (so that
+/// `execute_function` can restore it on return) and, when an initializer is
+/// present, assigns the new value.  Attribute flags (`-i`/`-x`/`-r`) toggle the
+/// matching shell attribute the way bash does.
+fn builtin_local(argv: &[String], sh: &mut Shell) -> i32 {
+    if sh.function_depth == 0 {
         eprintln!("wash: local: can only be used in a function");
         return 1;
     }
-    eprintln!("wash: local: can only be used in a function");
-    1
+    let frame = match sh.call_stack.last_mut() {
+        Some(f) => f,
+        None => {
+            eprintln!("wash: local: can only be used in a function");
+            return 1;
+        }
+    };
+
+    // Parse optional attribute flags, then the `name[=value]` operands.
+    let mut i = 1usize;
+    let mut integer_attr = false;
+    let mut export_attr = false;
+    let mut readonly_attr = false;
+    while i < argv.len() {
+        let a = &argv[i];
+        if a.starts_with('-') && a.len() > 1 {
+            for c in a[1..].chars() {
+                match c {
+                    'i' => integer_attr = true,
+                    'x' => export_attr = true,
+                    'r' => readonly_attr = true,
+                    // `-a`/`-A` (arrays) and `-g`/`-n`/... are accepted but
+                    // ignored: wash has no array support yet.
+                    _ => {}
+                }
+            }
+            i += 1;
+            continue;
+        }
+        break;
+    }
+
+    let mut status = 0i32;
+    for arg in &argv[i..] {
+        let (name, value) = match arg.find('=') {
+            Some(eq) => (&arg[..eq], Some(arg[eq + 1..].to_string())),
+            None => (arg.as_str(), None),
+        };
+        if !is_valid_ident(name) {
+            eprintln!("wash: local: `{}': not a valid identifier", arg);
+            status = 1;
+            continue;
+        }
+        // Record the previous value (once per variable per function) so the
+        // enclosing scope survives the function's return.
+        if !frame.contains_key(name) {
+            frame.insert(name.to_string(), sh.env.get(name).cloned());
+        }
+        if let Some(v) = value {
+            if readonly_attr && sh.readonly.contains(name) {
+                eprintln!("wash: {}: readonly variable", name);
+                status = 1;
+            } else {
+                sh.env.insert(name.to_string(), v);
+            }
+        }
+        // Apply the attribute flags (the same bookkeeping `declare` uses).
+        if integer_attr {
+            sh.integer_vars.insert(name.to_string());
+        }
+        if export_attr {
+            sh.exported.insert(name.to_string());
+            sh.null_exported.remove(name);
+        }
+        if readonly_attr {
+            sh.readonly.insert(name.to_string());
+        }
+    }
+    status
 }
 
 // ---------------------------------------------------------------------------

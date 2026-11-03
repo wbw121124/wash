@@ -236,7 +236,7 @@ pub struct Shell {
     pub exported: HashSet<String>,
     pub readonly: HashSet<String>,
     pub integer_vars: HashSet<String>,
-    pub functions: HashMap<String, String>,
+    pub functions: HashMap<String, parser::CommandList>,
     pub options: SetOptions,
     pub dir_stack: Vec<String>,
     pub traps: HashMap<String, String>,
@@ -292,6 +292,12 @@ pub struct Shell {
     /// How many shell-function calls are currently active. `local` is only
     /// legal inside a function.
     pub function_depth: usize,
+    /// The stack of local-variable scopes.  `execute_function` pushes a frame
+    /// for each call and the `local` builtin records, in the top frame, the
+    /// previous value of every variable it makes local so the enclosing scope
+    /// can be restored on return.  A frame maps a variable name to `Some(prev)`
+    /// (it had a value) or `None` (it was unset).
+    pub call_stack: Vec<HashMap<String, Option<String>>>,
 }
 
 impl Shell {
@@ -363,6 +369,7 @@ impl Shell {
             sourcing_depth: 0,
             loop_depth: 0,
             function_depth: 0,
+            call_stack: Vec::new(),
         }
     }
 

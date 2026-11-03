@@ -7,9 +7,14 @@
 //   Pipeline     := SimpleCommand ('|' SimpleCommand)*
 //   SimpleCommand:= word* (redirection word*)*
 //
-// `&&` and `||` have the same precedence and are left-associative, which is
-// why an AND-OR list keeps the operator that precedes every pipeline after
-// the first one (`AndOr::ops`).
+// `&&` and `||` have the same precedence and are left-associative.
+//
+// Compounds (control flow) — `if`/`for`/`while`/`until`/`case` and shell
+// function definitions — are extracted from the token stream *before* the
+// flat AND-OR / pipeline pass runs, exactly the way `if` already was: every
+// compound is replaced by a single `Token::Compound` (or `Token::FunctionDef`)
+// that carries the parsed sub-trees, so the flat pass never has to know about
+// their internal structure.
 
 use crate::error::{Result, WashError};
 use crate::lexer::{RedirKind, Token, WordPart};
@@ -21,20 +26,57 @@ pub enum Redir {
     Both { file: Vec<WordPart> }, // &> (stdout + stderr)
 }
 
-/// A compound command: a command that is built from other commands.
+/// A shell function definition (`NAME() { ... }` or `function NAME { ... }`).
 ///
-/// Only the `if` construct is supported so far.
+/// The body is a fully-parsed command list; nested function definitions are
+/// hoisted into `body.func_defs` so the executor can register every function
+/// globally (bash functions are global even when defined inside another).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FuncDef {
+    pub name: String,
+    pub body: CommandList,
+}
+
+/// A compound command: a command that is built from other commands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Compound {
     /// `if CONDITION; then BODY; [elif CONDITION; then BODY;]... [else BODY;] fi`
-    ///
-    /// The branches are tried in order; the first one whose condition
-    /// succeeds runs its body.  When no condition succeeds the `else` body
-    /// runs (if there is one).
     If {
         branches: Vec<(CommandList, CommandList)>,
         else_body: Option<CommandList>,
     },
+    /// `for NAME in WORDS; do BODY; done`
+    ///
+    /// `words` holds the raw word parts of each iteration value (expanded at
+    /// execution time); `var` is the loop variable; `body` runs once per value.
+    For {
+        var: String,
+        words: Vec<Vec<WordPart>>,
+        body: CommandList,
+    },
+    /// `while CONDITION; do BODY; done` (`is_until == false`) and
+    /// `until CONDITION; do BODY; done` (`is_until == true`).
+    While {
+        condition: CommandList,
+        body: CommandList,
+        is_until: bool,
+    },
+    /// `case WORD in PATTERN) BODY;; ... esac`
+    ///
+    /// Each `CaseArm` carries the patterns that select it (a `|`-separated
+    /// group becomes several single patterns) and the body that runs when one
+    /// of them matches.
+    Case {
+        word: Vec<WordPart>,
+        arms: Vec<CaseArm>,
+    },
+}
+
+/// One arm of a `case` command: a set of patterns and the body to run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaseArm {
+    pub patterns: Vec<Vec<WordPart>>,
+    pub body: CommandList,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +120,11 @@ pub struct AndOr {
 pub struct CommandList {
     /// The AND-OR lists, separated by `;`.
     pub andors: Vec<AndOr>,
+    /// Function definitions found anywhere in this list (including nested
+    /// ones inside compound bodies).  The executor registers each of them into
+    /// the shell so that functions are callable regardless of where they were
+    /// defined.
+    pub func_defs: Vec<FuncDef>,
 }
 
 impl AndOr {
@@ -90,89 +137,116 @@ impl AndOr {
     }
 }
 
-pub fn parse_command_list(tokens: &[Token]) -> Result<CommandList> {
-    // Compound commands (`if ... fi`) are extracted first: each of them is
-    // replaced by a single token that carries the parsed branches.
-    let tokens = extract_compounds(tokens)?;
-    let mut andors: Vec<AndOr> = Vec::new();
-    let mut pipelines: Vec<Pipeline> = Vec::new();
-    let mut ops: Vec<AndOrOp> = Vec::new();
-    let mut current_cmds: Vec<SimpleCommand> = Vec::new();
-    let mut stage: Vec<Token> = Vec::new();
-
-    for t in tokens {
-        match t {
-            Token::Pipe => {
-                current_cmds.push(parse_simple(&stage)?);
-                stage.clear();
-            }
-            Token::AndAnd | Token::OrOr => {
-                // The operator closes the current pipeline and starts the
-                // next one.
-                if !stage.is_empty() {
-                    current_cmds.push(parse_simple(&stage)?);
-                    stage.clear();
-                }
-                if !current_cmds.is_empty() {
-                    pipelines.push(Pipeline {
-                        commands: std::mem::take(&mut current_cmds),
-                    });
-                }
-                ops.push(match t {
-                    Token::AndAnd => AndOrOp::And,
-                    _ => AndOrOp::Or,
-                });
-            }
-            Token::Semicolon => {
-                // An empty command (e.g. two consecutive separators) is not a
-                // command at all and must not change `$?`.
-                if !stage.is_empty() {
-                    current_cmds.push(parse_simple(&stage)?);
-                    stage.clear();
-                }
-                if !current_cmds.is_empty() {
-                    pipelines.push(Pipeline {
-                        commands: std::mem::take(&mut current_cmds),
-                    });
-                }
-                // `;` terminates the AND-OR list.
-                flush_andor(&mut andors, &mut pipelines, &mut ops)?;
-            }
-            Token::Background => {
-                return Err(WashError::syntax("background jobs not supported yet (Phase 2)"));
-            }
-            _ => stage.push(t.clone()),
-        }
-    }
-
-    if !stage.is_empty() {
-        current_cmds.push(parse_simple(&stage)?);
-    }
-    if !current_cmds.is_empty() {
-        pipelines.push(Pipeline {
-            commands: current_cmds,
-        });
-    }
-    flush_andor(&mut andors, &mut pipelines, &mut ops)?;
-
-    Ok(CommandList { andors })
-}
-
-/// Replace every compound command (`if ... fi`) in the token stream by a
-/// single `Token::Compound` token that carries the parsed branches.
+/// Replace every compound command (`if ... fi`, `for ... done`, `while ...`,
+/// `until ...`, `case ... esac`) and function definition in the token stream
+/// by a single token (`Token::Compound` / `Token::FunctionDef`) that carries
+/// the parsed sub-trees.
 ///
-/// A reserved word that is not part of an `if` construct is a syntax error,
-/// exactly like in bash.
-fn extract_compounds(tokens: &[Token]) -> Result<Vec<Token>> {
+/// Returns the flattened token stream and the (possibly nested) function
+/// definitions discovered anywhere in it.
+fn parse_compounds(tokens: &[Token]) -> Result<(Vec<Token>, Vec<FuncDef>)> {
     let mut out: Vec<Token> = Vec::new();
+    let mut funcs: Vec<FuncDef> = Vec::new();
     let mut i = 0usize;
     while i < tokens.len() {
+        match &tokens[i] {
+            Token::Reserved(name) => match name.as_str() {
+                "if" => {
+                    let (compound, end) = parse_if_compound(tokens, i)?;
+                    out.push(Token::Compound(compound));
+                    i = end;
+                }
+                "for" => {
+                    let (compound, end) = parse_for_compound(tokens, i)?;
+                    out.push(Token::Compound(compound));
+                    i = end;
+                }
+                "while" => {
+                    let (compound, end) = parse_while_until_compound(tokens, i, false)?;
+                    out.push(Token::Compound(compound));
+                    i = end;
+                }
+                "until" => {
+                    let (compound, end) = parse_while_until_compound(tokens, i, true)?;
+                    out.push(Token::Compound(compound));
+                    i = end;
+                }
+                "case" => {
+                    let (compound, end) = parse_case_compound(tokens, i)?;
+                    out.push(Token::Compound(compound));
+                    i = end;
+                }
+                "function" => {
+                    let (fd, end) = parse_function_kw(tokens, i)?;
+                    funcs.push(fd.clone());
+                    out.push(Token::FunctionDef(fd.name.clone()));
+                    i = end;
+                }
+                other => {
+                    return Err(WashError::syntax(format!(
+                        "syntax error near unexpected token `{}'",
+                        other
+                    )))
+                }
+            },
+            Token::Word(_) => {
+                // A `NAME() { ... }` / `NAME () { ... }` function definition
+                // starts with an ordinary word; detect and extract it.
+                if let Some((fd, end)) = try_parse_funcdef(tokens, i)? {
+                    funcs.push(fd.clone());
+                    out.push(Token::FunctionDef(fd.name.clone()));
+                    i = end;
+                } else {
+                    out.push(tokens[i].clone());
+                    i += 1;
+                }
+            }
+            _ => {
+                out.push(tokens[i].clone());
+                i += 1;
+            }
+        }
+    }
+    Ok((out, funcs))
+}
+
+/// The name of the reserved word at `index`, if the token is one.
+fn reserved_name(tokens: &[Token], index: usize) -> Option<String> {
+    match tokens.get(index) {
+        Some(Token::Reserved(name)) => Some(name.clone()),
+        _ => None,
+    }
+}
+
+/// Collect the tokens from `from` up to the next reserved word whose name is
+/// listed in `stops`, COPYING any nested compound (`if`/`for`/`while`/`until`/
+/// `case`) verbatim so that its internal reserved words are not mistaken for
+/// terminators.
+///
+/// Returns the collected tokens and the index of the reserved word that
+/// stopped the scan (the word itself is not consumed).  A nested compound's
+/// closer is also a reserved word, but it belongs to the nested construct, so
+/// it is copied rather than treated as a stop.
+fn split_until_reserved(
+    tokens: &[Token],
+    from: usize,
+    stops: &[&str],
+) -> Result<(Vec<Token>, usize)> {
+    let mut out: Vec<Token> = Vec::new();
+    let mut i = from;
+    while i < tokens.len() {
         if let Token::Reserved(name) = &tokens[i] {
-            if name == "if" {
-                let (compound, end) = parse_if_compound(tokens, i)?;
-                out.push(Token::Compound(compound));
-                i = end;
-                continue;
+            match name.as_str() {
+                "if" | "for" | "while" | "until" | "case" => {
+                    let end = find_matching_closer(tokens, i)?;
+                    out.extend_from_slice(&tokens[i..end]);
+                    i = end;
+                    continue;
+                }
+                _ => {}
+            }
+            if stops.contains(&name.as_str()) {
+                return Ok((out, i));
             }
             return Err(WashError::syntax(format!(
                 "syntax error near unexpected token `{}'",
@@ -182,7 +256,68 @@ fn extract_compounds(tokens: &[Token]) -> Result<Vec<Token>> {
         out.push(tokens[i].clone());
         i += 1;
     }
-    Ok(out)
+    Err(WashError::syntax("syntax error: unexpected end of file"))
+}
+
+/// Find the index just after the closing reserved word of the compound that
+/// begins at `start` (the opener is the reserved word there).
+///
+/// Nesting is tracked with a small stack.  `do` is *not* a separate nesting
+/// level — a `for`/`while`/`until` and its `do` group share the single
+/// `done` that closes them both, so only the loop opener (`for`/`while`/
+/// `until`) pairs with `done`; `if` pairs with `fi` and `case` pairs with
+/// `esac`.
+fn find_matching_closer(tokens: &[Token], start: usize) -> Result<usize> {
+    let opener = reserved_name(tokens, start).ok_or_else(|| {
+        WashError::syntax("internal error: find_matching_closer on a non-reserved token")
+    })?;
+    let kind = match opener.as_str() {
+        "if" => "if",
+        "for" | "while" | "until" => "loop",
+        "case" => "case",
+        _ => {
+            return Err(WashError::syntax(format!(
+                "syntax error near unexpected token `{}'",
+                opener
+            )))
+        }
+    };
+    let mut stack: Vec<&str> = vec![kind];
+    let mut i = start + 1;
+    while i < tokens.len() {
+        if let Token::Reserved(name) = &tokens[i] {
+            match name.as_str() {
+                "if" | "for" | "while" | "until" | "case" => {
+                    stack.push(match name.as_str() {
+                        "if" => "if",
+                        "case" => "case",
+                        _ => "loop",
+                    });
+                }
+                "fi" => {
+                    if *stack.last().unwrap_or(&"") == "if" {
+                        stack.pop();
+                    }
+                }
+                "esac" => {
+                    if *stack.last().unwrap_or(&"") == "case" {
+                        stack.pop();
+                    }
+                }
+                "done" => {
+                    if *stack.last().unwrap_or(&"") == "loop" {
+                        stack.pop();
+                    }
+                }
+                _ => {}
+            }
+            if stack.is_empty() {
+                return Ok(i + 1);
+            }
+        }
+        i += 1;
+    }
+    Err(WashError::syntax("syntax error: unexpected end of file"))
 }
 
 /// Parse the `if` construct that starts at `start` (the `if` token itself).
@@ -222,70 +357,457 @@ fn parse_if_compound(tokens: &[Token], start: usize) -> Result<(Compound, usize)
     Ok((Compound::If { branches, else_body }, i))
 }
 
-/// The name of the reserved word at `index`, if the token is one.
-fn reserved_name(tokens: &[Token], index: usize) -> Option<String> {
-    match tokens.get(index) {
-        Some(Token::Reserved(name)) => Some(name.clone()),
-        _ => None,
-    }
-}
-
-/// Collect the tokens from `from` up to the next reserved word whose name is
-/// listed in `stops`.
-///
-/// Returns the collected tokens and the index of the reserved word that
-/// stopped the scan (the word itself is not consumed).  A nested `if ... fi`
-/// is copied verbatim.
-fn split_until_reserved(
-    tokens: &[Token],
-    from: usize,
-    stops: &[&str],
-) -> Result<(Vec<Token>, usize)> {
-    let mut out: Vec<Token> = Vec::new();
-    let mut i = from;
-    while i < tokens.len() {
-        if let Token::Reserved(name) = &tokens[i] {
-            if name == "if" {
-                // A nested compound: copy it as a whole.
-                let end = find_if_end(tokens, i)?;
-                out.extend_from_slice(&tokens[i..end]);
-                i = end;
-                continue;
-            }
-            if stops.contains(&name.as_str()) {
-                return Ok((out, i));
-            }
-            return Err(WashError::syntax(format!(
-                "syntax error near unexpected token `{}'",
-                name
-            )));
+/// Parse `for NAME [in WORDS] ; do BODY ; done` starting at the `for` token.
+fn parse_for_compound(tokens: &[Token], start: usize) -> Result<(Compound, usize)> {
+    // NAME is the word right after `for`.
+    let name = match tokens.get(start + 1) {
+        Some(Token::Word(parts)) if is_plain_ident(parts) => plain_text(parts),
+        _ => {
+            return Err(WashError::syntax(
+                "syntax error near unexpected token (expected a loop variable)",
+            ))
         }
-        out.push(tokens[i].clone());
-        i += 1;
+    };
+
+    // Expect `in` (a plain word, never a reserved word) after the NAME.
+    if !is_word_text(tokens.get(start + 2), "in") {
+        return Err(WashError::syntax(
+            "syntax error near unexpected token (expected `in')",
+        ));
     }
-    Err(WashError::syntax("syntax error: unexpected end of file"))
+
+    // Collect iteration words up to the `do` reserved word.  A `;` (or newline,
+    // which the lexer also turns into a `;`) between the word list and `do` is
+    // optional (`for i in a b c; do ...`).
+    let mut words: Vec<Vec<WordPart>> = Vec::new();
+    let mut do_index = 0usize;
+    let mut i = start + 3; // index just past `in`
+    loop {
+        match &tokens[i] {
+            Token::Word(parts) => {
+                words.push(parts.clone());
+                i += 1;
+            }
+            Token::Semicolon => {
+                // end of the word list; the `do` keyword follows.
+                i += 1;
+            }
+            Token::Reserved(r) if r == "do" => {
+                do_index = i;
+                break;
+            }
+            _ => {
+                return Err(WashError::syntax(
+                    "syntax error near unexpected token (expected `do')",
+                ))
+            }
+        }
+    }
+
+    let end = find_matching_closer(tokens, start)?; // index just after `done`
+    let done_index = end - 1;
+    let body = parse_command_list(&tokens[do_index + 1..done_index])?;
+
+    Ok((
+        Compound::For {
+            var: name,
+            words,
+            body,
+        },
+        end,
+    ))
 }
 
-/// Find the index just after the `fi` that closes the `if` at `start`.
-fn find_if_end(tokens: &[Token], start: usize) -> Result<usize> {
-    let mut depth = 0usize;
-    let mut i = start;
-    while i < tokens.len() {
-        if let Token::Reserved(name) = &tokens[i] {
-            match name.as_str() {
-                "if" => depth += 1,
-                "fi" => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Ok(i + 1);
-                    }
+/// Parse `while CONDITION ; do BODY ; done` (`is_until == false`) or
+/// `until CONDITION ; do BODY ; done` (`is_until == true`) from the opener.
+fn parse_while_until_compound(
+    tokens: &[Token],
+    start: usize,
+    is_until: bool,
+) -> Result<(Compound, usize)> {
+    let do_index = {
+        let mut i = start + 1;
+        loop {
+            match &tokens[i] {
+                Token::Reserved(r) if r == "do" => break i,
+                Token::Reserved(_) => {
+                    return Err(WashError::syntax(
+                        "syntax error near unexpected token (expected `do')",
+                    ))
                 }
+                _ => i += 1,
+            }
+        }
+    };
+    let end = find_matching_closer(tokens, start)?; // just after `done`
+    let done_index = end - 1;
+    let condition = parse_command_list(&tokens[start + 1..do_index])?;
+    let body = parse_command_list(&tokens[do_index + 1..done_index])?;
+    Ok((
+        Compound::While {
+            condition,
+            body,
+            is_until,
+        },
+        end,
+    ))
+}
+
+/// Parse `case WORD in PATTERN) BODY ;; ... esac` from the `case` token.
+fn parse_case_compound(tokens: &[Token], start: usize) -> Result<(Compound, usize)> {
+    let word = match tokens.get(start + 1) {
+        Some(Token::Word(parts)) => parts.clone(),
+        _ => {
+            return Err(WashError::syntax(
+                "syntax error near unexpected token (expected a case word)",
+            ))
+        }
+    };
+
+    // Locate the `in` keyword.
+    let mut in_index = start + 2;
+    while in_index < tokens.len() {
+        if is_word_text(tokens.get(in_index), "in") {
+            break;
+        }
+        in_index += 1;
+    }
+    if !is_word_text(tokens.get(in_index), "in") {
+        return Err(WashError::syntax(
+            "syntax error near unexpected token (expected `in')",
+        ));
+    }
+
+    let mut arms: Vec<CaseArm> = Vec::new();
+    let mut i = in_index + 1;
+    loop {
+        // End of the case: a top-level `esac`.
+        if matches!(reserved_name(tokens, i).as_deref(), Some("esac")) {
+            break;
+        }
+        // Collect patterns until the `)` delimiter (emitted as its own word by
+        // the lexer).  A `|` between patterns is tokenized as `Token::Pipe` and
+        // acts as a separator, so `a|b|c)` becomes the three patterns `a`, `b`,
+        // `c`.  A `|` *inside* a single word (e.g. a quoted `a|b`) is also a
+        // separator in bash, so we split each word on `|` as well.
+        let mut patterns: Vec<Vec<WordPart>> = Vec::new();
+        let mut current: Vec<WordPart> = Vec::new();
+        let mut saw_pipe = false;
+        loop {
+            match &tokens[i] {
+                Token::Word(parts) if is_plain_text(parts) => {
+                    let text = plain_text(parts);
+                    // The arm head ends at the `)` delimiter.
+                    if text == ")" {
+                        if !current.is_empty() || saw_pipe {
+                            patterns.push(std::mem::take(&mut current));
+                        } else {
+                            return Err(WashError::syntax(
+                                "syntax error near unexpected token (expected a pattern)",
+                            ));
+                        }
+                        i += 1;
+                        break;
+                    }
+                    // A `)` suffix (leftover from a non-delimited tokenizer) is
+                    // also treated as the terminator; any other text is appended
+                    // to the current pattern, split on `|`.
+                    let head = text.strip_suffix(')').unwrap_or(&text);
+                    for seg in head.split('|') {
+                        current.push(WordPart::Text(seg.to_string(), false));
+                    }
+                    i += 1;
+                }
+                Token::Pipe => {
+                    // Flush the current segment as a completed pattern.
+                    patterns.push(std::mem::take(&mut current));
+                    saw_pipe = true;
+                    i += 1;
+                }
+                _ => {
+                    return Err(WashError::syntax(
+                        "syntax error near unexpected token (expected `)')",
+                    ))
+                }
+            }
+        }
+        // The body runs until a top-level `;;` (two semicolons) or `esac`.
+        let body_start = i;
+        let mut body_end = i;
+        let mut depth = 0i32;
+        while body_end < tokens.len() {
+            match &tokens[body_end] {
+                Token::Reserved(r) if matches!(r.as_str(), "if" | "for" | "while" | "until" | "case") => {
+                    depth += 1;
+                }
+                Token::Reserved(r)
+                    if matches!(r.as_str(), "fi" | "esac" | "done") && depth > 0 =>
+                {
+                    depth -= 1;
+                }
+                Token::Semicolon
+                    if depth == 0
+                        && body_end + 1 < tokens.len()
+                        && matches!(tokens.get(body_end + 1), Some(Token::Semicolon)) =>
+                {
+                    break;
+                }
+                Token::Reserved(r) if r == "esac" && depth == 0 => break,
                 _ => {}
             }
+            body_end += 1;
         }
+        let body = parse_command_list(&tokens[body_start..body_end])?;
+        arms.push(CaseArm { patterns, body });
+
+        // Advance past the `;;` terminator if present.
+        if body_end < tokens.len()
+            && matches!(tokens.get(body_end), Some(Token::Semicolon))
+            && body_end + 1 < tokens.len()
+            && matches!(tokens.get(body_end + 1), Some(Token::Semicolon))
+        {
+            i = body_end + 2;
+        } else {
+            i = body_end;
+        }
+    }
+
+    let end = find_matching_closer(tokens, start)?; // just after `esac`
+    Ok((Compound::Case { word, arms }, end))
+}
+
+/// Parse a `function NAME { BODY }` (or `function NAME () { BODY }`) definition
+/// starting at the `function` reserved word.
+fn parse_function_kw(tokens: &[Token], start: usize) -> Result<(FuncDef, usize)> {
+    let name = match tokens.get(start + 1) {
+        Some(Token::Word(parts)) if is_plain_ident(parts) => plain_text(parts),
+        _ => {
+            return Err(WashError::syntax(
+                "syntax error near unexpected token (expected a function name)",
+            ))
+        }
+    };
+    let mut i = start + 2;
+    // Optional `()` after the name (bash allows `function NAME () { ... }`).
+    if matches!(tokens.get(i), Some(Token::Word(parts)) if is_plain_text(parts) && plain_text(parts) == "()")
+    {
         i += 1;
     }
-    Err(WashError::syntax("syntax error: unexpected end of file"))
+    // Skip the `{` that opens the function body so `parse_func_body` scans the
+    // body (it expects `open_index` to be just past the opener).
+    if matches!(tokens.get(i), Some(Token::Word(parts)) if is_plain_text(parts) && plain_text(parts) == "{")
+    {
+        i += 1;
+    }
+    let (body, end) = parse_func_body(tokens, i)?;
+    Ok((FuncDef { name, body }, end))
+}
+
+/// Detect and parse a `NAME() { BODY }` or `NAME () { BODY }` definition at
+/// index `i` (a plain word).  Returns the definition and the index just after
+/// the closing `}` when one is found, otherwise `None`.
+fn try_parse_funcdef(tokens: &[Token], i: usize) -> Result<Option<(FuncDef, usize)>> {
+    // Compact form: `NAME()` directly followed by `{`.
+    if let Some(Token::Word(parts)) = tokens.get(i) {
+        if is_plain_text(parts) {
+            let text = plain_text(parts);
+            if let Some(name) = ident_in_parens(&text) {
+                if matches!(tokens.get(i + 1), Some(Token::Word(p)) if is_plain_text(p) && plain_text(p) == "{")
+                {
+                    let (body, end) = parse_func_body(tokens, i + 2)?;
+                    return Ok(Some((FuncDef { name, body }, end)));
+                }
+            }
+        }
+    }
+    // Spaced form: `NAME` `(` `)` `{`.
+    if let (
+        Some(Token::Word(a)),
+        Some(Token::Word(b)),
+        Some(Token::Word(c)),
+        Some(Token::Word(d)),
+    ) = (tokens.get(i), tokens.get(i + 1), tokens.get(i + 2), tokens.get(i + 3))
+    {
+        if is_plain_ident(a)
+            && is_plain_text(b)
+            && plain_text(b) == "("
+            && is_plain_text(c)
+            && plain_text(c) == ")"
+            && is_plain_text(d)
+            && plain_text(d) == "{"
+        {
+            let (body, end) = parse_func_body(tokens, i + 4)?;
+            return Ok(Some((FuncDef {
+                name: plain_text(a),
+                body,
+            }, end)));
+        }
+    }
+    Ok(None)
+}
+
+/// Parse a function body delimited by `{ ... }` whose opening brace is at
+/// `open_index` (the token after `{`).  Returns the parsed body and the index
+/// just after the matching `}`.
+fn parse_func_body(tokens: &[Token], open_index: usize) -> Result<(CommandList, usize)> {
+    // Find the matching `}` by counting standalone `{` / `}` words.
+    let mut depth = 0i32;
+    let mut j = open_index;
+    let mut found = false;
+    while j < tokens.len() {
+        if let Some(Token::Word(parts)) = tokens.get(j) {
+            if is_plain_text(parts) {
+                let t = plain_text(parts);
+                if t == "{" {
+                    depth += 1;
+                } else if t == "}" {
+                    if depth == 0 {
+                        found = true;
+                        break;
+                    }
+                    depth -= 1;
+                }
+            }
+        }
+        j += 1;
+    }
+    if !found {
+        return Err(WashError::syntax("syntax error: unexpected end of file (expected `}')"));
+    }
+    let body = parse_command_list(&tokens[open_index..j])?;
+    Ok((body, j + 1))
+}
+
+/// True when a word is a single, unquoted identifier-looking text part (no
+/// expansions), e.g. a loop variable or function name.
+fn is_plain_ident(parts: &[WordPart]) -> bool {
+    match parts {
+        [WordPart::Text(t, false)] => is_valid_ident(t),
+        _ => false,
+    }
+}
+
+/// True when a word is a single, unquoted text part (no expansions).
+fn is_plain_text(parts: &[WordPart]) -> bool {
+    matches!(parts, [WordPart::Text(_, false)])
+}
+
+/// True when `tok` is a single, unquoted word whose text equals `text`.  Used
+/// to recognise positional keywords such as `in` that are NOT reserved words
+/// (they only ever appear inside `for` / `case` bodies, so the lexer leaves
+/// them as ordinary words and the parser recognises them by their text).
+fn is_word_text(tok: Option<&Token>, text: &str) -> bool {
+    match tok {
+        Some(Token::Word(parts)) if is_plain_text(parts) => plain_text(parts) == text,
+        _ => false,
+    }
+}
+
+/// Concatenate a word's plain text parts (used for reserved-keyword words such
+/// as `f()`, `(`, `)`, `{`, `}`).
+fn plain_text(parts: &[WordPart]) -> String {
+    let mut s = String::new();
+    for p in parts {
+        if let WordPart::Text(t, _) = p {
+            s.push_str(t);
+        }
+    }
+    s
+}
+
+/// If `text` is `IDENT(...)` (an identifier followed by balanced parens and
+/// nothing else), return the identifier.  `f` and `f()` both yield `f`.
+fn ident_in_parens(text: &str) -> Option<String> {
+    let open = text.find('(')?;
+    if text.ends_with(')') {
+        let pre = &text[..open];
+        // Allow an optional closing paren only; reject extra characters.
+        let post = &text[open + 1..text.len() - 1];
+        if post.is_empty() && is_valid_ident(pre) {
+            return Some(pre.to_string());
+        }
+    }
+    None
+}
+
+pub fn parse_command_list(tokens: &[Token]) -> Result<CommandList> {
+    // Extract compounds + function definitions first: each becomes a single
+    // token that carries the parsed branches.
+    let (tokens, funcs) = parse_compounds(tokens)?;
+    let mut andors: Vec<AndOr> = Vec::new();
+    let mut pipelines: Vec<Pipeline> = Vec::new();
+    let mut ops: Vec<AndOrOp> = Vec::new();
+    let mut current_cmds: Vec<SimpleCommand> = Vec::new();
+    let mut stage: Vec<Token> = Vec::new();
+
+    for t in &tokens {
+        match t {
+            Token::Pipe => {
+                current_cmds.push(parse_simple(&stage)?);
+                stage.clear();
+            }
+            Token::AndAnd | Token::OrOr => {
+                if !stage.is_empty() {
+                    current_cmds.push(parse_simple(&stage)?);
+                    stage.clear();
+                }
+                if !current_cmds.is_empty() {
+                    pipelines.push(Pipeline {
+                        commands: std::mem::take(&mut current_cmds),
+                    });
+                }
+                ops.push(match t {
+                    Token::AndAnd => AndOrOp::And,
+                    _ => AndOrOp::Or,
+                });
+            }
+            Token::Semicolon => {
+                if !stage.is_empty() {
+                    current_cmds.push(parse_simple(&stage)?);
+                    stage.clear();
+                }
+                if !current_cmds.is_empty() {
+                    pipelines.push(Pipeline {
+                        commands: std::mem::take(&mut current_cmds),
+                    });
+                }
+                flush_andor(&mut andors, &mut pipelines, &mut ops)?;
+            }
+            Token::Background => {
+                return Err(WashError::syntax("background jobs not supported yet (Phase 2)"));
+            }
+            // A function definition is a whole command that registers itself;
+            // it produces no executable, so it is skipped here.
+            Token::FunctionDef(_) => {
+                if !stage.is_empty() {
+                    current_cmds.push(parse_simple(&stage)?);
+                    stage.clear();
+                }
+                if !current_cmds.is_empty() {
+                    pipelines.push(Pipeline {
+                        commands: std::mem::take(&mut current_cmds),
+                    });
+                }
+                flush_andor(&mut andors, &mut pipelines, &mut ops)?;
+            }
+            _ => stage.push(t.clone()),
+        }
+    }
+
+    if !stage.is_empty() {
+        current_cmds.push(parse_simple(&stage)?);
+    }
+    if !current_cmds.is_empty() {
+        pipelines.push(Pipeline {
+            commands: current_cmds,
+        });
+    }
+    flush_andor(&mut andors, &mut pipelines, &mut ops)?;
+
+    Ok(CommandList {
+        andors,
+        func_defs: funcs,
+    })
 }
 
 /// Move the collected pipelines into the command list as one AND-OR list.
@@ -296,7 +818,6 @@ fn flush_andor(
 ) -> Result<()> {
     if pipelines.is_empty() {
         if !ops.is_empty() {
-            // An operator without a command on either side (`a && ; b`).
             return Err(WashError::syntax("syntax error near unexpected token"));
         }
         return Ok(());
@@ -326,7 +847,6 @@ fn as_assignment(parts: &[WordPart]) -> Option<(String, Vec<WordPart>, bool)> {
     if parts.is_empty() {
         return None;
     }
-    // Only the first part can begin the `name=` prefix.
     if let WordPart::Text(first, _) = &parts[0] {
         if let Some(eq) = first.find('=') {
             let (pre, valstart) = first.split_at(eq);
@@ -364,8 +884,6 @@ fn parse_simple(tokens: &[Token]) -> Result<SimpleCommand> {
                 argv.push(parts.clone());
             }
             Token::Compound(c) => {
-                // A compound command stands on its own: it cannot be
-                // combined with words.
                 if !argv.is_empty() {
                     return Err(WashError::syntax(
                         "syntax error near unexpected token `if'",
@@ -411,6 +929,11 @@ fn parse_simple(tokens: &[Token]) -> Result<SimpleCommand> {
             }
             Token::Pipe | Token::Semicolon | Token::Background | Token::AndAnd | Token::OrOr => {
                 return Err(WashError::syntax("syntax error: unexpected token in command"));
+            }
+            Token::FunctionDef(_) => {
+                // A function definition inside a simple command is unreachable
+                // (it is skipped earlier), but guard against it anyway.
+                return Err(WashError::syntax("syntax error near unexpected token"));
             }
         }
         i += 1;

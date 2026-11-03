@@ -41,6 +41,9 @@ pub enum Token {
     Reserved(String),
     /// A compound command (`if ... fi`) that has already been parsed.
     Compound(crate::parser::Compound),
+    /// A shell function definition (`NAME() { ... }` or `function NAME { ... }`).
+    /// Carries the function name; the body lives in `CommandList::func_defs`.
+    FunctionDef(String),
     Pipe,
     /// The `&&` operator: run the next pipeline only when the previous one
     /// succeeded.
@@ -55,7 +58,18 @@ pub enum Token {
 
 /// The reserved words wash recognises.  A reserved word is only special
 /// where a command may start; everywhere else it is an ordinary word.
-pub const RESERVED_WORDS: &[&str] = &["elif", "else", "fi", "if", "then"];
+///
+/// The compound-command keywords (`if`/`then`/`elif`/`else`/`fi` already
+/// present) are joined here by the loop / case / function keywords so that
+/// `for`, `while`, `until`, `case`, `do`, `done`, `esac` and `function`
+/// are recognised in command position and handed to the parser as reserved
+/// tokens. `in` is intentionally omitted: it only ever appears inside a
+/// `for`/`case` body (never at a command start), so the parser recognises
+/// it positionally by its text.
+pub const RESERVED_WORDS: &[&str] = &[
+    "elif", "else", "fi", "if", "then", "for", "while", "until", "do", "done", "case", "esac",
+    "function",
+];
 
 /// Push a word token.  A word that starts a command and spells a reserved
 /// word becomes a `Reserved` token; every other word stays a `Word`.
@@ -605,6 +619,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                 parts.push(WordPart::Backtick(body, false));
             }
             '{' => {
+                // Try brace expansion first (works mid-word too, e.g. `a{b,c}`).
                 if let Some((inner, ni)) = read_brace(&chars, i + 1) {
                     if let Some(alts) = brace_alternatives(&inner) {
                         flush_text(&mut pending, &mut parts, pending_quoted);
@@ -613,8 +628,48 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                         continue;
                     }
                 }
-                pending.push('{');
+                // Not a brace expansion: `{` is a command-group / function-body
+                // opener and a word delimiter.  It only starts a word at a
+                // boundary, so when preceded by other text we keep it literal
+                // (e.g. `a{` -> `a{`, matching bash).
+                if pending.is_empty() && parts.is_empty() {
+                    tokens.push(Token::Word(vec![WordPart::Text("{".to_string(), false)]));
+                    at_command_start = true;
+                    i += 1;
+                } else {
+                    pending.push('{');
+                    i += 1;
+                }
+            }
+            '(' | ')' => {
+                // `(` and `)` are word delimiters in bash: `f() { ... }` must
+                // tokenize as the separate words `f`, `(`, `)`, `{`.  Flush any
+                // pending text first, then emit the delimiter as its own word.
+                flush_text(&mut pending, &mut parts, pending_quoted);
+                if !parts.is_empty() {
+                    push_word(
+                        &mut tokens,
+                        std::mem::take(&mut parts),
+                        &mut at_command_start,
+                        &mut redirect_target,
+                    );
+                }
+                tokens.push(Token::Word(vec![WordPart::Text(c.to_string(), false)]));
+                at_command_start = true;
                 i += 1;
+            }
+            '}' => {
+                // `}` is a word delimiter (function-body / command-group closer)
+                // when it stands at a word boundary; mid-word it stays literal
+                // (e.g. `a}` -> `a}`).
+                if pending.is_empty() && parts.is_empty() {
+                    tokens.push(Token::Word(vec![WordPart::Text("}".to_string(), false)]));
+                    at_command_start = true;
+                    i += 1;
+                } else {
+                    pending.push('}');
+                    i += 1;
+                }
             }
             '~' => {
                 if pending.is_empty() && parts.is_empty() {

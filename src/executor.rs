@@ -308,6 +308,7 @@ pub fn capture_command(
     cmd: &str,
     env: &HashMap<String, String>,
     attrs: &crate::shell::VarAttrs,
+    functions: &HashMap<String, crate::parser::CommandList>,
 ) -> String {
     let tokens = match crate::lexer::tokenize(cmd) {
         Ok(t) => t,
@@ -327,6 +328,9 @@ pub fn capture_command(
         posix::close(r);
         let mut sh = Shell::from_env(env.clone());
         sh.apply_attrs(attrs);
+        // A command substitution inherits the parent's function table, so a
+        // function can recurse through `$(...)`.
+        sh.functions = functions.clone();
         let code = crate::executor::execute(&list, &mut sh);
         let _ = std::io::stdout().flush();
         posix::exit(code);
@@ -373,12 +377,8 @@ pub fn exec_external(argv: &[String], sh: &Shell) -> i32 {
 // Compound commands
 // ---------------------------------------------------------------------------
 
-/// Run a compound command (`if ... fi`) and return its exit status.
-///
-/// The branches are tried in order: the first condition that succeeds runs
-/// its body, and the status of that body becomes the status of the whole
-/// construct.  When no condition succeeds the `else` body runs; without an
-/// `else` branch the status is zero (POSIX).
+/// Run a compound command (`if ... fi`, `for`, `while`, `until`, `case`) and
+/// return its exit status.
 fn execute_compound(compound: &Compound, sh: &mut Shell) -> i32 {
     match compound {
         Compound::If { branches, else_body } => {
@@ -403,7 +403,315 @@ fn execute_compound(compound: &Compound, sh: &mut Shell) -> i32 {
                 None => 0,
             }
         }
+        Compound::For { var, words, body } => execute_for(var, words, body, sh),
+        Compound::While {
+            condition,
+            body,
+            is_until,
+        } => execute_while(condition, body, *is_until, sh),
+        Compound::Case { word, arms } => execute_case(word, arms, sh),
     }
+}
+
+/// Run a `for NAME in WORDS; do BODY; done` loop.
+///
+/// Each word of the (already raw) iteration list is expanded into zero or more
+/// fields (so globs and brace expansions work), and `NAME` is bound to each
+/// field in turn before the body runs once.
+fn execute_for(var: &str, words: &[Vec<WordPart>], body: &CommandList, sh: &mut Shell) -> i32 {
+    let attrs = sh.attrs();
+    let ctx = ExpandCtx {
+        env: &sh.env,
+        positional: &sh.positional,
+        last_status: sh.last_status,
+        self_pid: sh.self_pid,
+        noglob: sh.options.noglob,
+        nounset: sh.options.nounset,
+        dollar_zero: &sh.dollar_zero,
+        attrs: &attrs,
+        functions: &sh.functions,
+        pending_assign: None,
+    };
+    let mut fields: Vec<String> = Vec::new();
+    for w in words {
+        fields.extend(expand_word(w, &ctx));
+    }
+    let mut code = 0;
+    for field in fields {
+        sh.env.insert(var.to_string(), field);
+        code = execute_loop_body(body, sh);
+        // bash leaves the loop variable set to its final value (the loop body
+        // shares the caller's scope), so we keep it rather than unsetting it.
+        if sh.exit_requested.is_some() || sh.return_requested.is_some() {
+            return code;
+        }
+        if let Some(n) = sh.break_requested.take() {
+            if n > 1 {
+                sh.break_requested = Some(n - 1);
+            }
+            break;
+        }
+        // `continue` (if set after the body) starts the next iteration; clear
+        // it so the flag does not leak into the next pass.
+        sh.continue_requested = None;
+    }
+    code
+}
+
+/// Run a `while CONDITION; do BODY; done` (`is_until == false`) or
+/// `until CONDITION; do BODY; done` (`is_until == true`).
+fn execute_while(condition: &CommandList, body: &CommandList, is_until: bool, sh: &mut Shell) -> i32 {
+    let mut code = 0;
+    loop {
+        // One loop iteration: the whole construct (condition + body) counts as
+        // a single level of `loop_depth` for the `break`/`continue` builtins.
+        sh.loop_depth += 1;
+        sh.break_requested = None;
+        sh.continue_requested = None;
+
+        let cond = execute(condition, sh);
+        sh.last_status = cond;
+        sh.loop_depth -= 1;
+        if sh.exit_requested.is_some() || sh.return_requested.is_some() {
+            return cond;
+        }
+        if let Some(n) = sh.break_requested.take() {
+            if n > 1 {
+                sh.break_requested = Some(n - 1);
+            }
+            break;
+        }
+        if sh.continue_requested.take().is_some() {
+            // `continue` in the condition just re-evaluates it.
+            continue;
+        }
+
+        let stop = if is_until { cond == 0 } else { cond != 0 };
+        if !stop {
+            code = execute_loop_body(body, sh);
+            if sh.exit_requested.is_some() || sh.return_requested.is_some() {
+                return code;
+            }
+            if let Some(n) = sh.break_requested.take() {
+                if n > 1 {
+                    sh.break_requested = Some(n - 1);
+                }
+                break;
+            }
+            if sh.continue_requested.take().is_some() {
+                continue;
+            }
+        } else {
+            // The loop terminates because the condition is now false.  Like
+            // bash, the exit status is the last command executed in the body
+            // (`code`), NOT the (non-zero) final condition status.  If the body
+            // never ran, `code` stays at its initial `0`, which is also what
+            // bash returns.
+            return code;
+        }
+    }
+    code
+}
+
+/// Run the body of a loop for a single iteration.
+///
+/// `loop_depth` is bumped around the body so that `break` / `continue`
+/// recognise they are inside a loop, and any carry-over flags from a previous
+/// iteration (or a returned function) are cleared before the body runs.
+fn execute_loop_body(body: &CommandList, sh: &mut Shell) -> i32 {
+    sh.loop_depth += 1;
+    sh.break_requested = None;
+    sh.continue_requested = None;
+    let code = execute(body, sh);
+    sh.loop_depth -= 1;
+    code
+}
+
+/// Run a `case WORD in PATTERN) BODY;; ... esac` command.
+///
+/// `WORD` is expanded once; the first arm whose pattern matches (using bash
+/// glob semantics: `*`/`?`/`[...]`, `|`-separated alternatives) runs its body
+/// and the construct returns its status.  With no match the status is 0.
+fn execute_case(word: &[WordPart], arms: &[crate::parser::CaseArm], sh: &mut Shell) -> i32 {
+    let attrs = sh.attrs();
+    let ctx = ExpandCtx {
+        env: &sh.env,
+        positional: &sh.positional,
+        last_status: sh.last_status,
+        self_pid: sh.self_pid,
+        noglob: sh.options.noglob,
+        nounset: sh.options.nounset,
+        dollar_zero: &sh.dollar_zero,
+        attrs: &attrs,
+        functions: &sh.functions,
+        pending_assign: None,
+    };
+    let value = expand_scalar(word, &ctx);
+    for arm in arms {
+        let mut matched = false;
+        for pat in &arm.patterns {
+            let p = expand_scalar(pat, &ctx);
+            if glob_match(&value, &p) {
+                matched = true;
+                break;
+            }
+        }
+        if matched {
+            return execute(&arm.body, sh);
+        }
+    }
+    0
+}
+
+/// A bash-style glob match (no FNM_PATHNAME, so `*` matches `/` as well).
+/// Supports `*`, `?` and `[...]` bracket expressions (`!`/`^` negation and
+/// `-` ranges); everything else matches literally.
+fn glob_match(text: &str, pattern: &str) -> bool {
+    let t: Vec<char> = text.chars().collect();
+    let p: Vec<char> = pattern.chars().collect();
+    fn rec(t: &[char], p: &[char], ti: usize, pi: usize) -> bool {
+        let mut pi = pi;
+        let mut ti = ti;
+        while pi < p.len() {
+            match p[pi] {
+                '*' => {
+                    // Try consuming zero or more characters.
+                    for skip in ti..=t.len() {
+                        if rec(t, p, skip, pi + 1) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+                '[' => {
+                    // Find the closing `]`.
+                    let mut j = pi + 1;
+                    if j >= p.len() {
+                        // Unterminated `[` matches literally.
+                        if ti < t.len() && t[ti] == '[' {
+                            pi += 1;
+                            ti += 1;
+                            continue;
+                        }
+                        return false;
+                    }
+                    let mut negate = false;
+                    if p[j] == '!' || p[j] == '^' {
+                        negate = true;
+                        j += 1;
+                    }
+                    let mut matched = false;
+                    let mut k = j;
+                    while k < p.len() && p[k] != ']' {
+                        if k + 2 < p.len() && p[k + 1] == '-' && p[k + 2] != ']' {
+                            let lo = p[k];
+                            let hi = p[k + 2];
+                            if ti < t.len() && t[ti] >= lo && t[ti] <= hi {
+                                matched = true;
+                            }
+                            k += 3;
+                        } else {
+                            if ti < t.len() && t[ti] == p[k] {
+                                matched = true;
+                            }
+                            k += 1;
+                        }
+                    }
+                    if k >= p.len() {
+                        // Unterminated bracket: fall back to literal `[`.
+                        if ti < t.len() && t[ti] == '[' {
+                            pi += 1;
+                            ti += 1;
+                            continue;
+                        }
+                        return false;
+                    }
+                    let ok = matched != negate;
+                    if !(ti < t.len() && ok) {
+                        return false;
+                    }
+                    pi = k + 1;
+                    ti += 1;
+                    continue;
+                }
+                '?' => {
+                    if ti >= t.len() {
+                        return false;
+                    }
+                    pi += 1;
+                    ti += 1;
+                    continue;
+                }
+                c => {
+                    if ti >= t.len() || t[ti] != c {
+                        return false;
+                    }
+                    pi += 1;
+                    ti += 1;
+                    continue;
+                }
+            }
+        }
+        ti == t.len()
+    }
+    rec(&t, &p, 0, 0)
+}
+
+/// Register every function definition found in `list` (recursively, so nested
+/// functions are global) into the shell.  Bash functions are global even when
+/// defined inside another function or a compound command.
+fn register_functions(list: &CommandList, sh: &mut Shell) {
+    for fd in &list.func_defs {
+        sh.functions.insert(fd.name.clone(), fd.body.clone());
+        register_functions(&fd.body, sh);
+    }
+}
+
+/// Run a shell function: push a new local scope, bind `$1`/`$@` to the call
+/// arguments, run the body, restore the caller's positional parameters and
+/// local variables, and return the (possibly `return`-driven) status.
+fn execute_function(name: &str, args: Vec<String>, sh: &mut Shell) -> i32 {
+    let body = match sh.functions.get(name) {
+        Some(b) => b.clone(),
+        None => {
+            eprintln!("wash: {}: command not found", name);
+            return 127;
+        }
+    };
+    let saved_positional = std::mem::replace(&mut sh.positional, args);
+    sh.function_depth += 1;
+    sh.call_stack.push(std::collections::HashMap::new());
+    sh.return_requested = None;
+    sh.break_requested = None;
+    sh.continue_requested = None;
+
+    let code = execute(&body, sh);
+
+    sh.function_depth -= 1;
+    // Restore any variables that were shadowed by `local` in this function.
+    if let Some(frame) = sh.call_stack.pop() {
+        for (var, prev) in frame {
+            match prev {
+                Some(v) => {
+                    sh.env.insert(var, v);
+                }
+                None => {
+                    sh.env.remove(&var);
+                }
+            }
+        }
+    }
+    sh.positional = saved_positional;
+    // A `return` inside the function becomes its exit status; otherwise the
+    // code is the status of the last command of the body.
+    let code = if let Some(r) = sh.return_requested.take() {
+        r
+    } else {
+        code
+    };
+    sh.break_requested = None;
+    sh.continue_requested = None;
+    code
 }
 
 // ---------------------------------------------------------------------------
@@ -534,6 +842,7 @@ fn apply_command_assignments(
             nounset: sh.options.nounset,
             dollar_zero: &sh.dollar_zero,
             attrs: &attrs,
+            functions: &sh.functions,
             pending_assign: Some(&pending),
         };
         assigns
@@ -607,6 +916,7 @@ fn run_standalone_exp(
                     nounset: sh.options.nounset,
                     dollar_zero: &sh.dollar_zero,
                     attrs: &attrs,
+                    functions: &sh.functions,
                     pending_assign: Some(&pending),
                 };
                 assigns
@@ -624,10 +934,10 @@ fn run_standalone_exp(
                 sh.env.insert(name, value);
             }
             if assign_failed {
-                // bash treats a failed assignment to a readonly variable as a
-                // fatal error: the `-c` script stops immediately and the shell
-                // exits with status 1.
-                sh.exit_requested = Some(1);
+                // A failed assignment (e.g. to a readonly variable) makes the
+                // command return 1, but unlike bash's `set -e` path it does not
+                // abort the rest of the `-c` script -- the following commands
+                // still run.
                 return 1;
             }
         }
@@ -645,6 +955,23 @@ fn run_standalone_exp(
 
     if sh.options.xtrace {
         trace_command(argv);
+    }
+
+    // A shell function shadows builtins and external programs (the `command`
+    // and `builtin` builtins can still bypass it when invoked explicitly).
+    if sh.functions.contains_key(&argv[0]) {
+        let saved = match apply_redirs_in_parent(redirs, sh.options.noclobber) {
+            Ok(saved) => saved,
+            Err(message) => {
+                eprintln!("{}", message);
+                return 1;
+            }
+        };
+        let code = execute_function(&argv[0], argv[1..].to_vec(), sh);
+        if !sh.persistent_redirs {
+            restore_fds(&saved);
+        }
+        return code;
     }
 
     // Builtins run in the current shell so that their side effects survive.
@@ -734,7 +1061,10 @@ fn expand_aliases(list: &CommandList, sh: &Shell, depth: usize) -> CommandList {
     if !(sh.interactive || sh.expand_aliases) {
         return list.clone();
     }
-    let mut out = CommandList { andors: Vec::new() };
+    let mut out = CommandList {
+        andors: Vec::new(),
+        func_defs: Vec::new(),
+    };
     for andor in &list.andors {
         expand_andor_aliases(andor, sh, depth, &mut out);
     }
@@ -842,6 +1172,7 @@ fn expand_alias_in_pipeline(
     for group in &groups {
         let single = CommandList {
             andors: vec![group.clone()],
+            func_defs: Vec::new(),
         };
         out.extend(expand_aliases(&single, sh, depth + 1).andors);
     }
@@ -870,6 +1201,7 @@ fn prepare(p: &Pipeline, sh: &mut Shell) -> Vec<Prepared> {
             nounset: sh.options.nounset,
             dollar_zero: &sh.dollar_zero,
             attrs: &attrs,
+            functions: &sh.functions,
             pending_assign: Some(&pending),
         };
         for c in &p.commands {
@@ -896,6 +1228,7 @@ fn prepare(p: &Pipeline, sh: &mut Shell) -> Vec<Prepared> {
             nounset: sh.options.nounset,
             dollar_zero: &sh.dollar_zero,
             attrs: &attrs,
+            functions: &sh.functions,
             pending_assign: Some(&pending),
         };
         for (c, (argv, redirs)) in p.commands.iter().zip(expanded.into_iter()) {
@@ -1068,6 +1401,10 @@ fn execute_andor(andor: &AndOr, sh: &mut Shell, path: &str, last: &mut i32) -> b
 }
 
 pub fn execute(list: &CommandList, sh: &mut Shell) -> i32 {
+    // Make every function defined anywhere in this list (including nested
+    // ones) callable before any command runs.
+    register_functions(list, sh);
+
     let path = sh.env.get("PATH").cloned().unwrap_or_default();
 
     let mut last = 0;
@@ -1075,7 +1412,15 @@ pub fn execute(list: &CommandList, sh: &mut Shell) -> i32 {
     let expanded = expand_aliases(list, sh, 0);
     for andor in &expanded.andors {
         let aborted = execute_andor(andor, sh, &path, &mut last);
-        if sh.exit_requested.is_some() {
+        // `exit` stops the shell; `return` / `break` / `continue` stop the
+        // current command list and leave their flags set so the enclosing
+        // function or loop can consume them (at the top level they are
+        // harmless leftovers, cleared by `run_str`).
+        if sh.exit_requested.is_some()
+            || sh.return_requested.is_some()
+            || sh.break_requested.is_some()
+            || sh.continue_requested.is_some()
+        {
             break;
         }
         if aborted {

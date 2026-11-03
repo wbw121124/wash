@@ -9,6 +9,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use crate::lexer::WordPart;
+use crate::parser;
 use crate::shell::VarAttrs;
 
 pub struct ExpandCtx<'a> {
@@ -23,6 +24,11 @@ pub struct ExpandCtx<'a> {
     pub dollar_zero: &'a str,
     /// The variable attributes a command substitution inherits.
     pub attrs: &'a VarAttrs,
+    /// The function table a command substitution inherits.  Like bash, a
+    /// `$(...)` subshell can call functions defined in the parent shell, which
+    /// is what makes recursive functions (e.g. `fact`) work through
+    /// command substitution.
+    pub functions: &'a HashMap<String, parser::CommandList>,
     /// The assignments requested by the `${var=word}` / `${var:=word}`
     /// expansions.
     ///
@@ -58,7 +64,12 @@ pub fn expand_scalar(parts: &[WordPart], ctx: &ExpandCtx) -> String {
             WordPart::Var(name, _) => out.push_str(&eval_var(name, ctx)),
             WordPart::Braced(body, _) => out.push_str(&eval_braced(body, ctx)),
             WordPart::CmdSub(body, _) | WordPart::Backtick(body, _) => {
-                out.push_str(&crate::executor::capture_command(body, ctx.env, ctx.attrs));
+                out.push_str(&crate::executor::capture_command(
+                    body,
+                    ctx.env,
+                    ctx.attrs,
+                    ctx.functions,
+                ));
             }
             WordPart::Arith(body, _) => out.push_str(&eval_arith(body, ctx)),
             WordPart::Tilde => {
@@ -109,7 +120,12 @@ pub fn expand_word(parts: &[WordPart], ctx: &ExpandCtx) -> Vec<String> {
                 candidates = apply_value(candidates, &val, *quoted, ctx);
             }
             WordPart::CmdSub(body, quoted) | WordPart::Backtick(body, quoted) => {
-                let val = crate::executor::capture_command(body, ctx.env, ctx.attrs);
+                let val = crate::executor::capture_command(
+                    body,
+                    ctx.env,
+                    ctx.attrs,
+                    ctx.functions,
+                );
                 candidates = apply_value(candidates, &val, *quoted, ctx);
             }
             WordPart::Arith(body, _) => {
@@ -647,6 +663,51 @@ pub fn eval_arith(body: &str, ctx: &ExpandCtx) -> String {
     }
 }
 
+/// Resolve a parameter name to its string value, mirroring bash's expansion
+/// order used inside arithmetic: a numeric name (`1`, `2`, ...) refers to a
+/// positional parameter, `$0`/`$@`/`$*`/`$#`/`$?` to the usual special
+/// parameters, and any other name to an environment variable.
+fn resolve_param(name: &str, ctx: &ExpandCtx) -> String {
+    if let Ok(n) = name.parse::<usize>() {
+        if n == 0 {
+            return ctx.dollar_zero.to_string();
+        }
+        return ctx.positional.get(n - 1).cloned().unwrap_or_default();
+    }
+    match name {
+        "@" | "*" => ctx.positional.join(" "),
+        "#" => ctx.positional.len().to_string(),
+        "?" => ctx.last_status.to_string(),
+        "0" => ctx.dollar_zero.to_string(),
+        _ => ctx.env.get(name).cloned().unwrap_or_default(),
+    }
+}
+
+/// Expand a command-substitution body into the command string to run.  The
+/// body is expanded with the CURRENT context (so positional parameters and
+/// variables resolve to the caller's values), producing a flat command line
+/// that `capture_command` then executes in a subshell.  Pipelines/redirections
+/// in the body are not preserved -- this is sufficient for the arithmetic
+/// command-substitution cases (e.g. `$(fact ...)`).
+fn arith_cmd_sub(inner: &str, ctx: &ExpandCtx) -> String {
+    let tokens = match crate::lexer::tokenize(inner) {
+        Ok(t) => t,
+        Err(_) => return String::new(),
+    };
+    let mut cmd = String::new();
+    for t in &tokens {
+        if let crate::lexer::Token::Word(parts) = t {
+            for w in expand_word(parts, ctx) {
+                if !cmd.is_empty() {
+                    cmd.push(' ');
+                }
+                cmd.push_str(&w);
+            }
+        }
+    }
+    cmd
+}
+
 struct ArithParser<'a> {
     chars: Vec<char>,
     pos: usize,
@@ -864,6 +925,43 @@ impl<'a> ArithParser<'a> {
             }
             Some('$') => {
                 self.pos += 1;
+                // Command substitution: $( command ).  The command runs in a
+                // subshell (see `capture_command`), so it can call functions
+                // defined in the parent.  Its body is expanded in the CURRENT
+                // context first (so positional parameters like `$1` resolve to
+                // the caller's value), which is what makes recursive functions
+                // such as `fact` work through arithmetic.
+                if self.peek() == Some('(') {
+                    self.pos += 1;
+                    let start = self.pos;
+                    let mut depth = 1i32;
+                    while self.pos < self.chars.len() {
+                        match self.chars[self.pos] {
+                            '(' => depth += 1,
+                            ')' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        self.pos += 1;
+                    }
+                    let end = self.pos; // index of the matching `)`
+                    if self.pos < self.chars.len() && self.chars[self.pos] == ')' {
+                        self.pos += 1;
+                    }
+                    let inner: String = self.chars[start..end].iter().collect();
+                    let cmd = arith_cmd_sub(&inner, self.ctx);
+                    let out = crate::executor::capture_command(
+                        &cmd,
+                        self.ctx.env,
+                        self.ctx.attrs,
+                        self.ctx.functions,
+                    );
+                    return Ok(out.trim().parse::<i64>().unwrap_or(0));
+                }
                 // $name or ${name}
                 let name = if self.peek() == Some('{') {
                     self.pos += 1;
@@ -889,7 +987,7 @@ impl<'a> ArithParser<'a> {
                     }
                     n
                 };
-                Ok(self.ctx.env.get(&name).and_then(|v| v.parse::<i64>().ok()).unwrap_or(0))
+                Ok(resolve_param(&name, self.ctx).parse::<i64>().unwrap_or(0))
             }
             Some(c) if c.is_ascii_alphabetic() || c == '_' => {
                 // bare variable name (arithmetic allows X*3)
@@ -902,7 +1000,7 @@ impl<'a> ArithParser<'a> {
                         break;
                     }
                 }
-                Ok(self.ctx.env.get(&n).and_then(|v| v.parse::<i64>().ok()).unwrap_or(0))
+                Ok(resolve_param(&n, self.ctx).parse::<i64>().unwrap_or(0))
             }
             Some(c) if c.is_ascii_digit() => {
                 let mut s = String::new();
