@@ -191,6 +191,58 @@ report_failure() {
 }
 
 # ---------------------------------------------------------------------------
+# 语义不变量对比。用于 GROUP K 的「身份绑定」用例：bash 与 wash 在设计上
+# 永远不可能逐字节相等（被比较的内容绑定到运行中的二进制身份：
+# BASH_VERSION / EUID / PPID / shell 自身的 $0 路径）。这里绝不伪造 bash 的
+# 身份——我们不去断言某个字面量值，而是断言一个「与 shell 无关」的不变量，
+# 它对 bash 和 wash 都必须成立。
+#
+#   $1 = 分组（A/K/B/C/D）
+#   $2 = 标签
+#   $3 = 用例文本（与 run_case 一样支持 @SANDBOX@ 替换）
+#   $4 = INVARIANT 表达式，在子 shell 中对「每一侧」各求值一次，作用域内可见
+#        $OUT（stdout 文件路径）、$ERR（stderr 文件路径）、$RC（退出码）。
+#        仅当不变量对 bash 与 wash「两侧都成立」时，该用例才算通过。
+# ---------------------------------------------------------------------------
+run_case_sem() {
+    local group="$1" label="$2" case_text="$3" invariant="$4"
+    local rb rw
+
+    if [ -n "$ONLY_GROUP" ] && [ "$group" != "$ONLY_GROUP" ]; then
+        return 0
+    fi
+
+    case_text="${case_text//@SANDBOX@/$SANDBOX}"
+    g_total[$group]=$(( ${g_total[$group]:-0} + 1 ))
+
+    "${RUNNER[@]}" "$BASH_BIN" -c "$case_text" \
+        >"$TMP/bash.out" 2>"$TMP/bash.err" </dev/null
+    rb=$?
+    "${RUNNER[@]}" "$WASH_BIN" -c "$case_text" \
+        >"$TMP/wash.out" 2>"$TMP/wash.err" </dev/null
+    rw=$?
+
+    if ( OUT="$TMP/bash.out" ERR="$TMP/bash.err" RC=$rb eval "$invariant" ) 2>/dev/null &&
+       ( OUT="$TMP/wash.out" ERR="$TMP/wash.err" RC=$rw eval "$invariant" ) 2>/dev/null; then
+        pass=$((pass + 1))
+        g_pass[$group]=$(( ${g_pass[$group]:-0} + 1 ))
+    else
+        fail=$((fail + 1))
+        g_fail[$group]=$(( ${g_fail[$group]:-0} + 1 ))
+        report_failure_sem "$label" "$case_text" "$rb" "$rw" "$invariant"
+    fi
+}
+
+report_failure_sem() {
+    local label="$1" case_text="$2" rb="$3" rw="$4" invariant="$5"
+    echo "FAIL [$label]: $case_text"
+    echo "    （语义不变量用例；bash rc=$rb   wash rc=$rw）"
+    echo "    不变量：$invariant"
+    show_stream "bash stdout" "$TMP/bash.out"
+    show_stream "wash stdout" "$TMP/wash.out"
+}
+
+# ---------------------------------------------------------------------------
 # Core comparison: run the same case under bash and under wash.
 #   $1 = group (A/K/B/C/D)
 #   $2 = label
@@ -421,17 +473,28 @@ run_case A if-test-false     'if [ 1 -eq 2 ]; then echo EQ; else echo NE; fi'
 # record.  Every case in this group states WHY full byte equality is
 # impossible.
 #
-# --- set with no arguments --------------------------------------------------
-# bash prints its ENTIRE variable table, which contains bash's internal
-# variables (BASH, BASHOPTS, BASH_ARGC, BASH_ARGV, BASH_CMDS, BASH_LINENO,
-# BASH_SOURCE, BASH_VERSINFO, BASH_VERSION, DIRSTACK, EPOCHREALTIME,
-# EPOCHSECONDS, EUID, FUNCNAME, GROUPS, HOSTTYPE, MACHTYPE, OSTYPE, PIPESTATUS,
-# PPID, RANDOM, SECONDS, SHELLOPTS, UID, ...).  wash has its own, much
-# smaller, variable table and never grows bash's internal variables, so the
-# two lists differ in their variable SET -- no normalisation can make them
-# equal.  The `set` OPTION handling is covered by the GROUP A cases
-# `set-o` / `set-plus-o` / `set-invalid` / `set-errexit` / `set-noglob`.
-run_case K set-noargs        'set'
+# --- set 无参 ---------------------------------------------------------------
+# bash 会打印其「整个变量表」，其中包含 bash 的内部变量（BASH、BASHOPTS、
+# BASH_ARGC、BASH_ARGV、BASH_CMDS、BASH_LINENO、BASH_SOURCE、BASH_VERSINFO、
+# BASH_VERSION、DIRSTACK、EPOCHREALTIME、EPOCHSECONDS、EUID、FUNCNAME、GROUPS、
+# HOSTTYPE、MACHTYPE、OSTYPE、PIPESTATUS、PPID、RANDOM、SECONDS、SHELLOPTS、UID
+# 等）。wash 有自己一套小得多的变量表，且从不增长 bash 的内部变量，因此两份
+# 列表的「变量集合」必然不同——任何归一化都无法让它们逐字节相等。此用例曾是
+# 逐字节对比的 KNOWN-DIFF 用例；现改为「语义不变量」用例（run_case_sem），
+# 在不伪造 bash 取值的前提下断言身份绑定的性质：
+#   * `set` 退出码为 0；
+#   * 输出含 BASH_VERSION= 一行（非空版本串）；
+#   * EUID 为非负整数；
+#   * PPID 为非负整数。
+# 以上对 bash 与 wash 均真实成立（wash 把 BASH_VERSION 设成「自己的版本串」，
+# 而非伪造的 bash 版本）。`set` 的选项处理仍由 GROUP A 的 `set-o` / `set-plus-o`
+# / `set-invalid` / `set-errexit` / `set-noglob` 逐字节覆盖。
+run_case_sem K set-noargs 'set' '
+    [ -s "$OUT" ] &&
+    grep -q "^BASH_VERSION=" "$OUT" &&
+    grep -Eq "^EUID=[0-9]+$" "$OUT" &&
+    grep -Eq "^PPID=[0-9]+$" "$OUT" &&
+    [ "$RC" -eq 0 ]'
 #
 # --- counting the exported variables -----------------------------------------
 # The exported-variable SET is identical between bash and wash (GROUP A
@@ -444,13 +507,22 @@ run_case K set-noargs        'set'
 # elsewhere.
 run_case K export-count      "SHLVL=1; export -p | grep -c '^declare -x'"
 #
-# --- the raw value of `$0` ---------------------------------------------------
-# `$0` is the path the shell itself was invoked with: bash prints
-# "<...>/bash.exe", wash prints "<...>/wash.exe".  Two different binaries can
-# never produce the same path, so the raw value can never be equal.  The
-# SEMANTIC of `$0` (sourcing must not change it) is measured in GROUP A
-# `source-zero-semantics`.
-run_case K source-zero-raw   'source @SANDBOX@/args.sh; echo "0=$0"'
+# --- `$0` 的字面值 -----------------------------------------------------------
+# `$0` 是 shell 自身被调用时的路径：bash 打印 "<...>/bash.exe"，wash 打印
+# "<...>/wash.exe"。两个不同的二进制永远不可能产出相同路径，因此若对字面值做
+# 逐字节对比，必然「按设计失败」。所以我们改为断言「语义不变量」，而不比较
+# 字面路径，也绝不伪造 bash 的身份：
+#   * source 一个脚本后，`$0` 非空；
+#   * `$0` 不会被重绑定到被 source 的脚本路径（source 不得改变 $0——shell
+#     保留自己的调用路径）。
+# 以上对 bash 与 wash 均真实成立。字面值相等被「刻意不」断言。对应的 GROUP A
+# 用例 `source-zero-semantics* / source-zero-unchanged` 进一步逐字节证明 $0
+# 在 source 前后保持不变。
+run_case_sem K source-zero-raw 'source @SANDBOX@/args.sh; echo "0=$0"' '
+    val=$(grep "^0=" "$OUT"); val=${val#0=};
+    [ -n "$val" ] &&
+    [ "${val##*/}" != "args.sh" ] &&
+    [ "$val" != "args.sh" ]'
 
 ###############################################################################
 # GROUP C -- third priority builtins.
