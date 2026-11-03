@@ -303,6 +303,23 @@ int wash_stat(const char *path, int follow, struct wash_stat *out) {
 unsigned int wash_geteuid(void) { return (unsigned int)geteuid(); }
 unsigned int wash_getegid(void) { return (unsigned int)getegid(); }
 
+/* The (real) user id and the parent process id of the calling process. These
+   back wash's EUID/UID/PPID internal variables. */
+unsigned int wash_getuid(void) { return (unsigned int)getuid(); }
+int wash_getppid(void) { return (int)getppid(); }
+
+/* Fill `list` (capacity `cap`) with the calling process's supplementary group
+   ids and store the count in `*ng`. Returns 0 on success, -1 on failure. */
+int wash_getgroups(int cap, int *list, int *ng) {
+    gid_t g[512];
+    int n = getgroups(512, g);
+    if (n < 0) return -1;
+    int i;
+    for (i = 0; i < n && i < cap; i++) list[i] = (int)g[i];
+    *ng = n;
+    return 0;
+}
+
 // Read an entire file into the caller's buffer. When `buf` is NULL only the
 // file size is reported. Returns the number of bytes read, or -1 on error
 // (errno is set by the underlying stdio call).

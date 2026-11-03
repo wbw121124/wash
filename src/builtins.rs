@@ -748,13 +748,78 @@ fn print_option_list(sh: &Shell) {
 }
 
 /// Print every shell variable the way bash's `set` (without arguments) does.
+///
+/// bash prints its internal variables (BASH, BASHOPTS, BASH_VERSINFO, ...)
+/// first, in a fixed order, then the regular shell variables sorted
+/// alphabetically, then array variables.  The exact variable SET differs from
+/// bash's, so this output is a KNOWN-DIFF (GROUP K `set-noargs`); the goal
+/// here is a stable, bash-shaped listing.
 fn print_all_variables(sh: &Shell) {
+    const INTERNAL_ORDER: &[&str] = &[
+        "BASH",
+        "BASHOPTS",
+        "BASH_ALIASES",
+        "BASH_ARGC",
+        "BASH_ARGV",
+        "BASH_CMDS",
+        "BASH_EXECUTION_STRING",
+        "BASH_LINENO",
+        "BASH_LOADABLES_PATH",
+        "BASH_SOURCE",
+        "BASH_VERSINFO",
+        "BASH_VERSION",
+        "DIRSTACK",
+        "EUID",
+        "GROUPS",
+        "HOSTTYPE",
+        "MACHTYPE",
+        "OSTYPE",
+        "PPID",
+        "SHELLOPTS",
+        "UID",
+    ];
+    // Internal scalar variables first.
+    for name in INTERNAL_ORDER {
+        if let Some(value) = sh.env.get(*name) {
+            println!("{}={}", name, quote_for_set(value));
+        }
+    }
+    // Internal array variables (bash lists them interleaved with the scalars,
+    // but a stable grouping here is sufficient for our purposes).
+    let mut array_names: Vec<&String> = sh.arrays.keys().collect();
+    array_names.sort();
+    for name in array_names {
+        if let Some(elems) = sh.arrays.get(name) {
+            println!("{}={}", name, format_array(elems));
+        }
+    }
+    // Then every other scalar variable, sorted alphabetically.
     let mut names: Vec<&String> = sh.env.keys().collect();
     names.sort();
     for name in names {
+        if INTERNAL_ORDER.contains(&name.as_str()) {
+            continue;
+        }
         let value = sh.env.get(name).cloned().unwrap_or_default();
         println!("{}={}", name, quote_for_set(&value));
     }
+}
+
+/// Format an array the way bash's `set` does: `([0]="a" [1]="b")`.  An empty
+/// array is printed as `()`.
+fn format_array(elems: &[String]) -> String {
+    if elems.is_empty() {
+        return "()".to_string();
+    }
+    let mut out = String::from("(");
+    for (i, e) in elems.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        out.push_str(&format!("[{}]={}", i, quote_for_set(e)));
+    }
+    out.push(')');
+    out
 }
 
 // ---------------------------------------------------------------------------

@@ -94,6 +94,8 @@ pub struct SimpleCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pipeline {
     pub commands: Vec<SimpleCommand>,
+    /// True when the pipeline was suffixed with `&` (run in the background).
+    pub background: bool,
 }
 
 /// The operator that joins two pipelines of an AND-OR list.
@@ -730,6 +732,19 @@ fn ident_in_parens(text: &str) -> Option<String> {
     None
 }
 
+/// True when `stage` is exactly the bare word `coproc` (a reserved word that
+/// requires a command to follow it; bash rejects `coproc ;` and a trailing
+/// `coproc` with a syntax error).
+fn is_bare_coproc(stage: &[Token]) -> bool {
+    if stage.len() != 1 {
+        return false;
+    }
+    match &stage[0] {
+        Token::Word(parts) => is_plain_text(parts) && plain_text(parts) == "coproc",
+        _ => false,
+    }
+}
+
 pub fn parse_command_list(tokens: &[Token]) -> Result<CommandList> {
     // Extract compounds + function definitions first: each becomes a single
     // token that carries the parsed branches.
@@ -754,6 +769,7 @@ pub fn parse_command_list(tokens: &[Token]) -> Result<CommandList> {
                 if !current_cmds.is_empty() {
                     pipelines.push(Pipeline {
                         commands: std::mem::take(&mut current_cmds),
+                        background: false,
                     });
                 }
                 ops.push(match t {
@@ -763,18 +779,39 @@ pub fn parse_command_list(tokens: &[Token]) -> Result<CommandList> {
             }
             Token::Semicolon => {
                 if !stage.is_empty() {
+                    if is_bare_coproc(&stage) {
+                        return Err(WashError::syntax(
+                            "syntax error near unexpected token ';'",
+                        ));
+                    }
                     current_cmds.push(parse_simple(&stage)?);
                     stage.clear();
                 }
                 if !current_cmds.is_empty() {
                     pipelines.push(Pipeline {
                         commands: std::mem::take(&mut current_cmds),
+                        background: false,
                     });
                 }
                 flush_andor(&mut andors, &mut pipelines, &mut ops)?;
             }
             Token::Background => {
-                return Err(WashError::syntax("background jobs not supported yet (Phase 2)"));
+                if !stage.is_empty() {
+                    if is_bare_coproc(&stage) {
+                        return Err(WashError::syntax(
+                            "syntax error near unexpected token '&'",
+                        ));
+                    }
+                    current_cmds.push(parse_simple(&stage)?);
+                    stage.clear();
+                }
+                if !current_cmds.is_empty() {
+                    pipelines.push(Pipeline {
+                        commands: std::mem::take(&mut current_cmds),
+                        background: true,
+                    });
+                }
+                flush_andor(&mut andors, &mut pipelines, &mut ops)?;
             }
             // A function definition is a whole command that registers itself;
             // it produces no executable, so it is skipped here.
@@ -786,6 +823,7 @@ pub fn parse_command_list(tokens: &[Token]) -> Result<CommandList> {
                 if !current_cmds.is_empty() {
                     pipelines.push(Pipeline {
                         commands: std::mem::take(&mut current_cmds),
+                        background: false,
                     });
                 }
                 flush_andor(&mut andors, &mut pipelines, &mut ops)?;
@@ -795,11 +833,17 @@ pub fn parse_command_list(tokens: &[Token]) -> Result<CommandList> {
     }
 
     if !stage.is_empty() {
+        if is_bare_coproc(&stage) {
+            return Err(WashError::syntax(
+                "syntax error near unexpected token 'newline'",
+            ));
+        }
         current_cmds.push(parse_simple(&stage)?);
     }
     if !current_cmds.is_empty() {
         pipelines.push(Pipeline {
             commands: current_cmds,
+            background: false,
         });
     }
     flush_andor(&mut andors, &mut pipelines, &mut ops)?;

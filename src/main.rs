@@ -20,6 +20,8 @@ fn main() {
     // `$0` is the path the shell was invoked with, exactly like in bash.
     if let Some(argv0) = args.first() {
         sh.dollar_zero = argv0.clone();
+        // `$BASH` is the path the shell was invoked with (bash's own name).
+        sh.env.insert("BASH".to_string(), argv0.clone());
     }
 
     if args.len() >= 2 && (args[1] == "-c" || args[1] == "--command") {

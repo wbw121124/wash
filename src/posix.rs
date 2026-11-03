@@ -43,6 +43,9 @@ extern "C" {
     fn wash_stat(path: *const c_char, follow: c_int, out: *mut StatBuf) -> c_int;
     fn wash_geteuid() -> u32;
     fn wash_getegid() -> u32;
+    fn wash_getuid() -> u32;
+    fn wash_getppid() -> i32;
+    fn wash_getgroups(cap: c_int, list: *mut c_int, ng: *mut c_int) -> c_int;
 
     // bash-compatible numeric parsing / formatting (msys C library)
     fn wash_parse_ll(s: *const c_char, fully: *mut c_int, overflow: *mut c_int) -> i64;
@@ -145,6 +148,30 @@ pub fn effective_uid() -> u32 {
 /// The effective group id of the calling process (`test -G`).
 pub fn effective_gid() -> u32 {
     unsafe { wash_getegid() }
+}
+
+/// The (real) user id of the calling process (`$UID`).
+pub fn real_uid() -> u32 {
+    unsafe { wash_getuid() }
+}
+
+/// The parent process id of the calling process (`$PPID`).
+pub fn parent_pid() -> i32 {
+    unsafe { wash_getppid() }
+}
+
+/// The supplementary group ids of the calling process (`$GROUPS`), in the
+/// platform's natural order (the caller's real gid first).
+pub fn group_ids() -> Vec<i32> {
+    let mut buf: Vec<c_int> = vec![0; 512];
+    let mut ng: c_int = 0;
+    let r = unsafe { wash_getgroups(buf.len() as c_int, buf.as_mut_ptr(), &mut ng) };
+    if r != 0 || ng <= 0 {
+        Vec::new()
+    } else {
+        buf.truncate(ng as usize);
+        buf
+    }
 }
 
 pub fn fork() -> i32 {

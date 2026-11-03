@@ -427,6 +427,7 @@ fn execute_for(var: &str, words: &[Vec<WordPart>], body: &CommandList, sh: &mut 
         self_pid: sh.self_pid,
         noglob: sh.options.noglob,
         nounset: sh.options.nounset,
+        bg_pid: sh.bg_pid,
         dollar_zero: &sh.dollar_zero,
         attrs: &attrs,
         functions: &sh.functions,
@@ -541,6 +542,7 @@ fn execute_case(word: &[WordPart], arms: &[crate::parser::CaseArm], sh: &mut She
         self_pid: sh.self_pid,
         noglob: sh.options.noglob,
         nounset: sh.options.nounset,
+        bg_pid: sh.bg_pid,
         dollar_zero: &sh.dollar_zero,
         attrs: &attrs,
         functions: &sh.functions,
@@ -840,6 +842,7 @@ fn apply_command_assignments(
             self_pid: sh.self_pid,
             noglob: sh.options.noglob,
             nounset: sh.options.nounset,
+        bg_pid: sh.bg_pid,
             dollar_zero: &sh.dollar_zero,
             attrs: &attrs,
             functions: &sh.functions,
@@ -872,6 +875,28 @@ fn restore_command_assignments(saved: Vec<(String, Option<String>)>, sh: &mut Sh
     }
 }
 
+/// Update `$_` (the last-argument parameter) the way bash does.
+///
+/// * After a command with arguments, `$_` holds the command's LAST word.
+///   A command without arguments (e.g. `:`) leaves `$_` as the command name.
+/// * After an assignment-only command (`X=1`), `$_` becomes empty.
+/// * In both cases bash DROPS the export attribute of `$_`, so it disappears
+///   from `export -p` as soon as the first command has run.  At shell startup
+///   it is still exported, inherited from the parent shell.
+fn update_underscore(sh: &mut Shell, argv: &[String]) {
+    let value = argv.last().cloned().unwrap_or_default();
+    sh.env.insert("_".to_string(), value);
+    sh.exported.remove("_");
+}
+
+/// Drop the export attribute of `$_` without changing its value.
+///
+/// A compound command (`if ... fi`) runs its inner commands, which update
+/// `$_` themselves; the compound only ends the export attribute.
+fn drop_underscore_export(sh: &mut Shell) {
+    sh.exported.remove("_");
+}
+
 /// Run a single (non-pipeline) command in the parent shell.
 fn run_standalone_exp(
     argv: &[String],
@@ -897,10 +922,13 @@ fn run_standalone_exp(
             if !sh.persistent_redirs {
                 restore_fds(&saved);
             }
+            drop_underscore_export(sh);
             return code;
         }
         // Standalone assignment(s): persist to the shell environment.
         if !assigns.is_empty() {
+            // An assignment-only command sets `$_` to the empty string.
+            update_underscore(sh, &[]);
             let mut assign_failed = false;
             let attrs = sh.attrs();
             let pending: RefCell<Vec<(String, String)>> = RefCell::new(Vec::new());
@@ -914,6 +942,7 @@ fn run_standalone_exp(
                     self_pid: sh.self_pid,
                     noglob: sh.options.noglob,
                     nounset: sh.options.nounset,
+        bg_pid: sh.bg_pid,
                     dollar_zero: &sh.dollar_zero,
                     attrs: &attrs,
                     functions: &sh.functions,
@@ -935,9 +964,11 @@ fn run_standalone_exp(
             }
             if assign_failed {
                 // A failed assignment (e.g. to a readonly variable) makes the
-                // command return 1, but unlike bash's `set -e` path it does not
-                // abort the rest of the `-c` script -- the following commands
-                // still run.
+                // command return 1.  In bash a standalone assignment that fails
+                // because the variable is readonly also aborts the rest of the
+                // `-c` script (the remaining commands do not run), so we mirror
+                // that by flagging a fatal error.
+                sh.fatal_error = Some(1);
                 return 1;
             }
         }
@@ -971,6 +1002,7 @@ fn run_standalone_exp(
         if !sh.persistent_redirs {
             restore_fds(&saved);
         }
+        update_underscore(sh, argv);
         return code;
     }
 
@@ -993,6 +1025,8 @@ fn run_standalone_exp(
         if !sh.persistent_redirs {
             restore_fds(&saved);
         }
+        // `$_` becomes the last word of the command's expanded argv.
+        update_underscore(sh, argv);
         return code;
     }
 
@@ -1019,7 +1053,9 @@ fn run_standalone_exp(
         if let Some((_, reported)) = &program {
             record_hash_entry(sh, &argv[0], reported);
         }
-        posix::wait_pid(pid)
+        let status = posix::wait_pid(pid);
+        update_underscore(sh, argv);
+        status
     }
 }
 
@@ -1199,6 +1235,7 @@ fn prepare(p: &Pipeline, sh: &mut Shell) -> Vec<Prepared> {
             self_pid: sh.self_pid,
             noglob: sh.options.noglob,
             nounset: sh.options.nounset,
+        bg_pid: sh.bg_pid,
             dollar_zero: &sh.dollar_zero,
             attrs: &attrs,
             functions: &sh.functions,
@@ -1226,6 +1263,7 @@ fn prepare(p: &Pipeline, sh: &mut Shell) -> Vec<Prepared> {
             self_pid: sh.self_pid,
             noglob: sh.options.noglob,
             nounset: sh.options.nounset,
+        bg_pid: sh.bg_pid,
             dollar_zero: &sh.dollar_zero,
             attrs: &attrs,
             functions: &sh.functions,
@@ -1424,6 +1462,12 @@ pub fn execute(list: &CommandList, sh: &mut Shell) -> i32 {
             break;
         }
         if aborted {
+            break;
+        }
+        // A failed assignment to a readonly variable aborts the rest of the
+        // command list, exactly like bash does (`readonly R=1; R=2; echo hi`
+        // never reaches the `echo`).
+        if sh.fatal_error.is_some() {
             break;
         }
     }

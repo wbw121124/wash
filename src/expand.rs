@@ -19,6 +19,8 @@ pub struct ExpandCtx<'a> {
     pub self_pid: i32,
     pub noglob: bool,
     pub nounset: bool,
+    /// The pid of the most recently started background job (`$!`).
+    pub bg_pid: i32,
     /// The value of `$0` (the shell name, or the script path while a script
     /// is being sourced).
     pub dollar_zero: &'a str,
@@ -208,7 +210,15 @@ fn eval_var(name: &str, ctx: &ExpandCtx) -> String {
             ctx.positional.join(" ")
         }
         "0" => ctx.dollar_zero.to_string(),
-        "!" => String::new(), // last background pid (Phase 2)
+        "!" => {
+            // `$!` is the pid of the most recent background job; it is empty
+            // when no background job has been started.
+            if ctx.bg_pid == 0 {
+                String::new()
+            } else {
+                ctx.bg_pid.to_string()
+            }
+        }
         "-" => String::new(), // shell options (Phase 4+)
         _ => {
             if let Some(idx) = name.parse::<usize>().ok() {

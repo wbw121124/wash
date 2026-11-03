@@ -11,6 +11,18 @@ use std::collections::{HashMap, HashSet};
 use crate::executor;
 use crate::lexer;
 use crate::parser;
+use crate::posix;
+
+/// The absolute path of the running shell binary.
+///
+/// bash resolves its own name through `$PATH` and uses the result for `$_`
+/// and `$BASH`.  wash uses the real path of its own executable, which is the
+/// same idea expressed in terms of the Rust runtime.
+fn shell_self_path() -> String {
+    std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "wash".to_string())
+}
 
 /// Shell option flags (mirrors bash's `set -o` table). Defaults are set to
 /// match a freshly-started NON-INTERACTIVE bash (`bash -c`).
@@ -298,6 +310,19 @@ pub struct Shell {
     /// can be restored on return.  A frame maps a variable name to `Some(prev)`
     /// (it had a value) or `None` (it was unset).
     pub call_stack: Vec<HashMap<String, Option<String>>>,
+
+    /// The pid of the most recently started background job (`$!`).
+    pub bg_pid: i32,
+    /// Background job pids this shell has started and not yet reaped (`wait`).
+    pub jobs: Vec<i32>,
+    /// Array variables (`ARR=(a b)`). Each maps a name to an ordered list of
+    /// elements (bash arrays).
+    pub arrays: HashMap<String, Vec<String>>,
+    /// The interactive / non-interactive command history (`history`, `fc`).
+    pub history: Vec<String>,
+    /// A fatal error that aborts the rest of a `-c` script the way bash does
+    /// after an assignment to a readonly variable. The value is the exit code.
+    pub fatal_error: Option<i32>,
 }
 
 impl Shell {
@@ -338,7 +363,22 @@ impl Shell {
         if ifs_defaulted {
             exported.remove("IFS");
         }
-        Shell {
+        // bash increments SHLVL on every startup.  The inherited value
+        // defaults to 0 when the variable is absent.
+        let inherited_shlvl = env
+            .get("SHLVL")
+            .and_then(|v| v.parse::<i32>().ok())
+            .unwrap_or(0);
+        let shlvl = if inherited_shlvl < 0 { 0 } else { inherited_shlvl + 1 };
+        env.insert("SHLVL".to_string(), shlvl.to_string());
+        exported.insert("SHLVL".to_string());
+        // `$_` starts out as the shell's own path AND is exported (bash
+        // inherits both from the parent shell).  As soon as a command runs,
+        // bash replaces it with that command's last argument and drops its
+        // export attribute -- see `executor::update_underscore`.
+        env.insert("_".to_string(), shell_self_path());
+        exported.insert("_".to_string());
+        let mut sh = Shell {
             env,
             cwd: cwd.clone(),
             oldpwd: None,
@@ -370,7 +410,61 @@ impl Shell {
             loop_depth: 0,
             function_depth: 0,
             call_stack: Vec::new(),
-        }
+            bg_pid: 0,
+            jobs: Vec::new(),
+            arrays: HashMap::new(),
+            history: Vec::new(),
+            fatal_error: None,
+        };
+        Self::populate_internal_variables(&mut sh);
+        sh
+    }
+
+    /// Install bash's internal variables that are not shell-instance specific
+    /// (version strings, platform names, the empty array/option tables, ...).
+    /// None of these are exported.  `$SHLVL` and `$_` are handled separately
+    /// in `from_env` (SHLVL is exported and incremented; `_` is never
+    /// exported).
+    fn populate_internal_variables(sh: &mut Shell) {
+        sh.env
+            .insert("BASH_VERSION".to_string(), "wash 0.0.1".to_string());
+        sh.env.insert("BASH".to_string(), sh.dollar_zero.clone());
+        sh.env.insert("BASHOPTS".to_string(), String::new());
+        sh.env.insert("SHELLOPTS".to_string(), String::new());
+        sh.env.insert("HOSTTYPE".to_string(), "x86_64".to_string());
+        sh.env
+            .insert("MACHTYPE".to_string(), "x86_64-pc-cygwin".to_string());
+        sh.env.insert("OSTYPE".to_string(), "cygwin".to_string());
+        sh.env
+            .insert("EUID".to_string(), posix::effective_uid().to_string());
+        sh.env
+            .insert("UID".to_string(), posix::real_uid().to_string());
+        sh.env
+            .insert("PPID".to_string(), posix::parent_pid().to_string());
+        sh.env.insert("OPTIND".to_string(), "1".to_string());
+        sh.env.insert("OPTERR".to_string(), "1".to_string());
+        sh.env.insert("PS4".to_string(), "+ ".to_string());
+        // Array-valued internal variables.
+        sh.arrays.insert(
+            "BASH_VERSINFO".to_string(),
+            vec![
+                "0".to_string(),
+                "0".to_string(),
+                "1".to_string(),
+                "release".to_string(),
+                "".to_string(),
+                "x86_64-pc-cygwin".to_string(),
+            ],
+        );
+        sh.arrays.insert("DIRSTACK".to_string(), vec![sh.cwd.clone()]);
+        sh.arrays
+            .insert("GROUPS".to_string(), posix::group_ids().iter().map(|g| g.to_string()).collect());
+        sh.arrays.insert("BASH_ALIASES".to_string(), Vec::new());
+        sh.arrays.insert("BASH_ARGC".to_string(), Vec::new());
+        sh.arrays.insert("BASH_ARGV".to_string(), Vec::new());
+        sh.arrays.insert("BASH_CMDS".to_string(), Vec::new());
+        sh.arrays.insert("BASH_LINENO".to_string(), Vec::new());
+        sh.arrays.insert("BASH_SOURCE".to_string(), Vec::new());
     }
 
     /// Build the environment map handed to a child process: only exported
