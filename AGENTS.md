@@ -157,7 +157,7 @@ stderr + 退出码）跑出来，或由针对该内建的定向探针实测得�
 | `:` | full | 无参与带参数（`: foo`）均与 bash 一致（GROUP C `colon` / `colon-args` 通过） |
 | `true` / `false` | full | 退出码与 stdout 均一致（GROUP C `true` / `false` 通过） |
 | `echo` | full | `-n` / `-e` / `-E` / `--` 字面量 / 全部转义序列逐字节一致（`tests/bash_diff_echo_printf.sh` 100/100） |
-| `printf` | full | 全部转换说明符逐字节一致（`%s %d %i %o %u %x %X %e %E %f %g %G %a %A %c %b %q %%`、字段宽度/精度/`*`、`-v`），**25 条定向探针全通过**。两个历史缺陷已由 `f59ea30` 修复并复测：①`printf %%. a`（`%%` 在格式串中间 + 多余参数）不再挂起，输出 `%.` 与 bash 一致；②`printf %x ff` 非法数字现在会在 stderr 报 `printf: ff: invalid number`（stdout 仍为 `0`，rc=1），与 bash 一致 |
+| `printf` | full | 全部转换说明符逐字节一致（`%s %d %i %o %u %x %X %e %E %f %g %G %a %A %c %b %q %%`、字段宽度/精度/`*`、`-v`），**25 条定向探针全通过**。两个历史缺陷已由 `03b35e5 修复并复测：①`printf %%. a`（`%%` 在格式串中间 + 多余参数）不再挂起，输出 `%.` 与 bash 一致；②`printf %x ff` 非法数字现在会在 stderr 报 `printf: ff: invalid number`（stdout 仍为 `0`，rc=1），与 bash 一致 |
 | `cd` | full | 绝对/相对/逻辑(`/L`)/物理(`/P`)/`CDPATH`/`-`/`--`/空串/不存在/失败后 `PWD` 不变，全部一致。含 bash 的 `cd: too many arguments`（rc=2，`PWD` 不变） |
 | `exit` | full | 无参/`42`/`300`/`-1`/被 source 的脚本内 `exit` 一致；非法参数 `exit abc` 时 bash 报 `exit: abc: numeric argument required`、置 `$?=2`、**继续执行后续命令**，wash 已照此对齐 |
 | `export` | partial | `-p` / 无参 / `NAME=val` / `-n` / 赋值 / 非法标识符报错，格式与 bash 一致（GROUP A `export-p`/`export-noarg`/`export-no-name` 逐字节通过）。**差异**：①`export -f`（导出函数）wash 报 rc=2，bash 是 rc=1；②wash 不维护 bash 的 `BASH_*` / `BASHOPTS` / `BASH_VERSINFO` 等内部变量（这是 shell 内部变量集合差异，不是 `export` 本身的缺陷）；③`$_` 的导出属性处理与 bash 不同（bash 在命令执行后取消 `$_` 的导出属性，wash 保留） |
@@ -208,7 +208,7 @@ stderr + 退出码）跑出来，或由针对该内建的定向探针实测得�
 ### 已知缺陷（实测复现，待修）
 
 **当前无已复现待修的缺陷。** 上一轮记录的 `printf` 两处缺陷（`%%` 死循环、
-非法数字静默）已由 `f59ea30` 修复并复测通过，现已从本表移除；对应的回归
+非法数字静默）已由 `03b35e5 修复并复测通过，现已从本表移除；对应的回归
 用例保留在 `tests/bash_diff_builtins.sh` 的 GROUP D（`printf-pct-mid-extra` /
 `printf-pct-mid-extra2` / `printf-hex-invalid` / `printf-dec-invalid`），
 一旦缺陷复发会立刻变红。
@@ -237,7 +237,7 @@ stderr + 退出码）跑出来，或由针对该内建的定向探针实测得�
 ## 提交约定
 
 - 按阶段提交，commit message 用 `feat: Phase N ...` 风格（英文，简洁）。
-- 已提交：`40caffc feat: Phase 0 bootstrap ...`。
+- 已提交：`1fe796c feat: Phase 0 bootstrap ...`。
 - Phase 1 已提交（含展开系统与 echo/printf 内建，oracle 9/9 + 20/20）。
 
 ## 阶段 6：交互式 REPL（fish 风格）实现说明
