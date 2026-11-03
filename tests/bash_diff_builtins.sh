@@ -55,6 +55,19 @@ export LANG=C
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
+# ---------------------------------------------------------------------------
+# HOME ISOLATION (mandatory)
+#
+# Some cases read `$HOME` (`cd` without arguments, `~` expansion) and the
+# REPL writes `$HOME/.wash_history`.  Pointing HOME at a throw-away directory
+# inside the sandbox guarantees that a test run can never touch the REAL
+# user's home directory, no matter which directory the suite is started from.
+# Both sides of the comparison (bash and wash) see the same HOME, so the
+# byte-diff stays valid.
+# ---------------------------------------------------------------------------
+export HOME="$TMP/home"
+mkdir -p "$HOME"
+
 # Sandbox with the files / directories the cases need.
 SANDBOX="$TMP/sandbox"
 mkdir -p "$SANDBOX/sub" "$SANDBOX/bin" "$SANDBOX/cwd"

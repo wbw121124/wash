@@ -327,8 +327,30 @@ pub struct Shell {
 
 impl Shell {
     pub fn new() -> Self {
-        let env: HashMap<String, String> = std::env::vars().collect();
-        Shell::from_env(env)
+        let mut env: HashMap<String, String> = std::env::vars().collect();
+
+        // bash increments SHLVL on every shell startup.  This happens
+        // EXACTLY ONCE per process, here -- and NOT in `from_env`, which also
+        // builds the state of a forked child: a subshell must not increment
+        // SHLVL a second time (bash keeps the parent's value there).
+        let inherited = env
+            .get("SHLVL")
+            .and_then(|v| v.parse::<i32>().ok())
+            .unwrap_or(0);
+        env.insert("SHLVL".to_string(), (inherited.max(0) + 1).to_string());
+
+        // `$_` starts out as the shell's own path and is exported.  As soon
+        // as a command runs, bash replaces it with that command's last
+        // argument and drops its export attribute -- see
+        // `executor::update_underscore`.
+        if !env.contains_key("_") {
+            env.insert("_".to_string(), shell_self_path());
+        }
+
+        let mut sh = Shell::from_env(env);
+        sh.exported.insert("SHLVL".to_string());
+        sh.exported.insert("_".to_string());
+        sh
     }
 
     /// Build a shell from a given environment map (used for command
@@ -363,21 +385,10 @@ impl Shell {
         if ifs_defaulted {
             exported.remove("IFS");
         }
-        // bash increments SHLVL on every startup.  The inherited value
-        // defaults to 0 when the variable is absent.
-        let inherited_shlvl = env
-            .get("SHLVL")
-            .and_then(|v| v.parse::<i32>().ok())
-            .unwrap_or(0);
-        let shlvl = if inherited_shlvl < 0 { 0 } else { inherited_shlvl + 1 };
-        env.insert("SHLVL".to_string(), shlvl.to_string());
-        exported.insert("SHLVL".to_string());
-        // `$_` starts out as the shell's own path AND is exported (bash
-        // inherits both from the parent shell).  As soon as a command runs,
-        // bash replaces it with that command's last argument and drops its
-        // export attribute -- see `executor::update_underscore`.
-        env.insert("_".to_string(), shell_self_path());
-        exported.insert("_".to_string());
+        // NOTE: `SHLVL` and `$_` are deliberately NOT touched here.  This
+        // constructor also builds the state of a forked child, and a child
+        // must inherit the parent's `SHLVL` / `$_` values unchanged.  Both
+        // are established once per process in `Shell::new`.
         let mut sh = Shell {
             env,
             cwd: cwd.clone(),
@@ -423,8 +434,9 @@ impl Shell {
     /// Install bash's internal variables that are not shell-instance specific
     /// (version strings, platform names, the empty array/option tables, ...).
     /// None of these are exported.  `$SHLVL` and `$_` are handled separately
-    /// in `from_env` (SHLVL is exported and incremented; `_` is never
-    /// exported).
+    /// in `Shell::new` (both are exported; SHLVL is incremented once per
+    /// process and `$_` loses its export attribute as soon as a command
+    /// runs).
     fn populate_internal_variables(sh: &mut Shell) {
         sh.env
             .insert("BASH_VERSION".to_string(), "wash 0.0.1".to_string());

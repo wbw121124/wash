@@ -14,7 +14,7 @@
 
 ## 硬性约束（必须严格遵守）
 
-1. **工具链只能用 MSYS2，路径 `D:\msys2`，且 `MSYSTEM=MSYS`**
+1. **工具链只能用 MSYS2，路径 `D:\msys2`（目录联接），且 `MSYSTEM=MSYS`**
    （msys 子系统，二进制链接 `msys-2.0.dll`，POSIX 运行时：fork/exec/信号/
    作业控制/PTY 都可用）。**严禁 ucrt64 / mingw64**。
 2. Rust 来自 MSYS2 的 `msys/rust`（pacman 安装，约 1.99.1）。

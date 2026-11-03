@@ -8,10 +8,23 @@
 set -u
 
 BASH_BIN="${BASH_BIN:-/d/msys2/usr/bin/bash.exe}"
-WASH_BIN="${WASH_BIN:-target/debug/wash.exe}"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+WASH_BIN="${WASH_BIN:-$REPO_ROOT/target/debug/wash}"
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+
+# ---------------------------------------------------------------------------
+# HOME ISOLATION (mandatory)
+#
+# A few cases read `$HOME` (and `~` expands through it).  Pointing HOME at a
+# throw-away directory inside the sandbox guarantees that a test run can
+# never read or write anything in the REAL user's home directory, no matter
+# which directory the suite is started from.  Both sides of the comparison
+# (bash and wash) see the same HOME, so the byte-diff stays valid.
+# ---------------------------------------------------------------------------
+export HOME="$TMP/home"
+mkdir -p "$HOME"
 
 pass=0
 fail=0
