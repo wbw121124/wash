@@ -15,12 +15,11 @@
 # GROUP A（105 条核心语义）在任意 locale 环境下都保持逐字节稳定（105/105）。
 # 本脚本只负责「离开 C locale 后」的本地化行为，不重复跑 GROUP A。
 #
-# 当前状态（实现前 / 进行中）：wash 的 `help` 内建尚未实现，会回退到外部
-# Windows `help.exe`，导致：
-#   * 在 LC_ALL=C 下 `wash -lc "help"` 会挂起（超时，rc=124）；
-#   * 在 zh_CN.UTF-8 下也不会输出 bash 风格的中文帮助，结构不与 bash 一致。
-# 因此本脚本的「本地化 + 结构一致」用例目前 EXPECTED FAIL —— 这恰好是 i18n
-# 维度「进行中/部分」的实证。工程师落地 `help` 本地化后，这些用例应转绿。
+# 当前状态（进行中）：wash 的 `help` 内建已注册（commit 57ec1c7），且头部 3 句已通过
+# `tr!` 本地化——zh_CN.UTF-8 下输出中文、C 下输出英文，满足「轴 1 本地化」
+# （bash 与 wash 输出均含非 ASCII 多字节）。本脚本「轴 1 本地化」用例当前已转绿。
+# 「轴 2 结构一致」仍 FAIL，主因是 wash 的内建集合尚未对齐 bash（属内建实现进度
+# #2/#5），而非本地化缺失；待 wash-eng 的内建集合真正对齐 bash 后，该用例会自然转绿。
 #
 # 运行（必须用 MSYS2）：
 #   MSYSTEM=MSYS "/d/msys2/usr/bin/bash.exe" -lc \
@@ -164,7 +163,7 @@ if command -v timeout >/dev/null 2>&1; then
     RUNNER=(timeout 15)
 fi
 
-echo "=== 轴 1：本地化（bash 必须本地化；wash 当前预期未本地化）==="
+echo "=== 轴 1：本地化（bash / wash 都应被本地化，输出随 locale 变化且含非 ASCII）==="
 run_i18n_case i18n-help-localized 'help' 1
 
 echo
@@ -175,8 +174,8 @@ echo
 echo "================================================================="
 printf "i18n 维度: PASS=%d  FAIL=%d\n" "$pass" "$fail"
 if [ "$fail" -ne 0 ]; then
-    echo "NOTE: 当前 FAIL 即 i18n『进行中/部分』的实证 —— wash 的 help 本地化尚未实现。"
-    echo "      工程师落地 help 本地化后，上述用例应转绿。"
+    echo "NOTE: 当前 FAIL 为「轴 2 结构一致」用例 —— 主因是 wash 内建集合尚未对齐 bash（属内建实现进度 #2/#5），"
+    echo "      而非本地化缺失。轴 1 本地化（zh_CN 出中文 / C 出英文）已转绿。待内建集合对齐后该用例自然转绿。"
 fi
 echo "================================================================="
 
