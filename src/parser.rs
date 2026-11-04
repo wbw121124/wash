@@ -86,6 +86,11 @@ pub struct SimpleCommand {
     /// Variable assignments of the form `name=value` / `name+=value` appearing
     /// before the command word. `bool` is the append (`+=`) flag.
     pub assignments: Vec<(String, Vec<WordPart>, bool)>,
+    /// Array assignments of the form `name=(a b c)` appearing before the
+    /// command word.  Each value is a list of element words (each word itself a
+    /// list of pre-expansion `WordPart`s); the flag marks the append (`+=`)
+    /// form.
+    pub array_assignments: Vec<(String, Vec<Vec<WordPart>>, bool)>,
     /// The compound command this simple command stands for.  When it is set
     /// the command has no words of its own.
     pub compound: Option<Compound>,
@@ -906,10 +911,78 @@ fn as_assignment(parts: &[WordPart]) -> Option<(String, Vec<WordPart>, bool)> {
     None
 }
 
+/// True when `parts` is the head of an array assignment: a `name=` word with an
+/// empty RHS (the lexer split the following `(` into its own token).  `i` is
+/// the index of `parts` in `tokens`; the token right after it must be `(`.
+fn is_array_assignment_head(parts: &[WordPart], tokens: &[Token], i: usize) -> bool {
+    if let Some((name, value, _append)) = as_assignment(parts) {
+        if !is_valid_ident(&name) {
+            return false;
+        }
+        // `name=` with nothing after the `=` — the value `as_assignment`
+        // produced is a single empty `Text` part.
+        let empty = value.len() == 1
+            && matches!(value[0], WordPart::Text(ref s, _) if s.is_empty());
+        if empty {
+            if let Some(Token::Word(p)) = tokens.get(i + 1) {
+                return is_plain_text(p) && plain_text(p) == "(";
+            }
+        }
+    }
+    false
+}
+
+/// Parse an array assignment `name=( ... )` whose `name=` token is at index
+/// `*i`. Advances `*i` to the closing `)` and returns the array name together
+/// with its element words (each element is itself a list of `WordPart`s, so it
+/// can carry expansions / globs) and the append (`+=`) flag.  Returns `None` on
+/// an unterminated body.
+fn parse_array_assignment(
+    tokens: &[Token],
+    i: &mut usize,
+) -> Option<(String, Vec<Vec<WordPart>>, bool)> {
+    let head = match &tokens[*i] {
+        Token::Word(p) => p,
+        _ => return None,
+    };
+    let (name, _value, append) = as_assignment(head)?;
+    // The `(` that opens the array body.
+    match tokens.get(*i + 1) {
+        Some(Token::Word(p)) if is_plain_text(p) && plain_text(p) == "(" => {}
+        _ => return None,
+    }
+    let mut j = *i + 2; // skip `name=` and `(`
+    let mut elems: Vec<Vec<WordPart>> = Vec::new();
+    let mut depth: i32 = 1;
+    while j < tokens.len() {
+        match &tokens[j] {
+            Token::Word(p) if is_plain_text(p) && plain_text(p) == "(" => {
+                depth += 1;
+                elems.push(p.clone());
+            }
+            Token::Word(p) if is_plain_text(p) && plain_text(p) == ")" => {
+                depth -= 1;
+                if depth == 0 {
+                    *i = j;
+                    return Some((name, elems, append));
+                }
+                elems.push(p.clone());
+            }
+            Token::Word(p) => elems.push(p.clone()),
+            // Reserved words / compounds / operators are not valid array
+            // elements; skip them so the scan keeps looking for the closing `)`.
+            _ => {}
+        }
+        j += 1;
+    }
+    None
+}
+
 fn parse_simple(tokens: &[Token]) -> Result<SimpleCommand> {
     let mut argv: Vec<Vec<WordPart>> = Vec::new();
     let mut redirs = Vec::new();
     let mut assignments = Vec::new();
+    let mut array_assignments = Vec::new();
     let mut compound: Option<Compound> = None;
     let mut seen_command = false;
     let mut i = 0;
@@ -918,6 +991,20 @@ fn parse_simple(tokens: &[Token]) -> Result<SimpleCommand> {
         match &tokens[i] {
             Token::Word(parts) => {
                 if !seen_command {
+                    if is_array_assignment_head(parts, tokens, i) {
+                        match parse_array_assignment(tokens, &mut i) {
+                            Some((name, elems, append)) => {
+                                array_assignments.push((name, elems, append));
+                                i += 1;
+                                continue;
+                            }
+                            None => {
+                                return Err(WashError::syntax(
+                                    "syntax error near unexpected token (expected `)')",
+                                ))
+                            }
+                        }
+                    }
                     if let Some((name, value, append)) = as_assignment(parts) {
                         assignments.push((name, value, append));
                         i += 1;
@@ -991,6 +1078,7 @@ fn parse_simple(tokens: &[Token]) -> Result<SimpleCommand> {
         argv,
         redirs,
         assignments,
+        array_assignments,
         compound,
     })
 }

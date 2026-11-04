@@ -816,7 +816,7 @@ fn format_array(elems: &[String]) -> String {
         if i > 0 {
             out.push(' ');
         }
-        out.push_str(&format!("[{}]={}", i, quote_for_set(e)));
+        out.push_str(&format!("[{}]={}", i, quote_double(e)));
     }
     out.push(')');
     out
@@ -3988,6 +3988,7 @@ fn builtin_declare(argv: &[String], sh: &mut Shell, _is_typeset: bool) -> i32 {
     let mut export_attr = false;
     let mut readonly_attr = false;
     let mut integer_attr = false;
+    let mut array_attr = false;
     let mut print = false;
     let mut i = 1usize;
 
@@ -4008,8 +4009,9 @@ fn builtin_declare(argv: &[String], sh: &mut Shell, _is_typeset: bool) -> i32 {
                     'x' => export_attr = true,
                     'r' => readonly_attr = true,
                     'i' => integer_attr = true,
+                    'a' => array_attr = true,
                     'p' => print = true,
-                    'a' | 'A' | 'g' | 'n' | 't' | 'l' | 'u' | 'c' => {} // accepted but no-op
+                    'A' | 'g' | 'n' | 't' | 'l' | 'u' | 'c' | 'f' | 'F' => {} // 已接受但暂未实现
                     _ => {
                         eprintln!("wash: declare: {}: invalid option", a);
                         eprintln!("declare: usage: declare [-aAfFgilrtux] [-p] [name[=value] ...]");
@@ -4067,6 +4069,10 @@ fn builtin_declare(argv: &[String], sh: &mut Shell, _is_typeset: bool) -> i32 {
                     eprintln!("wash: declare: `{}': not a valid identifier", arg);
                     status = 1;
                     continue;
+                }
+                // `declare -a NAME` creates an (empty) array variable.
+                if array_attr {
+                    sh.arrays.entry(arg.clone()).or_insert_with(Vec::new);
                 }
                 apply_var_attrs(
                     sh,
@@ -4224,6 +4230,17 @@ fn print_declared(sh: &Shell, names: &[String]) {
     let mut sorted = names.to_vec();
     sorted.sort();
     for name in &sorted {
+        // Array variables are printed with the `-a` attribute and the
+        // `([0]="a" [1]="b")` body, exactly like bash does.  An empty array
+        // is printed without the `=()` part.
+        if let Some(elems) = sh.arrays.get(name) {
+            if elems.is_empty() {
+                println!("declare -a {}", name);
+            } else {
+                println!("declare -a {}={}", name, format_array(elems));
+            }
+            continue;
+        }
         let attrs = declare_attributes(sh, name);
         let attr_str = if attrs.is_empty() {
             "--".to_string()

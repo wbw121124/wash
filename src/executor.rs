@@ -309,6 +309,7 @@ pub fn capture_command(
     env: &HashMap<String, String>,
     attrs: &crate::shell::VarAttrs,
     functions: &HashMap<String, crate::parser::CommandList>,
+    arrays: &HashMap<String, Vec<String>>,
 ) -> String {
     let tokens = match crate::lexer::tokenize(cmd) {
         Ok(t) => t,
@@ -331,6 +332,9 @@ pub fn capture_command(
         // A command substitution inherits the parent's function table, so a
         // function can recurse through `$(...)`.
         sh.functions = functions.clone();
+        // Array variables are inherited as well (bash copies them into the
+        // subshell).
+        sh.arrays = arrays.clone();
         let code = crate::executor::execute(&list, &mut sh);
         let _ = std::io::stdout().flush();
         posix::exit(code);
@@ -431,6 +435,7 @@ fn execute_for(var: &str, words: &[Vec<WordPart>], body: &CommandList, sh: &mut 
         dollar_zero: &sh.dollar_zero,
         attrs: &attrs,
         functions: &sh.functions,
+        arrays: &sh.arrays,
         pending_assign: None,
     };
     let mut fields: Vec<String> = Vec::new();
@@ -546,6 +551,7 @@ fn execute_case(word: &[WordPart], arms: &[crate::parser::CaseArm], sh: &mut She
         dollar_zero: &sh.dollar_zero,
         attrs: &attrs,
         functions: &sh.functions,
+        arrays: &sh.arrays,
         pending_assign: None,
     };
     let value = expand_scalar(word, &ctx);
@@ -728,6 +734,9 @@ struct ChildContext<'a> {
     /// The complete variable table the child shell starts with — a subshell
     /// inherits every shell variable, exported or not.
     shell_env: &'a HashMap<String, String>,
+    /// The array variables the child shell starts with (a subshell inherits
+    /// the parent's arrays, just like bash does).
+    arrays: &'a HashMap<String, Vec<String>>,
     options: &'a SetOptions,
     positional: &'a [String],
     dollar_zero: &'a str,
@@ -754,6 +763,7 @@ fn child_run_exp(argv: &[String], path: &str, ctx: &ChildContext) -> ! {
         if let Some(compound) = ctx.compound {
             let mut sub = Shell::from_env(ctx.shell_env.clone());
             sub.apply_attrs(ctx.attrs);
+            sub.arrays = ctx.arrays.clone();
             sub.positional = ctx.positional.to_vec();
             sub.options = ctx.options.clone();
             sub.dollar_zero = ctx.dollar_zero.to_string();
@@ -767,6 +777,7 @@ fn child_run_exp(argv: &[String], path: &str, ctx: &ChildContext) -> ! {
     // command's own redirections), so the builtins can simply write to stdout.
     let mut sub = Shell::from_env(ctx.shell_env.clone());
     sub.apply_attrs(ctx.attrs);
+    sub.arrays = ctx.arrays.clone();
     sub.positional = ctx.positional.to_vec();
     sub.options = ctx.options.clone();
     sub.dollar_zero = ctx.dollar_zero.to_string();
@@ -846,6 +857,7 @@ fn apply_command_assignments(
             dollar_zero: &sh.dollar_zero,
             attrs: &attrs,
             functions: &sh.functions,
+            arrays: &sh.arrays,
             pending_assign: Some(&pending),
         };
         assigns
@@ -870,6 +882,76 @@ fn restore_command_assignments(saved: Vec<(String, Option<String>)>, sh: &mut Sh
             }
             None => {
                 sh.env.remove(&name);
+            }
+        }
+    }
+}
+
+/// Expand the element words of array assignments and store them in `sh.arrays`.
+///
+/// Returns the previous value of every named array so the caller can restore it
+/// afterwards (a temporary `name=(...) cmd` assignment).  For a persistent
+/// assignment (a standalone `a=(1 2 3)`) the returned saves may be ignored.
+fn apply_array_assignments(
+    arrays: &[(String, Vec<Vec<WordPart>>, bool)],
+    sh: &mut Shell,
+) -> Vec<(String, Option<Vec<String>>)> {
+    if arrays.is_empty() {
+        return Vec::new();
+    }
+    let attrs = sh.attrs();
+    // Expand every element first (immutable borrow of `sh`), then mutate
+    // `sh.arrays` once the borrow is released.
+    let expanded: Vec<(String, Vec<String>, bool)> = {
+        let ctx = ExpandCtx {
+            env: &sh.env,
+            positional: &sh.positional,
+            last_status: sh.last_status,
+            self_pid: sh.self_pid,
+            noglob: sh.options.noglob,
+            nounset: sh.options.nounset,
+            bg_pid: sh.bg_pid,
+            dollar_zero: &sh.dollar_zero,
+            attrs: &attrs,
+            functions: &sh.functions,
+            arrays: &sh.arrays,
+            pending_assign: None,
+        };
+        arrays
+            .iter()
+            .map(|(name, elems, append)| {
+                let mut v = Vec::new();
+                for w in elems {
+                    v.extend(expand_word(w, &ctx));
+                }
+                (name.clone(), v, *append)
+            })
+            .collect()
+    };
+    let mut saved = Vec::new();
+    for (name, v, append) in expanded {
+        saved.push((name.clone(), sh.arrays.get(&name).cloned()));
+        if append {
+            // `name+=(...)` appends to the existing elements.
+            let mut all = sh.arrays.get(&name).cloned().unwrap_or_default();
+            all.extend(v);
+            sh.arrays.insert(name, all);
+        } else {
+            sh.arrays.insert(name, v);
+        }
+    }
+    saved
+}
+
+/// Undo the array assignments saved by `apply_array_assignments`.
+fn restore_array_assignments(saved: Vec<(String, Option<Vec<String>>)>, sh: &mut Shell) {
+    for (name, value) in saved {
+        match value {
+            Some(v) => {
+                sh.arrays.insert(name, v);
+            }
+            None => {
+                sh.arrays.remove(&name);
             }
         }
     }
@@ -902,6 +984,7 @@ fn run_standalone_exp(
     argv: &[String],
     redirs: &[ExpRedir],
     assigns: &[(String, Vec<WordPart>, bool)],
+    array_assigns: &[(String, Vec<Vec<WordPart>>, bool)],
     compound: Option<&Compound>,
     env: &HashMap<String, String>,
     sh: &mut Shell,
@@ -926,7 +1009,7 @@ fn run_standalone_exp(
             return code;
         }
         // Standalone assignment(s): persist to the shell environment.
-        if !assigns.is_empty() {
+        if !assigns.is_empty() || !array_assigns.is_empty() {
             // An assignment-only command sets `$_` to the empty string.
             update_underscore(sh, &[]);
             let mut assign_failed = false;
@@ -946,6 +1029,7 @@ fn run_standalone_exp(
                     dollar_zero: &sh.dollar_zero,
                     attrs: &attrs,
                     functions: &sh.functions,
+            arrays: &sh.arrays,
                     pending_assign: Some(&pending),
                 };
                 assigns
@@ -962,6 +1046,8 @@ fn run_standalone_exp(
             for (name, value) in pending.borrow_mut().drain(..) {
                 sh.env.insert(name, value);
             }
+            // Persist array assignments (`a=(1 2 3)`) to the shell.
+            apply_array_assignments(array_assigns, sh);
             if assign_failed {
                 // A failed assignment (e.g. to a readonly variable) makes the
                 // command return 1.  In bash a standalone assignment that fails
@@ -1020,7 +1106,9 @@ fn run_standalone_exp(
         // visible to it.  It is always temporary: bash undoes it after the
         // command, even for the POSIX special builtins.
         let assignments = apply_command_assignments(assigns, sh);
+        let array_saves = apply_array_assignments(array_assigns, sh);
         let code = builtins::run_builtin(argv, sh).unwrap_or(0);
+        restore_array_assignments(array_saves, sh);
         restore_command_assignments(assignments, sh);
         if !sh.persistent_redirs {
             restore_fds(&saved);
@@ -1033,6 +1121,9 @@ fn run_standalone_exp(
     // External command: fork and apply the redirections in the child.  The
     // program is resolved in the parent, so that the hash table can record
     // it (bash does the same when the `hashall' option is on).
+    // A command-prefixed array assignment (`a=(1) prog`) is visible only to this
+    // command; we apply it temporarily and restore it afterwards.
+    let array_saves = apply_array_assignments(array_assigns, sh);
     let program = find_program(&argv[0], path);
     let pid = posix::fork();
     if pid == 0 {
@@ -1041,6 +1132,7 @@ fn run_standalone_exp(
         let ctx = ChildContext {
             env,
             shell_env: &sh.env,
+            arrays: &sh.arrays,
             options: &sh.options,
             positional: &sh.positional,
             dollar_zero: &sh.dollar_zero,
@@ -1055,6 +1147,7 @@ fn run_standalone_exp(
         }
         let status = posix::wait_pid(pid);
         update_underscore(sh, argv);
+        restore_array_assignments(array_saves, sh);
         status
     }
 }
@@ -1065,6 +1158,8 @@ struct Prepared {
     argv: Vec<String>,
     redirs: Vec<ExpRedir>,
     assigns: Vec<(String, Vec<WordPart>, bool)>,
+    /// Array assignments (`name=(...)`) carried by this command.
+    array_assigns: Vec<(String, Vec<Vec<WordPart>>, bool)>,
     /// The compound command (`if ... fi`) this command stands for.
     compound: Option<Compound>,
     /// The environment the command's program receives.
@@ -1239,6 +1334,7 @@ fn prepare(p: &Pipeline, sh: &mut Shell) -> Vec<Prepared> {
             dollar_zero: &sh.dollar_zero,
             attrs: &attrs,
             functions: &sh.functions,
+            arrays: &sh.arrays,
             pending_assign: Some(&pending),
         };
         for c in &p.commands {
@@ -1267,6 +1363,7 @@ fn prepare(p: &Pipeline, sh: &mut Shell) -> Vec<Prepared> {
             dollar_zero: &sh.dollar_zero,
             attrs: &attrs,
             functions: &sh.functions,
+            arrays: &sh.arrays,
             pending_assign: Some(&pending),
         };
         for (c, (argv, redirs)) in p.commands.iter().zip(expanded.into_iter()) {
@@ -1278,6 +1375,7 @@ fn prepare(p: &Pipeline, sh: &mut Shell) -> Vec<Prepared> {
                 argv,
                 redirs,
                 assigns: c.assignments.clone(),
+                array_assigns: c.array_assignments.clone(),
                 compound: c.compound.clone(),
                 env: cmd_env,
                 shell_env,
@@ -1303,6 +1401,7 @@ fn execute_pipeline(p: &Pipeline, sh: &mut Shell, path: &str) -> i32 {
             &pr.argv,
             &pr.redirs,
             &pr.assigns,
+            &pr.array_assigns,
             pr.compound.as_ref(),
             &pr.env,
             sh,
@@ -1347,6 +1446,7 @@ fn execute_pipeline(p: &Pipeline, sh: &mut Shell, path: &str) -> i32 {
             let ctx = ChildContext {
                 env: &pr.env,
                 shell_env: &pr.shell_env,
+                arrays: &sh.arrays,
                 options: &sh.options,
                 positional: &sh.positional,
                 dollar_zero: &sh.dollar_zero,

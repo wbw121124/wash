@@ -31,6 +31,8 @@ pub struct ExpandCtx<'a> {
     /// is what makes recursive functions (e.g. `fact`) work through
     /// command substitution.
     pub functions: &'a HashMap<String, parser::CommandList>,
+    /// Array variables (`name=(a b c)`).  Indexed by the (scalar) array name.
+    pub arrays: &'a HashMap<String, Vec<String>>,
     /// The assignments requested by the `${var=word}` / `${var:=word}`
     /// expansions.
     ///
@@ -38,6 +40,20 @@ pub struct ExpandCtx<'a> {
     /// the assignments are collected here and written back to the shell by
     /// the executor once the expansion is done.
     pub pending_assign: Option<&'a RefCell<Vec<(String, String)>>>,
+}
+
+/// The result of evaluating a parameter expansion.
+///
+/// A scalar expansion is a single string that, when unquoted, still undergoes
+/// IFS word-splitting.  The `@` and `*` forms of an array expansion, however,
+/// are already a *list* of fields: `@` yields one field per element (never
+/// re-split) and `*` yields a single field with the elements joined by the
+/// first character of `$IFS`.  Keeping these as a pre-split list lets the
+/// expander produce the correct number of words for `${arr[@]}` / `${arr[*]}`.
+enum Expansion {
+    Scalar(String),
+    At(Vec<String>),
+    Star(Vec<String>),
 }
 
 /// Report an unbound variable the way bash does under `set -u` and abort the
@@ -63,14 +79,17 @@ pub fn expand_scalar(parts: &[WordPart], ctx: &ExpandCtx) -> String {
     for part in parts {
         match part {
             WordPart::Text(s, _) => out.push_str(s),
-            WordPart::Var(name, _) => out.push_str(&eval_var(name, ctx)),
-            WordPart::Braced(body, _) => out.push_str(&eval_braced(body, ctx)),
+            WordPart::Var(name, _) => out.push_str(&expansion_to_scalar(eval_var(name, ctx), ctx)),
+            WordPart::Braced(body, _) => {
+                out.push_str(&expansion_to_scalar(eval_braced(body, ctx), ctx))
+            }
             WordPart::CmdSub(body, _) | WordPart::Backtick(body, _) => {
                 out.push_str(&crate::executor::capture_command(
                     body,
                     ctx.env,
                     ctx.attrs,
                     ctx.functions,
+                    ctx.arrays,
                 ));
             }
             WordPart::Arith(body, _) => out.push_str(&eval_arith(body, ctx)),
@@ -114,12 +133,12 @@ pub fn expand_word(parts: &[WordPart], ctx: &ExpandCtx) -> Vec<String> {
                     .collect();
             }
             WordPart::Var(name, quoted) => {
-                let val = eval_var(name, ctx);
-                candidates = apply_value(candidates, &val, *quoted, ctx);
+                let exp = eval_var(name, ctx);
+                candidates = apply_value(candidates, exp, *quoted, ctx);
             }
             WordPart::Braced(body, quoted) => {
-                let val = eval_braced(body, ctx);
-                candidates = apply_value(candidates, &val, *quoted, ctx);
+                let exp = eval_braced(body, ctx);
+                candidates = apply_value(candidates, exp, *quoted, ctx);
             }
             WordPart::CmdSub(body, quoted) | WordPart::Backtick(body, quoted) => {
                 let val = crate::executor::capture_command(
@@ -127,8 +146,9 @@ pub fn expand_word(parts: &[WordPart], ctx: &ExpandCtx) -> Vec<String> {
                     ctx.env,
                     ctx.attrs,
                     ctx.functions,
+                    ctx.arrays,
                 );
-                candidates = apply_value(candidates, &val, *quoted, ctx);
+                candidates = apply_value(candidates, Expansion::Scalar(val), *quoted, ctx);
             }
             WordPart::Arith(body, _) => {
                 let val = eval_arith(body, ctx);
@@ -148,28 +168,83 @@ pub fn expand_word(parts: &[WordPart], ctx: &ExpandCtx) -> Vec<String> {
     candidates
 }
 
-/// Append `val` to each candidate, applying word-splitting + globbing unless
+/// Append `exp` to each candidate, applying word-splitting + globbing unless
 /// `quoted`.
-fn apply_value(candidates: Vec<String>, val: &str, quoted: bool, ctx: &ExpandCtx) -> Vec<String> {
-    if quoted {
-        return candidates.iter().map(|c| format!("{}{}", c, val)).collect();
-    }
-    let fields = split_ifs(val);
+fn apply_value(candidates: Vec<String>, exp: Expansion, quoted: bool, ctx: &ExpandCtx) -> Vec<String> {
+    let noglob = ctx.noglob;
+    let ifs0 = ctx
+        .env
+        .get("IFS")
+        .and_then(|s| s.chars().next())
+        .unwrap_or(' ');
     let mut next = Vec::new();
     for c in &candidates {
-        if fields.is_empty() {
-            next.push(c.clone());
-        } else {
-            for f in &fields {
-                if ctx.noglob {
-                    next.push(format!("{}{}", c, f));
+        match exp {
+            Expansion::Scalar(ref s) => {
+                if quoted {
+                    next.push(format!("{}{}", c, s));
                 } else {
-                    next.push(format!("{}{}", c, glob_one(f)));
+                    let fields = split_ifs(s);
+                    if fields.is_empty() {
+                        next.push(c.clone());
+                    } else {
+                        for f in &fields {
+                            if noglob {
+                                next.push(format!("{}{}", c, f));
+                            } else {
+                                next.push(format!("{}{}", c, glob_one(f)));
+                            }
+                        }
+                    }
+                }
+            }
+            Expansion::At(ref fs) => {
+                // `${arr[@]}` — one field per element, never re-split.
+                if fs.is_empty() {
+                    next.push(c.clone());
+                } else {
+                    for f in fs {
+                        if quoted {
+                            next.push(format!("{}{}", c, f));
+                        } else if noglob {
+                            next.push(format!("{}{}", c, f));
+                        } else {
+                            next.push(format!("{}{}", c, glob_one(f)));
+                        }
+                    }
+                }
+            }
+            Expansion::Star(ref fs) => {
+                // `${arr[*]}` — elements joined by the first char of IFS into a
+                // single field (not re-split).
+                let joined = fs.join(&ifs0.to_string());
+                if quoted {
+                    next.push(format!("{}{}", c, joined));
+                } else if noglob {
+                    next.push(format!("{}{}", c, joined));
+                } else {
+                    next.push(format!("{}{}", c, glob_one(&joined)));
                 }
             }
         }
     }
     next
+}
+
+/// Reduce an `Expansion` to a single scalar string (used in assignment-RHS
+/// contexts, where array `@`/`*` are joined by the first character of `$IFS`).
+fn expansion_to_scalar(exp: Expansion, ctx: &ExpandCtx) -> String {
+    match exp {
+        Expansion::Scalar(s) => s,
+        Expansion::At(fs) | Expansion::Star(fs) => {
+            let sep = ctx
+                .env
+                .get("IFS")
+                .and_then(|s| s.chars().next())
+                .unwrap_or(' ');
+            fs.join(&sep.to_string())
+        }
+    }
 }
 
 fn split_ifs(val: &str) -> Vec<String> {
@@ -194,60 +269,71 @@ fn split_ifs(val: &str) -> Vec<String> {
 // Parameter evaluation
 // ---------------------------------------------------------------------------
 
-fn eval_var(name: &str, ctx: &ExpandCtx) -> String {
+fn eval_var(name: &str, ctx: &ExpandCtx) -> Expansion {
     match name {
-        "" => String::new(),
-        "?" => ctx.last_status.to_string(),
-        "$" => ctx.self_pid.to_string(),
-        "#" => ctx.positional.len().to_string(),
-        "@" => ctx.positional.join(" "),
+        "" => Expansion::Scalar(String::new()),
+        "?" => Expansion::Scalar(ctx.last_status.to_string()),
+        "$" => Expansion::Scalar(ctx.self_pid.to_string()),
+        "#" => Expansion::Scalar(ctx.positional.len().to_string()),
+        "@" => Expansion::At(ctx.positional.to_vec()),
         "*" => {
             // `$*` is an error under `set -u` when there are no positional
             // parameters (`$@` never is).
             if ctx.nounset && ctx.positional.is_empty() {
                 unbound_variable("$*");
             }
-            ctx.positional.join(" ")
+            Expansion::Star(ctx.positional.to_vec())
         }
-        "0" => ctx.dollar_zero.to_string(),
+        "0" => Expansion::Scalar(ctx.dollar_zero.to_string()),
         "!" => {
             // `$!` is the pid of the most recent background job; it is empty
             // when no background job has been started.
             if ctx.bg_pid == 0 {
-                String::new()
+                Expansion::Scalar(String::new())
             } else {
-                ctx.bg_pid.to_string()
+                Expansion::Scalar(ctx.bg_pid.to_string())
             }
         }
-        "-" => String::new(), // shell options (Phase 4+)
+        "-" => Expansion::Scalar(String::new()), // shell options (Phase 4+)
         _ => {
             if let Some(idx) = name.parse::<usize>().ok() {
                 if idx >= 1 && idx <= ctx.positional.len() {
-                    return ctx.positional[idx - 1].clone();
+                    return Expansion::Scalar(ctx.positional[idx - 1].clone());
                 }
                 if ctx.nounset {
                     unbound_variable(&format!("${}", idx));
                 }
-                return String::new();
+                return Expansion::Scalar(String::new());
+            }
+            // An array name with no subscript expands to element 0 (just like
+            // `$arr` / `${arr}` does in bash).
+            if let Some(elems) = ctx.arrays.get(name) {
+                if elems.is_empty() {
+                    if ctx.nounset {
+                        unbound_variable(name);
+                    }
+                    return Expansion::Scalar(String::new());
+                }
+                return Expansion::Scalar(elems[0].clone());
             }
             match ctx.env.get(name) {
-                Some(value) => value.clone(),
+                Some(value) => Expansion::Scalar(value.clone()),
                 None => {
                     if ctx.nounset {
                         unbound_variable(name);
                     }
-                    String::new()
+                    Expansion::Scalar(String::new())
                 }
             }
         }
     }
 }
 
-fn eval_braced(body: &str, ctx: &ExpandCtx) -> String {
+fn eval_braced(body: &str, ctx: &ExpandCtx) -> Expansion {
     // forms: name, name:-w, name:=w, name:+w, name:?w, #name, name:off,
     // name:off:len, name#pat, name##pat, name%pat, name%%pat,
     // name/pat/repl, name//pat/repl, name^, name^^, name,, name,,
-    // !name (indirect)
+    // name[subscript], !name (indirect)
     //
     // The "bare" operators (`-`, `=`, `+`, `?`) differ from their colon
     // variants: they only look at whether the variable is *set*, not at
@@ -255,15 +341,36 @@ fn eval_braced(body: &str, ctx: &ExpandCtx) -> String {
     if body.starts_with('#') {
         let name = &body[1..];
         if name.is_empty() {
-            return ctx.positional.len().to_string();
+            return Expansion::Scalar(ctx.positional.len().to_string());
+        }
+        // `${#arr[@]}` / `${#arr[*]}`: the number of elements.
+        // `${#arr[i]}`: the length of element `i`.
+        if let Some((arr, subscript)) = split_subscript(name) {
+            let elems = ctx.arrays.get(arr);
+            return match subscript {
+                "@" | "*" => {
+                    Expansion::Scalar(elems.map(|e| e.len()).unwrap_or(0).to_string())
+                }
+                _ => {
+                    let len = match (elems, subscript.parse::<i64>()) {
+                        (Some(e), Ok(i)) if i >= 0 && (i as usize) < e.len() => {
+                            e[i as usize].chars().count()
+                        }
+                        _ => 0,
+                    };
+                    Expansion::Scalar(len.to_string())
+                }
+            };
         }
         if !ctx.env.contains_key(name) {
             if ctx.nounset {
                 unbound_variable(name);
             }
-            return "0".to_string();
+            return Expansion::Scalar("0".to_string());
         }
-        return ctx.env.get(name).map(|v| v.len().to_string()).unwrap_or_else(|| "0".to_string());
+        return Expansion::Scalar(
+            ctx.env.get(name).map(|v| v.len().to_string()).unwrap_or_else(|| "0".to_string()),
+        );
     }
     if body.starts_with('!') && !body.contains(':') && !body.contains('/') && !body.contains('%')
         && !body.contains('#')
@@ -271,22 +378,86 @@ fn eval_braced(body: &str, ctx: &ExpandCtx) -> String {
         // indirect expansion ${!VAR}
         let name = &body[1..];
         let target = ctx.env.get(name).cloned().unwrap_or_default();
-        return ctx.env.get(&target).cloned().unwrap_or_default();
+        return Expansion::Scalar(ctx.env.get(&target).cloned().unwrap_or_default());
     }
 
-    let (name, op, arg) = split_braced(body);
+    let (rawname, op, arg) = split_braced(body);
 
-    // Whether the variable exists at all — the bare operators only care
-    // about this, the colon variants also look at the value being empty.
-    let is_set = ctx.env.contains_key(name);
-    let value = ctx.env.get(name).cloned().unwrap_or_default();
+    // Array subscript handling: `name[subscript]`.  `${a[@]}` / `${a[*]}`
+    // yield one field per element / a single IFS-joined field, and
+    // `${a[i]}` yields element `i` (0-based) as a scalar.
+    if let Some((name, subscript)) = split_subscript(rawname) {
+        let elems = ctx.arrays.get(name).cloned().unwrap_or_default();
+        match subscript {
+            "@" => return Expansion::At(elems),
+            "*" => return Expansion::Star(elems),
+            _ => {
+                let val = if let Ok(i) = subscript.parse::<i64>() {
+                    if i >= 0 && (i as usize) < elems.len() {
+                        elems[i as usize].clone()
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                };
+                return Expansion::Scalar(apply_scalar_op(
+                    &val,
+                    name,
+                    op,
+                    arg,
+                    !val.is_empty(),
+                    val.is_empty(),
+                    ctx,
+                ));
+            }
+        }
+    }
+
+    // A name that names an array (with no subscript) expands to element 0,
+    // just like `$arr` / `${arr}` does in bash.
+    let arr_elems = ctx.arrays.get(rawname);
+    let is_set = ctx.env.contains_key(rawname) || arr_elems.is_some();
+    let value = match arr_elems {
+        Some(e) if !e.is_empty() => e[0].clone(),
+        _ => ctx.env.get(rawname).cloned().unwrap_or_default(),
+    };
     let unset_or_empty = !is_set || value.is_empty();
 
+    let result = apply_scalar_op(&value, rawname, op, arg, is_set, unset_or_empty, ctx);
+    Expansion::Scalar(result)
+}
+
+/// Split `raw` into `(name, subscript)` when it has the form `name[subscript]`.
+/// Returns `None` for a plain (non-subscripted) name.
+fn split_subscript(raw: &str) -> Option<(&str, &str)> {
+    let open = raw.find('[')?;
+    let rest = &raw[open + 1..];
+    let close = rest.find(']')?;
+    let name = &raw[..open];
+    if name.is_empty() {
+        return None;
+    }
+    Some((name, &rest[..close]))
+}
+
+/// Apply a (possibly empty) braced-operator to a scalar `val`, returning the
+/// resulting string.  `is_set` / `unset_or_empty` carry the variable's status
+/// so the bare vs colon operators behave correctly.  The `""` (no-operator)
+/// arm also forwards special parameters to `eval_var`.
+fn apply_scalar_op(
+    val: &str,
+    name: &str,
+    op: &str,
+    arg: &str,
+    is_set: bool,
+    unset_or_empty: bool,
+    ctx: &ExpandCtx,
+) -> String {
     match op {
-        // `${var-word}`: use `word` only when the variable is *unset*.
         "-" => {
             if is_set {
-                value
+                val.to_string()
             } else {
                 arg.to_string()
             }
@@ -295,10 +466,9 @@ fn eval_braced(body: &str, ctx: &ExpandCtx) -> String {
             if unset_or_empty {
                 arg.to_string()
             } else {
-                value
+                val.to_string()
             }
         }
-        // `${var+word}`: use `word` when the variable is set (even if empty).
         "+" => {
             if is_set {
                 arg.to_string()
@@ -313,77 +483,69 @@ fn eval_braced(body: &str, ctx: &ExpandCtx) -> String {
                 arg.to_string()
             }
         }
-        // `${var=word}`: assign `word` when the variable is unset.
         "=" => {
             if is_set {
-                value
+                val.to_string()
             } else {
                 assign_default(ctx, name, arg);
                 arg.to_string()
             }
         }
-        // `${var:=word}`: assign `word` when the variable is unset or empty.
         ":=" => {
             if unset_or_empty {
                 assign_default(ctx, name, arg);
                 arg.to_string()
             } else {
-                value
+                val.to_string()
             }
         }
-        // `${var?word}`: complain when the variable is unset.
         "?" => {
             if is_set {
-                value
+                val.to_string()
             } else {
-                expansion_error(name, arg);
+                expansion_error(name, arg)
             }
         }
         ":?" => {
             if unset_or_empty {
                 expansion_error(name, arg);
             }
-            value
+            val.to_string()
         }
-        ":" => {
-            // substring ${name:offset} or ${name:offset:length}
-            substring(&value, arg)
-        }
-        "#" => strip_prefix(&value, arg, false),
-        "##" => strip_prefix(&value, arg, true),
-        "%" => strip_suffix(&value, arg, false),
-        "%%" => strip_suffix(&value, arg, true),
-        "/" | "//" => replace_pattern(&value, arg, op == "//"),
+        ":" => substring(val, arg),
+        "#" => strip_prefix(val, arg, false),
+        "##" => strip_prefix(val, arg, true),
+        "%" => strip_suffix(val, arg, false),
+        "%%" => strip_suffix(val, arg, true),
+        "/" | "//" => replace_pattern(val, arg, op == "//"),
         "^" => {
-            let mut c = value.chars();
+            let mut c = val.chars();
             match c.next() {
                 Some(f) => format!("{}{}", f.to_uppercase().collect::<String>(), c.collect::<String>()),
-                None => value.to_string(),
+                None => val.to_string(),
             }
         }
-        "^^" => value.to_uppercase(),
+        "^^" => val.to_uppercase(),
         "," => {
-            let mut c = value.chars();
+            let mut c = val.chars();
             match c.next() {
                 Some(f) => format!("{}{}", f.to_lowercase().collect::<String>(), c.collect::<String>()),
-                None => value.to_string(),
+                None => val.to_string(),
             }
         }
-        ",," => value.to_lowercase(),
+        ",," => val.to_lowercase(),
         "" => {
-            // A plain `${NAME}` reference: `set -u` makes an unset variable
-            // an error.
-            if !ctx.env.contains_key(name) && ctx.nounset {
+            // A plain `${NAME}` reference.  Under `set -u` an unset variable
+            // is an error; the special parameters are forwarded to `eval_var`.
+            if !is_set && ctx.nounset {
                 unbound_variable(name);
             }
-            // The special parameters (`$?`, `$#`, `$@`, ...) are not part of
-            // the variable table.
             if is_special_param(name) {
-                return eval_var(name, ctx);
+                return expansion_to_scalar(eval_var(name, ctx), ctx);
             }
-            value
+            val.to_string()
         }
-        _ => value,
+        _ => val.to_string(),
     }
 }
 
@@ -969,6 +1131,7 @@ impl<'a> ArithParser<'a> {
                         self.ctx.env,
                         self.ctx.attrs,
                         self.ctx.functions,
+                        self.ctx.arrays,
                     );
                     return Ok(out.trim().parse::<i64>().unwrap_or(0));
                 }
