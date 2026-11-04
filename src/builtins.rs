@@ -4312,16 +4312,30 @@ fn builtin_kill(argv: &[String], sh: &mut Shell) -> i32 {
         // `kill -l SIGSPEC` → name for a number, number for a name.
         let spec = &argv[2];
         if let Ok(n) = spec.trim().parse::<i32>() {
-            if let Some(name) = signal_name(n) {
-                println!("{}", name);
+            // 数字信号号 → 裸名（不含 SIG 前缀，与 bash 一致）。
+            match signal_name(n) {
+                Some(name) => {
+                    println!("{}", name);
+                    return 0;
+                }
+                None => {
+                    eprintln!("wash: kill: {}: invalid signal specification", spec);
+                    return 1;
+                }
             }
-            return 0;
         }
-        if let Some(n) = canonical_signal(spec) {
-            // spec is a name → print its number.
-            let num = signal_to_num(&n);
-            println!("{}", num);
-            return 0;
+        // 信号名（含 RTMIN+n / RTMAX-n）→ 编号。
+        if let Some(cn) = canonical_signal(spec) {
+            let bare = cn.strip_prefix("SIG").unwrap_or(&cn);
+            let num = if let Some(pos) = base_signal_names().iter().position(|x| *x == bare) {
+                Some((pos + 1) as i32)
+            } else {
+                parse_rt_name(bare)
+            };
+            if let Some(num) = num {
+                println!("{}", num);
+                return 0;
+            }
         }
         eprintln!("wash: kill: {}: invalid signal specification", spec);
         return 1;
@@ -4421,68 +4435,133 @@ fn builtin_kill(argv: &[String], sh: &mut Shell) -> i32 {
     status
 }
 
-/// Print the bash-like numbered signal table.
+/// 信号总数（bash 在本平台输出 1..64，含 33 个实时信号）。
+const SIGNAL_COUNT: i32 = 64;
+
+/// 基础信号名（1..=32，不含 `SIG` 前缀），与 bash 在本平台的编号一致。
+fn base_signal_names() -> &'static [&'static str] {
+    &[
+        "HUP", "INT", "QUIT", "ILL", "TRAP", "ABRT", "EMT", "FPE", "KILL", "BUS", "SEGV", "SYS",
+        "PIPE", "ALRM", "TERM", "URG", "STOP", "TSTP", "CONT", "CHLD", "TTIN", "TTOU", "IO",
+        "XCPU", "XFSZ", "VTALRM", "PROF", "WINCH", "PWR", "USR1", "USR2", "RTMIN",
+    ]
+}
+
+/// 实时信号（33..=64）的裸名：32=RTMIN，33..=48=RTMIN+n，49..=63=RTMAX-(64-n)，64=RTMAX。
+fn rt_signal_name(num: i32) -> Option<String> {
+    if num == 32 {
+        return Some("RTMIN".to_string());
+    }
+    if num == 64 {
+        return Some("RTMAX".to_string());
+    }
+    if (33..=48).contains(&num) {
+        return Some(format!("RTMIN+{}", num - 32));
+    }
+    if (49..=63).contains(&num) {
+        return Some(format!("RTMAX-{}", 64 - num));
+    }
+    None
+}
+
+/// 将形如 `RTMIN` / `RTMIN+5` / `RTMAX` / `RTMAX-3` 的裸名解析为 1-based 信号号。
+/// 越界或格式不符返回 `None`。
+fn parse_rt_name(s: &str) -> Option<i32> {
+    if s == "RTMIN" {
+        return Some(32);
+    }
+    if s == "RTMAX" {
+        return Some(64);
+    }
+    if let Some(rest) = s.strip_prefix("RTMIN+") {
+        if let Ok(k) = rest.trim().parse::<i32>() {
+            let num = 32 + k;
+            if (33..=48).contains(&num) {
+                return Some(num);
+            }
+        }
+        return None;
+    }
+    if let Some(rest) = s.strip_prefix("RTMAX-") {
+        if let Ok(k) = rest.trim().parse::<i32>() {
+            let num = 64 - k;
+            if (49..=63).contains(&num) {
+                return Some(num);
+            }
+        }
+        return None;
+    }
+    None
+}
+
+/// 打印 bash 风格的带编号信号表：5 列、按行优先排列，形如
+/// ` 1) SIGHUP\t 2) SIGINT\t ...`，末尾用制表符分隔。
 fn print_signal_table() {
-    let names = signal_names();
-    let mut row = 0;
-    while row < names.len() {
-        for col in 0..4 {
-            let idx = row + col * 16;
-            if idx >= names.len() {
+    const COLS: usize = 5;
+    let mut n = 0i32;
+    while n < SIGNAL_COUNT {
+        let mut last_col: i32 = -1;
+        for col in 0..COLS {
+            if n >= SIGNAL_COUNT {
                 break;
             }
             if col > 0 {
                 print!("\t");
             }
-            let num = idx + 1;
-            print!("{:>2}) SIG{}", num, names[idx]);
+            let num = n + 1;
+            let name = signal_name(num).unwrap_or_default();
+            print!("{:>2}) SIG{}", num, name);
+            n += 1;
+            last_col = col as i32;
+        }
+        // bash 在最后一行（不满 5 列）行末额外输出一个分隔 tab，
+        // 而完整行行末只有换行。逐字节对齐需据此区分。
+        if last_col >= 0 && (last_col as usize) < COLS - 1 {
+            print!("\t");
         }
         println!();
-        row += 16;
     }
 }
 
-/// The signal names in numeric order (1-based, like bash).
-fn signal_names() -> Vec<&'static str> {
-    vec![
-        "HUP", "INT", "QUIT", "ILL", "TRAP", "ABRT", "EMT", "FPE", "KILL", "BUS", "SEGV", "SYS",
-        "PIPE", "ALRM", "TERM", "URG", "STOP", "TSTP", "CONT", "CHLD", "TTIN", "TTOU", "IO",
-        "XCPU", "XFSZ", "VTALRM", "PROF", "WINCH", "PWR", "USR1", "USR2", "RTMIN", "RTMAX",
-    ]
-}
-
-/// Map a signal number (1-based) to its bash name (e.g. 9 → "KILL").
-fn signal_name(num: i32) -> Option<&'static str> {
-    let names = signal_names();
-    if num >= 1 && (num as usize) <= names.len() {
-        Some(names[(num - 1) as usize])
-    } else {
-        None
+/// Map a signal number (1-based) to its bash name (e.g. 9 → "KILL", 33 → "RTMIN+1").
+fn signal_name(num: i32) -> Option<String> {
+    if num >= 1 && num <= 32 {
+        return Some(base_signal_names()[(num - 1) as usize].to_string());
     }
+    if num >= 33 && num <= 64 {
+        return rt_signal_name(num);
+    }
+    None
 }
 
 /// Map a canonical signal name (e.g. "SIGINT") to its number.
 fn signal_to_num(name: &str) -> i32 {
     let n = name.strip_prefix("SIG").unwrap_or(name);
-    signal_names()
-        .iter()
-        .position(|x| *x == n)
-        .map(|i| (i + 1) as i32)
-        .unwrap_or(-1)
+    if let Some(pos) = base_signal_names().iter().position(|x| *x == n) {
+        return (pos + 1) as i32;
+    }
+    if let Some(num) = parse_rt_name(n) {
+        return num;
+    }
+    -1
 }
 
-/// Canonicalise a signal spec (`INT`, `SIGINT`, `2`, `EXIT`, `USR1`) to the
-/// `SIGxxx` form bash stores and prints (special traps like EXIT stay as-is).
+/// Canonicalise a signal spec (`INT`, `SIGINT`, `2`, `EXIT`, `USR1`, `RTMIN+3`)
+/// to the `SIGxxx` form bash stores and prints (special traps like EXIT stay as-is).
 fn canonical_signal(spec: &str) -> Option<String> {
     let s = spec.strip_prefix("SIG").unwrap_or(spec);
     if s == "EXIT" {
         return Some("EXIT".to_string());
     }
     let upper = s.to_uppercase();
-    if signal_names().iter().any(|x| *x == upper) {
+    if base_signal_names().iter().any(|x| *x == upper) {
         return Some(format!("SIG{}", upper));
     }
-    // Maybe it is a number.
+    if let Some(num) = parse_rt_name(&upper) {
+        // 规范名保留 RTMIN+n / RTMAX-n 形式（如 `SIGRTMIN+3`），与 bash 一致。
+        return rt_signal_name(num).map(|bare| format!("SIG{}", bare));
+    }
+    // 也许是一个数字。
     if let Ok(num) = s.trim().parse::<i32>() {
         if let Some(name) = signal_name(num) {
             return Some(format!("SIG{}", name));
