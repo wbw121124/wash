@@ -1391,6 +1391,9 @@ fn prepare(p: &Pipeline, sh: &mut Shell) -> Vec<Prepared> {
 }
 
 fn execute_pipeline(p: &Pipeline, sh: &mut Shell, path: &str) -> i32 {
+    if p.background {
+        return execute_background(p, sh, path);
+    }
     let noclobber = sh.options.noclobber;
     let pipefail = sh.options.pipefail;
     let prepared = prepare(p, sh);
@@ -1491,6 +1494,36 @@ fn execute_pipeline(p: &Pipeline, sh: &mut Shell, path: &str) -> i32 {
     } else {
         last
     }
+}
+
+/// Run the pipeline in the background (`cmd &`).
+///
+/// We fork once; the child runs the whole pipeline normally (with the
+/// `background` flag cleared so it does not recurse) and then exits with that
+/// pipeline's status.  The parent records the child pid in `Shell.jobs`, sets
+/// `$!`, prints the bash-style `[job] pid` line and returns immediately, so the
+/// REPL stays responsive.  This is the scaffolding the `jobs`/`fg`/`bg`/`wait`
+/// builtins build on.
+fn execute_background(p: &Pipeline, sh: &mut Shell, path: &str) -> i32 {
+    let pid = posix::fork();
+    if pid == 0 {
+        // 子进程：像前台一样跑完整个流水线（每个阶段会再 fork 一次并等待），
+        // 然后用该流水线的状态退出。
+        let mut p2 = p.clone();
+        p2.background = false;
+        let code = execute_pipeline(&p2, sh, path);
+        posix::exit(code);
+    }
+    // 父进程。
+    sh.jobs.push(pid);
+    sh.bg_pid = pid;
+    let jobno = sh.jobs.len();
+    // bash 只在交互式 shell（且打开了作业控制）里通报后台作业的启动；
+    // 非交互的 `bash -c 'sleep 1 &'` 什么都不打印。通报信息走 stderr。
+    if sh.interactive {
+        eprintln!("[{}] {}", jobno, pid);
+    }
+    0
 }
 
 /// Run one AND-OR list: the pipelines joined by `&&` / `||`, evaluated from

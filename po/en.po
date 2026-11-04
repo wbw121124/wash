@@ -1,0 +1,49 @@
+# English catalog for wash.
+#
+# The English text is the msgid itself, so this catalog mainly serves as the
+# reference: `msgstr` entries mirror the msgid.  A missing entry falls back to
+# the msgid, which keeps the English output byte-identical to the source
+# strings.
+msgid ""
+msgstr ""
+"Project-Id-Version: wash 0.0.1\n"
+"PO-Revision-Date: 2026-01-01 00:00+0800\n"
+"Last-Translator: wash i18n <wash@example.invalid>\n"
+"Language-Team: wash <wash@example.invalid>\n"
+"Language: en\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+
+msgid "These shell commands are defined internally.  Type `help' to see this list."
+msgstr "These shell commands are defined internally.  Type `help' to see this list."
+
+msgid "Type `help name' to find out more about the function `name'."
+msgstr "Type `help name' to find out more about the function `name'."
+
+msgid "no help topics match `%s'."
+msgstr "no help topics match `%s'."
+
+msgid "Builtin"
+msgstr "Builtin"
+
+msgid "Function"
+msgstr "Function"
+
+msgid "Directory"
+msgstr "Directory"
+
+msgid "File, %s"
+msgstr "File, %s"
+
+msgid "Symlink"
+msgstr "Symlink"
+
+msgid "Executable, %s"
+msgstr "Executable, %s"
+
+msgid "Executable link, %s"
+msgstr "Executable link, %s"
+
+msgid "rows %d to %d of %d"
+msgstr "rows %d to %d of %d"

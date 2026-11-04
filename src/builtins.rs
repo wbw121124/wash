@@ -22,6 +22,8 @@ use std::io::Write;
 use crate::arith;
 use crate::posix;
 use crate::shell::{Shell, SET_O_ORDER, SHOPT_ORDER};
+// fish 风格的翻译宏 `tr!("...")`，参见 `src/i18n.rs`。
+use crate::tr;
 
 // ---------------------------------------------------------------------------
 // Dispatch
@@ -48,6 +50,7 @@ const BUILTINS: &[&str] = &[
     "export",
     "false",
     "hash",
+    "help",
     "kill",
     "let",
     "local",
@@ -124,6 +127,7 @@ pub fn run_builtin(argv: &[String], sh: &mut Shell) -> Option<i32> {
         "dirs" => builtin_dirs(argv, sh),
         "pushd" => builtin_pushd(argv, sh),
         "popd" => builtin_popd(argv, sh),
+        "help" => builtin_help(argv, sh),
         _ => return None,
     };
     Some(code)
@@ -4811,6 +4815,96 @@ fn ansi_quote(value: &str) -> String {
     }
     out.push('\'');
     out
+}
+
+// ---------------------------------------------------------------------------
+// help
+// ---------------------------------------------------------------------------
+
+/// 每个内建命令的用法摘要，`help NAME` 时打印。
+///
+/// 只收录已经有明确用法的内建；其余的内建只打印名字（与 bash 的 `help`
+/// 列出用法行不同，但 wash 并没有为每个内建维护用法文本）。
+const BUILTIN_USAGE: &[(&str, &str)] = &[
+    ("alias", "alias [-p] [name[=value] ... ]"),
+    ("builtin", "builtin [shell-builtin [arg ...]]"),
+    ("cd", "cd [-L|[-P [-e]]] [-@] [dir]"),
+    ("command", "command [-pVv] command [arg ...]"),
+    ("declare", "declare [-aAfFgilrtux] [-p] [name[=value] ...]"),
+    ("dirs", "dirs [-clpv] [+N] [-N]"),
+    ("enable", "enable [-a] [-dnps] [-f filename] [name ...]"),
+    ("exec", "exec [-a name] [command [arguments ...]] [redirection ...]"),
+    ("export", "export [-fn] [name[=value] ...] or export -p [-f]"),
+    ("hash", "hash [-lr] [-p pathname] [-dt] [name ...]"),
+    ("kill", "kill [-s sigspec | -n signum | -sigspec] pid | jobspec ... or kill -l [sigspec]"),
+    ("popd", "popd [-n] [+N | -N]"),
+    ("pwd", "pwd [-LPW]"),
+    ("readonly", "readonly [-aAf] [name[=value] ...] or readonly -p"),
+    ("set", "set [-abefhkmnptuvxBCEHPT] [-o option-name] [--] [-] [arg ...]"),
+    ("shopt", "shopt [-psu] [-o] [option ...]"),
+    ("source", "source [-p path] filename [arguments]"),
+    ("type", "type [-afptP] name [name ...]"),
+    ("umask", "umask [-p] [-S] [mode]"),
+    ("unalias", "unalias [-a] name [name ...]"),
+    ("unset", "unset [-f] [-v] [-n] [name ...]"),
+];
+
+/// `help` 内建：列出 wash 自己支持的内建命令。
+///
+///   * `help`          —— 打印全部内建命令的清单；
+///   * `help NAME ...` —— 打印指定内建命令的用法。
+///
+/// `help` 必须走内建表：如果把它当成外部命令，Windows 上会落到 `help.exe`
+/// ——在 `LC_ALL=C` 下会挂起，在中文 locale 下还会输出 GBK 乱码。
+///
+/// 说明文本按当前 locale 本地化（参见 `src/i18n.rs`）：`LC_ALL=C` 下是英文，
+/// `zh_CN.UTF-8` 下是中文。
+fn builtin_help(argv: &[String], sh: &mut Shell) -> i32 {
+    let names: Vec<&str> = argv.iter().skip(1).map(|s| s.as_str()).collect();
+    if names.is_empty() {
+        // 抬头用 `$BASH_VERSION`（诚实标注 wash 自己的版本，不冒充 bash）。
+        let version = sh
+            .env
+            .get("BASH_VERSION")
+            .cloned()
+            .unwrap_or_else(|| "wash".to_string());
+        println!("{}", version);
+        println!(
+            "{}",
+            tr!("These shell commands are defined internally.  Type `help' to see this list.")
+        );
+        println!(
+            "{}",
+            tr!("Type `help name' to find out more about the function `name'.")
+        );
+        println!();
+        // 逐个列出内建命令；有用法摘要的连用法一起打印（和 bash 的清单一个
+        // 思路，只是 wash 的内建集合与 bash 不同）。用法摘要本身已经带了
+        // 命令名，所以这里不再重复一遍。
+        for b in BUILTINS {
+            match BUILTIN_USAGE.iter().find(|(n, _)| n == b) {
+                Some((_, usage)) => println!("  {}", usage),
+                None => println!("  {}", b),
+            }
+        }
+        return 0;
+    }
+
+    let mut status = 0;
+    for name in names {
+        if !is_builtin(name) {
+            // bash 的写法是 "help: no help topics match `foo'."，退出码 1。
+            let msg = tr!("no help topics match `%s'.");
+            eprintln!("wash: help: {}", msg.replace("%s", name));
+            status = 1;
+            continue;
+        }
+        match BUILTIN_USAGE.iter().find(|(n, _)| *n == name) {
+            Some((_, usage)) => println!("{}", usage),
+            None => println!("{}", name),
+        }
+    }
+    status
 }
 
 // ---------------------------------------------------------------------------

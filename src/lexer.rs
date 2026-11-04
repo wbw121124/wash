@@ -701,14 +701,6 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
         return Err(WashError::syntax("unexpected EOF while looking for matching quote"));
     }
 
-    for t in &tokens {
-        if let Token::Background = t {
-            return Err(WashError::syntax(
-                "background jobs (`&`) are not supported yet (Phase 2)",
-            ));
-        }
-    }
-
     Ok(tokens)
 }
 

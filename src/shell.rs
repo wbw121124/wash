@@ -323,6 +323,15 @@ pub struct Shell {
     /// A fatal error that aborts the rest of a `-c` script the way bash does
     /// after an assignment to a readonly variable. The value is the exit code.
     pub fatal_error: Option<i32>,
+
+    /// True while a profile file is being sourced: the shell's own parse and
+    /// lex errors are then suppressed.
+    ///
+    /// bash 的 profile 文件是用合法的 bash 语法写的，bash 读它们不会报错；
+    /// wash 的语法覆盖还不全，读同一个文件可能失败。这种失败是 wash 自身的
+    /// 限制，不应该混进命令的输出里，所以这里把错误静音（bash 在同样的情形
+    /// 下也是"干净"的输出）。
+    pub quiet_errors: bool,
 }
 
 impl Shell {
@@ -426,6 +435,7 @@ impl Shell {
             arrays: HashMap::new(),
             history: Vec::new(),
             fatal_error: None,
+            quiet_errors: false,
         };
         Self::populate_internal_variables(&mut sh);
         sh
@@ -521,12 +531,16 @@ impl Shell {
                     c
                 }
                 Err(e) => {
-                    eprintln!("wash: {}", e);
+                    if !self.quiet_errors {
+                        eprintln!("wash: {}", e);
+                    }
                     2
                 }
             },
             Err(e) => {
-                eprintln!("wash: {}", e);
+                if !self.quiet_errors {
+                    eprintln!("wash: {}", e);
+                }
                 2
             }
         };

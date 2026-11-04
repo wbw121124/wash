@@ -1,11 +1,17 @@
-// wash entry point. Phase 0: supports `-c <command>` (non-interactive, used
-// for oracle comparison tests) and a plain interactive REPL.
+// wash 入口：支持 `-c <command>`（非交互，供对拍测试用）与交互式 REPL。
+//
+// 参数风格与 bash 对齐：
+//   * `-c CMD`         —— 执行 CMD 后退出；
+//   * `-l`             —— 登录 shell（读取 profile 文件）；
+//   * `-lc CMD`        —— 上面两个的组合写法；
+//   * `-i`             —— 强制交互式。
 
 mod arith;
 mod builtins;
 mod error;
 mod executor;
 mod expand;
+mod i18n;
 mod lexer;
 mod parser;
 mod posix;
@@ -15,22 +21,110 @@ mod shell;
 use std::process::exit;
 
 fn main() {
+    // 本地化必须在任何输出之前初始化：`help` 等内建命令的说明文本要按
+    // 当前 locale 翻译（`LC_ALL=C` 下是英文，`zh_CN.UTF-8` 下是中文）。
+    i18n::init();
+
     let args: Vec<String> = std::env::args().collect();
     let mut sh = shell::Shell::new();
-    // `$0` is the path the shell was invoked with, exactly like in bash.
+    // `$0` 就是 shell 被调用时用的路径，与 bash 一致。
     if let Some(argv0) = args.first() {
         sh.dollar_zero = argv0.clone();
-        // `$BASH` is the path the shell was invoked with (bash's own name).
         sh.env.insert("BASH".to_string(), argv0.clone());
     }
 
-    if args.len() >= 2 && (args[1] == "-c" || args[1] == "--command") {
-        if args.len() < 3 {
+    // 解析短选项：`-c`、`-l`、`-i` 可以组合（`-lc`、`-cl` ...）。
+    let mut want_command = false;
+    let mut login = false;
+    let mut force_interactive = false;
+    let mut command: Option<String> = None;
+    let mut i = 1usize;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "--" {
+            i += 1;
+            break;
+        }
+        if a.starts_with("--") {
+            match a.as_str() {
+                "--help" => {
+                    println!("wash - a bash-compatible shell with fish-like interactive UX");
+                    println!("usage: wash [-l] [-i] [-c <command>]");
+                    exit(0);
+                }
+                "--version" => {
+                    println!("wash 0.0.1");
+                    exit(0);
+                }
+                "--command" => {
+                    want_command = true;
+                    i += 1;
+                    break;
+                }
+                _ => {
+                    eprintln!("wash: {}: invalid option", a);
+                    exit(2);
+                }
+            }
+        }
+        if a.starts_with('-') && a.len() > 1 {
+            for c in a[1..].chars() {
+                match c {
+                    'c' => want_command = true,
+                    'l' => login = true,
+                    'i' => force_interactive = true,
+                    _ => {
+                        eprintln!("wash: -{}: invalid option", c);
+                        eprintln!("usage: wash [-l] [-i] [-c <command>]");
+                        exit(2);
+                    }
+                }
+            }
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    if want_command {
+        // `-c` 的参数是紧跟其后的那个（`-lc CMD` 也一样）。
+        if i >= args.len() {
             eprintln!("wash: -c requires an argument");
             exit(2);
         }
-        let code = sh.run_str(&args[2]);
-        // Fire the EXIT trap (bash runs it just before the shell exits).
+        command = Some(args[i].clone());
+    }
+
+    if login {
+        // 登录 shell：读取 profile 文件（与 bash 的顺序一致）。文件不存在或
+        // 出错时静默忽略，跟 bash 一样。
+        //
+        // 读取期间把 wash 自己的语法错误静音：bash 读同一个文件不会报错，
+        // wash 的语法覆盖还不全，失败不应该污染命令的输出。
+        sh.quiet_errors = true;
+        for f in [
+            "/etc/profile",
+            "~/.bash_profile",
+            "~/.bash_login",
+            "~/.profile",
+        ] {
+            let path = if let Some(rest) = f.strip_prefix("~/") {
+                match std::env::var("HOME") {
+                    Ok(home) => format!("{}/{}", home, rest),
+                    Err(_) => continue,
+                }
+            } else {
+                f.to_string()
+            };
+            if std::path::Path::new(&path).is_file() {
+                sh.run_str(&format!(". {}", quote_for_shell(&path)));
+            }
+        }
+        sh.quiet_errors = false;
+    }
+
+    if let Some(cmd) = command {
+        let code = sh.run_str(&cmd);
+        // 退出前触发 EXIT trap（bash 就在退出前做这件事）。
         if let Some(action) = sh.traps.get("EXIT").cloned() {
             if action != "-" {
                 sh.run_str(&action);
@@ -39,16 +133,14 @@ fn main() {
         exit(code);
     }
 
-    if args.len() >= 2 && (args[1] == "-h" || args[1] == "--help") {
-        println!("wash - a bash-compatible shell with fish-like interactive UX");
-        println!("usage: wash [-c <command>]");
-        exit(0);
+    if force_interactive {
+        sh.run_interactive();
+        return;
     }
-
-    if args.len() >= 2 && args[1] == "--version" {
-        println!("wash 0.0.1");
-        exit(0);
-    }
-
     sh.run_interactive();
+}
+
+/// 给路径加单引号，便于安全地拼进 `source` 命令里。
+fn quote_for_shell(path: &str) -> String {
+    format!("'{}'", path.replace('\'', "'\\''"))
 }

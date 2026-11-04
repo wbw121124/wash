@@ -27,8 +27,10 @@
 
 #![allow(dead_code)]
 
+use crate::i18n;
 use crate::posix;
 use crate::shell::Shell;
+use crate::tr;
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -183,7 +185,7 @@ struct Editor {
     history: Vec<String>,
     hist_pos: Option<usize>, // Some(i) while navigating, None when editing fresh
     draft: String,           // saved buffer when history navigation began
-    completions: Option<Vec<String>>, // candidate list shown below input
+    completions: Option<Vec<(String, String)>>, // (候选名, 本地化描述) 列表，显示在输入下方
     last_total: usize,       // physical lines rendered last time (for clearing)
 }
 
@@ -365,7 +367,7 @@ impl Editor {
     }
 
     fn complete(&mut self) {
-        // Only complete at end-of-line for simplicity.
+        // 只在行尾触发补全，保持简单。
         if self.cursor != self.char_count() {
             self.completions = None;
             return;
@@ -373,28 +375,30 @@ impl Editor {
         let (word_start, word) = self.current_word();
         let prefix = &self.buffer[..char_to_byte(&self.buffer, word_start)];
         let is_cmd = word_start == 0 || is_command_position(prefix);
-        let candidates = if is_cmd && !word.contains('/') {
+        let cands = if is_cmd && !word.contains('/') {
             complete_command(&word)
         } else {
             complete_file(&word)
         };
-        if candidates.is_empty() {
+        if cands.is_empty() {
             self.completions = None;
             return;
         }
-        if candidates.len() == 1 {
-            let mut rep = candidates[0].clone();
+        // 只取名字列表用于公共前缀与替换计算（描述不参与替换）。
+        let names: Vec<String> = cands.iter().map(|(n, _)| n.clone()).collect();
+        if cands.len() == 1 {
+            let mut rep = cands[0].0.clone();
             if !rep.ends_with('/') {
                 rep.push(' ');
             }
             self.apply_replacement(word_start, &word, &rep);
             self.completions = None;
         } else {
-            let cp = common_prefix(&candidates);
+            let cp = common_prefix(&names);
             if cp.len() > word.len() {
                 self.apply_replacement(word_start, &word, &cp);
             }
-            self.completions = Some(vec![candidates.join("  ")]);
+            self.completions = Some(cands);
         }
     }
 
@@ -446,13 +450,32 @@ impl Editor {
             }
         }
 
-        // Draw the completion candidate list (counts as extra lines).
+        // 绘制补全候选列表：每个候选占一行，形如 `name (描述)`，描述按当前
+        // locale 本地化。候选超过一屏时只显示前 `page_limit()` 行，并用 fish
+        // 风格的 `rows N to M of K` 状态行提示剩余数量。
         let cand_lines = match &self.completions {
             Some(c) => {
-                for cl in c {
-                    print!("\r\n\x1b[K{}", cl);
+                let limit = page_limit();
+                let shown_count = c.len().min(limit);
+                for (name, desc) in c.iter().take(limit) {
+                    let line = if desc.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{} ({})", name, desc)
+                    };
+                    print!("\r\n\x1b[K{}", line);
                 }
-                c.len()
+                let mut lines = shown_count;
+                if c.len() > limit {
+                    // 状态行：`rows 1 to {limit} of {total}`（按 locale 本地化）。
+                    let status = i18n::format_msg(
+                        "rows %d to %d of %d",
+                        &[1.to_string(), limit.to_string(), c.len().to_string()],
+                    );
+                    print!("\r\n\x1b[K{}", status);
+                    lines += 1;
+                }
+                lines
             }
             None => 0,
         };
@@ -761,8 +784,8 @@ fn is_command_position(prefix: &str) -> bool {
     t.ends_with('|') || t.ends_with('&') || t.ends_with(';') || t.ends_with('(') || t.ends_with('{')
 }
 
-fn complete_command(word: &str) -> Vec<String> {
-    let mut cands: Vec<String> = Vec::new();
+fn complete_command(word: &str) -> Vec<(String, String)> {
+    let mut cands: Vec<(String, String)> = Vec::new();
     const BUILTINS: &[&str] = &[
         "echo", "printf", "cd", "exit", "export", "set", "unset", "read", "source", ".", "alias",
         "unalias", "true", "false", "pwd", "test", "[", "kill", "wait", "jobs", "fg", "bg", "eval",
@@ -770,11 +793,13 @@ fn complete_command(word: &str) -> Vec<String> {
         "trap", "shift", "times", "umask", "shopt", "help", "let", "bind", "builtin", "command",
         "dirs", "popd", "pushd", "fc", "disown", "enable", "history", "complete",
     ];
+    // 内建命令标注为 Builtin（按当前 locale 本地化）。
     for b in BUILTINS {
         if b.starts_with(word) {
-            cands.push((*b).to_string());
+            cands.push(((*b).to_string(), tr!("Builtin")));
         }
     }
+    // PATH 里的可执行文件：标注 `Executable, %s`（%s 是 fish 风格的大小串）。
     if let Some(path) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path) {
             let Ok(entries) = fs::read_dir(&dir) else {
@@ -785,25 +810,27 @@ fn complete_command(word: &str) -> Vec<String> {
                 if name.starts_with(word) {
                     if let Some(s) = e.path().to_str() {
                         if e.path().is_file() && posix::access(s, posix::X_OK) == 0 {
-                            cands.push(name);
+                            let desc = describe_path(s);
+                            cands.push((name, desc));
                         }
                     }
                 }
             }
         }
     }
-    cands.sort();
-    cands.dedup();
+    // 同名候选去重，保留先入者（内建优先于 PATH 里的同名可执行）。
+    cands.sort_by(|a, b| a.0.cmp(&b.0));
+    cands.dedup_by(|a, b| a.0 == b.0);
     cands
 }
 
-fn complete_file(word: &str) -> Vec<String> {
+fn complete_file(word: &str) -> Vec<(String, String)> {
     let (dirpath, prefix) = if let Some(slash) = word.rfind('/') {
         (&word[..slash + 1], &word[slash + 1..])
     } else {
         (".", word)
     };
-    let mut cands: Vec<String> = Vec::new();
+    let mut cands: Vec<(String, String)> = Vec::new();
     let Ok(entries) = fs::read_dir(dirpath) else {
         return cands;
     };
@@ -816,14 +843,78 @@ fn complete_file(word: &str) -> Vec<String> {
             } else {
                 name.clone()
             };
+            // 用真实路径探测类型与大小（相对当前目录，stat 可解析）。
+            let stat_path = e.path();
+            let desc = describe_path(stat_path.to_str().unwrap_or(rep.as_str()));
             if is_dir {
                 rep.push('/');
             }
-            cands.push(rep);
+            cands.push((rep, desc));
         }
     }
-    cands.sort();
+    cands.sort_by(|a, b| a.0.cmp(&b.0));
     cands
+}
+
+// ---------------------------------------------------------------------------
+// 补全描述（fish 风格，带类型与大小，并按 locale 本地化）
+// ---------------------------------------------------------------------------
+
+/// 把字节数格式化成 fish 风格的大小串（如 `34kB` / `1.5MB` / `2.0GB`）。
+/// 单位符号（B/kB/MB/GB）是技术记号，不进 po，跨 locale 保持一致。
+fn human_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    if bytes >= GB {
+        format!("{:.1}GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1}MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{}kB", bytes / KB)
+    } else {
+        format!("{}B", bytes)
+    }
+}
+
+/// 探测一个路径的类型，返回本地化的补全描述（与 fish 的 `(Executable, 34kB)`
+/// 风格一致）：符号链接 → `Symlink`，目录 → `Directory`，可执行文件 →
+/// `Executable, %s`，普通文件 → `File, %s`（%s 为大小串）。
+///
+/// 可执行性统一走 wash 的 posix 抽象层（`posix::access(..., X_OK)`），不依赖
+/// unix-only 的权限位 API —— MSYS2 的 target 是 windows-gnu，`cfg(unix)` 为假。
+fn describe_path(path: &str) -> String {
+    // 符号链接优先判定（symlink_metadata 不跟随）。
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return tr!("Symlink");
+        }
+    }
+    let Ok(meta) = fs::metadata(path) else {
+        return String::new();
+    };
+    if meta.is_dir() {
+        return tr!("Directory");
+    }
+    if meta.is_file() {
+        let size = human_size(meta.len());
+        if posix::access(path, posix::X_OK) == 0 {
+            return i18n::format_msg("Executable, %s", &[size]);
+        }
+        return i18n::format_msg("File, %s", &[size]);
+    }
+    String::new()
+}
+
+/// 补全候选每屏最多显示的行数（为输入行与状态行各留一行）。优先读 `LINES`
+/// 环境变量，拿不到时回退到 20。
+fn page_limit() -> usize {
+    std::env::var("LINES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|n| n.saturating_sub(2))
+        .filter(|&n| n >= 1)
+        .unwrap_or(20)
 }
 
 fn common_prefix(words: &[String]) -> String {
