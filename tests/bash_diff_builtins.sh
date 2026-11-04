@@ -782,11 +782,8 @@ run_case C times-status       'times > /dev/null; echo "rc=$?"'
 run_case C kill-l-num         'kill -l 9'
 run_case C kill-l-name        'kill -l KILL'
 # `kill -l` with NO argument prints the FULL numbered signal table
-# (` 1) SIGHUP\t 2) SIGINT\t ...`, 13 lines on this platform).  This is the
-# observable form of the matrix's `kill` difference #1: bash emits a numbered
-# `SIG`-prefixed table, while wash currently prints a flat `HUP INT QUIT ...`
-# list.  Once wash matches bash's exact layout byte-for-byte this case turns
-# green; until then it documents the divergence (see AGENTS.md `kill` row).
+# (` 1) SIGHUP\t 2) SIGINT\t ...`, 5 列、按行优先、共 64 个信号，含
+# RTMIN+1..RTMIN+16 与 RTMAX-15..RTMAX）。wash 已逐字节对齐 bash。
 run_case C kill-l-list        'kill -l'
 run_case C kill-noargs        'kill; echo "rc=$?"'
 run_case C kill-bad-sig       'kill -NOSUCHSIG 12345; echo "rc=$?"'

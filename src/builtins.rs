@@ -4904,28 +4904,33 @@ fn ansi_quote(value: &str) -> String {
 ///
 /// 只收录已经有明确用法的内建；其余的内建只打印名字（与 bash 的 `help`
 /// 列出用法行不同，但 wash 并没有为每个内建维护用法文本）。
-const BUILTIN_USAGE: &[(&str, &str)] = &[
-    ("alias", "alias [-p] [name[=value] ... ]"),
-    ("builtin", "builtin [shell-builtin [arg ...]]"),
-    ("cd", "cd [-L|[-P [-e]]] [-@] [dir]"),
-    ("command", "command [-pVv] command [arg ...]"),
-    ("declare", "declare [-aAfFgilrtux] [-p] [name[=value] ...]"),
-    ("dirs", "dirs [-clpv] [+N] [-N]"),
-    ("enable", "enable [-a] [-dnps] [-f filename] [name ...]"),
-    ("exec", "exec [-a name] [command [arguments ...]] [redirection ...]"),
-    ("export", "export [-fn] [name[=value] ...] or export -p [-f]"),
-    ("hash", "hash [-lr] [-p pathname] [-dt] [name ...]"),
-    ("kill", "kill [-s sigspec | -n signum | -sigspec] pid | jobspec ... or kill -l [sigspec]"),
-    ("popd", "popd [-n] [+N | -N]"),
-    ("pwd", "pwd [-LPW]"),
-    ("readonly", "readonly [-aAf] [name[=value] ...] or readonly -p"),
-    ("set", "set [-abefhkmnptuvxBCEHPT] [-o option-name] [--] [-] [arg ...]"),
-    ("shopt", "shopt [-psu] [-o] [option ...]"),
-    ("source", "source [-p path] filename [arguments]"),
-    ("type", "type [-afptP] name [name ...]"),
-    ("umask", "umask [-p] [-S] [mode]"),
-    ("unalias", "unalias [-a] name [name ...]"),
-    ("unset", "unset [-f] [-v] [-n] [name ...]"),
+/// 内建命令帮助表：`(名字, 用法摘要, 单行描述)`。
+///
+/// 描述取自 bash 的 `help` 原文（C locale 下需逐字节等于 bash）。
+const BUILTIN_HELP: &[(&str, &str, &str)] = &[
+    ("alias", "alias [-p] [name[=value] ... ]", "Define or display aliases."),
+    ("builtin", "builtin [shell-builtin [arg ...]]", "Run a shell builtin."),
+    ("cd", "cd [-L|[-P [-e]]] [-@] [dir]", "Change the shell working directory."),
+    ("command", "command [-pVv] command [arg ...]", "Execute a simple command or display information about commands."),
+    ("declare", "declare [-aAfFgilrtux] [-p] [name[=value] ...]", "Set variable values and attributes."),
+    ("dirs", "dirs [-clpv] [+N] [-N]", "Display the list of currently remembered directories."),
+    ("enable", "enable [-a] [-dnps] [-f filename] [name ...]", "Enable and disable builtin shell commands."),
+    ("exec", "exec [-a name] [command [arguments ...]] [redirection ...]", "Replace the shell with the given command."),
+    ("export", "export [-fn] [name[=value] ...] or export -p [-f]", "Mark shell variables for export."),
+    ("hash", "hash [-lr] [-p pathname] [-dt] [name ...]", "Remember or display program locations."),
+    ("kill", "kill [-s sigspec | -n signum | -sigspec] pid | jobspec ... or kill -l [sigspec]", "Send a signal to a job or process."),
+    ("popd", "popd [-n] [+N | -N]", "Remove an entry from the directory stack."),
+    ("pushd", "pushd [-n] [+N | -N | dir]", "Add a directory to the top of the directory stack."),
+    ("pwd", "pwd [-LPW]", "Print the current working directory."),
+    ("read", "read [-Eers] [-a array] [-d delim] [-i text] [-n nchars] [-N nchars] [-p prompt] [-t timeout] [-u fd] [name ...]", "Read a line from the standard input and split it into fields."),
+    ("readonly", "readonly [-aAf] [name[=value] ...] or readonly -p", "Mark shell variables as unmodifiable."),
+    ("set", "set [-abefhkmnptuvxBCEHPT] [-o option-name] [--] [-] [arg ...]", "Set or unset values of shell options and positional parameters."),
+    ("shopt", "shopt [-psu] [-o] [option ...]", "Set and unset shell options."),
+    ("source", "source [-p path] filename [arguments]", "Execute commands from a file in the current shell."),
+    ("type", "type [-afptP] name [name ...]", "Display information about command type."),
+    ("umask", "umask [-p] [-S] [mode]", "Display or set file mode mask."),
+    ("unalias", "unalias [-a] name [name ...]", "Remove each name from the list of defined aliases."),
+    ("unset", "unset [-f] [-v] [-n] [name ...]", "Remove variable or function names."),
 ];
 
 /// `help` 内建：列出 wash 自己支持的内建命令。
@@ -4961,8 +4966,8 @@ fn builtin_help(argv: &[String], sh: &mut Shell) -> i32 {
         // 思路，只是 wash 的内建集合与 bash 不同）。用法摘要本身已经带了
         // 命令名，所以这里不再重复一遍。
         for b in BUILTINS {
-            match BUILTIN_USAGE.iter().find(|(n, _)| n == b) {
-                Some((_, usage)) => println!("  {}", usage),
+            match BUILTIN_HELP.iter().find(|(n, _, _)| n == b) {
+                Some((_, usage, _)) => println!("  {}", usage),
                 None => println!("  {}", b),
             }
         }
@@ -4972,14 +4977,26 @@ fn builtin_help(argv: &[String], sh: &mut Shell) -> i32 {
     let mut status = 0;
     for name in names {
         if !is_builtin(name) {
-            // bash 的写法是 "help: no help topics match `foo'."，退出码 1。
+            // bash 的写法是 "help: no help topics match `foo'."，并附带
+            // "Try `help help' or `man -k foo' or `info foo'." 提示，退出码 1。
+            // （诊断文本本地化为后续增强，C locale 下需逐字节等于 bash 英文。）
             let msg = tr!("no help topics match `%s'.");
-            eprintln!("wash: help: {}", msg.replace("%s", name));
+            let with_name = msg.replace("%s", name);
+            let suffix = format!(
+                "  Try `help help' or `man -k {}' or `info {}'.",
+                name, name
+            );
+            eprintln!("wash: help: {}{}", with_name, suffix);
             status = 1;
             continue;
         }
-        match BUILTIN_USAGE.iter().find(|(n, _)| *n == name) {
-            Some((_, usage)) => println!("{}", usage),
+        match BUILTIN_HELP.iter().find(|(n, _, _)| *n == name) {
+            Some((_, usage, desc)) => {
+                // bash 的单条内建帮助格式：首行 `name: usage`，次行 4 空格缩进描述，末行空行。
+                println!("{}: {}", name, usage);
+                println!("    {}", desc);
+                println!();
+            }
             None => println!("{}", name),
         }
     }
