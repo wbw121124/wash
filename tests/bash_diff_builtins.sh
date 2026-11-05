@@ -467,13 +467,22 @@ run_case A if-test-false     'if [ 1 -eq 2 ]; then echo EQ; else echo NE; fi'
 # 规范化 stderr + rc；arith-neg-exp 两侧错误文案前缀/错误记号不同（实测 LC_ALL=C
 # 下 bash 为 `bash: line 1: 2 ** -1: exponent less than 0 (error token is "1")`、
 # wash 为 `wash: exponent less than 0 (error token is "")`），stderr 天然无法
-# 逐字节对拍，按框架约定改用 run_case_sem 语义不变量：不崩溃(rc≠101) 且 stderr
-# 含 "exponent less than 0"（已实测该 grep 模式在 bash / wash 两侧均成立）。
+# 逐字节对拍，按框架约定改用 run_case_sem 语义不变量：
+#   1) rc < 128 —— 挡住 Rust panic(101)、abort(134)、SIGSEGV(139)、timeout(124)
+#      等一切信号级崩溃（只判 rc≠101 会漏过这些）；
+#   2) stderr 含 "exponent less than 0" —— 必须真的报出负指数错误，不能静默吞错；
+#   3) stdout 不含任何非空白字符 —— 拒绝把算术结果误打到 stdout。
+# 更严的形式（要求 rc 相等或 stdout 全空）会破坏「两侧都成立」前提：bash 为
+# rc=1/stdout 空，wash 为 rc=0/stdout 一个空行；stderr 前缀与错误记号也不同。
+# 以上三项已由 QA 变异测试验证：bash/wash 两侧均成立，且能拒绝上述各反例。
 run_case A redir-fd2          'echo hi 2>@SANDBOX@/e; echo "rc=$?"; cat @SANDBOX@/e'
 run_case A redir-dup-2and1    'echo x 2>&1; echo "rc=$?"'
 run_case A glob-cwd-star      'mkdir -p @SANDBOX@/gd; cd @SANDBOX@/gd; touch a.txt b.txt c.log .hidden; echo *'
 run_case A param-pos-braced   'set -- foo bar; echo "[${1}][${2}][${3}]"'
-run_case_sem A arith-neg-exp  'echo $((2 ** -1))' '[ "$RC" -ne 101 ] && grep -q "exponent less than 0" "$ERR"'
+run_case_sem A arith-neg-exp  'echo $((2 ** -1))' '[ "$RC" -lt 128 ] && grep -q "exponent less than 0" "$ERR" && ! grep -q "[^[:space:]]" "$OUT"'
+# 同批修复的 P1#9 / P1#12：`$( )` 内引号里的 ) 是字面量；命令替换剥全部尾随换行。
+run_case A cmdsub-quoted-paren 'echo $(echo ")")'
+run_case A cmdsub-strip-newlines 'x=$(printf "a\n\n\n"); echo "[${#x}]"'
 
 ###############################################################################
 # GROUP B -- KNOWN-DEFECT.

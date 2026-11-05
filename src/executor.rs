@@ -368,11 +368,9 @@ pub fn capture_command(
     let s = posix::read_all(r);
     posix::close(r);
     posix::wait_pid(pid);
-    if let Some(stripped) = s.strip_suffix('\n') {
-        stripped.to_string()
-    } else {
-        s
-    }
+    // Bash strips *all* trailing newlines from command substitution output
+    // (`$(printf 'a\n\n\n')` -> "a"), not just one.
+    s.trim_end_matches('\n').to_string()
 }
 
 /// Run an external program, bypassing the shell functions and the aliases.

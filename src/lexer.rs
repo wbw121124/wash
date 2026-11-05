@@ -146,12 +146,50 @@ fn read_dup_target(chars: &[char], i: usize) -> (Vec<WordPart>, usize) {
     (vec![WordPart::Text(text, false)], j)
 }
 
+/// Read the body of a `$( ... )` / `$(( ... ))` up to its matching `)`.
+/// Parentheses inside single or double quotes are literal, so `$(echo ")")`
+/// must not terminate at the quoted `)`.
 fn read_paren(chars: &[char], i: usize) -> Option<(String, usize)> {
     let mut depth = 1;
     let mut s = String::new();
     let mut j = i;
+    let mut in_single = false;
+    let mut in_double = false;
     while j < chars.len() {
-        match chars[j] {
+        let c = chars[j];
+        // Inside quotes every character is copied verbatim; only the matching
+        // quote (and backslash escapes in double quotes) is special.
+        if in_single {
+            s.push(c);
+            if c == '\'' {
+                in_single = false;
+            }
+            j += 1;
+            continue;
+        }
+        if in_double {
+            if c == '\\' && j + 1 < chars.len() {
+                s.push(c);
+                s.push(chars[j + 1]);
+                j += 2;
+                continue;
+            }
+            s.push(c);
+            if c == '"' {
+                in_double = false;
+            }
+            j += 1;
+            continue;
+        }
+        match c {
+            '\'' => {
+                in_single = true;
+                s.push(c);
+            }
+            '"' => {
+                in_double = true;
+                s.push(c);
+            }
             '(' => {
                 depth += 1;
                 s.push('(');
@@ -172,7 +210,7 @@ fn read_paren(chars: &[char], i: usize) -> Option<(String, usize)> {
                 }
                 s.push('\\');
             }
-            c => s.push(c),
+            _ => s.push(c),
         }
         j += 1;
     }
