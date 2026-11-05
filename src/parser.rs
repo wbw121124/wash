@@ -72,6 +72,9 @@ pub enum Compound {
         word: Vec<WordPart>,
         arms: Vec<CaseArm>,
     },
+    /// `{ LIST; }` — a brace group: LIST runs in the current shell (no
+    /// subshell), so variable assignments and `cd` inside it persist.
+    Group { body: CommandList },
 }
 
 /// One arm of a `case` command: a set of patterns and the body to run.
@@ -205,6 +208,19 @@ fn parse_compounds(tokens: &[Token]) -> Result<(Vec<Token>, Vec<FuncDef>)> {
                     funcs.push(fd.clone());
                     out.push(Token::FunctionDef(fd.name.clone()));
                     i = end;
+                } else if at_command_position(&out) && is_word_text(tokens.get(i), "{") {
+                    // `{ LIST; }` is a reserved word only where a command may
+                    // start.  Extract it as a compound so its body is parsed
+                    // once here and can still take part in pipelines / AND-OR.
+                    let (group, end) = parse_group_compound(tokens, i)?;
+                    out.push(Token::Compound(group));
+                    i = end;
+                } else if at_command_position(&out) && is_word_text(tokens.get(i), "}") {
+                    // A stray `}` in command position is a syntax error, not a
+                    // command name (bash: `syntax error near unexpected token }').
+                    return Err(WashError::syntax(
+                        "syntax error near unexpected token `}'",
+                    ));
                 } else {
                     out.push(tokens[i].clone());
                     i += 1;
@@ -217,6 +233,74 @@ fn parse_compounds(tokens: &[Token]) -> Result<(Vec<Token>, Vec<FuncDef>)> {
         }
     }
     Ok((out, funcs))
+}
+
+/// True when a command may start at the current position of the flattened
+/// token stream.  Bash treats `{` / `}` as reserved words *only* there; in
+/// `echo {` the brace is an ordinary argument.
+fn at_command_position(out: &[Token]) -> bool {
+    match out.last() {
+        None => true,
+        Some(Token::Semicolon | Token::Pipe | Token::AndAnd | Token::OrOr | Token::Background) => {
+            true
+        }
+        Some(Token::Reserved(_)) => true,
+        _ => false,
+    }
+}
+
+/// Whether a standalone `}` at `close` may terminate the brace group that
+/// opened at `start`.
+///
+/// Bash only recognises `}` as a reserved word in command position, i.e. after
+/// a `;`, `&` or newline (the lexer turns newlines into `Semicolon`).  So
+/// `{ echo a }` does *not* close the group: the brace is an argument to
+/// `echo` and bash later reports an unexpected EOF.  An immediately empty
+/// group (`{ }`) is a syntax error for the same reason.
+fn group_may_close(tokens: &[Token], start: usize, close: usize) -> bool {
+    if close <= start + 1 {
+        return false;
+    }
+    matches!(
+        tokens.get(close - 1),
+        Some(Token::Semicolon | Token::Background)
+    )
+}
+
+/// Parse a `{ LIST; }` brace group whose opener is at `start`.
+///
+/// Returns the compound and the index just after the matching `}`.  Nested
+/// groups are tracked with a depth counter over standalone `{` / `}` words,
+/// exactly like `parse_func_body`.
+fn parse_group_compound(tokens: &[Token], start: usize) -> Result<(Compound, usize)> {
+    let mut depth = 0i32;
+    let mut j = start + 1;
+    let mut close = None;
+    while j < tokens.len() {
+        if is_word_text(tokens.get(j), "{") {
+            depth += 1;
+        } else if is_word_text(tokens.get(j), "}") {
+            if depth > 0 {
+                depth -= 1;
+            } else if group_may_close(tokens, start, j) {
+                close = Some(j);
+                break;
+            }
+            // Otherwise `}` is an ordinary argument here (e.g. `{ echo a }`);
+            // keep scanning for a later `}` that really is in command position.
+        }
+        j += 1;
+    }
+    let close = close.ok_or_else(|| {
+        WashError::syntax("syntax error: unexpected end of file from `{' command")
+    })?;
+    let body = parse_command_list(&tokens[start + 1..close])?;
+    if body.andors.is_empty() {
+        return Err(WashError::syntax(
+            "syntax error near unexpected token `;'",
+        ));
+    }
+    Ok((Compound::Group { body }, close + 1))
 }
 
 /// The name of the reserved word at `index`, if the token is one.

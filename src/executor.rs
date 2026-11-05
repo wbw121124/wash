@@ -437,6 +437,14 @@ fn execute_compound(compound: &Compound, sh: &mut Shell) -> i32 {
             is_until,
         } => execute_while(condition, body, *is_until, sh),
         Compound::Case { word, arms } => execute_case(word, arms, sh),
+        // A brace group runs in the *current* shell (no subshell): assignments
+        // and `cd` inside it persist.  When the group is part of a pipeline
+        // the executor already forked, which matches bash too.
+        Compound::Group { body } => {
+            let status = execute(body, sh);
+            sh.last_status = status;
+            status
+        }
     }
 }
 

@@ -1830,6 +1830,9 @@ fn render_compound(c: &crate::parser::Compound) -> String {
                 render_command_list(body, 1)
             )
         }
+        crate::parser::Compound::Group { body } => {
+            format!("{{\n{}\n}}", render_command_list(body, 1))
+        }
         crate::parser::Compound::Case { word, arms } => {
             let mut s = format!("case {} in\n", render_word(word));
             for arm in arms {

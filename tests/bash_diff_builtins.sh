@@ -490,6 +490,32 @@ run_case A arith-assign-persist 'x=0; echo $((x=5)); echo $x'
 run_case A arith-comma          'echo $((1,2,3))'
 run_case A glob-multiword-printf 'mkdir -p @SANDBOX@/gsub/gtest; touch @SANDBOX@/gsub/gtest/a.txt @SANDBOX@/gsub/gtest/b.txt; cd @SANDBOX@/gsub; x=gtest/*.txt; printf "[%s]" $x; echo'
 run_case A glob-multiword-for    'mkdir -p @SANDBOX@/gsub/gtest; touch @SANDBOX@/gsub/gtest/a.txt @SANDBOX@/gsub/gtest/b.txt; cd @SANDBOX@/gsub; x=gtest/*.txt; for f in $x; do echo "F=$f"; done'
+# 第三轮 review P0 #1：`{ LIST; }` 命令组。lexer 已把词边界的 `{`/`}` 切成
+# 独立 Word，parse_compounds 只在「命令位置」把它们当保留字（`echo {` 仍是
+# 普通参数、`{a,b}` 仍是 brace expansion、函数体花括号仍归 funcdef 消费）。
+# 组体在当前 shell 执行（非子壳），所以赋值 / cd / exit 状态会持久化。
+run_case A group-basic          '{ echo hi; }'
+run_case A group-persist-var    '{ x=1; }; echo $x'
+run_case A group-status         '{ false; }; echo $?'
+run_case A group-andor          '{ echo a; } && { echo b; }; { false; } || { echo c; }'
+run_case A group-nested         '{ echo a; { echo b; }; }'
+run_case A group-pipeline       '{ echo a; echo b; } | tr a-z A-Z'
+run_case A group-redir          '{ echo hi; } > @SANDBOX@/gout; cat @SANDBOX@/gout'
+run_case A group-dup-redir      '{ echo o; echo e >&2; } 2>/dev/null'
+run_case A group-in-if          'if true; then { echo g; }; fi'
+run_case A group-in-loop        'for i in 1 2; do { echo f$i; }; done'
+run_case A group-cd-persist     'cd @SANDBOX@; { cd sub; pwd; }; pwd'
+run_case A group-func-return    'f() { { return 5; }; echo nope; }; f; echo $?'
+run_case A group-exit-status    '{ exit 7; }; echo unreachable'
+run_case A group-brace-arg      'echo {'
+run_case A group-brace-expand   'echo {a,b}'
+run_case A group-funcdef        'f() { echo fn; }; f'
+# 语法错误路径：bash 会额外回显出错行、前缀也不同，stderr 无法逐字节对齐，
+# 故用语义不变量锁住 rc=2 / stdout 空 / 真的报了语法错（挡住静默吞错与崩溃）。
+run_case_sem A group-unclosed   '{ echo hi' '[ "$RC" -eq 2 ] && [ ! -s "$OUT" ] && grep -q "unexpected end of file" "$ERR"'
+run_case_sem A group-empty      '{ }' '[ "$RC" -eq 2 ] && [ ! -s "$OUT" ] && grep -q "syntax error" "$ERR"'
+run_case_sem A group-no-semi    '{ echo a }' '[ "$RC" -eq 2 ] && [ ! -s "$OUT" ] && grep -q "unexpected end of file" "$ERR"'
+run_case_sem A group-stray-close '}' '[ "$RC" -eq 2 ] && [ ! -s "$OUT" ] && grep -q "syntax error" "$ERR"'
 
 ###############################################################################
 # GROUP B -- KNOWN-DEFECT.
