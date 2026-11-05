@@ -115,6 +115,59 @@ fn push_word(
     *at_command_start = false;
 }
 
+/// Whether the word being built is an assignment word (`NAME=...` /
+/// `NAME+=...`).  Only the part before the first `=` must be a literal name;
+/// the RHS may contain expansions (`x=$v{a,b}` is still an assignment).
+fn word_is_assignment(parts: &[WordPart], pending: &str) -> bool {
+    let mut name = String::new();
+    let mut found_eq = false;
+    for p in parts {
+        match p {
+            WordPart::Text(s, _) => {
+                if let Some(pos) = s.find('=') {
+                    name.push_str(&s[..pos]);
+                    found_eq = true;
+                    break;
+                }
+                name.push_str(s);
+            }
+            _ => return false,
+        }
+    }
+    if !found_eq {
+        match pending.find('=') {
+            Some(pos) => name.push_str(&pending[..pos]),
+            None => return false,
+        }
+    }
+    let base = name.strip_suffix('+').unwrap_or(&name);
+    let b = base.as_bytes();
+    !b.is_empty()
+        && (b[0].is_ascii_alphabetic() || b[0] == b'_')
+        && b[1..].iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_')
+}
+
+/// Have all words emitted since the last command separator been assignment
+/// words?  bash disables brace expansion for the whole leading assignment
+/// run (`x={a,b} y={c,d}`), but `export x={a,b}` still expands because
+/// `export` is an ordinary command word.
+fn in_assignment_prefix(tokens: &[Token]) -> bool {
+    for t in tokens.iter().rev() {
+        match t {
+            Token::Semicolon | Token::Background | Token::Pipe
+            | Token::AndAnd | Token::OrOr => return true,
+            Token::Word(parts) => {
+                if !word_is_assignment(parts, "") {
+                    return false;
+                }
+            }
+            Token::Redirect { .. } => continue,
+            _ => return false,
+        }
+    }
+    true
+}
+
 fn take_digit_prefix(word: &mut String) -> Option<i32> {
     if !word.is_empty() && word.bytes().all(|b| b.is_ascii_digit()) {
         let fd = word.parse::<i32>().ok();
@@ -781,13 +834,21 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                 parts.push(WordPart::Backtick(body, false));
             }
             '{' => {
-                // Try brace expansion first (works mid-word too, e.g. `a{b,c}`).
-                if let Some((inner, ni)) = read_brace(&chars, i + 1) {
-                    if let Some(alts) = brace_alternatives(&inner) {
-                        flush_text(&mut pending, &mut parts, pending_quoted);
-                        parts.push(WordPart::Brace(alts));
-                        i = ni;
-                        continue;
+                // bash does NOT brace-expand assignment words: `x={a,b}`
+                // keeps the literal `{a,b}`, while `echo x={a,b}` and
+                // `export x={a,b}` do expand.  Only the leading run of
+                // assignment words in a simple command is affected.
+                let assign_word = (at_command_start || in_assignment_prefix(&tokens))
+                    && word_is_assignment(&parts, &pending);
+                if !assign_word {
+                    // Try brace expansion first (works mid-word too, e.g. `a{b,c}`).
+                    if let Some((inner, ni)) = read_brace(&chars, i + 1) {
+                        if let Some(alts) = brace_alternatives(&inner) {
+                            flush_text(&mut pending, &mut parts, pending_quoted);
+                            parts.push(WordPart::Brace(alts));
+                            i = ni;
+                            continue;
+                        }
                     }
                 }
                 // Not a brace expansion: `{` is a command-group / function-body

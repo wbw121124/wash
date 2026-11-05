@@ -662,6 +662,23 @@ run_case A redir-no-command      '> @SANDBOX@/r8; echo "rc=$? exists=$([ -f @SAN
 run_case A redir-no-command-fd   '2> @SANDBOX@/r9; echo ok'
 run_case A redir-no-command-app  '> @SANDBOX@/r10; echo one >> @SANDBOX@/r10; echo two &>> @SANDBOX@/r10; cat @SANDBOX@/r10'
 
+# 赋值语句的前导赋值词整段不做 brace expansion（bash 规则），但普通命令的
+# 参数、export 的参数仍然展开。旧 lexer 无条件把 {a,b} 结构化为 Brace，
+# expand_scalar 用 alts.concat() 拼成 "ab"，丢失字面文本。
+run_case A brace-assign-basic    'x={a,b}; echo "$x"'
+run_case A brace-assign-prefix   'x=pre{a,b}; echo "$x"'
+run_case A brace-assign-mid      'x=a{b,c}d; echo "$x"'
+run_case A brace-assign-range    'x={1..3}; echo "$x"'
+run_case A brace-assign-var      'v=Z; x=$v{a,b}; echo "$x"'
+run_case A brace-assign-append   'x=1; x+={a,b}; echo "$x"'
+run_case A brace-arg-not-assign  'echo x={a,b}'
+run_case A brace-nested-assign   'a=x={a,b}; echo "$a"'
+run_case A brace-export-expands  'export x={a,b}; echo "$x"'
+run_case A brace-multi-assign    'x={a,b} y={c,d}; echo "$x $y"'
+run_case A brace-plain-still     'echo {a,b}; echo pre{a,b}suf'
+run_case A brace-quoted-still    'x="pre{a,b}"; echo "$x"'
+run_case A brace-cmdsub-still    'x=$(echo {a,b}); echo "$x"'
+
 ###############################################################################
 # GROUP B -- KNOWN-DEFECT.
 # (Now empty: every case that used to live here has been fixed and promoted
