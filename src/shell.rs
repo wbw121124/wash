@@ -523,6 +523,9 @@ impl Shell {
 
     /// Run a single command string (used by `-c` and the interactive loop).
     pub fn run_str(&mut self, s: &str) -> i32 {
+        // 顶层命令开始即清掉上一轮可能残留的退出/返回标志，避免 `exit` 等内建设置的
+        // 标志跨命令泄漏、导致后续命令只执行第一个 and-or 列表（code-review P1-#20）。
+        self.exit_requested = None;
         let code = match lexer::tokenize(s) {
             Ok(tokens) => match parser::parse_command_list(&tokens) {
                 Ok(list) => {

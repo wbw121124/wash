@@ -5194,6 +5194,62 @@ const BUILTIN_HELP: &[(&str, &str, &str)] = &[
     ("unset", "unset [-f] [-v] [-n] [name ...]", "Remove variable or function names."),
 ];
 
+/// bash `help` 列出的保留字（关键字）及其用法摘要，按字母序与内建命令混排成双栏。
+const RESERVED_WORDS: &[&str] = &[
+    "! pipeline",
+    "(( expression ))",
+    "[[ expression ]]",
+    "case WORD in [PATTERN ...]",
+    "coproc [NAME] command",
+    "do",
+    "done",
+    "elif COMMANDS; then COMMANDS;",
+    "else COMMANDS;",
+    "esac",
+    "fi",
+    "for NAME [in WORDS ... ] ; do COMMANDS; done",
+    "function NAME () { COMMANDS ; }",
+    "if COMMANDS; then COMMANDS; [ elif ...] [ else COMMANDS; ] fi",
+    "in",
+    "select NAME [in WORDS ... ;] do COMMANDS; done",
+    "then",
+    "time [-p] pipeline",
+    "until COMMANDS; do COMMANDS; done",
+    "while COMMANDS; do COMMANDS; done",
+    "{",
+    "}",
+];
+
+/// 把候选名按终端宽度排成多栏（列优先，与 bash `help` 的版面一致）。
+fn print_columns(entries: &[String]) {
+    if entries.is_empty() {
+        return;
+    }
+    let width = entries.iter().map(|e| e.chars().count()).max().unwrap_or(0);
+    let term_w = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(80);
+    let col_w = width + 4;
+    let ncol = (term_w / col_w).max(1);
+    let nrow = (entries.len() + ncol - 1) / ncol;
+    for r in 0..nrow {
+        let mut line = String::new();
+        for c in 0..ncol {
+            let idx = c * nrow + r;
+            if idx >= entries.len() {
+                break;
+            }
+            line.push_str(&entries[idx]);
+            if c + 1 < ncol && idx + nrow < entries.len() {
+                let pad = col_w.saturating_sub(entries[idx].chars().count());
+                line.push_str(&" ".repeat(pad));
+            }
+        }
+        println!("{}", line);
+    }
+}
+
 /// `help` 内建：列出 wash 自己支持的内建命令。
 ///
 ///   * `help`          —— 打印全部内建命令的清单；
@@ -5204,34 +5260,34 @@ const BUILTIN_HELP: &[(&str, &str, &str)] = &[
 ///
 /// 说明文本按当前 locale 本地化（参见 `src/i18n.rs`）：`LC_ALL=C` 下是英文，
 /// `zh_CN.UTF-8` 下是中文。
-fn builtin_help(argv: &[String], sh: &mut Shell) -> i32 {
+fn builtin_help(argv: &[String], _sh: &mut Shell) -> i32 {
     let names: Vec<&str> = argv.iter().skip(1).map(|s| s.as_str()).collect();
     if names.is_empty() {
-        // 抬头用 `$BASH_VERSION`（诚实标注 wash 自己的版本，不冒充 bash）。
-        let version = sh
-            .env
-            .get("BASH_VERSION")
-            .cloned()
-            .unwrap_or_else(|| "wash".to_string());
-        println!("{}", version);
-        println!(
-            "{}",
-            tr!("These shell commands are defined internally.  Type `help' to see this list.")
-        );
-        println!(
-            "{}",
-            tr!("Type `help name' to find out more about the function `name'.")
-        );
+        // 抬头：诚实标注 wash 自己的版本，不冒充 bash 的 `GNU bash, version ...`。
+        println!("wash, version 0.0.1");
+        // 与 bash `help` 一致的英文抬头（LC_ALL=C 下的逐字节文本）。
+        println!("These shell commands are defined internally.  Type `help' to see this list.");
+        println!("Type `help name' to find out more about the function `name'.");
+        println!("Use `info bash' to learn more about the shell in general.");
+        println!("Use `man -k' or `info' to learn about commands not in this list.");
         println!();
-        // 逐个列出内建命令；有用法摘要的连用法一起打印（和 bash 的清单一个
-        // 思路，只是 wash 的内建集合与 bash 不同）。用法摘要本身已经带了
-        // 命令名，所以这里不再重复一遍。
+        println!("A star (*) next to a name indicates that the command is disabled.");
+        println!();
+        // bash 的 `help` 把内建命令与保留字（关键字）混在一起、按字母序排成双栏。
+        // 这里对齐该布局：先收集内建（带用法摘要）再加保留字。
+        let mut entries: Vec<String> = Vec::new();
         for b in BUILTINS {
-            match BUILTIN_HELP.iter().find(|(n, _, _)| n == b) {
-                Some((_, usage, _)) => println!("  {}", usage),
-                None => println!("  {}", b),
-            }
+            let s = match BUILTIN_HELP.iter().find(|(n, _, _)| n == b) {
+                Some((_, usage, _)) => (*usage).to_string(),
+                None => (*b).to_string(),
+            };
+            entries.push(s);
         }
+        for kw in RESERVED_WORDS {
+            entries.push((*kw).to_string());
+        }
+        entries.sort();
+        print_columns(&entries);
         return 0;
     }
 

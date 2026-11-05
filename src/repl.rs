@@ -49,6 +49,183 @@ const C_OP: &str = "\x1b[38;5;203m"; // operators/redirects: red
 const C_RST: &str = "\x1b[0m"; // reset
 const C_GHOST: &str = "\x1b[38;5;245m"; // ghost suggestion: gray
 
+// 控制字符的可见替代形式（readline/fish 风格）：以 `^X` 两格呈现。
+// 0x01..0x1A -> ^A..^Z，0x1C..0x1F -> ^[ ^\ ^] ^^，0x7F -> ^?。
+// 这样未绑定的控制键（如 Ctrl+Z）就不会以终端的 `▒` 乱码出现，而是显示成 `^Z`。
+fn caret_letter(c: char) -> char {
+    if c == '\u{7f}' {
+        '?'
+    } else {
+        (b'A' + ((c as u8).wrapping_sub(1))) as char
+    }
+}
+
+fn is_ctrl(c: char) -> bool {
+    (c as u32) < 0x20 || c == '\u{7f}'
+}
+
+/// 一个字符在屏幕上的显示宽度：控制字符以 `^X` 两格呈现，其余走 Unicode 宽度。
+fn disp_width(ch: char) -> usize {
+    if is_ctrl(ch) {
+        2
+    } else {
+        UnicodeWidthChar::width(ch).unwrap_or(0)
+    }
+}
+
+/// 打印一段文本，把其中的控制字符转义成 `^X`（其余原样输出）。
+fn print_escaped(s: &str) {
+    for ch in s.chars() {
+        if is_ctrl(ch) {
+            print!("^{}", caret_letter(ch));
+        } else {
+            print!("{}", ch);
+        }
+    }
+}
+
+/// 计算一段文本在屏幕上的可见宽度，跳过 ANSI/OSC 转义序列（`\e[..m`、`\e]..<BEL>` 等）。
+/// 用于按 $PS1 这种带颜色的提示符正确计算光标列。
+fn visible_width(s: &str) -> usize {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut w = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == 0x1b {
+            // 跳过转义序列：CSI(`\e[`) / OSC(`\e]`) 等，直到字母或 BEL(0x07)/ST(0x9c) 终结。
+            i += 1;
+            if i < bytes.len() && bytes[i] == b'[' {
+                i += 1;
+                while i < bytes.len() && !bytes[i].is_ascii_alphabetic() && bytes[i] != b'~' {
+                    i += 1;
+                }
+                i += 1; // 终结字母
+            } else if i < bytes.len() && bytes[i] == b']' {
+                i += 1;
+                while i < bytes.len() && bytes[i] != 0x07 && bytes[i] != 0x9c {
+                    i += 1;
+                }
+                i += 1; // BEL/ST
+            } else {
+                // 单个 ESC 后跟其它（如 `\e` 裸转义），跳过该字节。
+                if i < bytes.len() {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        // 把字节还原成 char 计算宽度（非 UTF-8 字节按 1 处理）。
+        let ch = if b < 0x80 {
+            b as char
+        } else {
+            // 粗略：跳过多字节序列首字节之外部分，按 1 计宽。
+            let len = if b >> 5 == 0b110 { 2 } else if b >> 4 == 0b1110 { 3 } else if b >> 3 == 0b11110 { 4 } else { 1 };
+            let s = std::str::from_utf8(&bytes[i..i + len.min(bytes.len() - i)]).ok();
+            i += len.min(bytes.len() - i).saturating_sub(1);
+            match s.and_then(|s| s.chars().next()) {
+                Some(c) => {
+                    w += disp_width(c);
+                    i += 1;
+                    continue;
+                }
+                None => {
+                    i += 1;
+                    w += 1;
+                    continue;
+                }
+            }
+        };
+        w += disp_width(ch);
+        i += 1;
+    }
+    w
+}
+
+/// 展开 bash 风格提示符模板（支持常见转义与 $VAR 变量展开），用于读取 $PS1/$PS2。
+fn render_prompt(template: &str, shell: &Shell) -> String {
+    let mut out = String::new();
+    let bytes = template.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\\' && i + 1 < bytes.len() {
+            let n = bytes[i + 1];
+            match n {
+                b'u' => out.push_str(&user_name(shell)),
+                b'h' => out.push_str(host_name().split('.').next().unwrap_or("")),
+                b'w' => out.push_str(cwd(shell)),
+                b'W' => {
+                    let w = cwd(shell);
+                    let base = w.rsplit('/').next().unwrap_or(&w);
+                    let base = base.rsplit('\\').next().unwrap_or(base);
+                    out.push_str(base);
+                }
+                b'$' => out.push_str(if euid_is_root() { "#" } else { "$" }),
+                b'n' => out.push('\n'),
+                b'e' | b'E' => out.push('\u{1b}'),
+                b'a' => out.push('\u{7}'), // bell：BEL（用于终止 OSC 标题序列）
+                b'[' | b']' => {} // 非打印标记：丢弃
+                b'\\' => out.push('\\'),
+                _ => {
+                    out.push('\\');
+                    out.push(n as char);
+                }
+            }
+            i += 2;
+        } else {
+            // $VAR 变量展开（仅 $NAME 形式，遇非标识符字符停止）。
+            if b == b'$' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_alphabetic() {
+                let start = i + 1;
+                let mut end = start;
+                while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+                    end += 1;
+                }
+                let name = std::str::from_utf8(&bytes[start..end]).unwrap_or("");
+                if let Some(v) = shell.env.get(name) {
+                    out.push_str(v);
+                }
+                i = end;
+            } else {
+                // 直接按字节拷贝（模板里的普通文本/ANSI 序列保持原样）。
+                out.push(b as char);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+fn user_name(_shell: &Shell) -> String {
+    // 真实用户名走环境变量，拿不到时回退。返回 String 而非 Box::leak，避免每次
+    // 渲染提示符都泄漏一块内存（code-review P3-#36）。
+    if let Some(u) = std::env::var_os("USER") {
+        u.to_string_lossy().into_owned()
+    } else if let Some(u) = std::env::var_os("USERNAME") {
+        u.to_string_lossy().into_owned()
+    } else {
+        "wash".to_string()
+    }
+}
+
+fn host_name() -> String {
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .unwrap_or_else(|_| "wash".to_string())
+}
+
+fn cwd(shell: &Shell) -> &str {
+    if shell.cwd.is_empty() {
+        "."
+    } else {
+        &shell.cwd
+    }
+}
+
+fn euid_is_root() -> bool {
+    posix::effective_uid() == 0
+}
+
 // ---------------------------------------------------------------------------
 // Key input
 // ---------------------------------------------------------------------------
@@ -62,6 +239,7 @@ enum Key {
     CtrlC,
     CtrlD,
     CtrlL,
+    CtrlV,
     Up,
     Down,
     Left,
@@ -86,6 +264,7 @@ fn read_key() -> Key {
     match b {
         0x03 => Key::CtrlC,
         0x0c => Key::CtrlL,
+        0x16 => Key::CtrlV,
         0x04 => Key::CtrlD,
         0x0d | 0x0a => Key::Enter,
         0x7f | 0x08 => Key::Backspace,
@@ -187,6 +366,7 @@ struct Editor {
     draft: String,           // saved buffer when history navigation began
     completions: Option<Vec<(String, String)>>, // (候选名, 本地化描述) 列表，显示在输入下方
     last_total: usize,       // physical lines rendered last time (for clearing)
+    literal_next: bool,      // 下一个键按字面插入（Ctrl+V 后的「引号」模式）
 }
 
 impl Editor {
@@ -199,6 +379,7 @@ impl Editor {
             draft: String::new(),
             completions: None,
             last_total: 0,
+            literal_next: false,
         }
     }
 
@@ -412,7 +593,20 @@ impl Editor {
 
     // --- rendering ---------------------------------------------------------
 
-    fn render(&mut self) {
+    fn render(&mut self, shell: &Shell) {
+        // 读取 $PS1/$PS2（带 bash 风格转义与 $VAR 展开）；没有则回退内置常量。
+        let prompt0 = render_prompt(
+            shell.env.get("PS1").map(|s| s.as_str()).unwrap_or(PRIMARY_PROMPT),
+            shell,
+        );
+        let prompt_cont = render_prompt(
+            shell.env.get("PS2").map(|s| s.as_str()).unwrap_or(CONT_PROMPT),
+            shell,
+        );
+        // 多行提示符（含 \n）时，首行输入前的「额外物理行数」与首段可见宽度。
+        let prompt0_last = prompt0.rsplit('\n').next().unwrap_or("");
+        let prompt_extra = prompt0.matches('\n').count();
+
         let lines: Vec<&str> = self.buffer.split('\n').collect();
         let total_phys = lines.len();
         let (cur_line, cur_col) = self.cursor_pos(&lines);
@@ -422,27 +616,19 @@ impl Editor {
             String::new()
         };
 
-        // Clear the previously rendered block.
-        if self.last_total > 1 {
-            print!("\x1b[{}A", self.last_total - 1);
-        }
-        for k in 0..self.last_total {
-            print!("\r\x1b[K");
-            if k + 1 < self.last_total {
-                print!("\x1b[1B");
-            }
-        }
-        if self.last_total > 1 {
-            print!("\x1b[{}A", self.last_total - 1);
+        // 一次「清到屏尾」清除光标之下整块（输入行 + 补全候选），比逐行清更稳健，
+        // 不会残留候选列表。多行提示符的首段在光标之上，属静态文本，无需重清。
+        if self.last_total > 0 {
+            print!("\x1b[J");
         }
 
         // Draw the input block.
         let last_idx = total_phys - 1;
         for (idx, line) in lines.iter().enumerate() {
-            let prompt = if idx == 0 { PRIMARY_PROMPT } else { CONT_PROMPT };
+            let prompt = if idx == 0 { &prompt0 } else { &prompt_cont };
             print!("\r\x1b[K{}", prompt);
             self.print_highlighted(line);
-            if idx == last_idx && !ghost.is_empty() {
+            if idx == last_idx && ! ghost.is_empty() {
                 print!("{}{}{}", C_GHOST, ghost, C_RST);
             }
             if idx != last_idx {
@@ -450,14 +636,14 @@ impl Editor {
             }
         }
 
-        // 绘制补全候选列表：每个候选占一行，形如 `name (描述)`，描述按当前
-        // locale 本地化。候选超过一屏时只显示前 `page_limit()` 行，并用 fish
-        // 风格的 `rows N to M of K` 状态行提示剩余数量。
+        // 绘制补全候选列表：仅对「实际可见」的候选（前 page_limit() 行）计算类型/
+        // 大小描述，避免 Tab 扫全盘时对上千文件逐个 stat 导致卡死。
         let cand_lines = match &self.completions {
             Some(c) => {
                 let limit = page_limit();
-                let shown_count = c.len().min(limit);
-                for (name, desc) in c.iter().take(limit) {
+                let shown = c.len().min(limit);
+                for (name, _desc) in c.iter().take(limit) {
+                    let desc = describe_path(name);
                     let line = if desc.is_empty() {
                         name.clone()
                     } else {
@@ -465,7 +651,7 @@ impl Editor {
                     };
                     print!("\r\n\x1b[K{}", line);
                 }
-                let mut lines = shown_count;
+                let mut lines = shown;
                 if c.len() > limit {
                     // 状态行：`rows 1 to {limit} of {total}`（按 locale 本地化）。
                     let status = i18n::format_msg(
@@ -480,16 +666,21 @@ impl Editor {
             None => 0,
         };
 
-        // Reposition the cursor into the input block.
+        // 把光标定位回输入块内的正确位置。
         let lines_from_end = (total_phys - 1 - cur_line) + cand_lines;
         if lines_from_end > 0 {
             print!("\x1b[{}A", lines_from_end);
         }
-        let abs_col = self.prompt_width(cur_line) + cur_col;
+        let base_col = if cur_line == 0 {
+            visible_width(prompt0_last)
+        } else {
+            visible_width(&prompt_cont)
+        };
+        let abs_col = base_col + cur_col;
         print!("\r\x1b[{}G", abs_col + 1);
 
         io::stdout().flush().ok();
-        self.last_total = total_phys + cand_lines;
+        self.last_total = total_phys + cand_lines + prompt_extra;
     }
 
     fn clear_screen(&mut self) {
@@ -517,7 +708,7 @@ impl Editor {
             if j >= offset {
                 break;
             }
-            col += UnicodeWidthChar::width(ch).unwrap_or(0);
+            col += disp_width(ch);
         }
         (line_idx, col)
     }
@@ -535,9 +726,15 @@ impl Editor {
         let chars: Vec<char> = line.chars().collect();
         for (start, end, color) in spans {
             let seg: String = chars[start..end].iter().collect();
+            // 控制字符以 `^X` 两格呈现（readline/fish 风格），而不是让终端渲染成
+            // `▒` 乱码；颜色序列本身不经过转义，仍是裸 ANSI。
             match color {
-                Some(c) => print!("{}{}{}", c, seg, C_RST),
-                None => print!("{}", seg),
+                Some(c) => {
+                    print!("{}", c);
+                    print_escaped(&seg);
+                    print!("{}", C_RST);
+                }
+                None => print_escaped(&seg),
             }
         }
     }
@@ -784,6 +981,10 @@ fn is_command_position(prefix: &str) -> bool {
     t.ends_with('|') || t.ends_with('&') || t.ends_with(';') || t.ends_with('(') || t.ends_with('{')
 }
 
+/// 补全候选数量上限：超过则截断，避免 Tab 在 PATH 巨大（如 System32 五千余文件）
+/// 时一次性生成 / 列出海量候选导致卡死。
+const COMPLETE_CAP: usize = 1000;
+
 fn complete_command(word: &str) -> Vec<(String, String)> {
     let mut cands: Vec<(String, String)> = Vec::new();
     const BUILTINS: &[&str] = &[
@@ -799,7 +1000,8 @@ fn complete_command(word: &str) -> Vec<(String, String)> {
             cands.push(((*b).to_string(), tr!("Builtin")));
         }
     }
-    // PATH 里的可执行文件：标注 `Executable, %s`（%s 是 fish 风格的大小串）。
+    // PATH 里的可执行文件：只收集名字（不在此处 stat——否则 System32 下数千文件的
+    // access() 风暴会让 Tab 卡死）。类型/大小描述延迟到 render 时只对可见候选计算。
     if let Some(path) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path) {
             let Ok(entries) = fs::read_dir(&dir) else {
@@ -808,13 +1010,14 @@ fn complete_command(word: &str) -> Vec<(String, String)> {
             for e in entries.flatten() {
                 let name = e.file_name().to_string_lossy().into_owned();
                 if name.starts_with(word) {
-                    if let Some(s) = e.path().to_str() {
-                        if e.path().is_file() && posix::access(s, posix::X_OK) == 0 {
-                            let desc = describe_path(s);
-                            cands.push((name, desc));
-                        }
-                    }
+                    cands.push((name, String::new()));
                 }
+                if cands.len() >= COMPLETE_CAP {
+                    break;
+                }
+            }
+            if cands.len() >= COMPLETE_CAP {
+                break;
             }
         }
     }
@@ -843,13 +1046,14 @@ fn complete_file(word: &str) -> Vec<(String, String)> {
             } else {
                 name.clone()
             };
-            // 用真实路径探测类型与大小（相对当前目录，stat 可解析）。
-            let stat_path = e.path();
-            let desc = describe_path(stat_path.to_str().unwrap_or(rep.as_str()));
+            // 目录补一个尾部 `/` 方便继续补全；类型/大小描述延迟到 render 计算。
             if is_dir {
                 rep.push('/');
             }
-            cands.push((rep, desc));
+            cands.push((rep, String::new()));
+        }
+        if cands.len() >= COMPLETE_CAP {
+            break;
         }
     }
     cands.sort_by(|a, b| a.0.cmp(&b.0));
@@ -922,11 +1126,11 @@ fn common_prefix(words: &[String]) -> String {
         return String::new();
     }
     let first = &words[0];
-    let mut end = first.len();
+    let mut end = first.chars().count();
     for w in &words[1..] {
-        let max = end.min(w.len());
+        let max = end.min(w.chars().count());
         let mut i = 0;
-        for (a, b) in first.bytes().zip(w.bytes()) {
+        for (a, b) in first.chars().zip(w.chars()) {
             if a != b {
                 break;
             }
@@ -937,7 +1141,8 @@ fn common_prefix(words: &[String]) -> String {
             break;
         }
     }
-    first[..end].to_string()
+    // 按字符数截取，绝不在多字节字符中间切片（修复 P0-2：中文文件名 panic）。
+    first.chars().take(end).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -986,6 +1191,12 @@ fn save_history(p: &Path, hist: &[String]) {
 // ---------------------------------------------------------------------------
 
 fn submit(editor: &mut Editor, shell: &mut Shell) {
+    // 提交前先清掉光标之下（输入行 + 补全候选）的全部内容，避免命令输出前
+    // 屏幕上残留一堆补全候选。
+    if editor.last_total > 0 {
+        print!("\x1b[J");
+        io::stdout().flush().ok();
+    }
     let line = std::mem::take(&mut editor.buffer);
     editor.cursor = 0;
     editor.hist_pos = None;
@@ -1021,6 +1232,10 @@ fn run_piped(shell: &mut Shell) {
             continue;
         }
         shell.run_str(line);
+        // `exit` 内建会把标志置位；此处检测并停止读取后续输入（对齐交互模式）。
+        if shell.exit_requested.is_some() {
+            break;
+        }
     }
 }
 
@@ -1039,16 +1254,34 @@ pub fn run(shell: &mut Shell) {
         return;
     }
 
-    editor.render();
+    editor.render(shell);
     loop {
-        let key = read_key();
+        // Ctrl+V 之后的那个键按字面插入：直接读一个裸字节，绕过控制键映射，
+        // 这样 Ctrl+V 后跟 Ctrl+C 会插入 0x03 而非取消整行（对齐 readline 行为）。
+        let key = if editor.literal_next {
+            editor.literal_next = false;
+            match posix::read_byte() {
+                Some(b) => Key::Char(decode_utf8(b)),
+                None => Key::Eof,
+            }
+        } else {
+            read_key()
+        };
         match key {
             Key::Eof => break,
             Key::CtrlC => {
-                editor.cancel_line();
+                // 清掉光标之下（输入行 + 补全候选）的全部内容，再打印 ^C 并换行，
+                // 由随后的 render() 在下一行重绘提示符。
+                if editor.last_total > 0 {
+                    print!("\x1b[J");
+                }
                 print!("\r\x1b[K^C\n");
                 io::stdout().flush().ok();
+                editor.cancel_line();
                 editor.last_total = 0;
+            }
+            Key::CtrlV => {
+                editor.literal_next = true;
             }
             Key::CtrlD => {
                 if editor.buffer.is_empty() {
@@ -1059,9 +1292,11 @@ pub fn run(shell: &mut Shell) {
             }
             Key::CtrlL => editor.clear_screen(),
             Key::Enter => {
-                let trimmed_empty = editor.buffer.trim().is_empty();
-                if !editor.buffer.contains('\n') && trimmed_empty {
-                    // Empty line: just reprint the prompt.
+                let trimmed_empty = !editor.buffer.contains('\n') && editor.buffer.trim().is_empty();
+                if trimmed_empty {
+                    // 空行：换行后在下一行重绘提示符。
+                    print!("\r\x1b[K\n");
+                    io::stdout().flush().ok();
                 } else {
                     let cur_empty = {
                         let after = match editor.buffer.rfind('\n') {
@@ -1102,12 +1337,85 @@ pub fn run(shell: &mut Shell) {
             }
             Key::Up => editor.history_prev(),
             Key::Down => editor.history_next(),
-            Key::Esc | Key::Unknown => {}
+            Key::Esc | Key::Unknown => {
+                // 退出 Tab 补全候选列表（不提交、不清空输入）。
+                editor.completions = None;
+            }
         }
 
-        editor.render();
+        // `exit` 内建会把标志置位；此处检测并干净退出（P1-#20）。
+        if shell.exit_requested.is_some() {
+            break;
+        }
+
+        editor.render(shell);
     }
 
     posix::disable_raw_mode();
     save_history(&hist_path, &editor.history);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn caret_form_for_control_bytes() {
+        assert_eq!(caret_letter('\u{1}'), 'A'); // ^A
+        assert_eq!(caret_letter('\u{1a}'), 'Z'); // ^Z
+        assert_eq!(caret_letter('\u{1b}'), '['); // ^[
+        assert_eq!(caret_letter('\u{1f}'), '_'); // ^_
+        assert_eq!(caret_letter('\u{7f}'), '?'); // ^?
+    }
+
+    #[test]
+    fn ctrl_classification() {
+        assert!(is_ctrl('\u{1a}')); // Ctrl+Z
+        assert!(is_ctrl('\u{3}')); // Ctrl+C
+        assert!(is_ctrl('\u{7f}')); // DEL
+        assert!(!is_ctrl('a'));
+        assert!(!is_ctrl('≤'));
+    }
+
+    #[test]
+    fn disp_width_control_is_two() {
+        assert_eq!(disp_width('\u{1a}'), 2); // 控制字符以 ^X 两格呈现
+        assert_eq!(disp_width('a'), 1);
+        assert_eq!(disp_width('中'), 2); // 宽字符
+    }
+
+    #[test]
+    fn visible_width_strips_ansi_and_counts_control() {
+        assert_eq!(visible_width("wash$ "), 6);
+        // ANSI 颜色序列对可见宽度无贡献。
+        assert_eq!(visible_width("\x1b[32mwash\x1b[0m"), 4);
+        // 裸控制字节按两格计。
+        assert_eq!(visible_width("\u{1a}"), 2);
+    }
+
+    #[test]
+    fn common_prefix_is_char_safe() {
+        // 中文文件名共享多字节首字节边界，绝不应当 panic（P0-2）。
+        let zh = vec!["你foo".to_string(), "你bar".to_string()];
+        assert_eq!(common_prefix(&zh), "你");
+        let ascii = vec!["abc".to_string(), "abd".to_string(), "ab".to_string()];
+        assert_eq!(common_prefix(&ascii), "ab");
+        assert_eq!(common_prefix(&[]), "");
+        assert_eq!(common_prefix(&["x".to_string()]), "x");
+    }
+
+    #[test]
+    fn render_prompt_expands_bash_escapes() {
+        // 用一个最小 Shell 验证 $PS1 转义：\u \h \w \$ 与 $VAR 展开。
+        let mut sh = crate::shell::Shell::new();
+        sh.env.insert("MYVAR".to_string(), "hi".to_string());
+        sh.cwd = "/home/wbw".to_string();
+        let p = render_prompt("\\u@\\h \\w \\$ $MYVAR", &sh);
+        assert!(p.contains("@"));
+        assert!(p.contains("/home/wbw"));
+        assert!(p.contains("hi"));
+        assert!(p.ends_with("hi") || p.contains('$'));
+        // \a 必须产出 BEL 而非被丢弃，否则 OSC 标题序列无法终止。
+        assert!(render_prompt("\\a", &sh).contains('\u{7}'));
+    }
 }
