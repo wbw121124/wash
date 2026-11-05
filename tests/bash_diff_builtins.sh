@@ -596,6 +596,56 @@ run_case A dollar-var-still-ok  'x=5; echo "$x"'
 run_case A dollar-cmdsub-still-ok 'echo "$(echo ok)"'
 run_case A dollar-arith-still-ok 'echo "$((1+2))"'
 
+# 第三轮 review P2：失败的算术展开是「整行致命错误」——当前命令不执行、
+# 后续命令全部跳过、rc=1，而交互 shell 本身存活。旧实现只 eprintln 后返回
+# 空串，导致 `echo $((1/0)); echo after` 仍然打印 after 且 rc=0。
+# 这些用例是逐字节断言：normalize_stderr 只剥 shell 名前缀，消息正文、
+# 行数、尾随换行都必须与 bash 完全相同。
+run_case A arith-divzero          'echo $((1/0))'
+run_case A arith-divzero-abort    'echo $((1/0)); echo after'
+run_case A arith-syntax-abort     'echo $((1+)); echo after'
+run_case A arith-divzero-in-word  'echo hi $((1/0)) bye; echo after'
+run_case A arith-divzero-assign   'x=$((1/0)); echo "x=[$x]"; echo after'
+run_case A arith-divzero-after-ok 'echo $((2+2)); echo $((1/0)); echo after'
+run_case A arith-divzero-in-func  'f() { echo $((1/0)); }; f; echo after'
+run_case A arith-divzero-in-if    'if echo $((1/0)); then echo yes; fi; echo after'
+run_case A arith-divzero-or       'echo $((1/0)) || echo fallback; echo after'
+run_case A arith-divzero-redir    'echo $((1/0)) > /dev/null; echo after'
+run_case A arith-divzero-spaces   'echo $(( 1 / 0 ))'
+run_case A arith-syntax-token     'echo $((1+*2))'
+run_case A arith-negexp           'echo $((2**-1))'
+run_case A arith-divzero-expr     'echo $((x=1/0))'
+run_case A arith-let-still-ok     'let x=1/0; echo "x=$x rc=$?"'
+
+# 数组 / 位置参数切片 `${a[@]:off:len}`、`${@:off:len}`。
+# 位置参数切片从 $0 起算（${@:1:2} 得到 $1 $2），故不测 offset 0 —— 那会
+# 绑定 shell 自身路径，属 GROUP K 身份差异。
+run_case A slice-arr-basic        'a=(1 2 3); echo "${a[@]:1:2}"'
+run_case A slice-arr-star         'a=(1 2 3); echo "${a[*]:1:2}"'
+run_case A slice-arr-no-len       'a=(1 2 3); echo "${a[@]:1}"'
+run_case A slice-arr-neg-off      'a=(1 2 3); echo "${a[@]: -2}"'
+run_case A slice-arr-neg-off-len  'a=(1 2 3); echo "${a[@]: -2:1}"'
+run_case A slice-arr-zero-one     'a=(1 2 3); echo "${a[@]:0:1}"'
+run_case A slice-arr-arith-off    'a=(1 2 3); echo "${a[@]:1+1:1}"'
+run_case A slice-arr-neg-len      'a=(1 2 3); echo "${a[@]:0:-1}"; echo after'
+run_case A slice-arr-elem-sub     'a=(10 22 33); echo "${a[1]:0:1}"'
+run_case A slice-pos-at           'set -- a b c d; echo "${@:2:2}"'
+run_case A slice-pos-star         'set -- a b c d; echo "${*:2:2}"'
+run_case A slice-pos-one          'set -- a b c d; echo "${@:1:2}"'
+run_case A slice-pos-no-len       'set -- a b c d; echo "${@:3}"'
+run_case A slice-pos-neg          'set -- a b c d; echo "${@: -2}"'
+run_case A substr-neg-len         'v=abcdef; echo "${v:0:-1}"'
+run_case A substr-neg-len-off     'v=abcdef; echo "${v:2:-1}"'
+run_case A substr-neg-off         'v=abcdef; echo "${v: -3}"'
+run_case A substr-neg-len-fatal   'v=abcdef; echo "${v:0:-10}"'
+
+# `$[ expr ]`：bash 5.3 仍支持的旧式算术替换，等价于 `$(( expr ))`。
+run_case A dollar-bracket-basic   'echo $[1+2]'
+run_case A dollar-bracket-prec    'echo $[1+2*3]'
+run_case A dollar-bracket-mid     'echo "a$[1+2]b"'
+run_case A dollar-bracket-assign  'echo $[x=3]'
+run_case A dollar-bracket-divzero 'echo $[1/0]'
+
 ###############################################################################
 # GROUP B -- KNOWN-DEFECT.
 # (Now empty: every case that used to live here has been fixed and promoted

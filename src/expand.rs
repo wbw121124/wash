@@ -5,12 +5,41 @@
 // Quoted parts (originating inside double quotes) are NOT word-split or
 // globbed. Arithmetic results are never split/globbed.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use crate::lexer::WordPart;
 use crate::parser;
 use crate::shell::VarAttrs;
+
+thread_local! {
+    /// Set when a `$(( ))` / `$[ ]` expansion fails.  Bash treats a failed
+    /// arithmetic expansion as a fatal error for the whole command line: the
+    /// current command is not run, the remaining commands are skipped and the
+    /// status is 1 -- while the interactive shell itself survives.  The
+    /// expander only has a read-only view of the shell, so the flag travels
+    /// through thread-local state (command substitutions run in forked
+    /// children and therefore cannot clobber the parent's flag).
+    static ARITH_FAILED: Cell<bool> = Cell::new(false);
+}
+
+/// Whether the current command line hit a fatal arithmetic expansion error.
+pub fn arith_failed() -> bool {
+    ARITH_FAILED.with(|c| c.get())
+}
+
+/// Reset the fatal-arithmetic flag at the start of each top-level command line.
+pub fn clear_arith_failed() {
+    ARITH_FAILED.with(|c| c.set(false))
+}
+
+/// Report a fatal expansion error once and mark the command line as aborted.
+fn flag_arith_failure(message: &str) {
+    if !arith_failed() {
+        eprintln!("wash: {}", message);
+        ARITH_FAILED.with(|c| c.set(true));
+    }
+}
 
 pub struct ExpandCtx<'a> {
     pub env: &'a HashMap<String, String>,
@@ -500,14 +529,41 @@ fn eval_braced(body: &str, ctx: &ExpandCtx) -> Expansion {
         ));
     }
 
+    // `${@:off:len}` / `${*:off:len}` slice the positional parameters.
+    // The unsliced forms are handled by `eval_var`.
+    if matches!(rawname, "@" | "*") && op == ":" {
+        // bash counts positional slices from `$0`: `${@:1:2}` yields `$1 $2`.
+        // The leading `$0` is shell-identity bound, so tests avoid offset 0.
+        let mut params = Vec::with_capacity(ctx.positional.len() + 1);
+        params.push(ctx.dollar_zero.to_string());
+        params.extend(ctx.positional.iter().cloned());
+        let fields = slice_fields(params, arg, ctx);
+        return if rawname == "@" {
+            Expansion::At(fields)
+        } else {
+            Expansion::Star(fields)
+        };
+    }
+
     // Array subscript handling: `name[subscript]`.  `${a[@]}` / `${a[*]}`
     // yield one field per element / a single IFS-joined field, and
-    // `${a[i]}` yields element `i` (0-based) as a scalar.
+    // `${a[i]}` yields element `i` (0-based) as a scalar.  A `:off:len`
+    // suffix slices the element list before it is turned into fields.
     if let Some((name, subscript)) = split_subscript(rawname) {
         let elems = ctx.arrays.get(name).cloned().unwrap_or_default();
         match subscript {
-            "@" => return Expansion::At(elems),
-            "*" => return Expansion::Star(elems),
+            "@" | "*" => {
+                let fields = if op == ":" {
+                    slice_fields(elems, arg, ctx)
+                } else {
+                    elems
+                };
+                return if subscript == "@" {
+                    Expansion::At(fields)
+                } else {
+                    Expansion::Star(fields)
+                };
+            }
             _ => {
                 let val = if let Ok(i) = subscript.parse::<i64>() {
                     if i >= 0 && (i as usize) < elems.len() {
@@ -556,6 +612,51 @@ fn split_subscript(raw: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((name, &rest[..close]))
+}
+
+/// Evaluate an offset/length expression of a `${...:off:len}` expansion.
+/// Bash evaluates these as arithmetic expressions, so `${a[@]:1+1:1}` is
+/// legal; empty text means zero (no offset / no length limit).
+fn eval_offset(expr: &str, ctx: &ExpandCtx) -> Option<i64> {
+    let s = expr.trim();
+    if s.is_empty() {
+        return Some(0);
+    }
+    if let Ok(v) = s.parse::<i64>() {
+        return Some(v);
+    }
+    let mut env = ArithCtx {
+        ctx,
+        assigned: RefCell::new(HashMap::new()),
+    };
+    crate::arith::eval(s, &mut env).ok()
+}
+
+/// Slice a list of fields for `${a[@]:off:len}` / `${@:off:len}`.
+/// A negative offset counts back from the end.  A negative *length* is a
+/// fatal error for a list slice in bash (`substring expression < 0`), which
+/// aborts the whole command line just like a failed arithmetic expansion.
+fn slice_fields(fields: Vec<String>, arg: &str, ctx: &ExpandCtx) -> Vec<String> {
+    let n = fields.len() as i64;
+    let (off_s, len_s) = match arg.split_once(':') {
+        Some((a, b)) => (a, b),
+        None => (arg, ""),
+    };
+    let mut off = eval_offset(off_s, ctx).unwrap_or(0);
+    if off < 0 {
+        off += n;
+    }
+    off = off.clamp(0, n);
+    let start = off as usize;
+    if len_s.is_empty() {
+        return fields[start..].to_vec();
+    }
+    let len = eval_offset(len_s, ctx).unwrap_or(0);
+    if len < 0 {
+        flag_arith_failure(&format!("{}: substring expression < 0", len_s.trim()));
+        return Vec::new();
+    }
+    fields[start..].iter().take(len as usize).cloned().collect()
 }
 
 /// Apply a (possibly empty) braced-operator to a scalar `val`, returning the
@@ -745,7 +846,9 @@ fn substring(value: &str, arg: &str) -> String {
     let len_s = parts.next().unwrap_or("");
     let chars: Vec<char> = value.chars().collect();
     let n = chars.len() as i64;
-    let mut off = off_s.parse::<i64>().unwrap_or(0);
+    // A space is required before a negative offset (`${v: -3}`), otherwise
+    // `:-` would be parsed as the "use default" operator.  Trim it here.
+    let mut off = off_s.trim().parse::<i64>().unwrap_or(0);
     if off < 0 {
         off = n + off;
     }
@@ -759,9 +862,18 @@ fn substring(value: &str, arg: &str) -> String {
     let taken = if len_s.is_empty() {
         chars.len() - start
     } else {
-        let len = len_s.parse::<i64>().unwrap_or(0);
+        let len = len_s.trim().parse::<i64>().unwrap_or(0);
         if len < 0 {
-            0
+            // A negative length means "up to |len| characters before the
+            // end of the string": `${v:0:-1}` drops the last character.
+            // When the resulting end lies before the start, bash aborts the
+            // command line with "substring expression < 0".
+            let end = n + len;
+            if end < off {
+                flag_arith_failure(&format!("{}: substring expression < 0", len_s.trim()));
+                return String::new();
+            }
+            (end - off) as usize
         } else {
             len as usize
         }
@@ -1197,7 +1309,25 @@ impl<'a> crate::arith::ArithEnv for ArithCtx<'a> {
     }
 }
 
+/// bash reports the *raw remainder* of the expression from the offending
+/// token onwards: `1+*2` reports `*2`, and `$(( 1 / 0 ))` reports `"0 "`.
+fn bash_error_token(body: &str, token: &str) -> String {
+    if token.is_empty() {
+        return String::new();
+    }
+    match body.rfind(token) {
+        Some(pos) => body[pos..].to_string(),
+        None => token.to_string(),
+    }
+}
+
 pub fn eval_arith(body: &str, ctx: &ExpandCtx) -> String {
+    // Once a command line has failed bash evaluates no further arithmetic
+    // expansions on it, and prints only the first diagnostic.  The early
+    // return also avoids repeating assignments performed inside expressions.
+    if arith_failed() {
+        return String::new();
+    }
     let mut env = ArithCtx {
         ctx,
         assigned: RefCell::new(HashMap::new()),
@@ -1205,7 +1335,19 @@ pub fn eval_arith(body: &str, ctx: &ExpandCtx) -> String {
     match crate::arith::eval(body, &mut env) {
         Ok(v) => v.to_string(),
         Err(e) => {
-            eprintln!("wash: {} (error token is \"{}\")", e.message, e.token);
+            // bash prefixes the expression itself, and labels parser-level
+            // failures as "arithmetic syntax error".
+            let msg = if e.message == "operand expected" {
+                format!("arithmetic syntax error: {}", e.message)
+            } else {
+                e.message.clone()
+            };
+            flag_arith_failure(&format!(
+                "{}: {} (error token is \"{}\")",
+                body.trim_start(),
+                msg,
+                bash_error_token(body, &e.token)
+            ));
             String::new()
         }
     }

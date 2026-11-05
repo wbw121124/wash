@@ -217,6 +217,34 @@ fn read_paren(chars: &[char], i: usize) -> Option<(String, usize)> {
     None
 }
 
+/// Read the body of the deprecated `$[ ... ]` arithmetic expansion.
+/// `i` points just past the opening `[`.  Nested brackets (array subscripts
+/// such as `$[a[1]+2]`) are tracked so the inner `]` does not end the body.
+/// Returns the body and the index just past the matching `]`.
+fn read_bracket(chars: &[char], i: usize) -> Option<(String, usize)> {
+    let mut depth = 1i32;
+    let mut s = String::new();
+    let mut j = i;
+    while j < chars.len() {
+        match chars[j] {
+            '[' => {
+                depth += 1;
+                s.push('[');
+            }
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((s, j + 1));
+                }
+                s.push(']');
+            }
+            c => s.push(c),
+        }
+        j += 1;
+    }
+    None
+}
+
 fn read_brace(chars: &[char], i: usize) -> Option<(String, usize)> {
     let mut depth = 1;
     let mut s = String::new();
@@ -421,6 +449,15 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                         }
                         parts.push(WordPart::Text("${".to_string(), true));
                         i += 1;
+                        continue;
+                    } else if i < n && chars[i] == '[' {
+                        // `$[ expr ]` is the obsolete spelling of `$(( expr ))`.
+                        if let Some((body, ni)) = read_bracket(&chars, i + 1) {
+                            parts.push(WordPart::Arith(body, true));
+                            i = ni;
+                            continue;
+                        }
+                        pending.push('$');
                         continue;
                     } else if i < n && is_expansion_start(chars[i]) {
                         let name = read_var_name(&chars, i);
@@ -698,6 +735,15 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                     }
                     parts.push(WordPart::Text("$".to_string(), false));
                     i += 1;
+                    continue;
+                } else if i < n && chars[i] == '[' {
+                    // `$[ expr ]` is the obsolete spelling of `$(( expr ))`.
+                    if let Some((body, ni)) = read_bracket(&chars, i + 1) {
+                        parts.push(WordPart::Arith(body, false));
+                        i = ni;
+                        continue;
+                    }
+                    pending.push('$');
                     continue;
                 } else if i < n && is_expansion_start(chars[i]) {
                     let name = read_var_name(&chars, i);

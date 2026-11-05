@@ -526,6 +526,9 @@ impl Shell {
         // 顶层命令开始即清掉上一轮可能残留的退出/返回标志，避免 `exit` 等内建设置的
         // 标志跨命令泄漏、导致后续命令只执行第一个 and-or 列表（code-review P1-#20）。
         self.exit_requested = None;
+        // A fatal arithmetic expansion is scoped to one command line; the
+        // interactive shell must remain usable on the next line.
+        crate::expand::clear_arith_failed();
         let code = match lexer::tokenize(s) {
             Ok(tokens) => match parser::parse_command_list(&tokens) {
                 Ok(list) => {

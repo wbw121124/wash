@@ -626,7 +626,14 @@ fn parse_power(lex: &mut Lexer, env: &mut dyn ArithEnv) -> Result<i64, ArithErro
         // right associative
         let exp = parse_unary(lex, env)?;
         if exp < 0 {
-            return Err(ArithError::new("exponent less than 0"));
+            // bash points at the exponent operand itself, e.g. `2**-1`
+            // reports (error token is "1").  The whole right-hand side has
+            // been consumed by now, so `error_token()` falls back to the
+            // text of the last token.
+            return Err(ArithError {
+                message: "exponent less than 0".to_string(),
+                token: lex.error_token(),
+            });
         }
         return Ok(base.wrapping_pow(exp as u32));
     }

@@ -1439,6 +1439,12 @@ fn execute_pipeline(p: &Pipeline, sh: &mut Shell, path: &str) -> i32 {
     let noclobber = sh.options.noclobber;
     let pipefail = sh.options.pipefail;
     let prepared = prepare(p, sh);
+    // A failed arithmetic expansion (or a negative-length array slice) is
+    // fatal for the whole command line: bash never runs `echo` when one of
+    // its own arguments failed to expand.
+    if crate::expand::arith_failed() {
+        return 1;
+    }
     let n = prepared.len();
     if n == 1 {
         let pr = &prepared[0];
@@ -1598,6 +1604,11 @@ fn execute_andor(andor: &AndOr, sh: &mut Shell, path: &str, last: &mut i32) -> b
         *last = execute_pipeline(pipeline, sh, path);
         // Propagate exit status so `$?` reflects the previous command.
         sh.last_status = *last;
+        // A fatal expansion error stops the AND-OR list as well: bash does
+        // not run the fallback in `echo $((1/0)) || echo fallback`.
+        if crate::expand::arith_failed() {
+            return true;
+        }
         // `exit` stops the shell, `set -e` stops it on a failure.
         if sh.exit_requested.is_some() {
             return false;
@@ -1625,6 +1636,11 @@ pub fn execute(list: &CommandList, sh: &mut Shell) -> i32 {
     let expanded = expand_aliases(list, sh, 0);
     for andor in &expanded.andors {
         let aborted = execute_andor(andor, sh, &path, &mut last);
+        // A fatal expansion error aborts every enclosing command list,
+        // including `if` / loop / function bodies that called us.
+        if crate::expand::arith_failed() {
+            break;
+        }
         // `exit` stops the shell; `return` / `break` / `continue` stop the
         // current command list and leave their flags set so the enclosing
         // function or loop can consume them (at the top level they are
@@ -1646,5 +1662,12 @@ pub fn execute(list: &CommandList, sh: &mut Shell) -> i32 {
             break;
         }
     }
-    last
+    // A fatal expansion error overrides the status of the enclosing compound
+    // command: `if echo $((1/0)); then ...; fi` has no `else` and would
+    // otherwise report success, while bash reports 1 for the whole line.
+    if crate::expand::arith_failed() {
+        1
+    } else {
+        last
+    }
 }
