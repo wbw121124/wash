@@ -25,6 +25,7 @@ extern "C" {
     fn wash_umask_set(mode: c_int) -> c_int;
     fn wash_times(u: *mut f64, s: *mut f64, cu: *mut f64, cs: *mut f64) -> c_int;
     fn wash_rlimit(resource: c_int, cur: u64, max: u64, set: c_int, got: *mut u64) -> c_int;
+    fn wash_rlimit_max(resource: c_int, got: *mut u64) -> c_int;
     fn wash_rlimit_resource(which: c_char) -> c_int;
     fn wash_getcwd() -> *const c_char;
     fn wash_chdir_getcwd(path: *const c_char, physical: c_int) -> *const c_char;
@@ -256,6 +257,20 @@ pub fn rlimit(which: u8, cur: u64, max: u64, set: bool) -> Option<u64> {
     }
 }
 
+/// Hard-limit variant of [`rlimit`] (returns `rlim_max`), used by `ulimit -H`.
+pub fn rlimit_hard(which: u8) -> Option<u64> {
+    let res = unsafe { wash_rlimit_resource(which as c_char) };
+    if res < 0 {
+        return None;
+    }
+    let mut got: u64 = 0;
+    if unsafe { wash_rlimit_max(res, &mut got) } != 0 {
+        None
+    } else {
+        Some(got)
+    }
+}
+
 pub fn open_read(path: &str) -> i32 {
     let c = CString::new(path).unwrap_or_default();
     unsafe { wash_open_read(c.as_ptr()) }
@@ -391,6 +406,20 @@ pub fn wait_pid_nohang(pid: i32) -> Option<i32> {
     let mut status: RawCInt = 0;
     let r = unsafe { wash_waitpid(pid, &mut status, WNOHANG) };
     if r == 0 {
+        None
+    } else {
+        Some(decode_status(status))
+    }
+}
+
+/// Like [`wait_pid`] (blocking, decoded status), but returns `None` when the
+/// pid is not a waitable child of this process (already reaped, or never a
+/// child of this shell → `ECHILD`). This lets the `wait` builtin tell
+/// "no such child" apart from a genuine exit status of 0.
+pub fn wait_pid_check(pid: i32) -> Option<i32> {
+    let mut status: RawCInt = 0;
+    let r = unsafe { wash_waitpid(pid, &mut status, 0) };
+    if r < 0 {
         None
     } else {
         Some(decode_status(status))

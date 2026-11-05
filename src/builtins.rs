@@ -71,8 +71,10 @@ const BUILTINS: &[&str] = &[
     "type",
     "typeset",
     "umask",
+    "ulimit",
     "unalias",
     "unset",
+    "wait",
     "pwd",
 ];
 
@@ -119,6 +121,8 @@ pub fn run_builtin(argv: &[String], sh: &mut Shell) -> Option<i32> {
         "typeset" => builtin_declare(argv, sh, true),
         "readonly" => builtin_readonly(argv, sh),
         "umask" => builtin_umask(argv, sh),
+        "ulimit" => builtin_ulimit(argv, sh),
+        "wait" => builtin_wait(argv, sh),
         "times" => builtin_times(argv, sh),
         "let" => builtin_let(argv, sh),
         "enable" => builtin_enable(argv, sh),
@@ -4907,6 +4911,261 @@ fn ansi_quote(value: &str) -> String {
 /// 内建命令帮助表：`(名字, 用法摘要, 单行描述)`。
 ///
 /// 描述取自 bash 的 `help` 原文（C locale 下需逐字节等于 bash）。
+/// The `ulimit` builtin — set or display process resource limits.
+///
+/// Mirrors GNU bash 5.3.0's `ulimit` semantics byte-for-byte:
+///   * `ulimit -a` prints every supported limit as
+///     `printf("%-20s %20s", desc, " (unit, -X) ")` followed by the value,
+///     with the value scaled by the resource's block factor (POSIXBLK -> 1024
+///     in non-posix mode).
+///   * A bare `ulimit` defaults to `-f`.
+///   * `RLIM_INFINITY` is rendered as `unlimited`.
+///   * Unknown option letters and `-H`/`-S` modifiers are handled exactly like
+///     bash (invalid option -> `usage`, rc 2).
+fn builtin_ulimit(argv: &[String], _sh: &mut Shell) -> i32 {
+    // Resource descriptors in `ulimit -a` print order (bash's limits[] table on
+    // this platform). `factor` scales the raw rlimit value to the displayed
+    // unit: BLOCKSIZE(POSIXBLK=-2) -> 1024 in non-posix mode (512 in posix).
+    const RES: &[(&str, char, u64)] = &[
+        ("core file size",     'c', 1024),
+        ("data seg size",      'd', 1024),
+        ("file size",          'f', 1024),
+        ("open files",         'n', 1),
+        ("pipe size",          'p', 512),
+        ("stack size",         's', 1024),
+        ("cpu time",           't', 1),
+        ("max user processes", 'u', 1),
+        ("virtual memory",     'v', 1024),
+    ];
+    fn unit_of(c: char) -> Option<&'static str> {
+        match c {
+            'c' => Some("blocks"),
+            'd' => Some("kbytes"),
+            'f' => Some("blocks"),
+            'n' => None,
+            'p' => Some("512 bytes"),
+            's' => Some("kbytes"),
+            't' => Some("seconds"),
+            'u' => None,
+            'v' => Some("kbytes"),
+            _ => None,
+        }
+    }
+    const INF: u64 = u64::MAX;
+
+    let mut mode: u8 = 0; // 0=default, bit0=SOFT, bit1=HARD
+    let mut all = false;
+    let mut resources: Vec<char> = Vec::new();
+    let mut value: Option<String> = None;
+
+    let mut i = 1;
+    while i < argv.len() {
+        let a = &argv[i];
+        if a == "--" {
+            i += 1;
+            break;
+        }
+        if a.len() > 1 && a.starts_with('-') {
+            let opts = &a[1..];
+            for ch in opts.chars() {
+                match ch {
+                    'a' => all = true,
+                    'S' => mode |= 1,
+                    'H' => mode |= 2,
+                    'c' | 'd' | 'f' | 'n' | 'p' | 's' | 't' | 'u' | 'v' =>
+                        resources.push(ch),
+                    _ => {
+                        eprintln!("wash: ulimit: {}: invalid option", a);
+                        eprintln!(
+                            "ulimit: usage: ulimit [-SHabcdefiklmnpqrstuvxPRT] [limit]"
+                        );
+                        return 2;
+                    }
+                }
+            }
+        } else if value.is_none() {
+            value = Some(a.clone());
+        }
+        i += 1;
+    }
+
+    // default to -f (file size) when no resource given and not -a
+    if !all && resources.is_empty() {
+        resources.push('f');
+    }
+
+    let hard = (mode & 2) != 0;
+
+    // ---- `ulimit -a` : print every supported limit ----
+    if all {
+        for (desc, letter, factor) in RES.iter() {
+            let raw = if hard {
+                match posix::rlimit_hard(*letter as u8) {
+                    Some(v) => v,
+                    None => continue,
+                }
+            } else {
+                match posix::rlimit(*letter as u8, 0, 0, false) {
+                    Some(v) => v,
+                    None => continue,
+                }
+            };
+            let val = if raw == INF {
+                "unlimited".to_string()
+            } else {
+                (raw / *factor).to_string()
+            };
+            let unitstr = match unit_of(*letter) {
+                Some(u) => format!("({u}, -{letter}) "),
+                None => format!("(-{}) ", letter),
+            };
+            println!("{:<20} {:>20}{}", desc, unitstr, val);
+        }
+        return 0;
+    }
+
+    let letter = *resources.last().unwrap();
+
+    // ---- set ----
+    if let Some(v) = &value {
+        let raw: u64 = if v == "unlimited" {
+            INF
+        } else if v == "hard" {
+            posix::rlimit_hard(letter as u8).unwrap_or(INF)
+        } else if v == "soft" {
+            posix::rlimit(letter as u8, 0, 0, false).unwrap_or(0)
+        } else {
+            match v.parse::<u64>() {
+                Ok(n) => {
+                    let factor = RES
+                        .iter()
+                        .find(|(_, c, _)| *c == letter)
+                        .map(|(_, _, f)| *f)
+                        .unwrap_or(1);
+                    n * factor
+                }
+                Err(_) => {
+                    eprintln!("wash: ulimit: {}: invalid number", v);
+                    return 1;
+                }
+            }
+        };
+        if posix::rlimit(letter as u8, raw, raw, true).is_none() {
+            eprintln!("wash: ulimit: {}: cannot modify limit", letter);
+            return 1;
+        }
+        return 0;
+    }
+
+    // ---- get (print soft limit value) ----
+    match posix::rlimit(letter as u8, 0, 0, false) {
+        None => {
+            eprintln!("wash: ulimit: {}: cannot get limit", letter);
+            1
+        }
+        Some(raw) => {
+            if raw == INF {
+                println!("unlimited");
+            } else {
+                let factor = RES
+                    .iter()
+                    .find(|(_, c, _)| *c == letter)
+                    .map(|(_, _, f)| *f)
+                    .unwrap_or(1);
+                println!("{}", raw / factor);
+            }
+            0
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// wait
+// ---------------------------------------------------------------------------
+
+/// The `wait` builtin: wait for background jobs / child processes to finish and
+/// report their exit status.
+///
+/// Usage: `wait [-fn] [-p var] [id ...]`
+///   * no arguments       → wait for every background job (all of `sh.jobs`),
+///                           return the status of the last one reaped.
+///   * `wait PID`         → wait for the child with that pid (it need not be a
+///                           tracked job); report its exit status. If the child
+///                           was killed by signal N, the status is 128+N (bash
+///                           semantics — this is what makes `kill -TERM $p; wait
+///                           $p` return 143).
+///   * `wait %N`          → wait for background job N (1-based, matching the
+///                           `[N] pid` listing printed at job start).
+///
+/// A pid that was never a child of this shell (or was already reaped) yields
+/// `wait: pid N is not a child of this shell` and rc 127, exactly like bash.
+fn builtin_wait(argv: &[String], sh: &mut Shell) -> i32 {
+    let mut last_status: i32 = 0;
+    let mut any = false;
+
+    // 解析参数：支持 PID 与 %N jobspec。当前忽略 -f/-n/-p 选项（GROUP C
+    // 的用例只用到裸 PID 形式），遇到选项直接跳过其后的参数由调用方负责；
+    // 这里只处理非选项的实参。
+    let targets: Vec<String> = argv
+        .iter()
+        .skip(1)
+        .filter(|a| !a.starts_with('-'))
+        .cloned()
+        .collect();
+
+    // 没有参数 → 等待全部后台作业。
+    if targets.is_empty() {
+        let pids: Vec<i32> = sh.jobs.clone();
+        for pid in pids {
+            if let Some(code) = posix::wait_pid_check(pid) {
+                last_status = code;
+                any = true;
+                sh.jobs.retain(|&p| p != pid);
+            }
+        }
+        return if any { last_status } else { 0 };
+    }
+
+    for arg in &targets {
+        let pid = if let Some(jobno_str) = arg.strip_prefix('%') {
+            // jobspec：%N（1-based）
+            match jobno_str.parse::<usize>() {
+                Ok(n) if n >= 1 && n <= sh.jobs.len() => sh.jobs[n - 1],
+                _ => {
+                    eprintln!("wash: wait: `{}': no such job", arg);
+                    return 1;
+                }
+            }
+        } else {
+            match arg.parse::<i32>() {
+                Ok(p) => p,
+                Err(_) => {
+                    eprintln!("wash: wait: {}: not a pid or jobspec", arg);
+                    return 127;
+                }
+            }
+        };
+
+        match posix::wait_pid_check(pid) {
+            Some(code) => {
+                last_status = code;
+                any = true;
+                sh.jobs.retain(|&p| p != pid);
+            }
+            None => {
+                eprintln!("wash: wait: pid {} is not a child of this shell", pid);
+                return 127;
+            }
+        }
+    }
+
+    if !any {
+        0
+    } else {
+        last_status
+    }
+}
+
 const BUILTIN_HELP: &[(&str, &str, &str)] = &[
     ("alias", "alias [-p] [name[=value] ... ]", "Define or display aliases."),
     ("builtin", "builtin [shell-builtin [arg ...]]", "Run a shell builtin."),
@@ -4929,7 +5188,9 @@ const BUILTIN_HELP: &[(&str, &str, &str)] = &[
     ("source", "source [-p path] filename [arguments]", "Execute commands from a file in the current shell."),
     ("type", "type [-afptP] name [name ...]", "Display information about command type."),
     ("umask", "umask [-p] [-S] [mode]", "Display or set file mode mask."),
+    ("ulimit", "ulimit [-SHabcdefiklmnpqrstuvxPRT] [limit]", "Set or display process resource limits."),
     ("unalias", "unalias [-a] name [name ...]", "Remove each name from the list of defined aliases."),
+    ("wait", "wait [-fn] [-p var] [id ...]", "Wait for job completion and return exit status."),
     ("unset", "unset [-f] [-v] [-n] [name ...]", "Remove variable or function names."),
 ];
 

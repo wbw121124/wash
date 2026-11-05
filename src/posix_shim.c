@@ -101,9 +101,33 @@ int wash_times(double *u, double *s, double *cu, double *cs) {
     return 0;
 }
 
+// Synthetic resource ids for limits bash obtains through non-getrlimit means.
+#define WASH_RLIM_PIPE    10001   // pipe size      -> pathconf(_PC_PIPE_BUF)
+#define WASH_RLIM_NPROC   10002   // max user procs -> sysconf(_SC_CHILD_MAX)
+
 // setrlimit / getrlimit wrappers. `cur`/`max` are rlim_t values; when
-// `set` is 0 only the current soft limit is retrieved into `*cur`.
+// `set` is 0 only the current soft limit is retrieved into `*got`.
 int wash_rlimit(int resource, rlim_t cur, rlim_t max, int set, rlim_t *got) {
+    if (resource == WASH_RLIM_PIPE) {
+        // pipe size is read-only and comes from pathconf, not getrlimit.
+        if (set) { errno = EINVAL; return -1; }
+        long r = pathconf(".", _PC_PIPE_BUF);
+        if (r < 0) return -1;
+        *got = (rlim_t)r;
+        return 0;
+    }
+    if (resource == WASH_RLIM_NPROC) {
+        // max user processes is read-only on Cygwin (sysconf).
+        if (set) { errno = EINVAL; return -1; }
+#ifdef _SC_CHILD_MAX
+        long r = sysconf(_SC_CHILD_MAX);
+        if (r < 0) return -1;
+        *got = (rlim_t)r;
+        return 0;
+#else
+        errno = EINVAL; return -1;
+#endif
+    }
     if (!set) {
         struct rlimit rl;
         if (getrlimit(resource, &rl) != 0) return -1;
@@ -118,10 +142,23 @@ int wash_rlimit(int resource, rlim_t cur, rlim_t max, int set, rlim_t *got) {
     return 0;
 }
 
-// Map a bash `ulimit` resource letter to the native RLIMIT_* constant (or -1
-// if unsupported). MSYS2's <sys/resource.h> only defines CPU, FSIZE, DATA,
-// STACK, CORE, NOFILE and AS — RLIMIT_NPROC / RLIMIT_RSS / RLIMIT_MEMLOCK do
-// not exist there, so they are guarded by #ifdef.
+// Like wash_rlimit(get) but returns the hard limit (rlim_max). Used by
+// `ulimit -H` / `ulimit -aH`.
+int wash_rlimit_max(int resource, rlim_t *got) {
+    if (resource == WASH_RLIM_PIPE || resource == WASH_RLIM_NPROC) {
+        // No distinct hard limit available; report the soft value.
+        return wash_rlimit(resource, 0, 0, 0, got);
+    }
+    struct rlimit rl;
+    if (getrlimit(resource, &rl) != 0) return -1;
+    *got = rl.rlim_max;
+    return 0;
+}
+
+// Map a bash `ulimit` resource letter to the native RLIMIT_* constant (or a
+// WASH_RLIM_* synthetic id, or -1 if unsupported). MSYS2/Cygwin's
+// <sys/resource.h> defines CORE, DATA, FSIZE, NOFILE, STACK, CPU and AS;
+// PIPE and NPROC are obtained via pathconf/sysconf respectively.
 int wash_rlimit_resource(char which) {
     switch (which) {
         case 'f': return RLIMIT_FSIZE;
@@ -131,12 +168,8 @@ int wash_rlimit_resource(char which) {
         case 't': return RLIMIT_CPU;
         case 'n': return RLIMIT_NOFILE;
         case 'v': return RLIMIT_AS;
-        case 'u':
-#ifdef RLIMIT_NPROC
-            return RLIMIT_NPROC;
-#else
-            return -1;
-#endif
+        case 'p': return WASH_RLIM_PIPE;
+        case 'u': return WASH_RLIM_NPROC;
         case 'm':
 #ifdef RLIMIT_RSS
             return RLIMIT_RSS;
