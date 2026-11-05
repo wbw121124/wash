@@ -390,6 +390,11 @@ fn parse_for_compound(tokens: &[Token], start: usize) -> Result<(Compound, usize
     let mut do_index = 0usize;
     let mut i = start + 3; // index just past `in`
     loop {
+        if i >= tokens.len() {
+            return Err(WashError::syntax(
+                "syntax error: unexpected end of file from `for' command",
+            ));
+        }
         match &tokens[i] {
             Token::Word(parts) => {
                 words.push(parts.clone());
@@ -435,6 +440,12 @@ fn parse_while_until_compound(
     let do_index = {
         let mut i = start + 1;
         loop {
+            if i >= tokens.len() {
+                return Err(WashError::syntax(format!(
+                    "syntax error: unexpected end of file from `{}' command",
+                    if is_until { "until" } else { "while" }
+                )));
+            }
             match &tokens[i] {
                 Token::Reserved(r) if r == "do" => break i,
                 Token::Reserved(_) => {
@@ -501,6 +512,11 @@ fn parse_case_compound(tokens: &[Token], start: usize) -> Result<(Compound, usiz
         let mut current: Vec<WordPart> = Vec::new();
         let mut saw_pipe = false;
         loop {
+            if i >= tokens.len() {
+                return Err(WashError::syntax(
+                    "syntax error: unexpected end of file from `case' command",
+                ));
+            }
             match &tokens[i] {
                 Token::Word(parts) if is_plain_text(parts) => {
                     let text = plain_text(parts);

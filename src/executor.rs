@@ -675,6 +675,12 @@ fn register_functions(list: &CommandList, sh: &mut Shell) {
     }
 }
 
+/// Maximum function call nesting depth before wash bails out with an error
+/// instead of overflowing the native stack. Bash enforces a similar limit
+/// (`maximum function nesting level exceeded`); without this guard a recursive
+/// function would abort the whole process via a stack overflow.
+const MAX_FUNCTION_DEPTH: usize = 200;
+
 /// Run a shell function: push a new local scope, bind `$1`/`$@` to the call
 /// arguments, run the body, restore the caller's positional parameters and
 /// local variables, and return the (possibly `return`-driven) status.
@@ -688,6 +694,11 @@ fn execute_function(name: &str, args: Vec<String>, sh: &mut Shell) -> i32 {
     };
     let saved_positional = std::mem::replace(&mut sh.positional, args);
     sh.function_depth += 1;
+    if sh.function_depth > MAX_FUNCTION_DEPTH {
+        sh.function_depth -= 1;
+        eprintln!("wash: maximum function nesting level exceeded");
+        return 1;
+    }
     sh.call_stack.push(std::collections::HashMap::new());
     sh.return_requested = None;
     sh.break_requested = None;
