@@ -102,34 +102,79 @@ pub fn expand_scalar(parts: &[WordPart], ctx: &ExpandCtx) -> String {
     out
 }
 
+/// A word under construction.
+///
+/// Bash expands a word left-to-right.  When an unquoted expansion splits into
+/// several fields, only the **last** field is still part of the word being
+/// built; all earlier fields are complete and must not receive the word's
+/// suffix.  `open` marks that still-growing field:
+///
+/// ```text
+/// pre$@suf   ->  [ "pre" + first ] [ middle ... ] [ last + "suf" ]
+/// ```
+#[derive(Clone, Debug)]
+struct Candidate {
+    text: String,
+    open: bool,
+}
+
+/// Append literal text to every still-open candidate.  Closed fields are
+/// already complete words and stay untouched.
+fn append_literal(candidates: Vec<Candidate>, text: &str) -> Vec<Candidate> {
+    candidates
+        .into_iter()
+        .map(|c| {
+            if c.open {
+                Candidate { text: format!("{}{}", c.text, text), open: true }
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 /// Expand a single word into 0+ resulting words (splitting + globbing for
 /// unquoted expansions).
 pub fn expand_word(parts: &[WordPart], ctx: &ExpandCtx) -> Vec<String> {
-    let mut candidates: Vec<String> = vec![String::new()];
+    let mut candidates: Vec<Candidate> = vec![Candidate { text: String::new(), open: true }];
     for part in parts {
         match part {
             WordPart::Text(s, quoted) => {
-                let mut next: Vec<String> =
-                    candidates.iter().map(|c| format!("{}{}", c, s)).collect();
-                if !*quoted {
-                    if ctx.noglob {
-                        // `set -f` / `set -o noglob`: literal, no globbing.
-                    } else {
-                        // Unquoted literal text is still subject to globbing.
-                        let mut globbed = Vec::new();
-                        for w in next.drain(..) {
-                            globbed.extend(glob(&w));
+                let mut next = append_literal(candidates, s);
+                if !*quoted && !ctx.noglob {
+                    // Unquoted literal text is still subject to globbing.  A
+                    // glob that yields several matches turns all but the last
+                    // into complete fields.
+                    let mut globbed = Vec::new();
+                    for c in next.drain(..) {
+                        if !c.open {
+                            globbed.push(c);
+                            continue;
                         }
-                        next = globbed;
+                        let matches = glob(&c.text);
+                        let n = matches.len();
+                        for (k, m) in matches.into_iter().enumerate() {
+                            globbed.push(Candidate { text: m, open: k + 1 == n });
+                        }
                     }
+                    next = globbed;
                 }
                 candidates = next;
             }
             WordPart::Tilde => {
                 let home = ctx.env.get("HOME").cloned().unwrap_or_else(|| "/".to_string());
                 candidates = candidates
-                    .iter()
-                    .map(|c| if c.is_empty() { home.clone() } else { format!("{}~", c) })
+                    .into_iter()
+                    .map(|c| {
+                        if c.open {
+                            Candidate {
+                                text: if c.text.is_empty() { home.clone() } else { format!("{}~", c.text) },
+                                open: true,
+                            }
+                        } else {
+                            c
+                        }
+                    })
                     .collect();
             }
             WordPart::Var(name, quoted) => {
@@ -152,71 +197,159 @@ pub fn expand_word(parts: &[WordPart], ctx: &ExpandCtx) -> Vec<String> {
             }
             WordPart::Arith(body, _) => {
                 let val = eval_arith(body, ctx);
-                candidates = candidates.iter().map(|c| format!("{}{}", c, val)).collect();
+                candidates = append_literal(candidates, &val);
             }
             WordPart::Brace(alts) => {
+                // Brace expansion forks the word into several *open* words.
                 let mut next = Vec::with_capacity(candidates.len() * alts.len());
-                for c in &candidates {
+                for c in candidates {
+                    if !c.open {
+                        next.push(c);
+                        continue;
+                    }
                     for a in alts {
-                        next.push(format!("{}{}", c, a));
+                        next.push(Candidate { text: format!("{}{}", c.text, a), open: true });
                     }
                 }
                 candidates = next;
             }
         }
     }
-    candidates
+    candidates.into_iter().map(|c| c.text).collect()
 }
 
-/// Append `exp` to each candidate, applying word-splitting + globbing unless
-/// `quoted`.
-fn apply_value(candidates: Vec<String>, exp: Expansion, quoted: bool, ctx: &ExpandCtx) -> Vec<String> {
-    let noglob = ctx.noglob;
-    let ifs0 = ctx
-        .env
+/// The value of `$IFS` for word splitting.  An *unset* IFS behaves like the
+/// default `" \t\n"`; an explicitly empty IFS disables splitting entirely.
+fn ifs_value(ctx: &ExpandCtx) -> String {
+    ctx.env
         .get("IFS")
-        .and_then(|s| s.chars().next())
-        .unwrap_or(' ');
+        .cloned()
+        .unwrap_or_else(|| " \t\n".to_string())
+}
+
+/// The separator bash uses to join `$*` / `${arr[*]}` / `${arr[@]}` in a
+/// scalar context: the first character of IFS, or `""` when IFS is empty.
+fn ifs_join_sep(ctx: &ExpandCtx) -> String {
+    match ctx.env.get("IFS") {
+        Some(s) => s.chars().next().map(|c| c.to_string()).unwrap_or_default(),
+        None => " ".to_string(),
+    }
+}
+
+/// Split `val` on the characters of `ifs` following bash's rules:
+///
+/// * IFS whitespace (space/tab/newline present in IFS) is ignored at the
+///   start/end; a run of it delimits one field.
+/// * An IFS character that is *not* whitespace, together with any adjacent
+///   IFS whitespace, delimits one field.  Consecutive non-whitespace IFS
+///   characters therefore produce empty fields (`:a` -> `["", "a"]`).
+/// * A trailing delimiter does not produce an extra empty field.
+fn split_ifs(val: &str, ifs: &str) -> Vec<String> {
+    if ifs.is_empty() {
+        return if val.is_empty() { Vec::new() } else { vec![val.to_string()] };
+    }
+    let chars: Vec<char> = val.chars().collect();
+    let is_ws = |c: char| matches!(c, ' ' | '\t' | '\n') && ifs.contains(c);
+    let is_nonws = |c: char| !matches!(c, ' ' | '\t' | '\n') && ifs.contains(c);
+    let n = chars.len();
+    let mut i = 0usize;
+    while i < n && is_ws(chars[i]) {
+        i += 1;
+    }
+    let mut fields: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    while i < n {
+        let c = chars[i];
+        if is_ws(c) {
+            while i < n && is_ws(chars[i]) {
+                i += 1;
+            }
+            // Absorb one adjacent non-whitespace IFS char into this delimiter.
+            if i < n && is_nonws(chars[i]) {
+                i += 1;
+                while i < n && is_ws(chars[i]) {
+                    i += 1;
+                }
+            }
+            fields.push(std::mem::take(&mut cur));
+        } else if is_nonws(c) {
+            i += 1;
+            while i < n && is_ws(chars[i]) {
+                i += 1;
+            }
+            fields.push(std::mem::take(&mut cur));
+        } else {
+            cur.push(c);
+            i += 1;
+        }
+    }
+    // Only a non-empty pending field survives the trailing delimiter.
+    if !cur.is_empty() {
+        fields.push(cur);
+    }
+    fields
+}
+
+/// The final field list produced by one expansion (before the word's prefix
+/// and suffix are attached).
+fn expansion_fields(exp: Expansion, quoted: bool, ctx: &ExpandCtx) -> Vec<String> {
+    if quoted {
+        return match exp {
+            Expansion::Scalar(s) => vec![s],
+            Expansion::At(fs) => fs,
+            Expansion::Star(fs) => vec![fs.join(&ifs_join_sep(ctx))],
+        };
+    }
+    let ifs = ifs_value(ctx);
+    let mut fields: Vec<String> = Vec::new();
+    match exp {
+        Expansion::Scalar(s) => fields.extend(split_ifs(&s, &ifs)),
+        Expansion::At(fs) => {
+            // Unquoted `$@`: each positional parameter / element is split
+            // independently, then the resulting lists are concatenated.
+            for f in &fs {
+                fields.extend(split_ifs(f, &ifs));
+            }
+        }
+        Expansion::Star(fs) => {
+            let joined = fs.join(&ifs_join_sep(ctx));
+            fields.extend(split_ifs(&joined, &ifs));
+        }
+    }
+    let mut out = Vec::new();
+    for f in &fields {
+        out.extend(glob_fields("", f, ctx.noglob));
+    }
+    out
+}
+
+/// Append `exp` to each open candidate.  When it yields several fields, only
+/// the first inherits the word's accumulated prefix and only the last stays
+/// open to receive the suffix — matching bash's `pre$@suf` behaviour.
+fn apply_value(candidates: Vec<Candidate>, exp: Expansion, quoted: bool, ctx: &ExpandCtx) -> Vec<Candidate> {
+    let fields = expansion_fields(exp, quoted, ctx);
     let mut next = Vec::new();
-    for c in &candidates {
-        match exp {
-            Expansion::Scalar(ref s) => {
-                if quoted {
-                    next.push(format!("{}{}", c, s));
-                } else {
-                    let fields = split_ifs(s);
-                    if fields.is_empty() {
-                        next.push(c.clone());
-                    } else {
-                        for f in &fields {
-                            next.extend(glob_fields(c, f, noglob));
-                        }
-                    }
-                }
-            }
-            Expansion::At(ref fs) => {
-                // `${arr[@]}` — one field per element, never re-split.
-                if fs.is_empty() {
-                    next.push(c.clone());
-                } else {
-                    for f in fs {
-                        if quoted {
-                            next.push(format!("{}{}", c, f));
-                        } else {
-                            next.extend(glob_fields(c, f, noglob));
-                        }
-                    }
-                }
-            }
-            Expansion::Star(ref fs) => {
-                // `${arr[*]}` — elements joined by the first char of IFS into a
-                // single field (not re-split).
-                let joined = fs.join(&ifs0.to_string());
-                if quoted {
-                    next.push(format!("{}{}", c, joined));
-                } else {
-                    next.extend(glob_fields(c, &joined, noglob));
-                }
+    for c in candidates {
+        if !c.open {
+            next.push(c);
+            continue;
+        }
+        if fields.is_empty() {
+            next.push(c);
+            continue;
+        }
+        let n = fields.len();
+        for (k, f) in fields.iter().enumerate() {
+            if k == 0 {
+                next.push(Candidate {
+                    text: format!("{}{}", c.text, f),
+                    open: n == 1,
+                });
+            } else {
+                next.push(Candidate {
+                    text: f.clone(),
+                    open: k + 1 == n,
+                });
             }
         }
     }
@@ -228,33 +361,8 @@ fn apply_value(candidates: Vec<String>, exp: Expansion, quoted: bool, ctx: &Expa
 fn expansion_to_scalar(exp: Expansion, ctx: &ExpandCtx) -> String {
     match exp {
         Expansion::Scalar(s) => s,
-        Expansion::At(fs) | Expansion::Star(fs) => {
-            let sep = ctx
-                .env
-                .get("IFS")
-                .and_then(|s| s.chars().next())
-                .unwrap_or(' ');
-            fs.join(&sep.to_string())
-        }
+        Expansion::At(fs) | Expansion::Star(fs) => fs.join(&ifs_join_sep(ctx)),
     }
-}
-
-fn split_ifs(val: &str) -> Vec<String> {
-    let mut fields = Vec::new();
-    let mut cur = String::new();
-    for ch in val.chars() {
-        if ch == ' ' || ch == '\t' || ch == '\n' {
-            if !cur.is_empty() {
-                fields.push(std::mem::take(&mut cur));
-            }
-        } else {
-            cur.push(ch);
-        }
-    }
-    if !cur.is_empty() {
-        fields.push(cur);
-    }
-    fields
 }
 
 // ---------------------------------------------------------------------------

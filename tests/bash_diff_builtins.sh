@@ -516,6 +516,42 @@ run_case_sem A group-unclosed   '{ echo hi' '[ "$RC" -eq 2 ] && [ ! -s "$OUT" ] 
 run_case_sem A group-empty      '{ }' '[ "$RC" -eq 2 ] && [ ! -s "$OUT" ] && grep -q "syntax error" "$ERR"'
 run_case_sem A group-no-semi    '{ echo a }' '[ "$RC" -eq 2 ] && [ ! -s "$OUT" ] && grep -q "unexpected end of file" "$ERR"'
 run_case_sem A group-stray-close '}' '[ "$RC" -eq 2 ] && [ ! -s "$OUT" ] && grep -q "syntax error" "$ERR"'
+# 第二/三轮 review P1 #7 / #11 / P3 #30：自定义 IFS 分词、未引号 $@/$* 的
+# 二次分词、以及多字段展开时「前缀只接首字段、后缀只接末字段」。
+# 旧实现 split_ifs 硬编码空格/tab/换行、At/Star 不分词、且给每个字段都拼前缀。
+# 这里同时锁住 IFS 非空白分隔符的连续/前导/尾随空字段规则。
+run_case A ifs-colon-basic     'IFS=:; x="a:b:c"; printf "[%s]" $x; echo'
+run_case A ifs-colon-empty     'IFS=:; x=":a:b:"; printf "[%s]" $x; echo'
+run_case A ifs-colon-double    'IFS=:; x="a::b"; printf "[%s]" $x; echo'
+run_case A ifs-colon-trailing  'IFS=:; x="a:b:"; printf "[%s]" $x; echo'
+run_case A ifs-colon-only      'IFS=:; x=":"; printf "[%s]" $x; echo'
+run_case A ifs-comma-empty     'IFS=,; x="a,,b,"; printf "[%s]" $x; echo'
+run_case A ifs-empty-no-split  'IFS=; x="a b"; printf "[%s]" $x; echo'
+run_case A ifs-unset-default   'unset IFS; x="a b"; printf "[%s]" $x; echo'
+run_case A ifs-mixed-ws        'IFS=" :"; x="a : b"; printf "[%s]" $x; echo'
+run_case A ifs-mixed-double    'IFS=" :"; x="a: :b"; printf "[%s]" $x; echo'
+run_case A ifs-mixed-leading   'IFS=" :"; x=" :a: "; printf "[%s]" $x; echo'
+run_case A ifs-custom-char     'IFS=x; v="axb"; printf "[%s]" $v; echo'
+run_case A ifs-cmdsub          'IFS=:; y=$(echo "a:b"); printf "[%s]" $y; echo'
+run_case A ifs-quoted-no-split 'IFS=:; x="a:b"; printf "[%s]" "$x"; echo'
+run_case A dollar-at-unquoted  'set -- "a b" c; printf "[%s]" $@; echo'
+run_case A dollar-star-unquoted 'set -- a b c; printf "[%s]" $*; echo'
+run_case A dollar-at-quoted    'set -- "a b" c; printf "[%s]" "$@"; echo'
+run_case A dollar-star-quoted  'set -- a b; printf "[%s]" "$*"; echo'
+run_case A dollar-star-ifs     'IFS=:; set -- a b; printf "[%s]" "$*"; echo'
+run_case A dollar-star-ifs-empty 'IFS=; set -- a b; printf "[%s]" "$*"; echo'
+run_case A dollar-at-ifs-split 'set -- "a:b" c; IFS=:; printf "[%s]" $@; echo'
+run_case A dollar-at-prefix    'set -- a b; printf "[%s]" pre$@; echo'
+run_case A dollar-at-suffix    'set -- a b; printf "[%s]" $@suf; echo'
+run_case A dollar-at-pre-suf   'set -- a b; printf "[%s]" pre$@suf; echo'
+run_case A dollar-at-quoted-pre 'set -- a b; printf "[%s]" "pre$@"; echo'
+run_case A scalar-split-prefix 'x="a b"; printf "[%s]" pre$x; echo'
+run_case A scalar-split-suffix 'x="a b"; printf "[%s]" $x-suf; echo'
+run_case A array-at-ifs        'a=(p q); IFS=:; printf "[%s]" "${a[*]}"; echo'
+run_case A brace-after-split   'x="a b"; echo pre$x-suf'
+run_case A for-in-ifs          'IFS=:; x="a:b"; for f in $x; do echo "F=$f"; done'
+run_case A for-in-dollar-at    'set -- "a b" c; for f in $@; do echo "F=$f"; done'
+run_case A for-in-quoted-at    'set -- "a b" c; for f in "$@"; do echo "F=$f"; done'
 
 ###############################################################################
 # GROUP B -- KNOWN-DEFECT.
