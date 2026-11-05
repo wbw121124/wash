@@ -8,7 +8,6 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use crate::arith;
 use crate::lexer::WordPart;
 use crate::parser;
 use crate::shell::VarAttrs;
@@ -190,11 +189,7 @@ fn apply_value(candidates: Vec<String>, exp: Expansion, quoted: bool, ctx: &Expa
                         next.push(c.clone());
                     } else {
                         for f in &fields {
-                            if noglob {
-                                next.push(format!("{}{}", c, f));
-                            } else {
-                                next.push(format!("{}{}", c, glob_one(f)));
-                            }
+                            next.extend(glob_fields(c, f, noglob));
                         }
                     }
                 }
@@ -207,10 +202,8 @@ fn apply_value(candidates: Vec<String>, exp: Expansion, quoted: bool, ctx: &Expa
                     for f in fs {
                         if quoted {
                             next.push(format!("{}{}", c, f));
-                        } else if noglob {
-                            next.push(format!("{}{}", c, f));
                         } else {
-                            next.push(format!("{}{}", c, glob_one(f)));
+                            next.extend(glob_fields(c, f, noglob));
                         }
                     }
                 }
@@ -221,10 +214,8 @@ fn apply_value(candidates: Vec<String>, exp: Expansion, quoted: bool, ctx: &Expa
                 let joined = fs.join(&ifs0.to_string());
                 if quoted {
                     next.push(format!("{}{}", c, joined));
-                } else if noglob {
-                    next.push(format!("{}{}", c, joined));
                 } else {
-                    next.push(format!("{}{}", c, glob_one(&joined)));
+                    next.extend(glob_fields(c, &joined, noglob));
                 }
             }
         }
@@ -744,12 +735,21 @@ fn has_glob(p: &str) -> bool {
     p.contains('*') || p.contains('?') || (p.contains('[') && p.contains(']'))
 }
 
-fn glob_one(pattern: &str) -> String {
-    let matches = glob(pattern);
+/// Expand one unquoted field into **one word per glob match**.  Joining all
+/// matches with a space (the old `glob_one`) collapsed them into a single
+/// argument, breaking `x=dir/*.txt; printf "[%s]" $x`, `for f in $x`, etc.
+fn glob_fields(prefix: &str, field: &str, noglob: bool) -> Vec<String> {
+    if noglob {
+        return vec![format!("{}{}", prefix, field)];
+    }
+    let matches = glob(field);
     if matches.is_empty() {
-        pattern.to_string()
+        vec![format!("{}{}", prefix, field)]
     } else {
-        matches.join(" ")
+        matches
+            .iter()
+            .map(|m| format!("{}{}", prefix, m))
+            .collect()
     }
 }
 
@@ -918,30 +918,49 @@ pub fn glob_match(s: &[char], pat: &[char]) -> bool {
 /// Adapter exposing the shell's expansion context to `arith::eval`, so that
 /// `$(( ... ))` uses the same panic-free engine as `let` / `(( ))` (proper
 /// `**`, wrapping shifts, negative-exponent errors, etc.).
-struct ArithCtx<'a>(&'a ExpandCtx<'a>);
+struct ArithCtx<'a> {
+    ctx: &'a ExpandCtx<'a>,
+    /// Values assigned inside the expression. Later reads in the SAME
+    /// expression must see them (`$(((x=5)+x))` is 10, not 5).
+    assigned: RefCell<HashMap<String, i64>>,
+}
 
 impl<'a> crate::arith::ArithEnv for ArithCtx<'a> {
     fn get(&self, name: &str) -> Option<i64> {
+        if let Some(v) = self.assigned.borrow().get(name) {
+            return Some(*v);
+        }
         if let Ok(n) = name.parse::<usize>() {
             if n == 0 {
-                return self.0.dollar_zero.parse::<i64>().ok();
+                return self.ctx.dollar_zero.parse::<i64>().ok();
             }
-            return self.0.positional.get(n - 1).and_then(|s| s.parse::<i64>().ok());
+            return self.ctx.positional.get(n - 1).and_then(|s| s.parse::<i64>().ok());
         }
         match name {
             "@" | "*" => return None,
-            "#" => return Some(self.0.positional.len() as i64),
-            "?" => return Some(self.0.last_status as i64),
-            "0" => return self.0.dollar_zero.parse::<i64>().ok(),
+            "#" => return Some(self.ctx.positional.len() as i64),
+            "?" => return Some(self.ctx.last_status as i64),
+            "0" => return self.ctx.dollar_zero.parse::<i64>().ok(),
             _ => {}
         }
-        self.0.env.get(name).and_then(|v| v.parse::<i64>().ok())
+        self.ctx.env.get(name).and_then(|v| v.parse::<i64>().ok())
     }
-    fn set(&mut self, _name: &str, _value: i64) {}
+    fn set(&mut self, name: &str, value: i64) {
+        self.assigned.borrow_mut().insert(name.to_string(), value);
+        // Persist the assignment through the same channel used by
+        // `${var=word}`; the executor drains it into `sh.env` after expansion,
+        // so `x=0; echo $((x=5)); echo $x` prints 5 / 5 like bash.
+        if let Some(cell) = &self.ctx.pending_assign {
+            cell.borrow_mut().push((name.to_string(), value.to_string()));
+        }
+    }
 }
 
 pub fn eval_arith(body: &str, ctx: &ExpandCtx) -> String {
-    let mut env = ArithCtx(ctx);
+    let mut env = ArithCtx {
+        ctx,
+        assigned: RefCell::new(HashMap::new()),
+    };
     match crate::arith::eval(body, &mut env) {
         Ok(v) => v.to_string(),
         Err(e) => {
@@ -968,342 +987,5 @@ fn resolve_param(name: &str, ctx: &ExpandCtx) -> String {
         "?" => ctx.last_status.to_string(),
         "0" => ctx.dollar_zero.to_string(),
         _ => ctx.env.get(name).cloned().unwrap_or_default(),
-    }
-}
-
-/// Expand a command-substitution body into the command string to run.  The
-/// body is expanded with the CURRENT context (so positional parameters and
-/// variables resolve to the caller's values), producing a flat command line
-/// that `capture_command` then executes in a subshell.  Pipelines/redirections
-/// in the body are not preserved -- this is sufficient for the arithmetic
-/// command-substitution cases (e.g. `$(fact ...)`).
-fn arith_cmd_sub(inner: &str, ctx: &ExpandCtx) -> String {
-    let tokens = match crate::lexer::tokenize(inner) {
-        Ok(t) => t,
-        Err(_) => return String::new(),
-    };
-    let mut cmd = String::new();
-    for t in &tokens {
-        if let crate::lexer::Token::Word(parts) = t {
-            for w in expand_word(parts, ctx) {
-                if !cmd.is_empty() {
-                    cmd.push(' ');
-                }
-                cmd.push_str(&w);
-            }
-        }
-    }
-    cmd
-}
-
-struct ArithParser<'a> {
-    chars: Vec<char>,
-    pos: usize,
-    ctx: &'a ExpandCtx<'a>,
-}
-
-impl<'a> ArithParser<'a> {
-    fn peek(&self) -> Option<char> {
-        self.chars.get(self.pos).copied()
-    }
-    fn skip_ws(&mut self) {
-        while let Some(c) = self.peek() {
-            if c.is_whitespace() {
-                self.pos += 1;
-            } else {
-                break;
-            }
-        }
-    }
-
-    fn parse_expr(&mut self) -> Result<i64, ()> {
-        self.parse_bor()
-    }
-    fn parse_bor(&mut self) -> Result<i64, ()> {
-        let mut v = self.parse_bxor()?;
-        loop {
-            self.skip_ws();
-            if self.peek() == Some('|') && self.chars.get(self.pos + 1).copied() != Some('|') {
-                self.pos += 1;
-                v |= self.parse_bxor()?;
-            } else {
-                break;
-            }
-        }
-        Ok(v)
-    }
-    fn parse_bxor(&mut self) -> Result<i64, ()> {
-        let mut v = self.parse_band()?;
-        loop {
-            self.skip_ws();
-            if self.peek() == Some('^') {
-                self.pos += 1;
-                v ^= self.parse_band()?;
-            } else {
-                break;
-            }
-        }
-        Ok(v)
-    }
-    fn parse_band(&mut self) -> Result<i64, ()> {
-        let mut v = self.parse_eq()?;
-        loop {
-            self.skip_ws();
-            if self.peek() == Some('&') && self.chars.get(self.pos + 1).copied() != Some('&') {
-                self.pos += 1;
-                v &= self.parse_eq()?;
-            } else {
-                break;
-            }
-        }
-        Ok(v)
-    }
-    fn parse_eq(&mut self) -> Result<i64, ()> {
-        let mut v = self.parse_rel()?;
-        loop {
-            self.skip_ws();
-            let p = self.peek();
-            if p == Some('=') && self.chars.get(self.pos + 1).copied() == Some('=') {
-                self.pos += 2;
-                let r = self.parse_rel()?;
-                v = if v == r { 1 } else { 0 };
-            } else if p == Some('!') && self.chars.get(self.pos + 1).copied() == Some('=') {
-                self.pos += 2;
-                let r = self.parse_rel()?;
-                v = if v != r { 1 } else { 0 };
-            } else {
-                break;
-            }
-        }
-        Ok(v)
-    }
-    fn parse_rel(&mut self) -> Result<i64, ()> {
-        let mut v = self.parse_shift()?;
-        loop {
-            self.skip_ws();
-            let p = self.peek();
-            let two = self.chars.get(self.pos + 1).copied();
-            let op = match (p, two) {
-                (Some('<'), Some('<')) => Some(0),
-                (Some('>'), Some('>')) => Some(1),
-                (Some('<'), _) => Some(2),
-                (Some('>'), _) => Some(3),
-                _ => None,
-            };
-            if let Some(kind) = op {
-                if kind < 2 {
-                    self.pos += 2;
-                } else {
-                    self.pos += 1;
-                }
-                let r = self.parse_shift()?;
-                v = match kind {
-                    0 => v << r,
-                    1 => v >> r,
-                    2 => {
-                        if v < r {
-                            1
-                        } else {
-                            0
-                        }
-                    }
-                    _ => {
-                        if v > r {
-                            1
-                        } else {
-                            0
-                        }
-                    }
-                };
-            } else {
-                break;
-            }
-        }
-        Ok(v)
-    }
-    fn parse_shift(&mut self) -> Result<i64, ()> {
-        self.parse_add()
-    }
-    fn parse_add(&mut self) -> Result<i64, ()> {
-        let mut v = self.parse_mul()?;
-        loop {
-            self.skip_ws();
-            match self.peek() {
-                Some('+') => {
-                    self.pos += 1;
-                    v += self.parse_mul()?;
-                }
-                Some('-') => {
-                    self.pos += 1;
-                    v -= self.parse_mul()?;
-                }
-                _ => break,
-            }
-        }
-        Ok(v)
-    }
-    fn parse_mul(&mut self) -> Result<i64, ()> {
-        let mut v = self.parse_unary()?;
-        loop {
-            self.skip_ws();
-            match self.peek() {
-                Some('*') => {
-                    self.pos += 1;
-                    v *= self.parse_unary()?;
-                }
-                Some('/') => {
-                    self.pos += 1;
-                    let r = self.parse_unary()?;
-                    v = if r == 0 { 0 } else { v / r };
-                }
-                Some('%') => {
-                    self.pos += 1;
-                    let r = self.parse_unary()?;
-                    v = if r == 0 { 0 } else { v % r };
-                }
-                _ => break,
-            }
-        }
-        Ok(v)
-    }
-    fn parse_unary(&mut self) -> Result<i64, ()> {
-        self.skip_ws();
-        match self.peek() {
-            Some('-') => {
-                self.pos += 1;
-                Ok(-self.parse_unary()?)
-            }
-            Some('+') => {
-                self.pos += 1;
-                self.parse_unary()
-            }
-            Some('~') => {
-                self.pos += 1;
-                Ok(!self.parse_unary()?)
-            }
-            Some('!') => {
-                self.pos += 1;
-                Ok(if self.parse_unary()? == 0 { 1 } else { 0 })
-            }
-            _ => self.parse_pow(),
-        }
-    }
-    fn parse_pow(&mut self) -> Result<i64, ()> {
-        let base = self.parse_primary()?;
-        self.skip_ws();
-        if self.peek() == Some('*') && self.chars.get(self.pos + 1).copied() == Some('*') {
-            self.pos += 2;
-            let exp = self.parse_unary()?;
-            Ok(base.pow(exp as u32))
-        } else {
-            Ok(base)
-        }
-    }
-    fn parse_primary(&mut self) -> Result<i64, ()> {
-        self.skip_ws();
-        match self.peek() {
-            Some('(') => {
-                self.pos += 1;
-                let v = self.parse_expr()?;
-                self.skip_ws();
-                if self.peek() == Some(')') {
-                    self.pos += 1;
-                }
-                Ok(v)
-            }
-            Some('$') => {
-                self.pos += 1;
-                // Command substitution: $( command ).  The command runs in a
-                // subshell (see `capture_command`), so it can call functions
-                // defined in the parent.  Its body is expanded in the CURRENT
-                // context first (so positional parameters like `$1` resolve to
-                // the caller's value), which is what makes recursive functions
-                // such as `fact` work through arithmetic.
-                if self.peek() == Some('(') {
-                    self.pos += 1;
-                    let start = self.pos;
-                    let mut depth = 1i32;
-                    while self.pos < self.chars.len() {
-                        match self.chars[self.pos] {
-                            '(' => depth += 1,
-                            ')' => {
-                                depth -= 1;
-                                if depth == 0 {
-                                    break;
-                                }
-                            }
-                            _ => {}
-                        }
-                        self.pos += 1;
-                    }
-                    let end = self.pos; // index of the matching `)`
-                    if self.pos < self.chars.len() && self.chars[self.pos] == ')' {
-                        self.pos += 1;
-                    }
-                    let inner: String = self.chars[start..end].iter().collect();
-                    let cmd = arith_cmd_sub(&inner, self.ctx);
-                    let out = crate::executor::capture_command(
-                        &cmd,
-                        self.ctx.env,
-                        self.ctx.attrs,
-                        self.ctx.functions,
-                        self.ctx.arrays,
-                    );
-                    return Ok(out.trim().parse::<i64>().unwrap_or(0));
-                }
-                // $name or ${name}
-                let name = if self.peek() == Some('{') {
-                    self.pos += 1;
-                    let mut n = String::new();
-                    while let Some(c) = self.peek() {
-                        if c == '}' {
-                            self.pos += 1;
-                            break;
-                        }
-                        n.push(c);
-                        self.pos += 1;
-                    }
-                    n
-                } else {
-                    let mut n = String::new();
-                    while let Some(c) = self.peek() {
-                        if c.is_ascii_alphanumeric() || c == '_' {
-                            n.push(c);
-                            self.pos += 1;
-                        } else {
-                            break;
-                        }
-                    }
-                    n
-                };
-                Ok(resolve_param(&name, self.ctx).parse::<i64>().unwrap_or(0))
-            }
-            Some(c) if c.is_ascii_alphabetic() || c == '_' => {
-                // bare variable name (arithmetic allows X*3)
-                let mut n = String::new();
-                while let Some(ch) = self.peek() {
-                    if ch.is_ascii_alphanumeric() || ch == '_' {
-                        n.push(ch);
-                        self.pos += 1;
-                    } else {
-                        break;
-                    }
-                }
-                Ok(resolve_param(&n, self.ctx).parse::<i64>().unwrap_or(0))
-            }
-            Some(c) if c.is_ascii_digit() => {
-                let mut s = String::new();
-                while let Some(d) = self.peek() {
-                    if d.is_ascii_digit() {
-                        s.push(d);
-                        self.pos += 1;
-                    } else {
-                        break;
-                    }
-                }
-                Ok(s.parse::<i64>().unwrap_or(0))
-            }
-            _ => Err(()),
-        }
     }
 }

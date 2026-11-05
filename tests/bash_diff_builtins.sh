@@ -483,6 +483,13 @@ run_case_sem A arith-neg-exp  'echo $((2 ** -1))' '[ "$RC" -lt 128 ] && grep -q 
 # 同批修复的 P1#9 / P1#12：`$( )` 内引号里的 ) 是字面量；命令替换剥全部尾随换行。
 run_case A cmdsub-quoted-paren 'echo $(echo ")")'
 run_case A cmdsub-strip-newlines 'x=$(printf "a\n\n\n"); echo "[${#x}]"'
+# 第三轮 review：算术内赋值必须落盘（ArithCtx::set 经 pending_assign 写回）、
+# 逗号表达式（arith lexer 的 Tok::Comma 与 eat_op(",") 对齐）、以及未引号变量
+# 展开后的 glob 多匹配必须是多个词（旧 glob_one 用 join(" ") 折叠成一个词）。
+run_case A arith-assign-persist 'x=0; echo $((x=5)); echo $x'
+run_case A arith-comma          'echo $((1,2,3))'
+run_case A glob-multiword-printf 'mkdir -p @SANDBOX@/gsub/gtest; touch @SANDBOX@/gsub/gtest/a.txt @SANDBOX@/gsub/gtest/b.txt; cd @SANDBOX@/gsub; x=gtest/*.txt; printf "[%s]" $x; echo'
+run_case A glob-multiword-for    'mkdir -p @SANDBOX@/gsub/gtest; touch @SANDBOX@/gsub/gtest/a.txt @SANDBOX@/gsub/gtest/b.txt; cd @SANDBOX@/gsub; x=gtest/*.txt; for f in $x; do echo "F=$f"; done'
 
 ###############################################################################
 # GROUP B -- KNOWN-DEFECT.

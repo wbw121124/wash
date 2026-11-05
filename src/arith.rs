@@ -246,8 +246,11 @@ impl Lexer {
                 continue;
             }
             if c == ',' {
+                // Emit an operator token so `parse_comma`'s eat_op(",")
+                // recognises it. `Tok::Comma` was never matchable by eat_op,
+                // which made every comma expression a syntax error.
                 last_text = ",".to_string();
-                toks.push(Tok::Comma);
+                toks.push(Tok::Op(","));
                 i += 1;
                 continue;
             }
