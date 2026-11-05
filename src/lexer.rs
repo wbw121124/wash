@@ -28,8 +28,12 @@ pub enum WordPart {
 pub enum RedirKind {
     In,
     Out,
+    /// `>|`: force truncation even when `set -C` (noclobber) is active.
+    Clobber,
     Append,
     Both,
+    /// `&>>`: append both stdout and stderr (`&>` is `Both`).
+    BothAppend,
     /// `N>&M`, `N<&M`, `>&N`, `<&N`, `>&-`: duplicate/close a descriptor.
     /// The target is pushed as the following `Token::Word`.
     Dup,
@@ -655,14 +659,17 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                     i = ni;
                 } else {
                     let is_append = i + 1 < n && chars[i + 1] == '>';
+                    let is_clobber = i + 1 < n && chars[i + 1] == '|';
                     let kind = if is_append {
                         RedirKind::Append
+                    } else if is_clobber {
+                        RedirKind::Clobber
                     } else {
                         RedirKind::Out
                     };
                     tokens.push(Token::Redirect { kind, fd });
                     redirect_target = true;
-                    i += if is_append { 2 } else { 1 };
+                    i += if is_append || is_clobber { 2 } else { 1 };
                 }
             }
             '&' => {
@@ -680,12 +687,17 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                     tokens.push(Token::AndAnd);
                     i += 2;
                 } else if i + 1 < n && chars[i + 1] == '>' {
+                    let is_append = i + 2 < n && chars[i + 2] == '>';
                     tokens.push(Token::Redirect {
-                        kind: RedirKind::Both,
+                        kind: if is_append {
+                            RedirKind::BothAppend
+                        } else {
+                            RedirKind::Both
+                        },
                         fd: None,
                     });
                     redirect_target = true;
-                    i += 2;
+                    i += if is_append { 3 } else { 2 };
                 } else {
                     tokens.push(Token::Background);
                     i += 1;

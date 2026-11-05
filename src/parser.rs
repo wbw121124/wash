@@ -22,8 +22,10 @@ use crate::lexer::{RedirKind, Token, WordPart};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Redir {
     In { fd: i32, file: Vec<WordPart> },
-    Out { fd: i32, file: Vec<WordPart>, append: bool },
-    Both { file: Vec<WordPart> }, // &> (stdout + stderr)
+    /// `clobber` is `>|`: truncate even under `set -C`.
+    Out { fd: i32, file: Vec<WordPart>, append: bool, clobber: bool },
+    /// `&>` / `&>>` (stdout + stderr, truncate / append).
+    Both { file: Vec<WordPart>, append: bool },
     /// `N>&M` / `N<&M`: duplicate descriptor M onto N (`-` closes N).
     Dup { fd: i32, file: Vec<WordPart> },
 }
@@ -1145,17 +1147,22 @@ fn parse_simple(tokens: &[Token]) -> Result<SimpleCommand> {
                         fd: fd.unwrap_or(0),
                         file,
                     }),
-                    RedirKind::Out => redirs.push(Redir::Out {
+                    RedirKind::Out | RedirKind::Clobber => redirs.push(Redir::Out {
                         fd: fd.unwrap_or(1),
                         file,
                         append: false,
+                        clobber: matches!(kind, RedirKind::Clobber),
                     }),
                     RedirKind::Append => redirs.push(Redir::Out {
                         fd: fd.unwrap_or(1),
                         file,
                         append: true,
+                        clobber: false,
                     }),
-                    RedirKind::Both => redirs.push(Redir::Both { file }),
+                    RedirKind::Both | RedirKind::BothAppend => redirs.push(Redir::Both {
+                        file,
+                        append: matches!(kind, RedirKind::BothAppend),
+                    }),
                     RedirKind::Dup => redirs.push(Redir::Dup {
                         fd: fd.unwrap_or(1),
                         file,
@@ -1176,9 +1183,11 @@ fn parse_simple(tokens: &[Token]) -> Result<SimpleCommand> {
         i += 1;
     }
 
-    if argv.is_empty() && !redirs.is_empty() && compound.is_none() {
-        return Err(WashError::syntax("syntax error: redirection with no command"));
-    }
+    // A command made only of redirections (`> file`, `2>&1`) is legal: bash
+    // applies them for the duration of that command and restores the
+    // descriptors afterwards.  `run_standalone_exp` already implements this
+    // (apply_redirs_in_parent -> restore_fds -> 0), so it must reach the
+    // executor rather than being rejected here.
 
     Ok(SimpleCommand {
         argv,

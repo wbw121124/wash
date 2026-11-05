@@ -143,8 +143,10 @@ pub fn path_matches(name: &str, path: &str) -> Vec<String> {
 
 enum ExpRedir {
     In(i32, String),
-    Out(i32, String, bool),
-    Both(String),
+    /// fd, file, append, clobber (`>|` bypasses noclobber).
+    Out(i32, String, bool, bool),
+    /// file, append (`&>>`).
+    Both(String, bool),
     Dup(i32, String), // `N>&M` / `N<&M` / `>&-`
 }
 
@@ -158,8 +160,10 @@ fn expand_redirs(redirs: &[Redir], ctx: &ExpandCtx) -> Vec<ExpRedir> {
         .iter()
         .map(|r| match r {
             Redir::In { fd, file } => ExpRedir::In(*fd, expand_file(file, ctx)),
-            Redir::Out { fd, file, append } => ExpRedir::Out(*fd, expand_file(file, ctx), *append),
-            Redir::Both { file } => ExpRedir::Both(expand_file(file, ctx)),
+            Redir::Out { fd, file, append, clobber } => {
+                ExpRedir::Out(*fd, expand_file(file, ctx), *append, *clobber)
+            }
+            Redir::Both { file, append } => ExpRedir::Both(expand_file(file, ctx), *append),
             Redir::Dup { fd, file } => ExpRedir::Dup(*fd, expand_file(file, ctx)),
         })
         .collect()
@@ -177,15 +181,15 @@ fn apply_exp_redirs(redirs: &[ExpRedir], noclobber: bool) {
                     posix::close(f);
                 }
             }
-            ExpRedir::Out(fd, file, append) => {
-                let f = posix::open_write(file, *append, !*append && noclobber);
+            ExpRedir::Out(fd, file, append, clobber) => {
+                let f = posix::open_write(file, *append, !*append && !*clobber && noclobber);
                 if f >= 0 {
                     posix::dup2(f, *fd);
                     posix::close(f);
                 }
             }
-            ExpRedir::Both(file) => {
-                let f = posix::open_write(file, false, false);
+            ExpRedir::Both(file, append) => {
+                let f = posix::open_write(file, *append, false);
                 if f >= 0 {
                     posix::dup2(f, 1);
                     posix::dup2(f, 2);
@@ -234,8 +238,8 @@ fn apply_redirs_in_parent(
                 posix::dup2(f, *fd);
                 posix::close(f);
             }
-            ExpRedir::Out(fd, file, append) => {
-                let f = posix::open_write(file, *append, !*append && noclobber);
+            ExpRedir::Out(fd, file, append, clobber) => {
+                let f = posix::open_write(file, *append, !*append && !*clobber && noclobber);
                 if f < 0 {
                     let e = posix::errno();
                     restore_fds(&saved);
@@ -249,8 +253,8 @@ fn apply_redirs_in_parent(
                 posix::dup2(f, *fd);
                 posix::close(f);
             }
-            ExpRedir::Both(file) => {
-                let f = posix::open_write(file, false, false);
+            ExpRedir::Both(file, append) => {
+                let f = posix::open_write(file, *append, false);
                 if f < 0 {
                     let e = posix::errno();
                     restore_fds(&saved);

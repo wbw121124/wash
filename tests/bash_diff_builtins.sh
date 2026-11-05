@@ -646,6 +646,22 @@ run_case A dollar-bracket-mid     'echo "a$[1+2]b"'
 run_case A dollar-bracket-assign  'echo $[x=3]'
 run_case A dollar-bracket-divzero 'echo $[1/0]'
 
+# 第三轮 review P2：`>|` 强制截断（绕过 set -C）、`&>>` 追加 stdout+stderr、
+# 以及「只有重定向、没有命令」的合法形式。executor 本就有
+# apply_redirs_in_parent -> restore_fds -> 0 的路径，是 parser 误报语法错误。
+# append 类用例一律先用 `>` / `&>` 截断，避免 bash、wash 两侧共享沙箱时
+# 相互追加导致假 FAIL。
+run_case A redir-clobber         'echo hi >| @SANDBOX@/r1; cat @SANDBOX@/r1'
+run_case A redir-clobber-setC    'set -C; echo hi >| @SANDBOX@/r2; cat @SANDBOX@/r2'
+run_case A redir-clobber-twice   'echo hi >| @SANDBOX@/r3; echo hi > @SANDBOX@/r3; cat @SANDBOX@/r3'
+run_case A redir-noclobber       'set -C; echo seed >| @SANDBOX@/r4; echo hi > @SANDBOX@/r4; echo rc=$?'
+run_case A redir-both-append     'echo one &> @SANDBOX@/r5; echo two &>> @SANDBOX@/r5; cat @SANDBOX@/r5'
+run_case A redir-both-group      '{ echo out; echo err >&2; } &> @SANDBOX@/r6; cat @SANDBOX@/r6'
+run_case A redir-both-app-group  '> @SANDBOX@/r7; { echo out; echo err >&2; } &>> @SANDBOX@/r7; cat @SANDBOX@/r7'
+run_case A redir-no-command      '> @SANDBOX@/r8; echo "rc=$? exists=$([ -f @SANDBOX@/r8 ] && echo y)"'
+run_case A redir-no-command-fd   '2> @SANDBOX@/r9; echo ok'
+run_case A redir-no-command-app  '> @SANDBOX@/r10; echo one >> @SANDBOX@/r10; echo two &>> @SANDBOX@/r10; cat @SANDBOX@/r10'
+
 ###############################################################################
 # GROUP B -- KNOWN-DEFECT.
 # (Now empty: every case that used to live here has been fixed and promoted

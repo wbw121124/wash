@@ -1718,13 +1718,17 @@ fn render_redir(r: &crate::parser::Redir) -> String {
         crate::parser::Redir::In { fd, file } => {
             format!("{}<{}", if *fd == 0 { String::new() } else { fd.to_string() }, render_word(file))
         }
-        crate::parser::Redir::Out { fd, file, append } => format!(
+        crate::parser::Redir::Out { fd, file, append, clobber } => format!(
             "{}{}{}",
             if *fd == 1 { String::new() } else { fd.to_string() },
-            if *append { ">>" } else { ">" },
+            if *append { ">>" } else if *clobber { ">|" } else { ">" },
             render_word(file)
         ),
-        crate::parser::Redir::Both { file } => format!("&>{}", render_word(file)),
+        crate::parser::Redir::Both { file, append } => format!(
+            "{}{}",
+            if *append { "&>>" } else { "&>" },
+            render_word(file)
+        ),
         // Dup's execution is direction-independent (dup2(src, fd)); the fd
         // value is only used to pick the `<&` / `>&` spelling for display.
         crate::parser::Redir::Dup { fd, file } => format!(
