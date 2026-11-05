@@ -145,6 +145,7 @@ enum ExpRedir {
     In(i32, String),
     Out(i32, String, bool),
     Both(String),
+    Dup(i32, String), // `N>&M` / `N<&M` / `>&-`
 }
 
 fn expand_file(file: &[WordPart], ctx: &ExpandCtx) -> String {
@@ -159,6 +160,7 @@ fn expand_redirs(redirs: &[Redir], ctx: &ExpandCtx) -> Vec<ExpRedir> {
             Redir::In { fd, file } => ExpRedir::In(*fd, expand_file(file, ctx)),
             Redir::Out { fd, file, append } => ExpRedir::Out(*fd, expand_file(file, ctx), *append),
             Redir::Both { file } => ExpRedir::Both(expand_file(file, ctx)),
+            Redir::Dup { fd, file } => ExpRedir::Dup(*fd, expand_file(file, ctx)),
         })
         .collect()
 }
@@ -188,6 +190,15 @@ fn apply_exp_redirs(redirs: &[ExpRedir], noclobber: bool) {
                     posix::dup2(f, 1);
                     posix::dup2(f, 2);
                     posix::close(f);
+                }
+            }
+            ExpRedir::Dup(fd, target) => {
+                // `N>&M` makes N refer to whatever M currently refers to;
+                // `>&-` closes the descriptor.
+                if target == "-" {
+                    posix::close(*fd);
+                } else if let Ok(src) = target.parse::<i32>() {
+                    posix::dup2(src, *fd);
                 }
             }
         }
@@ -251,6 +262,20 @@ fn apply_redirs_in_parent(
                     posix::dup2(f, fd);
                 }
                 posix::close(f);
+            }
+            ExpRedir::Dup(fd, target) => {
+                // Builtins run in the parent, so the descriptor must be saved
+                // for restore_fds() afterwards.
+                let backup = posix::dup(*fd);
+                saved.push((*fd, backup));
+                if target == "-" {
+                    posix::close(*fd);
+                } else if let Ok(src) = target.parse::<i32>() {
+                    posix::dup2(src, *fd);
+                } else {
+                    restore_fds(&saved);
+                    return Err(format!("wash: {}: ambiguous redirect", target));
+                }
             }
         }
     }

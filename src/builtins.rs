@@ -1725,6 +1725,18 @@ fn render_redir(r: &crate::parser::Redir) -> String {
             render_word(file)
         ),
         crate::parser::Redir::Both { file } => format!("&>{}", render_word(file)),
+        // Dup's execution is direction-independent (dup2(src, fd)); the fd
+        // value is only used to pick the `<&` / `>&` spelling for display.
+        crate::parser::Redir::Dup { fd, file } => format!(
+            "{}{}&{}",
+            if *fd == 0 || *fd == 1 {
+                String::new()
+            } else {
+                fd.to_string()
+            },
+            if *fd == 0 { "<" } else { ">" },
+            render_word(file)
+        ),
     }
 }
 

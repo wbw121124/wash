@@ -460,6 +460,21 @@ run_case A if-assign         'if true; then X=1; fi; echo "X=$X"'
 run_case A if-test           'if [ 1 -eq 1 ]; then echo EQ; fi'
 run_case A if-test-false     'if [ 1 -eq 2 ]; then echo EQ; else echo NE; fi'
 
+# --- code review 盲区补齐（5 条，来源：team-lead 派发的 GROUP A 闸门补强用例）---
+# 覆盖此前对拍未触及的核心语义：fd 数字前缀重定向、fd 复制 2>&1、当前目录
+# 无斜杠 glob（跳过 dotfile）、位置参数 ${1}/${2} 花括号展开，以及负指数算术
+# 的「不 panic + 报负指数错误」哨兵。前 4 条用 run_case 逐字节对拍 stdout +
+# 规范化 stderr + rc；arith-neg-exp 两侧错误文案前缀/错误记号不同（实测 LC_ALL=C
+# 下 bash 为 `bash: line 1: 2 ** -1: exponent less than 0 (error token is "1")`、
+# wash 为 `wash: exponent less than 0 (error token is "")`），stderr 天然无法
+# 逐字节对拍，按框架约定改用 run_case_sem 语义不变量：不崩溃(rc≠101) 且 stderr
+# 含 "exponent less than 0"（已实测该 grep 模式在 bash / wash 两侧均成立）。
+run_case A redir-fd2          'echo hi 2>@SANDBOX@/e; echo "rc=$?"; cat @SANDBOX@/e'
+run_case A redir-dup-2and1    'echo x 2>&1; echo "rc=$?"'
+run_case A glob-cwd-star      'mkdir -p @SANDBOX@/gd; cd @SANDBOX@/gd; touch a.txt b.txt c.log .hidden; echo *'
+run_case A param-pos-braced   'set -- foo bar; echo "[${1}][${2}][${3}]"'
+run_case_sem A arith-neg-exp  'echo $((2 ** -1))' '[ "$RC" -ne 101 ] && grep -q "exponent less than 0" "$ERR"'
+
 ###############################################################################
 # GROUP B -- KNOWN-DEFECT.
 # (Now empty: every case that used to live here has been fixed and promoted

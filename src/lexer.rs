@@ -30,6 +30,9 @@ pub enum RedirKind {
     Out,
     Append,
     Both,
+    /// `N>&M`, `N<&M`, `>&N`, `<&N`, `>&-`: duplicate/close a descriptor.
+    /// The target is pushed as the following `Token::Word`.
+    Dup,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,6 +119,31 @@ fn take_digit_prefix(word: &mut String) -> Option<i32> {
     } else {
         None
     }
+}
+
+/// Read the target of a descriptor-duplication redirection (`>&N`, `<&N`,
+/// `>&-`, `>&$fd`).  Returns the target as a word (so a variable target still
+/// goes through the normal expander) and the index just past it.
+fn read_dup_target(chars: &[char], i: usize) -> (Vec<WordPart>, usize) {
+    let mut j = i;
+    if j < chars.len() && chars[j] == '-' {
+        return (vec![WordPart::Text("-".to_string(), false)], j + 1);
+    }
+    if j < chars.len() && chars[j] == '$' {
+        j += 1;
+        let start = j;
+        while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
+            j += 1;
+        }
+        let name: String = chars[start..j].iter().collect();
+        return (vec![WordPart::Var(name, false)], j);
+    }
+    let start = j;
+    while j < chars.len() && chars[j].is_ascii_digit() {
+        j += 1;
+    }
+    let text: String = chars[start..j].iter().collect();
+    (vec![WordPart::Text(text, false)], j)
 }
 
 fn read_paren(chars: &[char], i: usize) -> Option<(String, usize)> {
@@ -491,6 +519,11 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                 i += 1;
             }
             '<' => {
+                // A digit run immediately before the operator is the redirected
+                // descriptor (`0<file`, `2>err`).  It MUST be consumed before
+                // flushing `pending` into a word, otherwise it becomes an extra
+                // argument and the fd is lost.
+                let fd = take_digit_prefix(&mut pending);
                 flush_text(&mut pending, &mut parts, pending_quoted);
                 if !parts.is_empty() {
                     push_word(
@@ -500,15 +533,27 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                         &mut redirect_target,
                     );
                 }
-                let fd = take_digit_prefix(&mut pending);
-                tokens.push(Token::Redirect {
-                    kind: RedirKind::In,
-                    fd,
-                });
-                redirect_target = true;
-                i += 1;
+                if i + 1 < n && chars[i + 1] == '&' {
+                    // `<&N` / `<&-`: duplicate or close an input descriptor.
+                    let (target, ni) = read_dup_target(&chars, i + 2);
+                    tokens.push(Token::Redirect {
+                        kind: RedirKind::Dup,
+                        fd: Some(fd.unwrap_or(0)),
+                    });
+                    tokens.push(Token::Word(target));
+                    redirect_target = false;
+                    i = ni;
+                } else {
+                    tokens.push(Token::Redirect {
+                        kind: RedirKind::In,
+                        fd,
+                    });
+                    redirect_target = true;
+                    i += 1;
+                }
             }
             '>' => {
+                let fd = take_digit_prefix(&mut pending);
                 flush_text(&mut pending, &mut parts, pending_quoted);
                 if !parts.is_empty() {
                     push_word(
@@ -518,16 +563,27 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                         &mut redirect_target,
                     );
                 }
-                let is_append = i + 1 < n && chars[i + 1] == '>';
-                let fd = take_digit_prefix(&mut pending);
-                let kind = if is_append {
-                    RedirKind::Append
+                if i + 1 < n && chars[i + 1] == '&' {
+                    // `>&N` / `>&-`: duplicate or close an output descriptor.
+                    let (target, ni) = read_dup_target(&chars, i + 2);
+                    tokens.push(Token::Redirect {
+                        kind: RedirKind::Dup,
+                        fd: Some(fd.unwrap_or(1)),
+                    });
+                    tokens.push(Token::Word(target));
+                    redirect_target = false;
+                    i = ni;
                 } else {
-                    RedirKind::Out
-                };
-                tokens.push(Token::Redirect { kind, fd });
-                redirect_target = true;
-                i += if is_append { 2 } else { 1 };
+                    let is_append = i + 1 < n && chars[i + 1] == '>';
+                    let kind = if is_append {
+                        RedirKind::Append
+                    } else {
+                        RedirKind::Out
+                    };
+                    tokens.push(Token::Redirect { kind, fd });
+                    redirect_target = true;
+                    i += if is_append { 2 } else { 1 };
+                }
             }
             '&' => {
                 flush_text(&mut pending, &mut parts, pending_quoted);

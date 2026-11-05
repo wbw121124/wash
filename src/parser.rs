@@ -24,6 +24,8 @@ pub enum Redir {
     In { fd: i32, file: Vec<WordPart> },
     Out { fd: i32, file: Vec<WordPart>, append: bool },
     Both { file: Vec<WordPart> }, // &> (stdout + stderr)
+    /// `N>&M` / `N<&M`: duplicate descriptor M onto N (`-` closes N).
+    Dup { fd: i32, file: Vec<WordPart> },
 }
 
 /// A shell function definition (`NAME() { ... }` or `function NAME { ... }`).
@@ -1070,6 +1072,10 @@ fn parse_simple(tokens: &[Token]) -> Result<SimpleCommand> {
                         append: true,
                     }),
                     RedirKind::Both => redirs.push(Redir::Both { file }),
+                    RedirKind::Dup => redirs.push(Redir::Dup {
+                        fd: fd.unwrap_or(1),
+                        file,
+                    }),
                 }
                 i += 2;
                 continue;

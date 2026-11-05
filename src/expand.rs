@@ -8,6 +8,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+use crate::arith;
 use crate::lexer::WordPart;
 use crate::parser;
 use crate::shell::VarAttrs;
@@ -383,6 +384,23 @@ fn eval_braced(body: &str, ctx: &ExpandCtx) -> Expansion {
 
     let (rawname, op, arg) = split_braced(body);
 
+    // Numeric names are positional parameters (`${1}`, `${10}`, `${0}`), not
+    // environment variables.  Route them through the same resolver used by
+    // bare `$n` so `${n:-word}`, `${n:+word}` etc. behave like bash.
+    if !rawname.is_empty() && rawname.bytes().all(|b| b.is_ascii_digit()) {
+        let val = resolve_param(rawname, ctx);
+        let is_set = !val.is_empty();
+        return Expansion::Scalar(apply_scalar_op(
+            &val,
+            rawname,
+            op,
+            arg,
+            is_set,
+            !is_set,
+            ctx,
+        ));
+    }
+
     // Array subscript handling: `name[subscript]`.  `${a[@]}` / `${a[*]}`
     // yield one field per element / a single IFS-joined field, and
     // `${a[i]}` yields element `i` (0-based) as a scalar.
@@ -754,24 +772,40 @@ pub fn glob(pattern: &str) -> Vec<String> {
     if !has_glob(pattern) {
         return vec![pattern.to_string()];
     }
-    let (dir, base) = split_dir(pattern);
+    let (mut dir, base) = split_dir(pattern);
+    // A pattern without a directory component refers to the current directory;
+    // `read_dir("")` fails, so normalise the empty directory to ".".
+    if dir.is_empty() {
+        dir = ".".to_string();
+    }
     // Resolve the directory: msys drive paths must become native Windows paths
     // for `std::fs::read_dir`, but we keep the msys form for the output.
     let (dir_for_read, dir_for_out) = match translate_msys_path(&dir) {
         Some(win) => (win, dir.clone()),
         None => (dir.clone(), dir.clone()),
     };
+    let out_prefix = if dir_for_out.is_empty() || dir_for_out == "." {
+        String::new()
+    } else {
+        format!("{}/", dir_for_out)
+    };
     let patc: Vec<char> = base.chars().collect();
+    // A leading dot in the pattern opts into matching hidden files.
+    let hidden_ok = base.starts_with('.');
     let mut out = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&dir_for_read) {
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
+            // Skip dotfiles unless the pattern explicitly asks for them.
+            if name.starts_with('.') && !hidden_ok {
+                continue;
+            }
             let nc: Vec<char> = name.chars().collect();
             if glob_match(&nc, &patc) {
-                out.push(if dir_for_out.is_empty() {
+                out.push(if out_prefix.is_empty() {
                     name
                 } else {
-                    format!("{}/{}", dir_for_out, name)
+                    format!("{}{}", out_prefix, name)
                 });
             }
         }
@@ -792,46 +826,128 @@ fn split_dir(pattern: &str) -> (String, String) {
     }
 }
 
-/// Simple glob matcher supporting *, ?, and [...] (no extglob yet).
+/// Glob matcher supporting `*`, `?` and `[...]` character classes (with `!`/`^`
+/// negation and `a-z` ranges). Recursive backtracking keeps the `*` handling
+/// correct without the off-by-one risks of the previous iterative version.
 pub fn glob_match(s: &[char], pat: &[char]) -> bool {
-    // iterative backtracking
-    let (mut si, mut pi) = (0usize, 0usize);
-    let (mut star, mut mark) = (None, (0usize, 0usize));
-    while si < s.len() {
-        if pi < pat.len() && (pat[pi] == '?' || pat[pi] == s[si]) {
-            si += 1;
-            pi += 1;
-        } else if pi < pat.len() && pat[pi] == '*' {
-            star = Some(pi);
-            mark = (si, pi);
-            pi += 1;
-        } else if let Some(sp) = star {
-            pi = sp + 1;
-            si = mark.0 + 1;
-            mark.0 = si;
-        } else {
-            return false;
+    fn rec(s: &[char], si: usize, pat: &[char], pi: usize) -> bool {
+        let mut si = si;
+        let mut pi = pi;
+        while pi < pat.len() {
+            match pat[pi] {
+                '*' => {
+                    // Try every alignment of the rest of the pattern.
+                    let mut k = si;
+                    while k <= s.len() {
+                        if rec(s, k, pat, pi + 1) {
+                            return true;
+                        }
+                        k += 1;
+                    }
+                    return false;
+                }
+                '?' => {
+                    if si >= s.len() {
+                        return false;
+                    }
+                    si += 1;
+                    pi += 1;
+                }
+                '[' => {
+                    if si >= s.len() {
+                        return false;
+                    }
+                    let mut j = pi + 1;
+                    let neg = if j < pat.len() && (pat[j] == '!' || pat[j] == '^') {
+                        j += 1;
+                        true
+                    } else {
+                        false
+                    };
+                    let mut matched = false;
+                    // A `]` immediately after `[` or `[!` is a literal `]`.
+                    if j < pat.len() && pat[j] == ']' {
+                        if s[si] == ']' {
+                            matched = true;
+                        }
+                        j += 1;
+                    }
+                    let mut k = j;
+                    while k < pat.len() && pat[k] != ']' {
+                        if k + 2 < pat.len() && pat[k + 1] == '-' && pat[k + 2] != ']' {
+                            let lo = pat[k];
+                            let hi = pat[k + 2];
+                            if s[si] >= lo && s[si] <= hi {
+                                matched = true;
+                            }
+                            k += 3;
+                        } else {
+                            if s[si] == pat[k] {
+                                matched = true;
+                            }
+                            k += 1;
+                        }
+                    }
+                    if neg {
+                        matched = !matched;
+                    }
+                    if !matched {
+                        return false;
+                    }
+                    si += 1;
+                    pi = k + 1; // consume the closing `]`
+                }
+                c => {
+                    if si >= s.len() || s[si] != c {
+                        return false;
+                    }
+                    si += 1;
+                    pi += 1;
+                }
+            }
         }
+        si == s.len()
     }
-    while pi < pat.len() && pat[pi] == '*' {
-        pi += 1;
-    }
-    pi == pat.len()
+    rec(s, 0, pat, 0)
 }
 
 // ---------------------------------------------------------------------------
 // Arithmetic $(( ... ))
 // ---------------------------------------------------------------------------
 
+/// Adapter exposing the shell's expansion context to `arith::eval`, so that
+/// `$(( ... ))` uses the same panic-free engine as `let` / `(( ))` (proper
+/// `**`, wrapping shifts, negative-exponent errors, etc.).
+struct ArithCtx<'a>(&'a ExpandCtx<'a>);
+
+impl<'a> crate::arith::ArithEnv for ArithCtx<'a> {
+    fn get(&self, name: &str) -> Option<i64> {
+        if let Ok(n) = name.parse::<usize>() {
+            if n == 0 {
+                return self.0.dollar_zero.parse::<i64>().ok();
+            }
+            return self.0.positional.get(n - 1).and_then(|s| s.parse::<i64>().ok());
+        }
+        match name {
+            "@" | "*" => return None,
+            "#" => return Some(self.0.positional.len() as i64),
+            "?" => return Some(self.0.last_status as i64),
+            "0" => return self.0.dollar_zero.parse::<i64>().ok(),
+            _ => {}
+        }
+        self.0.env.get(name).and_then(|v| v.parse::<i64>().ok())
+    }
+    fn set(&mut self, _name: &str, _value: i64) {}
+}
+
 pub fn eval_arith(body: &str, ctx: &ExpandCtx) -> String {
-    let mut p = ArithParser {
-        chars: body.chars().collect(),
-        pos: 0,
-        ctx,
-    };
-    match p.parse_expr() {
+    let mut env = ArithCtx(ctx);
+    match crate::arith::eval(body, &mut env) {
         Ok(v) => v.to_string(),
-        Err(_) => "0".to_string(),
+        Err(e) => {
+            eprintln!("wash: {} (error token is \"{}\")", e.message, e.token);
+            String::new()
+        }
     }
 }
 
