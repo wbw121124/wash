@@ -817,22 +817,155 @@ fn strip_suffix(value: &str, pat: &str, longest: bool) -> String {
     value.to_string()
 }
 
-fn replace_pattern(value: &str, arg: &str, all: bool) -> String {
-    // arg is "pattern/replacement"
-    if let Some(slash) = arg.find('/') {
-        let pat = &arg[..slash];
-        let repl = &arg[slash + 1..];
-        if pat.is_empty() {
-            return value.to_string();
+/// Split the `pattern/replacement` argument of `${v/pat/rep}`.  A `/` escaped
+/// with a backslash belongs to the pattern (`${v/\//-}`), so only an
+/// unescaped slash separates the two halves.  With no slash at all bash
+/// deletes the matches.
+fn split_replacement(arg: &str) -> (&str, &str) {
+    let b = arg.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' && i + 1 < b.len() {
+            i += 2;
+            continue;
         }
-        if all {
-            value.replacen(pat, repl, usize::MAX)
-        } else {
-            value.replacen(pat, repl, 1)
+        if b[i] == b'/' {
+            return (&arg[..i], &arg[i + 1..]);
         }
-    } else {
-        value.replacen(arg, "", usize::MAX)
+        i += 1;
     }
+    (arg, "")
+}
+
+/// Pattern substitution works on **bytes**, not Unicode scalars.  The oracle
+/// runs with `LC_ALL=C`, where bash treats a multibyte character as several
+/// independent bytes (`${v//[!中]/X}` leaves the three bytes of `中` intact
+/// and replaces every other byte).  Mapping each byte to a `char` in 0..=255
+/// lets `glob_match` (which compares and ranges over `char`) implement exactly
+/// that byte semantics.
+fn bytes_as_chars(s: &str) -> Vec<char> {
+    s.as_bytes().iter().map(|&b| b as char).collect()
+}
+
+fn chars_as_bytes(cs: &[char]) -> Vec<u8> {
+    cs.iter().map(|&c| c as u8).collect()
+}
+
+/// Turn backslash escapes in a `${v/pat/rep}` pattern into forms the glob
+/// matcher understands.  `\*`, `\?`, `\[`, `\]`, `\\` become one-character
+/// bracket expressions so they compare literally; all other `\x` become `x`.
+fn unescape_pattern(pat: &str) -> Vec<char> {
+    let src = bytes_as_chars(pat);
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < src.len() {
+        if src[i] == '\\' && i + 1 < src.len() {
+            let c = src[i + 1];
+            if matches!(c, '*' | '?' | '[' | ']' | '\\') {
+                out.push('[');
+                out.push(c);
+                out.push(']');
+            } else {
+                out.push(c);
+            }
+            i += 2;
+        } else {
+            out.push(src[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Expand the replacement text of `${v/pat/rep}`: an unescaped `&` stands for
+/// the matched bytes, and `\&` is a literal ampersand.
+fn expand_replacement(repl: &str, matched: &[char]) -> Vec<char> {
+    let src = bytes_as_chars(repl);
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < src.len() {
+        match src[i] {
+            '\\' if i + 1 < src.len() && src[i + 1] == '&' => {
+                out.push('&');
+                i += 2;
+            }
+            '&' => {
+                out.extend_from_slice(matched);
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+fn replace_pattern(value: &str, arg: &str, all: bool) -> String {
+    let (raw_pat, repl) = split_replacement(arg);
+    if raw_pat.is_empty() {
+        return value.to_string();
+    }
+    // `#` anchors the pattern at the start of the value, `%` at the end.
+    let (pat_src, anchor) = if let Some(rest) = raw_pat.strip_prefix('#') {
+        (rest, 1i8)
+    } else if let Some(rest) = raw_pat.strip_prefix('%') {
+        (rest, -1i8)
+    } else {
+        (raw_pat, 0i8)
+    };
+    let pat = unescape_pattern(pat_src);
+    let chars = bytes_as_chars(value);
+    let n = chars.len();
+    let mut out: Vec<char> = Vec::new();
+    let mut i = 0usize;
+    let mut copied = 0usize; // bytes of `value` already emitted
+    let mut did_replace = false;
+
+    // At `i == n` only a first, not-yet-replaced match may be tried: bash
+    // does not append a second empty match after a `*` consumed the string.
+    while i < n || (i == n && !did_replace) {
+        if !all && did_replace {
+            break;
+        }
+        // Find the longest match starting at `i` (bash prefers the longest
+        // match at the earliest position).  `#` anchors at the start, `%`
+        // requires the match to reach the end of the value.
+        let mut best: Option<usize> = None;
+        let mut j = n;
+        loop {
+            let allowed = match anchor {
+                1 => i == 0,
+                -1 => j == n,
+                _ => true,
+            };
+            if allowed && glob_match(&chars[i..j], &pat) {
+                best = Some(j);
+                break;
+            }
+            if j == i {
+                break;
+            }
+            j -= 1;
+        }
+        if let Some(end) = best {
+            out.extend_from_slice(&chars[copied..i]);
+            out.extend(expand_replacement(repl, &chars[i..end]));
+            copied = end;
+            did_replace = true;
+            i = if end > i { end } else { i + 1 };
+            if i > n {
+                break;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out.extend_from_slice(&chars[copied..]);
+    // Reconstruct the original bytes: a replacement may legally leave an
+    // incomplete multibyte sequence, so use lossy decoding (bash keeps bytes).
+    String::from_utf8_lossy(&chars_as_bytes(&out)).into_owned()
 }
 
 // ---------------------------------------------------------------------------

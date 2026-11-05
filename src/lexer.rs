@@ -422,10 +422,15 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                         parts.push(WordPart::Text("${".to_string(), true));
                         i += 1;
                         continue;
-                    } else {
+                    } else if i < n && is_expansion_start(chars[i]) {
                         let name = read_var_name(&chars, i);
                         i += name.chars().count();
                         parts.push(WordPart::Var(name, true));
+                        continue;
+                    } else {
+                        // `$` is literal here; leave the following character
+                        // for the next iteration (bash keeps `"a$ b"` as-is).
+                        pending.push('$');
                         continue;
                     }
                 }
@@ -694,10 +699,15 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                     parts.push(WordPart::Text("$".to_string(), false));
                     i += 1;
                     continue;
-                } else {
+                } else if i < n && is_expansion_start(chars[i]) {
                     let name = read_var_name(&chars, i);
                     i += name.chars().count();
                     parts.push(WordPart::Var(name, false));
+                    continue;
+                } else {
+                    // Literal `$` (trailing, or followed by whitespace or
+                    // punctuation).  The following character is NOT consumed.
+                    pending.push('$');
                     continue;
                 }
             }
@@ -894,4 +904,14 @@ fn read_var_name(chars: &[char], i: usize) -> String {
     } else {
         c.to_string()
     }
+}
+
+/// True when the character right after `$` starts a parameter expansion
+/// (a name, a positional parameter, or one of the special parameters).
+/// Anything else — whitespace, punctuation, EOF — leaves the `$` literal:
+/// bash prints `echo "a$ b"` as `a$ b` and `echo a$` as `a$`.
+fn is_expansion_start(c: char) -> bool {
+    c.is_ascii_alphanumeric()
+        || c == '_'
+        || matches!(c, '*' | '@' | '#' | '?' | '-' | '$' | '!')
 }
