@@ -27,11 +27,89 @@
 #include <termios.h>
 #include <poll.h>
 #include <limits.h>
+#include <time.h>
+
+// --- 交互 shell 的信号捕获 -------------------------------------------------
+//
+// 交互 shell 必须捕获 SIGINT 等「可 trap」信号：前台命令运行期间终端处于
+// cooked 模式（ISIG 打开），Ctrl-C 产生的 SIGINT 默认动作会终止整个 shell
+// 并丢失历史。handler 只设置一个 volatile sig_atomic_t 标志，绝不做任何非
+// async-signal-safe 的调用；Rust 侧在 REPL 循环里读取该标志，派发对应 trap
+// 并回到提示符。非交互（-c / 脚本）路径不安装这些 handler，保持默认语义。
+static volatile sig_atomic_t g_pending_signal = 0;
+static int g_handlers_installed = 0;
+
+// bash 允许 trap 的常见终止类信号；SIGKILL / SIGSTOP 不可捕获，不列入。
+static const int g_caught_signals[] = {
+    SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGUSR1, SIGUSR2
+};
+#define WASH_NCAUGHT ((int)(sizeof(g_caught_signals) / sizeof(g_caught_signals[0])))
+
+static void wash_on_signal(int signo) {
+    // 只记录信号号，后续处理全部交给 Rust 侧（异步信号安全）。
+    g_pending_signal = (sig_atomic_t)signo;
+}
+
+static void wash_do_install(void) {
+    struct sigaction sa;
+    int i;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = wash_on_signal;
+    sigemptyset(&sa.sa_mask);
+    // SA_RESTART：避免阻塞的 read() 被信号打断后 REPL 把 EINTR 误判成 EOF
+    // 而退出；前台子进程被 SIGINT 终止后 waitpid 仍会正常返回。
+    sa.sa_flags = SA_RESTART;
+    for (i = 0; i < WASH_NCAUGHT; i++) {
+        sigaction(g_caught_signals[i], &sa, NULL);
+    }
+}
+
+static void wash_do_reset(void) {
+    struct sigaction sa;
+    int i;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = SIG_DFL;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    for (i = 0; i < WASH_NCAUGHT; i++) {
+        sigaction(g_caught_signals[i], &sa, NULL);
+    }
+}
+
+// 安装（或重新安装）交互 shell 的信号捕获 handler。每次调用都重新执行
+// sigaction，因此前台命令 wait 结束后可再次调用以恢复 handler（executor 侧
+// 用法）；不清空待处理信号标志，避免丢掉刚收到的 SIGINT。
+int wash_install_signal_handlers(void) {
+    wash_do_install();
+    g_handlers_installed = 1;
+    return 0;
+}
+
+// 读取并清除待处理信号号（返回 0 表示没有）。
+int wash_take_pending_signal(void) {
+    int s = (int)g_pending_signal;
+    g_pending_signal = 0;
+    return s;
+}
+
+// 供 fork 后的子进程 / exec 内建显式恢复默认信号处理。
+int wash_reset_signals_default(void) {
+    wash_do_reset();
+    return 0;
+}
 
 int wash_fork(void) { return fork(); }
 
 int wash_execve(const char *path, char *const argv[], char *const envp[]) {
-    return execve(path, argv, envp);
+    // 被 exec 的外部程序必须恢复默认信号处理：交互 shell 捕获的 SIGINT 等
+    // 不能继承过去，否则 Ctrl-C 到达前台子进程时只会置标志而无法中断命令。
+    // execve 失败返回时（exec 内建在当前进程直接调用）把 shell 的 handler
+    // 装回去，避免之后的 Ctrl-C 杀死整个 shell。
+    int installed = g_handlers_installed;
+    if (installed) wash_do_reset();
+    int r = execve(path, argv, envp);
+    if (installed) wash_do_install();
+    return r;
 }
 
 int wash_waitpid(int pid, int *status, int options) {
@@ -55,6 +133,12 @@ int wash_getpid(void) { return getpid(); }
 int wash_setsid(void) { return setsid(); }
 
 int wash_setpgid(int pid, int pgid) { return setpgid(pid, pgid); }
+
+// 把前台进程组交给终端（作业控制）。pid_t 由 <sys/types.h> 提供。
+int wash_tcsetpgrp(int fd, int pgrp) { return tcsetpgrp(fd, (pid_t)pgrp); }
+
+// 当前进程组 ID：前台命令 wait 结束后用它恢复终端的前台进程组。
+int wash_getpgrp(void) { return getpgrp(); }
 
 // Open for writing. `append` selects O_APPEND instead of O_TRUNC. When
 // `noclobber` is set, O_TRUNC opens of an existing file fail with EEXIST
@@ -533,6 +617,16 @@ int wash_disable_raw(int fd) {
 }
 
 int wash_isatty(int fd) { return isatty(fd); }
+
+// 本地时间格式化，供 PS1 的 \d \t \T \A \@ 转义使用。buf 由调用方提供。
+// 返回 0 成功、-1 失败。
+int wash_strftime(char *buf, size_t n, const char *fmt) {
+    time_t now = time(NULL);
+    struct tm *tp = localtime(&now);
+    if (tp == NULL) return -1;
+    if (strftime(buf, n, fmt, tp) == 0) return -1;
+    return 0;
+}
 
 // Return >0 if fd is readable within `ms` milliseconds (for non-blocking
 // detection of the tail of an escape sequence after ESC).

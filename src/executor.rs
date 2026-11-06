@@ -69,6 +69,28 @@ pub(crate) fn execve(path: &CString, argv: &[*const c_char], envp: &[*const c_ch
     posix::execve(path, argv, envp)
 }
 
+/// Fork a command child, restoring default signal dispositions in the child.
+///
+/// The interactive shell installs handlers for SIGINT/SIGQUIT/SIGTERM/... so
+/// that Ctrl-C during a foreground command does not kill the whole session.
+/// Those handlers must NOT survive in a command: an external program has to be
+/// interruptible by the terminal-generated SIGINT, and a builtin running in a
+/// forked pipeline stage must not leave a pending-signal flag behind.
+///
+/// We deliberately do *not* move the foreground child into its own process
+/// group here. Shell and child staying in the terminal's foreground group is
+/// what makes Ctrl-C reach both: the shell's handler records the signal (and
+/// the REPL dispatches the SIGINT trap), while the child takes the default
+/// action and dies. `setpgid` + `tcsetpgrp` would hide the signal from the
+/// shell and break trap dispatch; proper job control needs both halves at once.
+fn fork_child() -> i32 {
+    let pid = posix::fork();
+    if pid == 0 {
+        posix::reset_signals_default();
+    }
+    pid
+}
+
 /// Look `name` up in `path` (or directly, when it contains a slash).
 ///
 /// Returns the path to execute and the path as the `$PATH` search reports
@@ -351,7 +373,7 @@ pub fn capture_command(
     let fds = posix::pipe();
     let r = fds[0];
     let w = fds[1];
-    let pid = posix::fork();
+    let pid = fork_child();
     if pid == 0 {
         posix::dup2(w, 1);
         posix::close(w);
@@ -386,7 +408,7 @@ pub fn exec_external(argv: &[String], sh: &Shell) -> i32 {
         return 0;
     }
     let path = sh.env.get("PATH").cloned().unwrap_or_default();
-    let pid = posix::fork();
+    let pid = fork_child();
     if pid == 0 {
         let env = sh.child_env();
         let (_cstrings, env_ptrs) = build_env_ptrs(&env);
@@ -1171,7 +1193,7 @@ fn run_standalone_exp(
     // command; we apply it temporarily and restore it afterwards.
     let array_saves = apply_array_assignments(array_assigns, sh);
     let program = find_program(&argv[0], path);
-    let pid = posix::fork();
+    let pid = fork_child();
     if pid == 0 {
         apply_exp_redirs(redirs, sh.options.noclobber);
         let attrs = sh.attrs();
@@ -1484,7 +1506,7 @@ fn execute_pipeline(p: &Pipeline, sh: &mut Shell, path: &str) -> i32 {
             find_program(&pr.argv[0], path)
         };
 
-        let pid = posix::fork();
+        let pid = fork_child();
         if pid == 0 {
             if let Some(fd) = prev_read {
                 posix::dup2(fd, 0);
@@ -1557,7 +1579,7 @@ fn execute_pipeline(p: &Pipeline, sh: &mut Shell, path: &str) -> i32 {
 /// REPL stays responsive.  This is the scaffolding the `jobs`/`fg`/`bg`/`wait`
 /// builtins build on.
 fn execute_background(p: &Pipeline, sh: &mut Shell, path: &str) -> i32 {
-    let pid = posix::fork();
+    let pid = fork_child();
     if pid == 0 {
         // 子进程：像前台一样跑完整个流水线（每个阶段会再 fork 一次并等待），
         // 然后用该流水线的状态退出。

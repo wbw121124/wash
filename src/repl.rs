@@ -142,6 +142,10 @@ fn visible_width(s: &str) -> usize {
     w
 }
 
+/// 本次会话已提交的命令序号（PS1 的 \! / \#）。bash 中二者分别对应历史
+/// 编号与命令编号，通常一致；这里用同一个计数器近似，在 submit() 里递增。
+static COMMAND_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// 展开 bash 风格提示符模板（支持常见转义与 $VAR 变量展开），用于读取 $PS1/$PS2。
 fn render_prompt(template: &str, shell: &Shell) -> String {
     let mut out = String::new();
@@ -165,6 +169,19 @@ fn render_prompt(template: &str, shell: &Shell) -> String {
                 b'n' => out.push('\n'),
                 b'e' | b'E' => out.push('\u{1b}'),
                 b'a' => out.push('\u{7}'), // bell：BEL（用于终止 OSC 标题序列）
+                b'H' => out.push_str(&host_name()),
+                b'd' => out.push_str(&posix::strftime_local("%a %b %d")),
+                b't' => out.push_str(&posix::strftime_local("%H:%M:%S")),
+                b'T' => out.push_str(&posix::strftime_local("%I:%M:%S")),
+                b'A' => out.push_str(&posix::strftime_local("%H:%M")),
+                b'@' => out.push_str(&posix::strftime_local("%I:%M %p")),
+                b'r' => out.push('\r'),
+                // \v 用 wash 自身版本串，绝不冒充 BASH_VERSION。
+                b'v' => out.push_str("0.0.1"),
+                b'!' | b'#' => {
+                    use std::sync::atomic::Ordering;
+                    out.push_str(&(COMMAND_SEQ.load(Ordering::Relaxed) + 1).to_string());
+                }
                 b'[' | b']' => {} // 非打印标记：丢弃
                 b'\\' => out.push('\\'),
                 _ => {
@@ -966,7 +983,9 @@ fn is_incomplete(line: &str) -> bool {
         return true;
     }
     let t = line.trim_end();
-    t.ends_with('|') || t.ends_with('&')
+    // 管道（`|` / `||` / `|&`）与逻辑与（`&&`）结尾需要续行；结尾的单个
+    // `&` 是后台作业（如 `sleep 2 &`），bash 直接执行，不是续行。
+    t.ends_with('|') || t.ends_with("|&") || t.ends_with("&&")
 }
 
 // ---------------------------------------------------------------------------
@@ -1204,6 +1223,8 @@ fn submit(editor: &mut Editor, shell: &mut Shell) {
     editor.last_total = 0;
 
     let line = line.trim_end_matches('\n').to_string();
+    // 每提交一行就推进命令序号（PS1 的 \! / \#）。
+    COMMAND_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if !line.trim().is_empty() {
         editor.history.push(line.clone());
     }
@@ -1256,6 +1277,26 @@ pub fn run(shell: &mut Shell) {
 
     editor.render(shell);
     loop {
+        // 前台命令运行期间（cooked 模式、ISIG 打开）若收到 SIGINT 等信号，
+        // C handler 只置了标志；这里统一处理：派发对应 trap，丢弃当前输入
+        // 行，回到新行提示符，shell 保持存活且历史不丢（P1-1 / P1-2）。
+        // raw 模式下 ISIG 关闭，Ctrl-C 是字节 0x03，仍由下面的 Key::CtrlC
+        // 分支处理，不走这里。
+        let sig = posix::take_pending_signal();
+        if sig > 0 {
+            // 让 trap 命令的输出走正常的 cooked 终端。
+            posix::disable_raw_mode();
+            crate::builtins::dispatch_signal_trap(shell, sig);
+            io::stdout().flush().ok();
+            println!();
+            io::stdout().flush().ok();
+            posix::enable_raw_mode();
+            editor.cancel_line();
+            editor.last_total = 0;
+            save_history(&hist_path, &editor.history);
+            editor.render(shell);
+            continue;
+        }
         // Ctrl+V 之后的那个键按字面插入：直接读一个裸字节，绕过控制键映射，
         // 这样 Ctrl+V 后跟 Ctrl+C 会插入 0x03 而非取消整行（对齐 readline 行为）。
         let key = if editor.literal_next {
@@ -1279,13 +1320,28 @@ pub fn run(shell: &mut Shell) {
                 io::stdout().flush().ok();
                 editor.cancel_line();
                 editor.last_total = 0;
+                // bash 的 readline 在提示符处按 Ctrl-C 仍会产生 SIGINT 并派发
+                // 已安装的 INT trap。raw 模式下 ISIG 关闭、0x03 作为字节到达
+                // 这里（不走 signal handler），所以手动派发一次；补一个回车让
+                // trap 的输出从行首开始、成为独立输出行。
+                print!("\r");
+                io::stdout().flush().ok();
+                crate::builtins::dispatch_signal_trap(shell, 2);
             }
             Key::CtrlV => {
                 editor.literal_next = true;
             }
             Key::CtrlD => {
                 if editor.buffer.is_empty() {
-                    break;
+                    if shell.options.ignoreeof {
+                        // bash: `set -o ignoreeof` 后空缓冲的 Ctrl-D 不退出，
+                        // 打印提示并继续（bash 需连续多次才真正退出）。
+                        print!("\r\x1b[K\nUse \"exit\" to leave the shell.\n");
+                        io::stdout().flush().ok();
+                        editor.last_total = 0;
+                    } else {
+                        break;
+                    }
                 } else {
                     editor.delete_forward();
                 }
@@ -1352,6 +1408,16 @@ pub fn run(shell: &mut Shell) {
     }
 
     posix::disable_raw_mode();
+    // 退出前触发 EXIT trap（与 main.rs 的 -c 路径对称）。run_str 会在开头
+    // 清空 exit_requested，因此先保存、派发后恢复，免得 main 读不到显式
+    // `exit N` 的退出码。
+    let saved_exit = shell.exit_requested;
+    if let Some(action) = shell.traps.get("EXIT").cloned() {
+        if action != "-" {
+            shell.run_str(&action);
+        }
+    }
+    shell.exit_requested = saved_exit;
     save_history(&hist_path, &editor.history);
 }
 

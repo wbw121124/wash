@@ -2,6 +2,7 @@
 //
 // 参数风格与 bash 对齐：
 //   * `-c CMD`         —— 执行 CMD 后退出；
+//   * `--command CMD`  —— `-c` 的长选项写法；
 //   * `-l`             —— 登录 shell（读取 profile 文件）；
 //   * `-lc CMD`        —— 上面两个的组合写法；
 //   * `-i`             —— 强制交互式。
@@ -49,7 +50,7 @@ fn main() {
             match a.as_str() {
                 "--help" => {
                     println!("wash - a bash-compatible shell with fish-like interactive UX");
-                    println!("usage: wash [-l] [-i] [-c <command>]");
+                    println!("usage: wash [-l] [-i] [-c <command> | --command <command>]");
                     exit(0);
                 }
                 "--version" => {
@@ -75,7 +76,7 @@ fn main() {
                     'i' => force_interactive = true,
                     _ => {
                         eprintln!("wash: -{}: invalid option", c);
-                        eprintln!("usage: wash [-l] [-i] [-c <command>]");
+                        eprintln!("usage: wash [-l] [-i] [-c <command> | --command <command>]");
                         exit(2);
                     }
                 }
@@ -133,11 +134,20 @@ fn main() {
         exit(code);
     }
 
-    if force_interactive {
-        sh.run_interactive();
-        return;
+    // 交互路径：仅当 stdin 是真终端时安装信号捕获，让前台命令期间的
+    // Ctrl-C 只中断命令、不杀死 shell；-c / piped 路径保持默认 SIGINT 语义。
+    if posix::isatty(0) {
+        posix::install_signal_handlers();
     }
+    // `-i` 的作用（置交互标志）已在 run_interactive 里体现，这里无需再分流；
+    // 两个原本重复的分支合并为一次调用。
+    let _ = force_interactive;
     sh.run_interactive();
+    // 显式 `exit N` 的码在 sh.exit_requested（EXIT trap 的 run_str 会清空该
+    // 标志，repl::run 已在派发 trap 前后保存/恢复）；EOF / Ctrl-D 无显式退出
+    // 时，bash 用最后一条命令的状态。对 256 取模对齐进程退出码范围。
+    let code = sh.exit_requested.unwrap_or(sh.last_status);
+    exit(code.rem_euclid(256));
 }
 
 /// 给路径加单引号，便于安全地拼进 `source` 命令里。

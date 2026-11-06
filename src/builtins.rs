@@ -2752,14 +2752,20 @@ fn builtin_exec(argv: &[String], sh: &mut Shell) -> i32 {
                 program,
                 posix::errno_message(code)
             );
-            // A failed `exec` terminates a non-interactive shell.
-            sh.exit_requested = Some(127);
+            // 只有非交互 shell（-c / 脚本）在 exec 失败时终止；交互 shell
+            // 只报错并返回 127，REPL 继续存活（对齐 bash 交互行为）。
+            if !sh.interactive {
+                sh.exit_requested = Some(127);
+            }
             127
         }
         None => {
             eprintln!("wash: exec: {}: not found", program);
-            // A failed `exec` terminates a non-interactive shell.
-            sh.exit_requested = Some(127);
+            // 只有非交互 shell（-c / 脚本）在 exec 失败时终止；交互 shell
+            // 只报错并返回 127，REPL 继续存活（对齐 bash 交互行为）。
+            if !sh.interactive {
+                sh.exit_requested = Some(127);
+            }
             127
         }
     }
@@ -4598,6 +4604,24 @@ fn signal_to_name(num: i32) -> String {
     match signal_name(num) {
         Some(n) => format!("SIG{}", n),
         None => format!("SIG{}", num),
+    }
+}
+
+/// 把运行时收到的信号号派发到已安装的信号 trap（P1-2）。
+///
+/// C 侧 handler 只记录信号号（异步信号安全），REPL 循环在回到提示符前的
+/// 安全时机调用本函数：把信号号映射成 bash 的 `SIGxxx` 规范名，查
+/// `sh.traps`，存在且非 "-" 时用 run_str 执行 trap 命令。
+pub fn dispatch_signal_trap(sh: &mut Shell, signo: i32) -> bool {
+    let canon = signal_to_name(signo);
+    match sh.traps.get(&canon).cloned() {
+        Some(action) => {
+            if action != "-" {
+                sh.run_str(&action);
+            }
+            true
+        }
+        None => false,
     }
 }
 

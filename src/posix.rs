@@ -66,6 +66,16 @@ extern "C" {
     fn wash_disable_raw(fd: c_int) -> c_int;
     fn wash_isatty(fd: c_int) -> c_int;
     fn wash_poll_readable(fd: c_int, ms: c_int) -> c_int;
+
+    // 交互 shell 的信号捕获（见 posix_shim.c）
+    fn wash_install_signal_handlers() -> c_int;
+    fn wash_take_pending_signal() -> c_int;
+    fn wash_reset_signals_default() -> c_int;
+    fn wash_setpgid(pid: c_int, pgid: c_int) -> c_int;
+    fn wash_tcsetpgrp(fd: c_int, pgrp: c_int) -> c_int;
+    fn wash_getpgrp() -> c_int;
+    // 本地时间格式化（PS1 的 \d \t \T \A \@）
+    fn wash_strftime(buf: *mut c_char, n: usize, fmt: *const c_char) -> c_int;
 }
 
 pub const X_OK: c_int = 1;
@@ -606,4 +616,53 @@ pub fn read_byte_timeout(ms: i32) -> Option<u8> {
         return None;
     }
     read_byte()
+}
+
+// --- 交互 shell 信号 / 作业控制 / 本地时间 -------------------------------
+
+/// 交互 shell 启动时安装信号捕获 handler（幂等）。非交互（-c / 脚本）路径
+/// 不要调用，否则会改变默认的 SIGINT 语义。
+pub fn install_signal_handlers() {
+    unsafe {
+        wash_install_signal_handlers();
+    }
+}
+
+/// 读取并清除待处理的信号号；返回 0 表示没有待处理信号。
+pub fn take_pending_signal() -> i32 {
+    unsafe { wash_take_pending_signal() }
+}
+
+/// 恢复默认信号处理（fork 后的子进程 / exec 内建用）。
+pub fn reset_signals_default() {
+    unsafe {
+        wash_reset_signals_default();
+    }
+}
+
+/// 把进程置入指定进程组（作业控制）。
+pub fn setpgid(pid: i32, pgid: i32) -> i32 {
+    unsafe { wash_setpgid(pid, pgid) }
+}
+
+/// 把前台进程组交给终端（作业控制）。
+pub fn tcsetpgrp(fd: i32, pgrp: i32) -> i32 {
+    unsafe { wash_tcsetpgrp(fd, pgrp) }
+}
+
+/// 当前进程组 ID：前台命令 wait 结束后用它恢复终端的前台进程组。
+pub fn getpgrp() -> i32 {
+    unsafe { wash_getpgrp() }
+}
+
+/// 按 strftime 格式取本地时间字符串（供 PS1 转义使用）。
+pub fn strftime_local(fmt: &str) -> String {
+    let c = CString::new(fmt).unwrap_or_default();
+    let mut buf = [0u8; 128];
+    let r = unsafe { wash_strftime(buf.as_mut_ptr() as *mut c_char, buf.len(), c.as_ptr()) };
+    if r != 0 {
+        return String::new();
+    }
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..len]).into_owned()
 }
