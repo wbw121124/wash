@@ -124,6 +124,10 @@ fn main() {
     }
 
     if let Some(cmd) = command {
+        // bash tags parse errors from a command string with `-c: line N:`
+        // and echoes the offending line; run_str needs to know it is in
+        // that mode (the interactive REPL keeps the plain one-line form).
+        sh.command_string_mode = true;
         let code = sh.run_str(&cmd);
         // 退出前触发 EXIT trap（bash 就在退出前做这件事）。
         if let Some(action) = sh.traps.get("EXIT").cloned() {

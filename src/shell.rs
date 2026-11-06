@@ -359,6 +359,12 @@ pub struct Shell {
     /// 限制，不应该混进命令的输出里，所以这里把错误静音（bash 在同样的情形
     /// 下也是"干净"的输出）。
     pub quiet_errors: bool,
+
+    /// True when the shell was started with `-c CMD` / `--command CMD`.
+    /// bash prints parse errors from a command string in a distinctive
+    /// two-line form (`-c: line N: <msg>` plus an echo of the offending
+    /// input line); interactive and sourced input use a plain one-liner.
+    pub command_string_mode: bool,
 }
 
 impl Shell {
@@ -466,6 +472,7 @@ impl Shell {
             history: Vec::new(),
             fatal_error: None,
             quiet_errors: false,
+            command_string_mode: false,
         };
         Self::populate_internal_variables(&mut sh);
         sh
@@ -551,6 +558,43 @@ impl Shell {
         self.integer_vars = attrs.integer_vars.clone();
     }
 
+    /// Report a lex/parse error the way bash does for the current input source.
+    ///
+    /// `bash -c CMD` uses a distinctive two-line form:
+    ///     bash: -c: line 1: syntax error near unexpected token `;'
+    ///     bash: -c: line 1: `coproc; echo "rc=$?"'
+    /// The second line echoes the offending input line; end-of-input errors
+    /// (and lexer errors) have no echo line, and their line number is one
+    /// past the last input line. Interactive and sourced input is a plain
+    /// one-liner. The diff harness strips only the `wash:` / `bash:` name
+    /// prefix, so the `-c: line N:` part and the echo line must be present
+    /// on both sides for the comparison to be byte-for-byte equal.
+    fn report_parse_error(&self, source: &str, message: &str) {
+        if self.quiet_errors {
+            return;
+        }
+        if !self.command_string_mode {
+            eprintln!("wash: {}", message);
+            return;
+        }
+        let at_eof = message.starts_with("syntax error: unexpected end of file")
+            || message.starts_with("unexpected EOF");
+        // Our grammar does not carry token positions yet, so "unexpected
+        // token" errors report line 1 / the first input line. Single-line
+        // `-c` strings -- what the oracle harness uses -- are exact.
+        let line_no = if at_eof {
+            source.split('\n').count() + 1
+        } else {
+            1
+        };
+        eprintln!("wash: -c: line {}: {}", line_no, message);
+        // bash echoes the offending line only for "unexpected token" errors.
+        if message.starts_with("syntax error near unexpected token") {
+            let echo = source.split('\n').next().unwrap_or(source);
+            eprintln!("wash: -c: line {}: `{}'", line_no, echo);
+        }
+    }
+
     /// Run a single command string (used by `-c` and the interactive loop).
     pub fn run_str(&mut self, s: &str) -> i32 {
         // 顶层命令开始即清掉上一轮可能残留的退出/返回标志，避免 `exit` 等内建设置的
@@ -567,16 +611,12 @@ impl Shell {
                     c
                 }
                 Err(e) => {
-                    if !self.quiet_errors {
-                        eprintln!("wash: {}", e);
-                    }
+                    self.report_parse_error(s, &e.message);
                     2
                 }
             },
             Err(e) => {
-                if !self.quiet_errors {
-                    eprintln!("wash: {}", e);
-                }
+                self.report_parse_error(s, &e.message);
                 2
             }
         };

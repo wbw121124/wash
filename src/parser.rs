@@ -890,7 +890,7 @@ pub fn parse_command_list(tokens: &[Token]) -> Result<CommandList> {
                 if !stage.is_empty() {
                     if is_bare_coproc(&stage) {
                         return Err(WashError::syntax(
-                            "syntax error near unexpected token ';'",
+                            "syntax error near unexpected token `;'",
                         ));
                     }
                     current_cmds.push(parse_simple(&stage)?);
@@ -908,7 +908,7 @@ pub fn parse_command_list(tokens: &[Token]) -> Result<CommandList> {
                 if !stage.is_empty() {
                     if is_bare_coproc(&stage) {
                         return Err(WashError::syntax(
-                            "syntax error near unexpected token '&'",
+                            "syntax error near unexpected token `&'",
                         ));
                     }
                     current_cmds.push(parse_simple(&stage)?);
@@ -944,7 +944,7 @@ pub fn parse_command_list(tokens: &[Token]) -> Result<CommandList> {
     if !stage.is_empty() {
         if is_bare_coproc(&stage) {
             return Err(WashError::syntax(
-                "syntax error near unexpected token 'newline'",
+                "syntax error near unexpected token `newline'",
             ));
         }
         current_cmds.push(parse_simple(&stage)?);
