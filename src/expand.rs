@@ -437,11 +437,9 @@ fn eval_var(name: &str, ctx: &ExpandCtx) -> Expansion {
         "#" => Expansion::Scalar(ctx.positional.len().to_string()),
         "@" => Expansion::At(ctx.positional.to_vec()),
         "*" => {
-            // `$*` is an error under `set -u` when there are no positional
-            // parameters (`$@` never is).
-            if ctx.nounset && ctx.positional.is_empty() {
-                unbound_variable("$*");
-            }
+            // `$*` is NOT an error under `set -u` (unlike `$1`): bash treats
+            // the positional parameters as set even when there are none, so it
+            // expands to the empty string with no diagnostic.
             Expansion::Star(ctx.positional.to_vec())
         }
         "0" => Expansion::Scalar(ctx.dollar_zero.to_string()),
@@ -784,13 +782,16 @@ fn apply_scalar_op(
         }
         ",," => val.to_lowercase(),
         "" => {
-            // A plain `${NAME}` reference.  Under `set -u` an unset variable
-            // is an error; the special parameters are forwarded to `eval_var`.
-            if !is_set && ctx.nounset {
-                unbound_variable(name);
-            }
+            // Bash's special parameters (`? $ # * @ ! - 0`) are always
+            // considered set under `set -u`, so they must be forwarded to
+            // `eval_var` *before* the nounset check.  (`${!}` is intercepted
+            // earlier by the indirect-expansion branch and `$!` is handled in
+            // `eval_var`; both intentionally remain nounset-fatal separately.)
             if is_special_param(name) {
                 return expansion_to_scalar(eval_var(name, ctx), ctx);
+            }
+            if !is_set && ctx.nounset {
+                unbound_variable(name);
             }
             val.to_string()
         }

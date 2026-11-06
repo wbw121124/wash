@@ -708,6 +708,17 @@ run_case A df-set-b              'set -b; echo "$-"'               # bhBc (notif
 run_case A df-set-k              'set -k; echo "$-"'               # hkBc (keyword)
 run_case A df-set-p              'set -p; echo "$-"'               # hpBc (privileged)
 
+# --- nounset 差异 2 修复：$*/${*} 等 special param 在 set -u 下不报 unbound ---
+# bash 5.3 实测：下列在 set -u 下 rc=0、stdout 如注释、无诊断（与 $1 不同）。
+run_case A ns2-bare-star       'set -u; echo "[$*]"'             # [](空)
+run_case A ns2-bare-at         'set -u; echo "[$@]"'             # [](空)
+run_case A ns2-bstar           'set -u; echo "[${*}]"'           # [](空)
+run_case A ns2-bat             'set -u; echo "[${@}]"'           # [](空)
+run_case A ns2-bq              'set -u; echo "[${?}]"'           # [0]
+run_case A ns2-bdash           'set -u; echo "[${-}]"'           # [huBc]（当前 $- 含 u）
+# set -t 应置 onecmd，使 $- 含 t（bash 5.3 实测 htBc）
+run_case A set-t-dash          'set -t; echo "$-"'               # htBc
+
 ###############################################################################
 # GROUP B -- KNOWN-DEFECT.
 # (Now empty: every case that used to live here has been fixed and promoted

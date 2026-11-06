@@ -706,9 +706,10 @@ fn apply_short_option(ch: char, sh: &mut Shell) -> bool {
         'm' => sh.options.monitor = true,
         'n' => sh.options.noexec = true,
         'p' => sh.options.privileged = true,
-        // `set -t` is a one-shot xtrace in bash; the option is accepted but
-        // the one-shot behaviour is not implemented.
-        't' => {}
+        // `set -t` enables `onecmd` (run a single command then exit).  The
+        // one-shot behaviour itself is not yet implemented, but the flag must
+        // be recorded so `${-}` / `$-` reflect it.
+        't' => sh.options.onecmd = true,
         'u' => sh.options.nounset = true,
         'v' => sh.options.verbose = true,
         'x' => sh.options.xtrace = true,
@@ -735,7 +736,7 @@ fn unset_short_option(ch: char, sh: &mut Shell) -> bool {
         'm' => sh.options.monitor = false,
         'n' => sh.options.noexec = false,
         'p' => sh.options.privileged = false,
-        't' => {}
+        't' => sh.options.onecmd = false,
         'u' => sh.options.nounset = false,
         'v' => sh.options.verbose = false,
         'x' => sh.options.xtrace = false,
