@@ -716,6 +716,8 @@ run_case A ns2-bstar           'set -u; echo "[${*}]"'           # [](空)
 run_case A ns2-bat             'set -u; echo "[${@}]"'           # [](空)
 run_case A ns2-bq              'set -u; echo "[${?}]"'           # [0]
 run_case A ns2-bdash           'set -u; echo "[${-}]"'           # [huBc]（当前 $- 含 u）
+# --- 差异 1 修复：set -u 下算术展开引用 UNSET 具名变量须 FATAL unbound variable（rc 127）---
+run_case A ns1-arith-unbound    'set -u; echo $((NOPE+1))'        # rc=127, 无 stdout, stderr "NOPE: unbound variable"
 # set -t 应置 onecmd，使 $- 含 t（bash 5.3 实测 htBc）
 run_case A set-t-dash          'set -t; echo "$-"'               # htBc
 

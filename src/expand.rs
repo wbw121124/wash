@@ -1311,7 +1311,7 @@ struct ArithCtx<'a> {
 }
 
 impl<'a> crate::arith::ArithEnv for ArithCtx<'a> {
-    fn get(&self, name: &str) -> Option<i64> {
+    fn get(&self, name: &str, may_unbound: bool) -> Option<i64> {
         if let Some(v) = self.assigned.borrow().get(name) {
             return Some(*v);
         }
@@ -1328,7 +1328,12 @@ impl<'a> crate::arith::ArithEnv for ArithCtx<'a> {
             "0" => return self.ctx.dollar_zero.parse::<i64>().ok(),
             _ => {}
         }
-        self.ctx.env.get(name).and_then(|v| v.parse::<i64>().ok())
+        let val = self.ctx.env.get(name).and_then(|v| v.parse::<i64>().ok());
+        if may_unbound && val.is_none() && self.ctx.nounset && !is_special_param(name) {
+            unbound_variable(name);
+            return None;
+        }
+        val
     }
     fn set(&mut self, name: &str, value: i64) {
         self.assigned.borrow_mut().insert(name.to_string(), value);

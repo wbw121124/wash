@@ -45,7 +45,13 @@ fn token_text(t: &Option<Tok>) -> String {
 /// Variable access used while evaluating an expression.
 pub trait ArithEnv {
     /// Value of `name`, or `None` when the variable is unset.
-    fn get(&self, name: &str) -> Option<i64>;
+    ///
+    /// `may_unbound` is true when this read may legitimately raise an
+    /// "unbound variable" error under `set -u` (a real read, or a
+    /// compound-assignment/increment LHS that must be read first). It is
+    /// false only for the LHS of a plain `=` assignment, which bash does
+    /// not treat as a read.
+    fn get(&self, name: &str, may_unbound: bool) -> Option<i64>;
     /// Assign `value` to `name`.
     fn set(&mut self, name: &str, value: i64);
 }
@@ -57,7 +63,7 @@ pub struct MapEnv<'a> {
 }
 
 impl<'a> ArithEnv for MapEnv<'a> {
-    fn get(&self, name: &str) -> Option<i64> {
+    fn get(&self, name: &str, _may_unbound: bool) -> Option<i64> {
         self.vars.get(name).and_then(|v| parse_number(v).ok())
     }
     fn set(&mut self, name: &str, value: i64) {
@@ -71,7 +77,7 @@ pub struct ReadOnlyEnv<'a> {
 }
 
 impl<'a> ArithEnv for ReadOnlyEnv<'a> {
-    fn get(&self, name: &str) -> Option<i64> {
+    fn get(&self, name: &str, _may_unbound: bool) -> Option<i64> {
         self.vars.get(name).and_then(|v| parse_number(v).ok())
     }
     fn set(&mut self, _name: &str, _value: i64) {}
@@ -371,7 +377,7 @@ fn parse_assign(lex: &mut Lexer, env: &mut dyn ArithEnv) -> Result<i64, ArithErr
                 lex.pos += 2;
                 let divisor_tok = lex.peek().cloned();
                 let rhs = parse_assign(lex, env)?;
-                let cur = env.get(&name).unwrap_or(0);
+                let cur = env.get(&name, aop != "=").unwrap_or(0);
                 let newv = match aop {
                     "=" => rhs,
                     "+=" => cur.wrapping_add(rhs),
@@ -607,7 +613,7 @@ fn parse_unary(lex: &mut Lexer, env: &mut dyn ArithEnv) -> Result<i64, ArithErro
             _ => return Err(operand_expected(lex)),
         };
         lex.pos += 1;
-        let cur = env.get(&name).unwrap_or(0);
+        let cur = env.get(&name, true).unwrap_or(0);
         let newv = if op == "++" {
             cur.wrapping_add(1)
         } else {
@@ -667,7 +673,7 @@ fn parse_primary(lex: &mut Lexer, env: &mut dyn ArithEnv) -> Result<i64, ArithEr
         }
         Some(Tok::Ident(name)) => {
             lex.pos += 1;
-            Ok(env.get(&name).unwrap_or(0))
+            Ok(env.get(&name, true).unwrap_or(0))
         }
         Some(Tok::LParen) => {
             lex.pos += 1;
