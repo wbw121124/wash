@@ -63,19 +63,44 @@ pub enum Token {
     Redirect { kind: RedirKind, fd: Option<i32> },
 }
 
-/// The reserved words wash recognises.  A reserved word is only special
-/// where a command may start; everywhere else it is an ordinary word.
+/// GNU bash 5.3 `compgen -k` 列出的全部 shell 关键字，按 bash 的输出顺序。
 ///
-/// The compound-command keywords (`if`/`then`/`elif`/`else`/`fi` already
-/// present) are joined here by the loop / case / function keywords so that
-/// `for`, `while`, `until`, `case`, `do`, `done`, `esac` and `function`
-/// are recognised in command position and handed to the parser as reserved
-/// tokens. `in` is intentionally omitted: it only ever appears inside a
-/// `for`/`case` body (never at a command start), so the parser recognises
-/// it positionally by its text.
-pub const RESERVED_WORDS: &[&str] = &[
-    "elif", "else", "fi", "if", "then", "for", "while", "until", "do", "done", "case", "esac",
-    "function",
+/// 这是 wash 关于「哪些词是 shell 关键字」的唯一权威定义，三处共用这一份表，
+/// 避免各自维护常量导致两处漂移：
+///   * lexer 只把 `recognised == true` 的项在命令起始位置当作 `Token::Reserved`
+///     （见 `push_word`），parser 随之只收到这些保留字；
+///   * `compgen -k`（`builtins.rs`）按本表顺序原样输出全部 22 项；
+///   * `type` 的关键字判定（`builtins.rs::describe_command`）也查本表。
+///
+/// `recognised == false` 的项（`in`/`select`/`time`/`{`/`}`/`!`/`[[`/`]]`/
+/// `coproc` 等）在 bash 里同样是关键字，但 wash 不在命令位置把它们当保留字：
+/// `in` 只在 for/case 体内由 parser 按文本位置识别，其余尚未实现对应语法。
+///
+/// 来源：MSYS2 `LC_ALL=C bash -c 'compgen -k'`，GNU bash
+/// 5.3.20(1)-release (x86_64-pc-cygwin)，共 22 项。
+pub const SHELL_KEYWORDS: &[(&str, bool)] = &[
+    ("if", true),
+    ("then", true),
+    ("else", true),
+    ("elif", true),
+    ("fi", true),
+    ("case", true),
+    ("esac", true),
+    ("for", true),
+    ("select", false),
+    ("while", true),
+    ("until", true),
+    ("do", true),
+    ("done", true),
+    ("in", false),
+    ("function", true),
+    ("time", false),
+    ("{", false),
+    ("}", false),
+    ("!", false),
+    ("[[", false),
+    ("]]", false),
+    ("coproc", false),
 ];
 
 /// Push a word token.  A word that starts a command and spells a reserved
@@ -98,7 +123,9 @@ fn push_word(
         return;
     }
     let reserved = match parts.as_slice() {
-        [WordPart::Text(text, false)] => RESERVED_WORDS.contains(&text.as_str()),
+        [WordPart::Text(text, false)] => SHELL_KEYWORDS
+            .iter()
+            .any(|(word, recognised)| *recognised && *word == text.as_str()),
         _ => false,
     };
     if reserved && *at_command_start {

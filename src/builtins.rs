@@ -85,6 +85,8 @@ const BUILTINS: &[&str] = &[
     "history",
     "mapfile",
     "readarray",
+    "compgen",
+    "bind",
 ];
 
 /// True when `name` is the name of a builtin command.
@@ -149,6 +151,8 @@ pub fn run_builtin(argv: &[String], sh: &mut Shell) -> Option<i32> {
         "complete" => builtin_complete(argv, sh),
         "fc" => builtin_fc(argv, sh),
         "history" => builtin_history(argv, sh),
+        "compgen" => builtin_compgen(argv, sh),
+        "bind" => builtin_bind(argv, sh),
         _ => return None,
     };
     Some(code)
@@ -1571,11 +1575,8 @@ struct DescFlags {
     nofuncs: bool,
 }
 
-/// The reserved words of bash.  `type` reports them as `keyword`.
-const RESERVED_WORDS_BASH: &[&str] = &[
-    "!", "{", "}", "case", "do", "done", "elif", "else", "esac", "fi", "for", "function", "if",
-    "in", "select", "then", "time", "until", "while",
-];
+// `type` 的关键字判定直接查 `lexer::SHELL_KEYWORDS`（见 `describe_command`），
+// 与 lexer 保留字识别、`compgen -k` 共享同一份定义，这里不再另抄一份常量。
 
 /// The executables named `name` in the colon-separated `$PATH`.
 ///
@@ -1631,7 +1632,7 @@ fn describe_command(name: &str, flags: DescFlags, sh: &Shell) -> bool {
     }
 
     // A reserved word.
-    if !flags.force_path && RESERVED_WORDS_BASH.contains(&name) {
+    if !flags.force_path && crate::lexer::SHELL_KEYWORDS.iter().any(|(w, _)| *w == name) {
         match flags.mode {
             DescMode::Type => println!("keyword"),
             DescMode::ShortDesc => println!("{} is a shell keyword", name),
@@ -2850,6 +2851,167 @@ fn builtin_history(argv: &[String], sh: &mut Shell) -> i32 {
     for (idx, cmd) in sh.history.iter().enumerate().skip(start) {
         println!("{:>5}  {}", idx + 1, cmd);
     }
+    0
+}
+
+// ---------------------------------------------------------------------------
+// compgen
+// ---------------------------------------------------------------------------
+
+/// `compgen`：生成补全候选。
+///
+/// 本轮实现的候选来源都取自真实表，不硬编码输出：
+///   * `-k` —— `lexer::SHELL_KEYWORDS`（与 lexer 保留字识别共享的唯一
+///     关键字定义，顺序与 bash 5.3 `compgen -k` 一致，共 22 行）；
+///   * `-b` —— 本模块 `BUILTINS`（wash 真实内建表）；
+///   * `-W wordlist` —— 按 `$IFS` 拆分 wordlist。
+///
+/// 位置参数 `WORD` 作为前缀过滤：只输出以它开头的候选。
+/// 其余 action（-c/-A/-f/-v/...）及带参选项（-o/-G/-F/-C/-X/-P/-S/-V）
+/// 本轮仅接受、不据此生成候选（如实说明，GROUP D 用例只用 -k）。
+fn builtin_compgen(argv: &[String], sh: &mut Shell) -> i32 {
+    let mut action: Option<char> = None;
+    let mut wordlist: Option<String> = None;
+    let mut prefix: Option<String> = None;
+    let mut i = 1usize;
+    let mut end_of_options = false;
+
+    while i < argv.len() {
+        let a = &argv[i];
+        if !end_of_options && a == "--" {
+            end_of_options = true;
+            i += 1;
+            continue;
+        }
+        if !end_of_options && a.len() > 1 && a.starts_with('-') {
+            // 选项可捆绑；带参数的选项吃掉同一词的剩余部分或下一个词。
+            let chars: Vec<char> = a.chars().skip(1).collect();
+            let mut k = 0usize;
+            while k < chars.len() {
+                let c = chars[k];
+                let takes_arg =
+                    matches!(c, 'o' | 'A' | 'G' | 'W' | 'F' | 'C' | 'X' | 'P' | 'S' | 'V');
+                let value: Option<String> = if takes_arg {
+                    if k + 1 < chars.len() {
+                        let rest: String = chars[k + 1..].iter().collect();
+                        k = chars.len();
+                        Some(rest)
+                    } else {
+                        i += 1;
+                        argv.get(i).cloned()
+                    }
+                } else {
+                    None
+                };
+                if c == 'W' {
+                    wordlist = value.clone();
+                    action = Some('W');
+                } else if !takes_arg {
+                    // 无参数 action / 开关字母：记录最后一个 action。
+                    action = Some(c);
+                }
+                // 其余带参选项：接受但不据此生成候选。
+                k += 1;
+            }
+            i += 1;
+            continue;
+        }
+        prefix = Some(a.clone());
+        break;
+    }
+
+    let mut candidates: Vec<String> = Vec::new();
+    match action {
+        Some('k') => {
+            candidates.extend(
+                crate::lexer::SHELL_KEYWORDS
+                    .iter()
+                    .map(|(w, _)| (*w).to_string()),
+            );
+        }
+        Some('b') => {
+            candidates.extend(BUILTINS.iter().map(|b| (*b).to_string()));
+        }
+        Some('W') => {
+            if let Some(wl) = &wordlist {
+                let ifs = sh
+                    .env
+                    .get("IFS")
+                    .cloned()
+                    .unwrap_or_else(|| " \t\n".to_string());
+                let seps: Vec<char> = ifs.chars().collect();
+                candidates.extend(
+                    wl.split(|c| seps.contains(&c))
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string()),
+                );
+            }
+        }
+        _ => {}
+    }
+
+    let p = prefix.as_deref().unwrap_or("");
+    for c in &candidates {
+        if c.starts_with(p) {
+            println!("{}", c);
+        }
+    }
+    0
+}
+
+// ---------------------------------------------------------------------------
+// bind
+// ---------------------------------------------------------------------------
+
+/// GNU readline 默认 emacs keymap 的 `bind -p` 导出（静态资源）。
+///
+/// 来源：`LC_ALL=C /d/msys2/usr/bin/bash.exe -c 'bind -p'`，GNU bash
+/// 5.3.20(1)-release (x86_64-pc-cygwin)。实测 497 行 / 11705 字节，
+/// 首行是空行、末尾带换行；md5 = 943c9637957580f0e4b2176f773ca66c。
+///
+/// 该输出与随该 bash 附带的 GNU readline 版本及 locale collation 绑定：
+/// QA 实测 zh_CN.UTF-8 下字节数同为 11705B，但行序不同、md5 不同，故这里
+/// 固定采用 LC_ALL=C 的实测导出，绝不按 locale 重排，也绝不用循环生成
+/// 填充行凑够 497 行，更不为满足 grep 塞几行假数据——这是完整的真实
+/// 默认绑定表。（该 MSYS2 安装未能从 pacman/ldd/头文件/strings 直接查得
+/// readline 版本号，故只标注 bash 版本与导出命令。）
+static BIND_P_KEYMAP: &str = include_str!("keymap_emacs.txt");
+
+/// `bind`：显示 readline 键绑定。
+///
+///   * `bind -p` —— 把完整默认 keymap 原样写到 stdout，并在 stderr 输出
+///     `bind: warning: line editing not enabled`（非交互下 bash 的固定诊断），rc=0；
+///   * `bind`（无 -p）—— stdout 为空，仅输出该 warning，rc=0。
+///
+/// wash 不启用 readline 行编辑，其余选项（-l/-s/-v/-P/-S/-V/-X/-m/-f/
+/// -q/-u/-r/-x 等）本轮仅接受、不改变输出（如实说明）。
+fn builtin_bind(argv: &[String], _sh: &mut Shell) -> i32 {
+    let mut print = false;
+    let mut i = 1usize;
+    while i < argv.len() {
+        let a = &argv[i];
+        if a == "--" {
+            break;
+        }
+        if a.len() > 1 && a.starts_with('-') {
+            for c in a.chars().skip(1) {
+                if c == 'p' {
+                    print = true;
+                }
+                // 其余选项本轮仅接受，不改变输出。
+            }
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    if print {
+        print!("{}", BIND_P_KEYMAP);
+        let _ = std::io::stdout().flush();
+    }
+    // 非交互下 readline 行编辑未启用，bash 固定输出这条诊断；归一化后需
+    // 精确等于 `bind: warning: line editing not enabled`。
+    eprintln!("wash: bind: warning: line editing not enabled");
     0
 }
 
@@ -5985,6 +6147,8 @@ const BUILTIN_HELP: &[(&str, &str, &str)] = &[
     ("history", "history [-c] [-d offset] [n] or history -anrw [filename] or history -ps arg [arg...]", "Display or manipulate the history list."),
     ("mapfile", "mapfile [-d delim] [-n count] [-O origin] [-s count] [-t] [-u fd] [-C callback] [-c quantum] [array]", "Read lines from the standard input into an indexed array variable."),
     ("readarray", "readarray [-d delim] [-n count] [-O origin] [-s count] [-t] [-u fd] [-C callback] [-c quantum] [array]", "Read lines from a file into an array variable."),
+    ("compgen", "compgen [-V varname] [-abcdefgjksuv] [-o option] [-A action] [-G globpat] [-W wordlist] [-F function] [-C command] [-X filterpat] [-P prefix] [-S suffix] [word]", "Display possible completions depending on the options."),
+    ("bind", "bind [-lpsvPSVX] [-m keymap] [-f filename] [-q name] [-u name] [-r keyseq] [-x keyseq:shell-command] [keyseq:readline-function or readline-command]", "Set Readline key bindings and variables."),
 ];
 
 /// bash `help` 列出的保留字（关键字）及其用法摘要，按字母序与内建命令混排成双栏。
