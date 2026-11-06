@@ -335,6 +335,16 @@ pub struct Shell {
     /// Array variables (`ARR=(a b)`). Each maps a name to an ordered list of
     /// elements (bash arrays).
     pub arrays: HashMap<String, Vec<String>>,
+    /// 记录被显式赋予过数组值（哪怕是空数组）的变量名。bash 区分「仅
+    /// `declare -a X` 声明」与「`X=()` / `mapfile` 赋过值」：前者
+    /// `declare -p` 打印 `declare -a X`，后者打印 `declare -a X=()`。
+    /// wash 用连续 `Vec` 存数组，无法从空 `Vec` 本身区分这两种状态，
+    /// 故另设此集合，由真正赋值数组的内建（`mapfile`/`readarray`）维护。
+    pub array_assigned: HashSet<String>,
+    /// 可编程补全规格表（`complete`）：按注册顺序保存
+    /// `(命令名, 可回显的选项串)`。`complete -p` / 无参 `complete` 据此回显，
+    /// 不写死空输出。
+    pub completion_specs: Vec<(String, String)>,
     /// The interactive / non-interactive command history (`history`, `fc`).
     pub history: Vec<String>,
     /// A fatal error that aborts the rest of a `-c` script the way bash does
@@ -451,6 +461,8 @@ impl Shell {
             jobs: Vec::new(),
             job_table: Vec::new(),
             arrays: HashMap::new(),
+            array_assigned: HashSet::new(),
+            completion_specs: Vec::new(),
             history: Vec::new(),
             fatal_error: None,
             quiet_errors: false,

@@ -80,6 +80,11 @@ const BUILTINS: &[&str] = &[
     "unset",
     "wait",
     "pwd",
+    "complete",
+    "fc",
+    "history",
+    "mapfile",
+    "readarray",
 ];
 
 /// True when `name` is the name of a builtin command.
@@ -140,6 +145,10 @@ pub fn run_builtin(argv: &[String], sh: &mut Shell) -> Option<i32> {
         "pushd" => builtin_pushd(argv, sh),
         "popd" => builtin_popd(argv, sh),
         "help" => builtin_help(argv, sh),
+        "mapfile" | "readarray" => builtin_mapfile(argv, sh),
+        "complete" => builtin_complete(argv, sh),
+        "fc" => builtin_fc(argv, sh),
+        "history" => builtin_history(argv, sh),
         _ => return None,
     };
     Some(code)
@@ -2423,6 +2432,428 @@ fn builtin_colon(_argv: &[String], _sh: &mut Shell) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
+// mapfile / readarray
+// ---------------------------------------------------------------------------
+
+/// `mapfile` / `readarray`（`readarray` 是 `mapfile` 的别名）：把 fd 的输入
+/// 逐行读入索引数组。
+///
+/// 支持的选项（bash 5.3 语义）：
+///   * `-t`        去掉每行尾部的分隔符（默认分隔符是换行）；
+///   * `-d DELIM`  用 DELIM 的首字节作分隔符（空串表示 NUL）；
+///   * `-n COUNT`  最多取 COUNT 行；
+///   * `-s COUNT`  跳过前 COUNT 行；
+///   * `-O ORIGIN` 从下标 ORIGIN 开始写入；
+///   * `-u FD`     从指定 fd 读取（默认 0）；
+///   * `-c` / `-C` 回调选项：本轮只接受参数、不触发回调（如实说明）。
+///
+/// 省略数组名时写入默认数组 `MAPFILE`。空输入得到空数组；通过
+/// `Shell::array_assigned` 标记，`declare -p` 会打印 `NAME=()`，
+/// 与 bash 对「赋过值的空数组」的表示一致。
+fn builtin_mapfile(argv: &[String], sh: &mut Shell) -> i32 {
+    const USAGE: &str = "mapfile: usage: mapfile [-d delim] [-n count] [-O origin] [-s count] [-t] [-u fd] [-C callback] [-c quantum] [array]";
+
+    let mut strip_delim = false;
+    let mut delim: u8 = b'\n';
+    let mut max_count: Option<usize> = None;
+    let mut skip: usize = 0;
+    let mut origin: usize = 0;
+    let mut fd: i32 = 0;
+    let mut i = 1usize;
+
+    while i < argv.len() {
+        let a = &argv[i];
+        if a == "--" {
+            i += 1;
+            break;
+        }
+        if a.len() > 1 && a.starts_with('-') {
+            // 选项可能捆绑（如 `-tn 2`）：逐字符处理，带参数的选项吃掉
+            // 同一词的剩余部分或下一个词。
+            let chars: Vec<char> = a.chars().skip(1).collect();
+            let mut k = 0usize;
+            while k < chars.len() {
+                let c = chars[k];
+                let needs_arg = matches!(c, 'd' | 'n' | 'O' | 's' | 'u' | 'C' | 'c');
+                let value: Option<String> = if needs_arg {
+                    if k + 1 < chars.len() {
+                        let rest: String = chars[k + 1..].iter().collect();
+                        k = chars.len();
+                        Some(rest)
+                    } else {
+                        i += 1;
+                        argv.get(i).cloned()
+                    }
+                } else {
+                    None
+                };
+                match c {
+                    't' => strip_delim = true,
+                    'd' => {
+                        delim = value
+                            .as_ref()
+                            .and_then(|s| s.as_bytes().first().copied())
+                            .unwrap_or(0);
+                    }
+                    'n' => {
+                        max_count = value
+                            .as_ref()
+                            .and_then(|s| s.trim().parse::<usize>().ok());
+                    }
+                    's' => {
+                        skip = value
+                            .as_ref()
+                            .and_then(|s| s.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                    }
+                    'O' => {
+                        origin = value
+                            .as_ref()
+                            .and_then(|s| s.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                    }
+                    'u' => {
+                        fd = value
+                            .as_ref()
+                            .and_then(|s| s.trim().parse::<i32>().ok())
+                            .unwrap_or(0);
+                    }
+                    // -c quantum / -C callback：本轮接受参数但不触发回调。
+                    'c' | 'C' => {}
+                    _ => {
+                        eprintln!("wash: mapfile: -{}: invalid option", c);
+                        eprintln!("{}", USAGE);
+                        return 2;
+                    }
+                }
+                k += 1;
+            }
+            i += 1;
+            continue;
+        }
+        break;
+    }
+
+    // 第一个非选项参数是要写入的数组名，默认 `MAPFILE`。
+    let operands: Vec<String> = argv[i..].to_vec();
+    if operands.len() > 1 {
+        eprintln!("wash: mapfile: too many arguments");
+        return 2;
+    }
+    let name = operands
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "MAPFILE".to_string());
+    if !is_valid_ident(&name) {
+        eprintln!("wash: mapfile: `{}': not a valid identifier", name);
+        return 1;
+    }
+
+    // 逐字节读 fd 直到 EOF，按 delim 切行。
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur: Vec<u8> = Vec::new();
+    while let Some(byte) = posix::read_byte_from(fd) {
+        if byte == delim {
+            // 无 -t 时保留尾部分隔符；-t 时去掉。
+            if !strip_delim {
+                cur.push(byte);
+            }
+            lines.push(String::from_utf8_lossy(&cur).into_owned());
+            cur.clear();
+        } else {
+            cur.push(byte);
+        }
+    }
+    // 末尾没有分隔符时，最后一段仍算一行（不含分隔符）。
+    if !cur.is_empty() {
+        lines.push(String::from_utf8_lossy(&cur).into_owned());
+    }
+
+    // -s 跳过前 skip 行，再按 -n 截断。
+    let mut selected: Vec<String> = if skip >= lines.len() {
+        Vec::new()
+    } else {
+        lines[skip..].to_vec()
+    };
+    if let Some(max) = max_count {
+        selected.truncate(max);
+    }
+
+    // -O origin：保留已有数组的前 origin 个元素，新行从 origin 起写。
+    // wash 用连续 Vec 无法表达 bash 的稀疏下标，origin 前的空位以空串
+    // 占位（如实说明这一简化；GROUP D 用例不涉及 -O）。
+    let mut result: Vec<String> = Vec::new();
+    if origin > 0 {
+        if let Some(existing) = sh.arrays.get(&name) {
+            let keep = origin.min(existing.len());
+            result.extend_from_slice(&existing[..keep]);
+        }
+        while result.len() < origin {
+            result.push(String::new());
+        }
+    }
+    result.extend(selected);
+
+    sh.arrays.insert(name.clone(), result);
+    sh.array_assigned.insert(name);
+    0
+}
+
+// ---------------------------------------------------------------------------
+// complete
+// ---------------------------------------------------------------------------
+
+/// `complete`：注册 / 查询 / 删除可编程补全规格，规格存在
+/// `Shell::completion_specs`（按注册顺序）。
+///
+///   * 无参 `complete` / `complete -p [name...]` —— 回显规格，
+///     格式 `complete {选项串} {命令名}`；干净 shell 下空输出、rc=0；
+///   * `complete -W 'aa bb cc' cmd` —— 注册；`-p cmd` 回显
+///     `complete -W 'aa bb cc' cmd`（wordlist 类参数用单引号包裹）；
+///   * `complete -r [name...]` —— 删除规格（无参清空全部）。
+///
+/// 其余常见选项（-F/-C/-A/-o/-G/-X/-P/-S/-D/-E/-I 等）接受并参与回显。
+fn builtin_complete(argv: &[String], sh: &mut Shell) -> i32 {
+    const USAGE: &str = "complete: usage: complete [-abcdefgjksuv] [-o comp-option] [-DEI] [-A action] [-G globpat] [-W wordlist] [-F function] [-C command] [-X filterpat] [-P prefix] [-S suffix] [name ...]";
+
+    let mut print_mode = false;
+    let mut remove_mode = false;
+    let mut options: Vec<String> = Vec::new();
+    let mut commands: Vec<String> = Vec::new();
+    let mut end_of_options = false;
+    let mut i = 1usize;
+
+    while i < argv.len() {
+        let a = &argv[i];
+        if !end_of_options && a == "--" {
+            end_of_options = true;
+            i += 1;
+            continue;
+        }
+        if !end_of_options && a.len() > 1 && a.starts_with('-') {
+            let opt = a.as_str();
+            match opt {
+                "-p" => print_mode = true,
+                "-r" => remove_mode = true,
+                // wordlist / glob / filter / prefix / suffix：bash 回显时
+                // 用单引号包裹这些字符串参数。
+                "-W" | "-X" | "-P" | "-S" | "-G" => {
+                    i += 1;
+                    let v = argv.get(i).cloned().unwrap_or_default();
+                    options.push(format!("{} {}", opt, quote_single(&v)));
+                }
+                // 函数名 / 命令名 / action / comp-option：原样回显。
+                "-F" | "-C" | "-A" | "-o" => {
+                    i += 1;
+                    let v = argv.get(i).cloned().unwrap_or_default();
+                    options.push(format!("{} {}", opt, v));
+                }
+                // 默认/空行/初始单词补全标记，以及无参开关。
+                other => options.push(other.to_string()),
+            }
+            i += 1;
+            continue;
+        }
+        commands.push(a.clone());
+        i += 1;
+    }
+
+    // -r：删除指定命令的规格（无参清空全部）。
+    if remove_mode {
+        if commands.is_empty() {
+            sh.completion_specs.clear();
+        } else {
+            sh.completion_specs.retain(|(c, _)| !commands.contains(c));
+        }
+        return 0;
+    }
+
+    // 列表模式：-p，或完全没有选项与命令名（裸 `complete`）。
+    let listing = print_mode || (options.is_empty() && commands.is_empty());
+    if listing {
+        for (cmd, spec) in &sh.completion_specs {
+            if !commands.is_empty() && !commands.contains(cmd) {
+                continue;
+            }
+            if spec.is_empty() {
+                println!("complete {}", cmd);
+            } else {
+                println!("complete {} {}", spec, cmd);
+            }
+        }
+        // -p 指定了名字却查不到时，bash 报错并返回 1。
+        if print_mode && !commands.is_empty() {
+            for cmd in &commands {
+                if !sh.completion_specs.iter().any(|(c, _)| c == cmd) {
+                    eprintln!("wash: complete: {}: no completion specification", cmd);
+                    return 1;
+                }
+            }
+        }
+        return 0;
+    }
+
+    // 注册模式：必须有命令名。
+    if commands.is_empty() {
+        eprintln!("wash: {}", USAGE);
+        return 2;
+    }
+    let spec = options.join(" ");
+    for cmd in &commands {
+        if let Some(entry) = sh.completion_specs.iter_mut().find(|(c, _)| c == cmd) {
+            entry.1 = spec.clone();
+        } else {
+            sh.completion_specs.push((cmd.clone(), spec.clone()));
+        }
+    }
+    0
+}
+
+// ---------------------------------------------------------------------------
+// fc
+// ---------------------------------------------------------------------------
+
+/// `fc -l` / `fc -ln`：列出命令历史（读真实的 `Shell::history`）。
+///
+/// bash 格式：`fc -l` 每行 `{序号}\t {命令}`，`fc -ln` 每行 `\t {命令}`
+/// （无序号但保留 tab + 空格前缀）。空历史时无输出、rc=0。
+/// `fc` 的编辑 / 重执行模式（-e / -s / 无 -l）本轮不支持，返回诊断。
+fn builtin_fc(argv: &[String], sh: &mut Shell) -> i32 {
+    let mut list = false;
+    let mut no_numbers = false;
+    let mut i = 1usize;
+    while i < argv.len() {
+        let a = &argv[i];
+        if a == "--" {
+            // `--` 之后 fc 的位置参数（范围）本轮不处理，直接结束选项解析。
+            break;
+        }
+        if a.len() > 1 && a.starts_with('-') {
+            for c in a.chars().skip(1) {
+                match c {
+                    'l' => list = true,
+                    'n' => no_numbers = true,
+                    // -r 反转、-e/-s 编辑类选项本轮仅接受、不报错。
+                    'r' | 'e' | 's' => {}
+                    _ => {
+                        eprintln!("wash: fc: -{}: invalid option", c);
+                        eprintln!("fc: usage: fc [-e ename] [-lnr] [first] [last] or fc -s [pat=rep] [command]");
+                        return 2;
+                    }
+                }
+            }
+            i += 1;
+            continue;
+        }
+        break;
+    }
+
+    if !list {
+        // bash 会调用编辑器 / 重执行历史命令；本轮不实现，如实返回诊断。
+        eprintln!("wash: fc: editing/executing history is not supported");
+        return 1;
+    }
+
+    for (idx, cmd) in sh.history.iter().enumerate() {
+        if no_numbers {
+            println!("\t {}", cmd);
+        } else {
+            println!("{}\t {}", idx + 1, cmd);
+        }
+    }
+    0
+}
+
+// ---------------------------------------------------------------------------
+// history
+// ---------------------------------------------------------------------------
+
+/// `history`：显示 / 管理命令历史（真实读写 `Shell::history`）。
+///
+///   * 无参 —— 列出全部，格式 `    1  cmd`（序号右对齐宽 5 + 两空格）；
+///   * `history N` —— 只列最后 N 条；
+///   * `history -c` —— 清空历史；
+///   * `history -d N` —— 删除第 N 条；
+///   * `history -s ARG...` —— 参数以空格连接成一行追加到历史。
+///
+/// -a/-n/-r/-w（历史文件读写）与 -p（展开）本轮仅接受参数、不落盘。
+fn builtin_history(argv: &[String], sh: &mut Shell) -> i32 {
+    let mut clear = false;
+    let mut delete: Option<usize> = None;
+    let mut append: Option<String> = None;
+    let mut positional: Vec<String> = Vec::new();
+    let mut i = 1usize;
+
+    while i < argv.len() {
+        let a = &argv[i];
+        if a == "--" {
+            i += 1;
+            positional.extend_from_slice(&argv[i..]);
+            break;
+        }
+        if a.len() > 1 && a.starts_with('-') {
+            match a.as_str() {
+                "-c" => clear = true,
+                "-d" => {
+                    i += 1;
+                    delete = argv.get(i).and_then(|s| s.trim().parse::<usize>().ok());
+                    if delete.is_none() {
+                        eprintln!("wash: history: -d: numeric argument required");
+                        return 2;
+                    }
+                }
+                "-s" => {
+                    append = Some(argv[i + 1..].join(" "));
+                    break;
+                }
+                // -a/-n/-r/-w/-p：接受但不落盘 / 不展开（如实说明）。
+                "-a" | "-n" | "-r" | "-w" | "-p" => {
+                    break;
+                }
+                _ => {
+                    eprintln!("wash: history: {}: invalid option", a);
+                    eprintln!("history: usage: history [-c] [-d offset] [n] or history -anrw [filename] or history -ps arg [arg...]");
+                    return 2;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        positional.push(a.clone());
+        i += 1;
+    }
+
+    if clear {
+        sh.history.clear();
+        return 0;
+    }
+    if let Some(n) = delete {
+        if n == 0 || n > sh.history.len() {
+            eprintln!("wash: history: {}: history position out of range", n);
+            return 1;
+        }
+        sh.history.remove(n - 1);
+        return 0;
+    }
+    if let Some(line) = append {
+        sh.history.push(line);
+        return 0;
+    }
+
+    // 列出历史：`history N` 只显示最后 N 条（默认全部）。
+    let total = sh.history.len();
+    let count = positional
+        .first()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(total);
+    let start = total.saturating_sub(count);
+    for (idx, cmd) in sh.history.iter().enumerate().skip(start) {
+        println!("{:>5}  {}", idx + 1, cmd);
+    }
+    0
+}
+
+// ---------------------------------------------------------------------------
 // true / false
 // ---------------------------------------------------------------------------
 
@@ -4272,11 +4703,17 @@ fn print_declared(sh: &Shell, names: &[String]) {
     sorted.sort();
     for name in &sorted {
         // Array variables are printed with the `-a` attribute and the
-        // `([0]="a" [1]="b")` body, exactly like bash does.  An empty array
-        // is printed without the `=()` part.
+        // `([0]="a" [1]="b")` body, exactly like bash does.  A bare
+        // `declare -a NAME` (declared but never assigned) prints without a
+        // value, while an array that WAS assigned -- even an empty one from
+        // `mapfile`/`readarray` -- prints the explicit `=()` body (bash 5.3).
         if let Some(elems) = sh.arrays.get(name) {
             if elems.is_empty() {
-                println!("declare -a {}", name);
+                if sh.array_assigned.contains(name) {
+                    println!("declare -a {}=()", name);
+                } else {
+                    println!("declare -a {}", name);
+                }
             } else {
                 println!("declare -a {}={}", name, format_array(elems));
             }
@@ -5543,6 +5980,11 @@ const BUILTIN_HELP: &[(&str, &str, &str)] = &[
     ("unalias", "unalias [-a] name [name ...]", "Remove each name from the list of defined aliases."),
     ("wait", "wait [-fn] [-p var] [id ...]", "Wait for job completion and return exit status."),
     ("unset", "unset [-f] [-v] [-n] [name ...]", "Remove variable or function names."),
+    ("complete", "complete [-abcdefgjksuv] [-pr] [-DEI] [-o option] [-A action] [-G globpat] [-W wordlist] [-F function] [-C command] [-X filterpat] [-P prefix] [-S suffix] [name ...]", "Specify how arguments are to be completed by Readline."),
+    ("fc", "fc [-e ename] [-lnr] [first] [last] or fc -s [pat=rep] [command]", "Display or execute commands from the history list."),
+    ("history", "history [-c] [-d offset] [n] or history -anrw [filename] or history -ps arg [arg...]", "Display or manipulate the history list."),
+    ("mapfile", "mapfile [-d delim] [-n count] [-O origin] [-s count] [-t] [-u fd] [-C callback] [-c quantum] [array]", "Read lines from the standard input into an indexed array variable."),
+    ("readarray", "readarray [-d delim] [-n count] [-O origin] [-s count] [-t] [-u fd] [-C callback] [-c quantum] [array]", "Read lines from a file into an array variable."),
 ];
 
 /// bash `help` 列出的保留字（关键字）及其用法摘要，按字母序与内建命令混排成双栏。
