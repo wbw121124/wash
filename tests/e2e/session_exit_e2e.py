@@ -154,7 +154,12 @@ def build_cases():
         name="Ctrl-C during foreground sleep",
         # 注意：Ctrl-C 必须在 `sleep` 前台执行期间（cooked 模式）发出，才是在测
         # 「信号不应杀死 shell」。后续 echo/exit 留足 pause 等 REPL 回到 raw mode。
-        steps=[("sleep 8\r", 0.8), ("\x03", 0.8), ("echo ok\r", 1.0), ("exit 0\r", 0.6)],
+        # 时序加固：Ctrl-C 之前的 pause 由 0.8s 提到 1.2s（与两条 EOF 用例的
+        # 1.2s 策略一致），给 oracle/wash 足够时间完成前台作业控制与信号
+        # handler 安装，避免 Ctrl-C 过早落在 cooked 窗口被行规程/信号竞态
+        # 影响 oracle 侧退出码（实测该竞态曾让 oracle 在 EXIT(0)/EXIT(2) 摆动）。
+        # 仅调整发送控制字符前的等待时长，不动任何断言/期望值/进程状态判据。
+        steps=[("sleep 8\r", 1.2), ("\x03", 0.8), ("echo ok\r", 1.0), ("exit 0\r", 0.6)],
         timeout=6.0,
         expect_alive={1: True},
         expect_lines=["ok"],
