@@ -86,6 +86,13 @@ fn main() {
         }
         break;
     }
+    // bash 的参数语义：
+    //   `-c CMD NAME ARGS...` -> 执行 CMD，$0=NAME，$1..=ARGS
+    //   `SCRIPT ARGS...`      -> 读并执行脚本，$0=SCRIPT，$1..=ARGS
+    // 没有额外参数时 $0 保持上面设置的 shell 自身路径。
+    let mut script: Option<String> = None;
+    let mut command_name: Option<String> = None;
+    let mut positional: Vec<String> = Vec::new();
     if want_command {
         // `-c` 的参数是紧跟其后的那个（`-lc CMD` 也一样）。
         if i >= args.len() {
@@ -93,7 +100,20 @@ fn main() {
             exit(2);
         }
         command = Some(args[i].clone());
+        if i + 1 < args.len() {
+            command_name = Some(args[i + 1].clone());
+            positional = args[i + 2..].to_vec();
+        }
+    } else if i < args.len() {
+        script = Some(args[i].clone());
+        command_name = Some(args[i].clone());
+        positional = args[i + 1..].to_vec();
     }
+    if let Some(name) = command_name {
+        // `$BASH` stays the shell's own path; only `$0` follows the argv.
+        sh.dollar_zero = name;
+    }
+    sh.positional = positional;
 
     if login {
         // 登录 shell：读取 profile 文件（与 bash 的顺序一致）。文件不存在或
@@ -130,6 +150,26 @@ fn main() {
         sh.error_context = Some(shell::ErrorContext::command_string());
         let code = sh.run_str(&cmd);
         // 退出前触发 EXIT trap（bash 就在退出前做这件事）。
+        if let Some(action) = sh.traps.get("EXIT").cloned() {
+            if action != "-" {
+                sh.run_in_error_context(shell::ErrorContext::exit_trap(), &action);
+            }
+        }
+        exit(code);
+    }
+
+    if let Some(path) = script {
+        // A bare non-option argument is a script file, not a REPL session.
+        // bash labels parse errors from it with the script path (no shell
+        // name), so the sourced-script error context is the right one.
+        let content = match posix::read_file(&path) {
+            Some(c) => c,
+            None => {
+                eprintln!("wash: {}: {}", path, posix::errno_message(posix::errno()));
+                exit(127);
+            }
+        };
+        let code = sh.run_in_error_context(shell::ErrorContext::sourced(&path), &content);
         if let Some(action) = sh.traps.get("EXIT").cloned() {
             if action != "-" {
                 sh.run_in_error_context(shell::ErrorContext::exit_trap(), &action);
