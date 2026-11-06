@@ -1652,8 +1652,16 @@ fn execute_background(p: &Pipeline, sh: &mut Shell, path: &str) -> i32 {
         let code = execute_pipeline(&p2, sh, path);
         posix::exit(code);
     }
-    // 父进程。
+    // 父进程：登记真实作业条目。子进程 fork 后走 pid==0 分支并 posix::exit，
+    // 不会执行到这里；且子进程持有独立的 Shell 副本，其内部若再起后台作业
+    // 也只改自己的副本，不会污染父 shell 的作业表。
     sh.jobs.push(pid);
+    sh.job_table.push(crate::shell::JobInfo {
+        pid,
+        // 命令文本取自流水线渲染（不含结尾的 `&`），是真实输入，非伪造。
+        command: crate::builtins::render_pipeline(p),
+        done: false,
+    });
     sh.bg_pid = pid;
     let jobno = sh.jobs.len();
     // bash 只在交互式 shell（且打开了作业控制）里通报后台作业的启动；

@@ -21,7 +21,7 @@ use std::io::Write;
 
 use crate::arith;
 use crate::posix;
-use crate::shell::{Shell, SET_O_ORDER, SHOPT_ORDER};
+use crate::shell::{Shell, JobInfo, SET_O_ORDER, SHOPT_ORDER};
 // fish 风格的翻译宏 `tr!("...")`，参见 `src/i18n.rs`。
 use crate::tr;
 
@@ -35,12 +35,14 @@ const BUILTINS: &[&str] = &[
     ":",
     "[",
     "alias",
+    "bg",
     "break",
     "builtin",
     "cd",
     "command",
     "continue",
     "declare",
+    "disown",
     "dirs",
     "echo",
     "enable",
@@ -49,8 +51,10 @@ const BUILTINS: &[&str] = &[
     "exit",
     "export",
     "false",
+    "fg",
     "hash",
     "help",
+    "jobs",
     "kill",
     "let",
     "local",
@@ -123,6 +127,10 @@ pub fn run_builtin(argv: &[String], sh: &mut Shell) -> Option<i32> {
         "umask" => builtin_umask(argv, sh),
         "ulimit" => builtin_ulimit(argv, sh),
         "wait" => builtin_wait(argv, sh),
+        "jobs" => builtin_jobs(argv, sh),
+        "fg" => builtin_fg(argv, sh),
+        "bg" => builtin_bg(argv, sh),
+        "disown" => builtin_disown(argv, sh),
         "times" => builtin_times(argv, sh),
         "let" => builtin_let(argv, sh),
         "enable" => builtin_enable(argv, sh),
@@ -1752,7 +1760,7 @@ fn render_simple(c: &crate::parser::SimpleCommand) -> String {
     parts.join(" ")
 }
 
-fn render_pipeline(p: &crate::parser::Pipeline) -> String {
+pub(crate) fn render_pipeline(p: &crate::parser::Pipeline) -> String {
     p.commands.iter().map(render_simple).collect::<Vec<_>>().join(" | ")
 }
 
@@ -5164,6 +5172,9 @@ fn builtin_wait(argv: &[String], sh: &mut Shell) -> i32 {
                 last_status = code;
                 any = true;
                 sh.jobs.retain(|&p| p != pid);
+                // 两表同步：wait 回收后作业也从真实作业表移除，保证
+                // jobs / fg / disown 的 %N 下标与 wait 的 %N 一致。
+                sh.job_table.retain(|j| j.pid != pid);
             }
         }
         return if any { last_status } else { 0 };
@@ -5194,6 +5205,7 @@ fn builtin_wait(argv: &[String], sh: &mut Shell) -> i32 {
                 last_status = code;
                 any = true;
                 sh.jobs.retain(|&p| p != pid);
+                sh.job_table.retain(|j| j.pid != pid);
             }
             None => {
                 eprintln!("wash: wait: pid {} is not a child of this shell", pid);
@@ -5209,17 +5221,313 @@ fn builtin_wait(argv: &[String], sh: &mut Shell) -> i32 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 作业控制内建：jobs / fg / bg / disown
+// ---------------------------------------------------------------------------
+
+/// 是否启用作业控制：`set -m` 显式开启，或交互式 tty 下默认开启。
+/// `-c` / stdin 非 tty 时关闭，此时 `fg` / `bg` 报 "no job control"。
+fn job_control_on(sh: &Shell) -> bool {
+    sh.options.monitor || (sh.interactive && posix::isatty(0))
+}
+
+/// 把 jobspec 解析成 `job_table` 的下标（0-based）。
+///
+/// 支持 `%N`（1-based 作业号）、`%%` / `%+`（当前作业，表中最后一个）、
+/// `%-`（前一个作业）、`%?str`（命令含 str）、`%str`（命令以 str 开头）。
+/// `None` 表示省略 jobspec，按当前作业处理。失败时 `Err` 携带用于报错的
+/// spec 文本（省略时用 bash 的 "current"）。
+fn find_job(sh: &Shell, spec: Option<&str>) -> Result<usize, String> {
+    let n = sh.job_table.len();
+    let raw = spec.unwrap_or("current");
+    if n == 0 {
+        return Err(raw.to_string());
+    }
+    let found = match raw {
+        "current" | "%%" | "%+" => Some(n - 1),
+        "%-" => n.checked_sub(2),
+        s if s.starts_with('%') => {
+            let rest = &s[1..];
+            if let Ok(num) = rest.parse::<usize>() {
+                if num >= 1 && num <= n {
+                    Some(num - 1)
+                } else {
+                    None
+                }
+            } else if let Some(needle) = rest.strip_prefix('?') {
+                sh.job_table.iter().position(|j| j.command.contains(needle))
+            } else {
+                sh.job_table.iter().position(|j| j.command.starts_with(rest))
+            }
+        }
+        _ => sh.job_table.iter().position(|j| j.command.starts_with(raw)),
+    };
+    found.ok_or_else(|| raw.to_string())
+}
+
+/// 用 `kill(pid, 0)` 非破坏性地刷新作业存活状态。
+///
+/// 不调用 waitpid，避免回收掉子进程而破坏 `wait` 内建语义（已结束但未被
+/// wait 的僵尸进程仍会被判为存活，作为遗留边界记录）。
+fn refresh_job_states(sh: &mut Shell) {
+    for j in &mut sh.job_table {
+        if !j.done && posix::kill(j.pid, 0) < 0 {
+            j.done = true;
+        }
+    }
+}
+
+/// 作业状态文本（bash 的 jobs 列表用 Running / Done）。
+fn job_state(j: &JobInfo) -> &'static str {
+    if j.done {
+        "Done"
+    } else {
+        "Running"
+    }
+}
+
+/// 从两张作业表中同时移除一个 pid，保持 `jobs` / `wait` 视图一致。
+fn drop_job(sh: &mut Shell, pid: i32) {
+    sh.jobs.retain(|&p| p != pid);
+    sh.job_table.retain(|j| j.pid != pid);
+}
+
+/// `jobs [-lnprs] [jobspec ...]`：列出真实后台作业。
+///
+/// `-l` 带 pid、`-p` 只输出 pid、`-r` 仅未结束、`-s` 仅已结束；其余选项
+/// 与 `-x` 本轮忽略。列宽对齐 bash 5.3：状态字段固定 27 宽。
+fn builtin_jobs(argv: &[String], sh: &mut Shell) -> i32 {
+    let mut long = false;
+    let mut pid_only = false;
+    let mut running_only = false;
+    let mut done_only = false;
+    let mut specs: Vec<&str> = Vec::new();
+    for a in argv.iter().skip(1) {
+        if a.starts_with('-') && a.len() > 1 {
+            for c in a[1..].chars() {
+                match c {
+                    'l' => long = true,
+                    'p' => pid_only = true,
+                    'r' => running_only = true,
+                    's' => done_only = true,
+                    _ => {}
+                }
+            }
+        } else {
+            specs.push(a.as_str());
+        }
+    }
+
+    refresh_job_states(sh);
+
+    // 显式 jobspec 过滤；无 jobspec 时列出全部。
+    let wanted: Option<Vec<usize>> = if specs.is_empty() {
+        None
+    } else {
+        let mut v = Vec::new();
+        for s in &specs {
+            match find_job(sh, Some(s)) {
+                Ok(i) => v.push(i),
+                Err(text) => {
+                    eprintln!("wash: jobs: {}: no such job", text);
+                    return 1;
+                }
+            }
+        }
+        Some(v)
+    };
+
+    let n = sh.job_table.len();
+    for (i, j) in sh.job_table.iter().enumerate() {
+        if let Some(w) = &wanted {
+            if !w.contains(&i) {
+                continue;
+            }
+        }
+        let running = !j.done;
+        if (running_only && !running) || (done_only && running) {
+            continue;
+        }
+        if pid_only {
+            println!("{}", j.pid);
+            continue;
+        }
+        // 最后一个作业标 `+`、倒数第二个标 `-`、其余留空（bash 语义）。
+        let marker = if i + 1 == n {
+            '+'
+        } else if i + 2 == n {
+            '-'
+        } else {
+            ' '
+        };
+        let state = job_state(j);
+        if long {
+            println!("[{}]{} {:>5} {:<27}{} &", i + 1, marker, j.pid, state, j.command);
+        } else {
+            println!("[{}]{}  {:<27}{} &", i + 1, marker, state, j.command);
+        }
+    }
+    0
+}
+
+/// `fg [jobspec]`：把后台作业带回前台。
+///
+/// 本轮实现到「定位真实 pid → 回显命令 → SIGCONT 续跑 → 阻塞等待 →
+/// 从作业表移除」。遗留边界：后台作业没有独立进程组（execute_background
+/// 的子进程被 SUPPRESS_JOB_CONTROL 排除在 setpgid 接线之外），因此没有做
+/// tcsetpgrp 交还终端；完整作业切换留待后续阶段，不假装完成。
+fn builtin_fg(argv: &[String], sh: &mut Shell) -> i32 {
+    if !job_control_on(sh) {
+        eprintln!("wash: fg: no job control");
+        return 1;
+    }
+    let idx = match find_job(sh, argv.get(1).map(|s| s.as_str())) {
+        Ok(i) => i,
+        Err(text) => {
+            eprintln!("wash: fg: {}: no such job", text);
+            return 1;
+        }
+    };
+    let pid = sh.job_table[idx].pid;
+    let command = sh.job_table[idx].command.clone();
+
+    // bash 把作业命令回显到 stdout（不带 `&`）。
+    println!("{}", command);
+    std::io::stdout().flush().ok();
+
+    let cont = posix::signal_number("CONT");
+    if cont > 0 {
+        posix::kill(pid, cont);
+    }
+    let code = posix::wait_pid(pid);
+    drop_job(sh, pid);
+    code
+}
+
+/// `bg [jobspec ...]`：让后台作业继续运行。
+///
+/// 本轮实现到「按 jobspec 定位真实 pid → 对已停止/结束的作业发 SIGCONT
+/// 续跑并回显」。wash 无 stopped 状态，Running 作业按 bash 语义报
+/// "job N already in background"（rc 仍为 0）。
+fn builtin_bg(argv: &[String], sh: &mut Shell) -> i32 {
+    if !job_control_on(sh) {
+        eprintln!("wash: bg: no job control");
+        return 1;
+    }
+    let specs: Vec<Option<&str>> = if argv.len() > 1 {
+        argv.iter()
+            .skip(1)
+            .filter(|a| !a.starts_with('-'))
+            .map(|s| Some(s.as_str()))
+            .collect()
+    } else {
+        vec![None]
+    };
+
+    refresh_job_states(sh);
+    for spec in specs {
+        let idx = match find_job(sh, spec) {
+            Ok(i) => i,
+            Err(text) => {
+                eprintln!("wash: bg: {}: no such job", text);
+                return 1;
+            }
+        };
+        let jobno = idx + 1;
+        if !sh.job_table[idx].done {
+            eprintln!("wash: bg: job {} already in background", jobno);
+            continue;
+        }
+        let pid = sh.job_table[idx].pid;
+        let cont = posix::signal_number("CONT");
+        if cont > 0 {
+            posix::kill(pid, cont);
+        }
+        sh.job_table[idx].done = false;
+        println!("[{}]+ {} &", jobno, sh.job_table[idx].command);
+    }
+    0
+}
+
+/// `disown [-arh] [jobspec ...]`：把作业从作业表移除。
+///
+/// 不检查作业控制（bash 的 disown 在 `-c` 下也能对空表给出
+/// "current: no such job"）。`-a` 全部、`-r` 仅未结束、`-h` 保留在表中
+/// 仅标记不发送 SIGHUP（wash 暂无 SIGHUP 转发，故为近似）。
+fn builtin_disown(argv: &[String], sh: &mut Shell) -> i32 {
+    let mut all = false;
+    let mut running_only = false;
+    let mut keep = false;
+    let mut specs: Vec<&str> = Vec::new();
+    for a in argv.iter().skip(1) {
+        if a.starts_with('-') && a.len() > 1 {
+            for c in a[1..].chars() {
+                match c {
+                    'a' => all = true,
+                    'r' => running_only = true,
+                    'h' => keep = true,
+                    _ => {}
+                }
+            }
+        } else {
+            specs.push(a.as_str());
+        }
+    }
+
+    refresh_job_states(sh);
+
+    let targets: Vec<i32> = if all {
+        sh.job_table
+            .iter()
+            .filter(|j| !running_only || !j.done)
+            .map(|j| j.pid)
+            .collect()
+    } else {
+        let list: Vec<Option<&str>> = if specs.is_empty() {
+            vec![None]
+        } else {
+            specs.iter().map(|s| Some(*s)).collect()
+        };
+        let mut v = Vec::new();
+        for s in list {
+            match find_job(sh, s) {
+                Ok(i) => {
+                    if !running_only || !sh.job_table[i].done {
+                        v.push(sh.job_table[i].pid);
+                    }
+                }
+                Err(text) => {
+                    eprintln!("wash: disown: {}: no such job", text);
+                    return 1;
+                }
+            }
+        }
+        v
+    };
+
+    if !keep {
+        for pid in targets {
+            drop_job(sh, pid);
+        }
+    }
+    0
+}
+
 const BUILTIN_HELP: &[(&str, &str, &str)] = &[
     ("alias", "alias [-p] [name[=value] ... ]", "Define or display aliases."),
+    ("bg", "bg [job_spec ...]", "Move jobs to the background."),
     ("builtin", "builtin [shell-builtin [arg ...]]", "Run a shell builtin."),
     ("cd", "cd [-L|[-P [-e]]] [-@] [dir]", "Change the shell working directory."),
     ("command", "command [-pVv] command [arg ...]", "Execute a simple command or display information about commands."),
     ("declare", "declare [-aAfFgilrtux] [-p] [name[=value] ...]", "Set variable values and attributes."),
     ("dirs", "dirs [-clpv] [+N] [-N]", "Display the list of currently remembered directories."),
+    ("disown", "disown [-h] [-ar] [jobspec ... | pid ...]", "Remove jobs from current shell."),
     ("enable", "enable [-a] [-dnps] [-f filename] [name ...]", "Enable and disable builtin shell commands."),
     ("exec", "exec [-a name] [command [arguments ...]] [redirection ...]", "Replace the shell with the given command."),
     ("export", "export [-fn] [name[=value] ...] or export -p [-f]", "Mark shell variables for export."),
+    ("fg", "fg [job_spec]", "Move job to the foreground."),
     ("hash", "hash [-lr] [-p pathname] [-dt] [name ...]", "Remember or display program locations."),
+    ("jobs", "jobs [-lnprs] [jobspec ...] or jobs -x command [args]", "Display status of jobs."),
     ("kill", "kill [-s sigspec | -n signum | -sigspec] pid | jobspec ... or kill -l [sigspec]", "Send a signal to a job or process."),
     ("popd", "popd [-n] [+N | -N]", "Remove an entry from the directory stack."),
     ("pushd", "pushd [-n] [+N | -N | dir]", "Add a directory to the top of the directory stack."),

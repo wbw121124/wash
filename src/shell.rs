@@ -236,6 +236,19 @@ impl Shell {
     }
 }
 
+/// 一条后台作业的真实记录，供 `jobs` / `fg` / `bg` / `disown` 使用。
+///
+/// `pid` 是 `execute_background` 真正 fork 出来的子进程 pid；`command` 是
+/// 该作业流水线渲染出的命令文本（不含结尾的 `&`）。所有条目都来自真实启动
+/// 的后台作业，不预置、不伪造。`done` / `code` 记录作业是否已被探测为结束。
+#[derive(Debug, Clone)]
+pub struct JobInfo {
+    pub pid: i32,
+    pub command: String,
+    /// 已被非阻塞探测判定为结束（进程已消失），不再计入 Running。
+    pub done: bool,
+}
+
 pub struct Shell {
     pub env: HashMap<String, String>,
     pub cwd: String,
@@ -315,6 +328,10 @@ pub struct Shell {
     pub bg_pid: i32,
     /// Background job pids this shell has started and not yet reaped (`wait`).
     pub jobs: Vec<i32>,
+    /// 与 `jobs` 平行的真实作业表：保存 pid、命令文本与状态，供
+    /// `jobs` / `fg` / `bg` / `disown` 定位与展示。`wait` 只操作 `jobs`，
+    /// 回收时会同步清理这里的对应条目。
+    pub job_table: Vec<JobInfo>,
     /// Array variables (`ARR=(a b)`). Each maps a name to an ordered list of
     /// elements (bash arrays).
     pub arrays: HashMap<String, Vec<String>>,
@@ -432,6 +449,7 @@ impl Shell {
             call_stack: Vec::new(),
             bg_pid: 0,
             jobs: Vec::new(),
+            job_table: Vec::new(),
             arrays: HashMap::new(),
             history: Vec::new(),
             fatal_error: None,
