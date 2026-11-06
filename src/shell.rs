@@ -675,6 +675,7 @@ impl Shell {
         // A fatal arithmetic expansion is scoped to one command line; the
         // interactive shell must remain usable on the next line.
         crate::expand::clear_arith_failed();
+        crate::expand::clear_expansion_abort();
         let code = match lexer::tokenize(s) {
             Ok(tokens) => match parser::parse_command_list(&tokens) {
                 Ok(list) => {
@@ -692,6 +693,16 @@ impl Shell {
                 2
             }
         };
+        // A fatal parameter expansion terminates a non-interactive shell with
+        // 127 (bash does the same), but an interactive REPL must survive:
+        // only this command line is aborted and its status becomes 127.
+        if crate::expand::expansion_aborted() {
+            if !self.interactive {
+                std::process::exit(127);
+            }
+            self.last_status = 127;
+            return 127;
+        }
         self.last_status = code;
         code
     }

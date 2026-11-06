@@ -1503,6 +1503,11 @@ fn execute_pipeline(p: &Pipeline, sh: &mut Shell, path: &str) -> i32 {
     // A failed arithmetic expansion (or a negative-length array slice) is
     // fatal for the whole command line: bash never runs `echo` when one of
     // its own arguments failed to expand.
+    // A `set -u` unbound variable or a failed `${var?word}` is fatal for the
+    // whole line (status 127), just like a bad arithmetic expansion (status 1).
+    if crate::expand::expansion_aborted() {
+        return 127;
+    }
     if crate::expand::arith_failed() {
         return 1;
     }
@@ -1704,7 +1709,7 @@ fn execute_andor(andor: &AndOr, sh: &mut Shell, path: &str, last: &mut i32) -> b
         sh.last_status = *last;
         // A fatal expansion error stops the AND-OR list as well: bash does
         // not run the fallback in `echo $((1/0)) || echo fallback`.
-        if crate::expand::arith_failed() {
+        if crate::expand::arith_failed() || crate::expand::expansion_aborted() {
             return true;
         }
         // `exit` stops the shell, `set -e` stops it on a failure.
@@ -1736,7 +1741,7 @@ pub fn execute(list: &CommandList, sh: &mut Shell) -> i32 {
         let aborted = execute_andor(andor, sh, &path, &mut last);
         // A fatal expansion error aborts every enclosing command list,
         // including `if` / loop / function bodies that called us.
-        if crate::expand::arith_failed() {
+        if crate::expand::arith_failed() || crate::expand::expansion_aborted() {
             break;
         }
         // `exit` stops the shell; `return` / `break` / `continue` stop the
@@ -1763,7 +1768,10 @@ pub fn execute(list: &CommandList, sh: &mut Shell) -> i32 {
     // A fatal expansion error overrides the status of the enclosing compound
     // command: `if echo $((1/0)); then ...; fi` has no `else` and would
     // otherwise report success, while bash reports 1 for the whole line.
-    if crate::expand::arith_failed() {
+    // Parameter-expansion failures carry 127 (`set -u`, `${var?word}`).
+    if crate::expand::expansion_aborted() {
+        127
+    } else if crate::expand::arith_failed() {
         1
     } else {
         last

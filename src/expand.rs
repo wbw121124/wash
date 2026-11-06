@@ -21,6 +21,11 @@ thread_local! {
     /// through thread-local state (command substitutions run in forked
     /// children and therefore cannot clobber the parent's flag).
     static ARITH_FAILED: Cell<bool> = Cell::new(false);
+    /// A fatal parameter expansion (`set -u` unbound variable, `${var?word}`).
+    /// Kept separate from ARITH_FAILED because it carries exit status 127
+    /// instead of 1. A non-interactive shell exits with 127; an interactive
+    /// REPL only aborts the current line so the session survives.
+    static EXPANSION_ABORT: Cell<bool> = Cell::new(false);
 }
 
 /// Whether the current command line hit a fatal arithmetic expansion error.
@@ -38,6 +43,26 @@ fn flag_arith_failure(message: &str) {
     if !arith_failed() {
         eprintln!("wash: {}", message);
         ARITH_FAILED.with(|c| c.set(true));
+    }
+}
+
+/// Whether the current command line hit `set -u` / `${var?word}`.
+pub fn expansion_aborted() -> bool {
+    EXPANSION_ABORT.with(|c| c.get())
+}
+
+/// Reset the fatal-parameter-expansion flag for each top-level command line.
+pub fn clear_expansion_abort() {
+    EXPANSION_ABORT.with(|c| c.set(false))
+}
+
+/// Print bash's diagnostic once and mark this command line as aborted. The
+/// caller (`Shell::run_str`) decides whether the process exits or the REPL
+/// survives, so the expander needs no knowledge of interactivity.
+fn flag_expansion_abort(message: &str) {
+    if !expansion_aborted() {
+        eprintln!("wash: {}", message);
+        EXPANSION_ABORT.with(|c| c.set(true));
     }
 }
 
@@ -85,11 +110,12 @@ enum Expansion {
     Star(Vec<String>),
 }
 
-/// Report an unbound variable the way bash does under `set -u` and abort the
-/// shell: a non-interactive bash prints the diagnostic and exits with 127.
-fn unbound_variable(name: &str) -> ! {
-    eprintln!("wash: {}: unbound variable", name);
-    std::process::exit(127);
+/// Report an unbound variable the way bash does under `set -u`: print the
+/// diagnostic and abort the current command line. `Shell::run_str` exits a
+/// non-interactive shell with 127 but keeps an interactive REPL alive.
+fn unbound_variable(name: &str) -> String {
+    flag_expansion_abort(&format!("{}: unbound variable", name));
+    String::new()
 }
 
 /// Expand a command's raw argv (list of words) into the final argv strings.
@@ -780,11 +806,11 @@ fn assign_default(ctx: &ExpandCtx, name: &str, value: &str) {
     }
 }
 
-/// Report a failed parameter expansion (`${var?word}`) and abort the shell
-/// the way a non-interactive bash does.
-fn expansion_error(name: &str, word: &str) -> ! {
-    eprintln!("wash: {}: {}", name, word);
-    std::process::exit(127);
+/// Report a failed `${var?word}` expansion and abort the current command
+/// line; `Shell::run_str` decides whether the process exits or the REPL lives.
+fn expansion_error(name: &str, word: &str) -> String {
+    flag_expansion_abort(&format!("{}: {}", name, word));
+    String::new()
 }
 
 fn split_braced(body: &str) -> (&str, &str, &str) {

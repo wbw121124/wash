@@ -1021,7 +1021,12 @@ run_case C kill-noexist       'kill -TERM 999999; echo "rc=$?"'
 # `kill` semantics.  It is kept here (rather than skipped) because sending
 # a real signal is the only way to observe `kill` end-to-end, and it
 # turns green as soon as Phase 2 lands.
-run_case C kill-TERM-child    'sleep 2 & p=$!; kill -TERM $p; wait $p; echo "rc=$?"'
+# 时序加固（只调时序，不动断言 / 期望值 / 判定方式）：`sleep 2 &` fork 之后立刻
+# `kill -TERM $p` 会与子进程 exec 竞态 —— MSYS2 bash 5.3 实测 20 次里有 4 次
+# 信号打在尚未 exec 的子 shell 上，导致 oracle 自己的 `wait` 返回 0（其余 16 次
+# 为 143），逐字节基线随机波动。插入 `sleep 0.1` 等后台作业真正进入 sleep 后再
+# 发信号；20 次连跑 bash / wash 均为 rc=143、零差异。判定标准一字未改。
+run_case C kill-TERM-child    'sleep 2 & p=$!; sleep 0.1; kill -TERM $p; wait $p; echo "rc=$?"'
 
 # --- trap -------------------------------------------------------------------
 run_case C trap-empty         'trap'
