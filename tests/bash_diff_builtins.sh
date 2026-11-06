@@ -1225,15 +1225,31 @@ run_case D wait              'wait; echo "rc=$?"'
 run_case D disown            'disown; echo "rc=$?"'
 
 # --- arrays / coproc (Phase 4) ----------------------------------------------
-run_case D mapfile           'mapfile -t ARR < @SANDBOX@/in.txt; echo "rc=$?"'
-run_case D readarray         'readarray -t ARR < @SANDBOX@/in.txt; echo "rc=$?"'
+# 加固（收紧）：原用例只跑 `echo "rc=$?"`，若把内建实现成 no-op（返回 0、不
+# 填充数组）即可假绿。追加 `declare -p` 把数组内容纳入逐字节比对，并覆盖
+# 多种能证伪 no-op 的情形：mapfile 覆盖 -t 去尾换行 + 默认数组名 MAPFILE；
+# readarray 覆盖 -t + 空输入（E=()）。期望输出均由 MSYS2 bash 5.3 实测生成。
+run_case D mapfile           'mapfile -t ARR < @SANDBOX@/in.txt; echo "rc=$?"; declare -p ARR; mapfile -t < @SANDBOX@/in.txt; declare -p MAPFILE'
+run_case D readarray         'readarray -t ARR < @SANDBOX@/in.txt; echo "rc=$?"; declare -p ARR; readarray -t E < /dev/null; declare -p E'
 run_case D coproc            'coproc; echo "rc=$?"'
 run_case D array-assign      'ARR=(a b); echo "rc=$?"'
 
 # --- completion / key bindings ----------------------------------------------
-run_case D compgen           'compgen -c; echo "rc=$?"'
+# compgen -c 不能用于逐字节对拍：它枚举 PATH 下全部命令，实测输出 6132 行且
+# 强绑定环境（PATH=/usr/bin 时降到 776 行）；更致命的是单条耗时约 18s，会被
+# runner 的 timeout 10 杀掉，oracle 侧产生 rc=124 + 空输出，基准本身失真。
+# 改用 compgen -k：只列 22 个 shell 关键字（+ `rc=0` 共 23 行），完全确定、
+# 无 PATH / 内建表 / 历史文件绑定，可稳定逐字节比对。
+run_case D compgen           'compgen -k; echo "rc=$?"'
 run_case D complete           'complete; echo "rc=$?"'
-run_case D bind              'bind -p; echo "rc=$?"'
+# bind -p 的 497 行 keymap 绑定 readline 版本与 locale collation：实测
+# LC_ALL=C 与 zh_CN.UTF-8 下字节数同为 11705B，但 md5 不同、行序不同
+# （C 下 `"\C-x\C-r": re-read-init-file` 在 `# redraw-current-line` 之前，
+# zh 下相反；vi-* 一批 not-bound 行整体错位），逐字节不可比。改用语义不变量：
+# 断言 rc=0、stderr 归一化后精确等于 `bind: warning: line editing not enabled`、
+# stdout 恰好 497 行、含关键绑定行 `"\C-a": beginning-of-line`、且含
+# `# ... (not bound)` 条目；不得只断言 rc 或「输出非空」。
+run_case_sem D bind 'bind -p' '[ "$RC" -eq 0 ] && [ "$(normalize_stderr "$ERR")" = "bind: warning: line editing not enabled" ] && [ "$(wc -l < "$OUT")" -eq 497 ] && grep -qF "\"\C-a\": beginning-of-line" "$OUT" && grep -qF "(not bound)" "$OUT"'
 
 # --- history ----------------------------------------------------------------
 run_case D fc                'fc -l; echo "rc=$?"'
