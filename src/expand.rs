@@ -150,6 +150,7 @@ pub fn expand_scalar(parts: &[WordPart], ctx: &ExpandCtx) -> String {
                     ctx.attrs,
                     ctx.functions,
                     ctx.arrays,
+                    ctx.nounset,
                 ));
             }
             WordPart::Arith(body, _) => out.push_str(&eval_arith(body, ctx)),
@@ -252,6 +253,7 @@ pub fn expand_word(parts: &[WordPart], ctx: &ExpandCtx) -> Vec<String> {
                     ctx.attrs,
                     ctx.functions,
                     ctx.arrays,
+                    ctx.nounset,
                 );
                 candidates = apply_value(candidates, Expansion::Scalar(val), *quoted, ctx);
             }

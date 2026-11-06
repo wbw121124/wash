@@ -726,6 +726,12 @@ run_case A set-t-dash          'set -t; echo "$-"'               # htBc
 run_case A nounset-pipe-stage-unbound 'set -u; echo $NOPE | cat; echo after'   # rc=0, 打 after, stderr "NOPE: unbound variable"
 run_case A nounset-pipe-stage-arith   'echo $((1/0)) | cat; echo after'        # rc=0, 打 after, 算术失败只杀该 stage
 run_case A nounset-standalone-aborts  'set -u; echo $NOPE; echo after'         # rc=127, 不打印 after（单命令仍整行中止）
+# --- 差异 4 修复：命令替换继承 set -u、退出状态传播、$? 与 RHS 只展开一次 ---
+run_case A ns4-cmdsub-unbound    'set -u; echo x$(echo $NOPE)y'   # rc=0, stdout xy, stderr "NOPE: unbound variable"
+run_case A ns4-cmdsub-status-false 'v=$(false); echo $?'          # 1
+run_case A ns4-cmdsub-status-true  'v=$(true); echo $?'           # 0
+run_case A ns4-cmdsub-rhs-once   'v=$(printf OOPS >&2); echo done'  # 只打 1 条 OOPS, stdout done
+run_case A ns4-cmdsub-unbound-status 'set -u; out=$(echo $UNSET); echo "rc=$?"'  # rc=1, stderr "UNSET: unbound variable"
 # GROUP B -- KNOWN-DEFECT.
 # (Now empty: every case that used to live here has been fixed and promoted
 # to GROUP A, where it serves as a regression fence.)

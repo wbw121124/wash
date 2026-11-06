@@ -346,37 +346,44 @@ fn trace_command(argv: &[String]) {
 // Command substitution capture
 // ---------------------------------------------------------------------------
 
-/// Apply a command's variable assignments on top of `base` to build its
-/// (non-persistent) environment.
-///
-/// `base` must be the *exported* variables only: a command inherits the
-/// exported variables of the shell plus its own temporary assignments.
-fn build_cmd_env(
-    base: &HashMap<String, String>,
-    assigns: &[(String, Vec<WordPart>, bool)],
-    ctx: &ExpandCtx,
-) -> HashMap<String, String> {
-    let mut env = base.clone();
-    for (name, valparts, append) in assigns {
-        let val = expand_scalar(valparts, ctx);
-        if *append {
-            let cur = env.get(name).cloned().unwrap_or_default();
-            env.insert(name.clone(), cur + &val);
-        } else {
-            env.insert(name.clone(), val);
-        }
-    }
-    env
+/// The exit status of the most recent command substitution, recorded by the
+/// forked subshell that ran it.  A command substitution that is the RHS of a
+/// standalone assignment (`v=$(cmd)`) makes the assignment's `$?` equal to this
+/// status (matching bash).  We keep it in a thread-local because expansion is
+/// synchronous on the main thread and the expander otherwise has no access to
+/// the parent shell's `last_status`.
+thread_local! {
+    static LAST_CMDSIB_STATUS: RefCell<Option<i32>> = RefCell::new(None);
 }
 
-/// Run `cmd` in a forked subshell, capturing its stdout (with one trailing
-/// newline stripped, matching bash).
+/// Reset the recorded command-substitution status.  The standalone-assignment
+/// path calls this immediately before expanding an assignment's RHS so that a
+/// later `take_cmdsub_status` reflects only substitutions produced by *this*
+/// assignment (and is `None` when the assignment contained no substitution).
+fn reset_cmdsub_status() {
+    LAST_CMDSIB_STATUS.with(|c| *c.borrow_mut() = None);
+}
+
+/// Return the status recorded by the most recent command substitution and clear
+/// it, or `None` if no substitution ran since the last `reset_cmdsub_status`.
+fn take_cmdsub_status() -> Option<i32> {
+    LAST_CMDSIB_STATUS.with(|c| c.borrow_mut().take())
+}
+
+/// Run `cmd` in a forked subshell, capturing its stdout (with all trailing
+/// newlines stripped, matching bash).
+///
+/// `nounset` is the parent shell's `set -u` setting: a command substitution is
+/// a subshell that inherits the parent's options, so an unbound variable inside
+/// `$(...)` must trigger the same `unbound variable` diagnostic (and failure)
+/// as at the top level.
 pub fn capture_command(
     cmd: &str,
     env: &HashMap<String, String>,
     attrs: &crate::shell::VarAttrs,
     functions: &HashMap<String, crate::parser::CommandList>,
     arrays: &HashMap<String, Vec<String>>,
+    nounset: bool,
 ) -> String {
     let tokens = match crate::lexer::tokenize(cmd) {
         Ok(t) => t,
@@ -395,6 +402,11 @@ pub fn capture_command(
         posix::close(w);
         posix::close(r);
         let mut sh = Shell::from_env(env.clone());
+        // A command substitution is a subshell that inherits the parent's
+        // options, so a `set -u` active in the parent also applies inside
+        // `$(...)`.  `Shell::from_env` can only build default options, so the
+        // parent's `nounset` flag is threaded through explicitly here.
+        sh.options.nounset = nounset;
         sh.apply_attrs(attrs);
         // A command substitution inherits the parent's function table, so a
         // function can recurse through `$(...)`.
@@ -403,13 +415,20 @@ pub fn capture_command(
         // subshell).
         sh.arrays = arrays.clone();
         let code = crate::executor::execute(&list, &mut sh);
+        // Inside a command substitution, an unbound variable under `set -u`
+        // (or a failed `${var?word}`) fails the substitution with status 1,
+        // NOT the 127 reserved for a fatal top-level error.
+        let code = if crate::expand::expansion_aborted() { 1 } else { code };
         let _ = std::io::stdout().flush();
         posix::exit(code);
     }
     posix::close(w);
     let s = posix::read_all(r);
     posix::close(r);
-    posix::wait_pid(pid);
+    let status = posix::wait_pid(pid);
+    // Record the substitution's exit status so a standalone assignment can
+    // expose it as `$?` (bash: `v=$(false); echo $?` -> 1).
+    LAST_CMDSIB_STATUS.with(|c| *c.borrow_mut() = Some(status));
     // Bash strips *all* trailing newlines from command substitution output
     // (`$(printf 'a\n\n\n')` -> "a"), not just one.
     s.trim_end_matches('\n').to_string()
@@ -1097,9 +1116,14 @@ fn run_standalone_exp(
             return code;
         }
         // Standalone assignment(s): persist to the shell environment.
+        let mut assign_rc: i32 = 0;
         if !assigns.is_empty() || !array_assigns.is_empty() {
             // An assignment-only command sets `$_` to the empty string.
             update_underscore(sh, &[]);
+            // Start tracking command-substitution exit statuses afresh for this
+            // assignment (so a later `take_cmdsub_status` reflects only what this
+            // assignment expanded, not a stale value from a previous command).
+            reset_cmdsub_status();
             let mut assign_failed = false;
             let attrs = sh.attrs();
             let pending: RefCell<Vec<(String, String)>> = RefCell::new(Vec::new());
@@ -1137,6 +1161,13 @@ fn run_standalone_exp(
             }
             // Persist array assignments (`a=(1 2 3)`) to the shell.
             apply_array_assignments(array_assigns, sh);
+            // A standalone assignment's `$?` is the exit status of its last
+            // command substitution (bash: `v=$(false); echo $?` -> 1), or 0 when
+            // it contains none (`v=5; echo $?` -> 0).  This status is also the
+            // assignment command's own exit status (so `if v=$(false); then ...`
+            // skips the body the way bash does).
+            assign_rc = take_cmdsub_status().unwrap_or(0);
+            sh.last_status = assign_rc;
             if assign_failed {
                 // A failed assignment (e.g. to a readonly variable) makes the
                 // command return 1.  In bash a standalone assignment that fails
@@ -1156,7 +1187,7 @@ fn run_standalone_exp(
                 return 1;
             }
         }
-        return 0;
+        return assign_rc;
     }
 
     if sh.options.xtrace {
@@ -1461,8 +1492,20 @@ fn prepare_stage(c: &SimpleCommand, sh: &mut Shell) -> Prepared {
     }
 
     // Build the environments of the stage.
-    let (cmd_env, shell_env) = {
-        let ctx = ExpandCtx {
+    //
+    // The assignment RHSes (`v=$(...)` etc.) must be expanded EXACTLY once: a
+    // previous version called `build_cmd_env` twice (once for the exported-only
+    // command environment and once for the full child-shell environment), and
+    // STILL again in `run_standalone_exp` for a standalone assignment, so a
+    // `$(...)` inside an assignment ran two-to-three times.  We now expand the
+    // values once and reuse them for both environments.  When there is no
+    // command word to execute (a standalone assignment or a compound command),
+    // the environments built here are never consumed by the caller, so we skip
+    // the expansion entirely to avoid the extra command-substitution runs.
+    let (cmd_env, shell_env) = if argv.is_empty() {
+        (HashMap::new(), sh.env.clone())
+    } else {
+        let value_ctx = ExpandCtx {
             env: &sh.env,
             positional: &sh.positional,
             last_status: sh.last_status,
@@ -1477,10 +1520,31 @@ fn prepare_stage(c: &SimpleCommand, sh: &mut Shell) -> Prepared {
             arrays: &sh.arrays,
             pending_assign: Some(&pending),
         };
+        let values: Vec<(String, String, bool)> = c
+            .assignments
+            .iter()
+            .map(|(n, vp, ap)| (n.clone(), expand_scalar(vp, &value_ctx), *ap))
+            .collect();
         // Only the exported variables are passed on to the program ...
-        let cmd_env = build_cmd_env(&sh.child_env(), &c.assignments, &ctx);
+        let mut cmd_env = sh.child_env();
+        for (n, v, ap) in &values {
+            if *ap {
+                let cur = cmd_env.get(n).cloned().unwrap_or_default();
+                cmd_env.insert(n.clone(), cur + v);
+            } else {
+                cmd_env.insert(n.clone(), v.clone());
+            }
+        }
         // ... but a forked child shell inherits every shell variable.
-        let shell_env = build_cmd_env(&sh.env, &c.assignments, &ctx);
+        let mut shell_env = sh.env.clone();
+        for (n, v, ap) in &values {
+            if *ap {
+                let cur = shell_env.get(n).cloned().unwrap_or_default();
+                shell_env.insert(n.clone(), cur + v);
+            } else {
+                shell_env.insert(n.clone(), v.clone());
+            }
+        }
         (cmd_env, shell_env)
     };
     // The expansion of the assignments themselves may have requested further
