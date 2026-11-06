@@ -722,6 +722,10 @@ run_case A ns1-arith-unbound    'set -u; echo $((NOPE+1))'        # rc=127, 无 
 run_case A set-t-dash          'set -t; echo "$-"'               # htBc
 
 ###############################################################################
+# --- 差异 3 修复：pipeline 各 stage 在子进程内展开自身词，unbound 只杀该 stage ---
+run_case A nounset-pipe-stage-unbound 'set -u; echo $NOPE | cat; echo after'   # rc=0, 打 after, stderr "NOPE: unbound variable"
+run_case A nounset-pipe-stage-arith   'echo $((1/0)) | cat; echo after'        # rc=0, 打 after, 算术失败只杀该 stage
+run_case A nounset-standalone-aborts  'set -u; echo $NOPE; echo after'         # rc=127, 不打印 after（单命令仍整行中止）
 # GROUP B -- KNOWN-DEFECT.
 # (Now empty: every case that used to live here has been fixed and promoted
 # to GROUP A, where it serves as a regression fence.)
