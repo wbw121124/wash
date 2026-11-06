@@ -323,6 +323,9 @@ def case_ctrl_c():
     s.send("echo interrupted_line_xyz")
     s.send(b"\x03")  # Ctrl-C
     saw_caret = s.wait_for("^C", 2.0)
+    # wait_for 命中 ^C 时，Ctrl-C 后重绘的干净提示符可能仍在 PTY 缓冲区；
+    # 先短 drain 把剩余输出读齐再取 text()（纯采集时序，不改下方任何判据）。
+    s.drain(0.3)
     text = s.text()
     # 主提示符必须出现在 ^C 之后（即中断后重新画出了干净提示符）。
     after = text.rfind("wash$ ") > text.find("^C")
