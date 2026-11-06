@@ -381,7 +381,10 @@ struct Editor {
     history: Vec<String>,
     hist_pos: Option<usize>, // Some(i) while navigating, None when editing fresh
     draft: String,           // saved buffer when history navigation began
-    completions: Option<Vec<(String, String)>>, // (候选名, 本地化描述) 列表，显示在输入下方
+    // (显示名, 预置的本地化描述, 完整路径) 列表，显示在输入下方。
+    // 预置描述非空时直接用（如内建的 "Builtin"）；为空时按完整路径在渲染
+    // 阶段延迟计算描述，避免 Tab 扫全盘时对上千候选逐个 stat 卡死。
+    completions: Option<Vec<(String, String, String)>>,
     last_total: usize,       // physical lines rendered last time (for clearing)
     literal_next: bool,      // 下一个键按字面插入（Ctrl+V 后的「引号」模式）
 }
@@ -583,7 +586,7 @@ impl Editor {
             return;
         }
         // 只取名字列表用于公共前缀与替换计算（描述不参与替换）。
-        let names: Vec<String> = cands.iter().map(|(n, _)| n.clone()).collect();
+        let names: Vec<String> = cands.iter().map(|(n, _, _)| n.clone()).collect();
         if cands.len() == 1 {
             let mut rep = cands[0].0.clone();
             if !rep.ends_with('/') {
@@ -659,8 +662,17 @@ impl Editor {
             Some(c) => {
                 let limit = page_limit();
                 let shown = c.len().min(limit);
-                for (name, _desc) in c.iter().take(limit) {
-                    let desc = describe_path(name);
+                for (name, preset, path) in c.iter().take(limit) {
+                    // 内建等候选已算好本地化描述（tr!("Builtin")），直接沿用；
+                    // 其余按完整路径在渲染阶段计算，且只对这一屏可见的候
+                    // 选执行，避免 Tab 扫全盘时上千次 stat 卡死。
+                    let desc = if !preset.is_empty() {
+                        preset.clone()
+                    } else if !path.is_empty() {
+                        describe_path(path)
+                    } else {
+                        String::new()
+                    };
                     let line = if desc.is_empty() {
                         name.clone()
                     } else {
@@ -1004,8 +1016,8 @@ fn is_command_position(prefix: &str) -> bool {
 /// 时一次性生成 / 列出海量候选导致卡死。
 const COMPLETE_CAP: usize = 1000;
 
-fn complete_command(word: &str) -> Vec<(String, String)> {
-    let mut cands: Vec<(String, String)> = Vec::new();
+fn complete_command(word: &str) -> Vec<(String, String, String)> {
+    let mut cands: Vec<(String, String, String)> = Vec::new();
     const BUILTINS: &[&str] = &[
         "echo", "printf", "cd", "exit", "export", "set", "unset", "read", "source", ".", "alias",
         "unalias", "true", "false", "pwd", "test", "[", "kill", "wait", "jobs", "fg", "bg", "eval",
@@ -1016,7 +1028,7 @@ fn complete_command(word: &str) -> Vec<(String, String)> {
     // 内建命令标注为 Builtin（按当前 locale 本地化）。
     for b in BUILTINS {
         if b.starts_with(word) {
-            cands.push(((*b).to_string(), tr!("Builtin")));
+            cands.push(((*b).to_string(), tr!("Builtin"), String::new()));
         }
     }
     // PATH 里的可执行文件：只收集名字（不在此处 stat——否则 System32 下数千文件的
@@ -1029,7 +1041,10 @@ fn complete_command(word: &str) -> Vec<(String, String)> {
             for e in entries.flatten() {
                 let name = e.file_name().to_string_lossy().into_owned();
                 if name.starts_with(word) {
-                    cands.push((name, String::new()));
+                    // 只记名字与完整路径，不在此处 stat；描述延迟到 render
+                    // 阶段只对可见候选按完整路径计算，避免 Tab 扫全盘卡死。
+                    let full = e.path().to_string_lossy().into_owned();
+                    cands.push((name, String::new(), full));
                 }
                 if cands.len() >= COMPLETE_CAP {
                     break;
@@ -1046,13 +1061,13 @@ fn complete_command(word: &str) -> Vec<(String, String)> {
     cands
 }
 
-fn complete_file(word: &str) -> Vec<(String, String)> {
+fn complete_file(word: &str) -> Vec<(String, String, String)> {
     let (dirpath, prefix) = if let Some(slash) = word.rfind('/') {
         (&word[..slash + 1], &word[slash + 1..])
     } else {
         (".", word)
     };
-    let mut cands: Vec<(String, String)> = Vec::new();
+    let mut cands: Vec<(String, String, String)> = Vec::new();
     let Ok(entries) = fs::read_dir(dirpath) else {
         return cands;
     };
@@ -1069,7 +1084,9 @@ fn complete_file(word: &str) -> Vec<(String, String)> {
             if is_dir {
                 rep.push('/');
             }
-            cands.push((rep, String::new()));
+            // 完整路径用于 render 阶段按可见候选 stat，避免扫全盘卡死。
+            let full = e.path().to_string_lossy().into_owned();
+            cands.push((rep, String::new(), full));
         }
         if cands.len() >= COMPLETE_CAP {
             break;
