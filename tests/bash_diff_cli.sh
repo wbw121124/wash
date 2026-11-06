@@ -39,6 +39,7 @@ printf 'echo FROM_SCRIPT\n'              > "$SANDBOX/plain.sh"
 printf '}\n'                             > "$SANDBOX/bad.sh"
 printf 'trap "echo TRAP" EXIT\necho BODY\n' > "$SANDBOX/trap.sh"
 printf 'echo "1=$1 2=$2 n=$#"\nfalse\n'  > "$SANDBOX/status.sh"
+printf 'echo "$-"\n'                      > "$SANDBOX/dashflags.sh"
 
 RUNNER=()
 if command -v timeout >/dev/null 2>&1; then
@@ -80,6 +81,33 @@ run_cli() {
     fi
 }
 
+# 变体：从 stdin 喂入脚本内容，用于 `printf ... | bash -s` 这类 argv 形态。
+# 逐字节比较 stdout、归一化 stderr、rc，判定与 run_cli 完全一致。
+run_cli_stdin() {
+    local label="$1" input="$2" rb rw
+    shift 2
+    printf '%s\n' "$input" | "${RUNNER[@]}" "$BASH_BIN" "$@" >"$TMP/b.out" 2>"$TMP/b.err"
+    rb=$?
+    printf '%s\n' "$input" | "${RUNNER[@]}" "$WASH_BIN" "$@" >"$TMP/w.out" 2>"$TMP/w.err"
+    rw=$?
+    normalize_stderr "$TMP/b.err" > "$TMP/b.err.n"
+    normalize_stderr "$TMP/w.err" > "$TMP/w.err.n"
+
+    if [ "$(hexdump "$TMP/b.out")" = "$(hexdump "$TMP/w.out")" ] &&
+       [ "$rb" = "$rw" ] &&
+       [ "$(hexdump "$TMP/b.err.n")" = "$(hexdump "$TMP/w.err.n")" ]; then
+        pass=$((pass + 1))
+        printf 'PASS [%s]\n' "$label"
+    else
+        fail=$((fail + 1))
+        printf 'FAIL [%s]  rc=%s/%s\n' "$label" "$rb" "$rw"
+        printf '  bash.out:\n';    sed 's/^/    |/' "$TMP/b.out"
+        printf '  wash.out:\n';    sed 's/^/    |/' "$TMP/w.out"
+        printf '  bash.err.n:\n';  sed 's/^/    |/' "$TMP/b.err.n"
+        printf '  wash.err.n:\n';  sed 's/^/    |/' "$TMP/w.err.n"
+    fi
+}
+
 # --- `-c` 之后的多余参数：$0 / $1 / $# / $@ / $* --------------------------
 run_cli c-positional       -c 'echo "0=$0 1=$1 2=$2 n=$#"' NAME A B
 run_cli c-positional-one   -c 'echo "0=$0 1=$1 n=$#"' NAME A
@@ -99,6 +127,26 @@ run_cli script-trap        "$SANDBOX/trap.sh"
 run_cli script-syntax      "$SANDBOX/bad.sh"
 run_cli script-missing     "$SANDBOX/nope.sh" A
 run_cli script-args-empty  "$SANDBOX/args.sh" "" "B B"
+
+# --- 特殊参数 `$-` 的 argv 形态（MSYS2 bash 5.3 实测，LC_ALL=C）------------
+#   -lc 'echo "$-"'        -> hBc      (login 不影响 $-)
+#   -sc 'echo "$-"'        -> hBcs     (-s 与 -c 同置：c + s)
+#   printf .. | bash -s    -> hBs      (从 stdin 读脚本，非交互无 i/H)
+#   printf .. | bash       -> hBs      (无 -s 但无 -c/脚本，同样读 stdin)
+#   bash script.sh         -> hB       (脚本文件：无 c 无 s)
+# 以下 -ic / -isc 形态经实测未纳入逐字节闸门，如实说明原因：
+#   -ic  'echo "$-"'       -> bash stdout=hiBHc, wash stdout=hiBHc（一致）
+#   -isc 'echo "$-"'       -> bash stdout=hiBHcs, wash stdout=hiBHcs（一致）
+# 但 bash 在非 tty 交互启动时会向 stderr 打印两条作业控制诊断，其中
+# `cannot set terminal process group (N)` 的 N 是当前进程组 id，随父进程 /
+# timeout 上下文变化（实测 -1 / 659 / 1578 / 1600 等），是进程绑定的动态值，
+# wash 无法逐字节复现。该 stderr 差异无法靠对齐消除，故不把这两条放进闸门，
+# 也不伪造诊断、不放宽判定；stdout 侧 `$-` 语义已正确实现。
+run_cli        df-dash-lc      -lc 'echo "$-"'
+run_cli        df-dash-sc      -sc 'echo "$-"'
+run_cli_stdin  df-dash-s       'echo "$-"' -s
+run_cli_stdin  df-dash-piped   'echo "$-"'
+run_cli        df-dash-script  "$SANDBOX/dashflags.sh"
 
 # --- wash 扩展自洽性（不伪装成 bash 兼容项）--------------------------------
 # `--command` 是 wash 的便利扩展，不是 GNU bash 5.3 的选项。MSYS2 oracle 实测：

@@ -683,6 +683,31 @@ run_case A brace-plain-still     'echo {a,b}; echo pre{a,b}suf'
 run_case A brace-quoted-still    'x="pre{a,b}"; echo "$x"'
 run_case A brace-cmdsub-still    'x=$(echo {a,b}); echo "$x"'
 
+# --- 特殊参数 `$-`（当前 shell 选项标志串）-----------------------------------
+# 全部期望值均先用 MSYS2 bash 5.3 实测（本套件固定 `-c`，故末尾恒有 `c`）。
+# 字母固定顺序（实测 `set -abefhkmptuvxBCEHPT` -> `abefhkmptuvxBCEHPTc`）：
+#   a b e f h i k m p t u v x B C E H P T c s
+# 默认 `hashall`/`braceexpand` 开，故裸 `echo "$-"` 为 `hBc`。
+# 含 `set -x`/`-v` 的组合会引入 xtrace/verbose 的 stderr，除非能真正对齐，
+# 否则不纳入闸门；下列用例 stderr 均为空。
+run_case A df-basic              'echo "$-"'                       # hBc
+run_case A df-set-eu             'set -eu; echo "$-"'              # ehuBc
+run_case A df-set-plus-B         'set +B; echo "$-"'               # hc
+run_case A df-set-plus-h         'set +h; echo "$-"'               # Bc
+run_case A df-set-C              'set -C; echo "$-"'               # hBCc
+run_case A df-set-m              'set -m; echo "$-"'               # hmBc
+run_case A df-set-a              'set -a; echo "$-"'               # ahBc
+run_case A df-set-f              'set -f; echo "$-"'               # fhBc
+run_case A df-set-BCEHPT         'set -BCEHPT; echo "$-"'          # hBCEHPTc
+run_case A df-set-plus-h-B       'set +h +B; echo "$-"'            # c
+run_case A df-braced             'echo "${-}"'                     # hBc（花括号形态）
+run_case A df-set-aef            'set -aef; echo "$-"'             # aefhBc
+run_case A df-set-eum            'set -eum; echo "$-"'             # ehmuBc
+run_case A df-set-all            'set -aefhmuBCEHPT; echo "$-"'    # aefhmuBCEHPTc
+run_case A df-set-b              'set -b; echo "$-"'               # bhBc (notify)
+run_case A df-set-k              'set -k; echo "$-"'               # hkBc (keyword)
+run_case A df-set-p              'set -p; echo "$-"'               # hpBc (privileged)
+
 ###############################################################################
 # GROUP B -- KNOWN-DEFECT.
 # (Now empty: every case that used to live here has been fixed and promoted

@@ -34,8 +34,9 @@ fn main() {
         sh.env.insert("BASH".to_string(), argv0.clone());
     }
 
-    // 解析短选项：`-c`、`-l`、`-i` 可以组合（`-lc`、`-cl` ...）。
+    // 解析短选项：`-c`、`-s`、`-l`、`-i` 可以组合（`-lc`、`-sc`、`-cl` ...）。
     let mut want_command = false;
+    let mut want_stdin = false;
     let mut login = false;
     let mut force_interactive = false;
     let mut command: Option<String> = None;
@@ -72,6 +73,7 @@ fn main() {
             for c in a[1..].chars() {
                 match c {
                     'c' => want_command = true,
+                    's' => want_stdin = true,
                     'l' => login = true,
                     'i' => force_interactive = true,
                     _ => {
@@ -114,6 +116,23 @@ fn main() {
         sh.dollar_zero = name;
     }
     sh.positional = positional;
+
+    // `$-` startup flags (fixed for the life of this shell; the mutable
+    // single-letter `set` options are read fresh from `sh.options` instead).
+    sh.command_string = command.is_some();
+    sh.reading_stdin = if command.is_some() {
+        want_stdin // `-s` may be combined with `-c`
+    } else if script.is_some() {
+        false // a script file is neither `-c` nor stdin
+    } else {
+        true // no `-c` and no script: commands are read from stdin
+    };
+    sh.dash_interactive = force_interactive
+        || (command.is_none() && script.is_none() && posix::isatty(0));
+    if sh.dash_interactive {
+        // Interactive bash defaults history (`!`) expansion ON (`H` flag).
+        sh.options.histexpand = true;
+    }
 
     if login {
         // 登录 shell：读取 profile 文件（与 bash 的顺序一致）。文件不存在或

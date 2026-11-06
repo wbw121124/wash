@@ -332,6 +332,21 @@ pub struct Shell {
     /// in interactive shells unless the `expand_aliases` shell option is set.
     pub interactive: bool,
 
+    /// Startup flags reported by the special parameter `$-`.  Unlike the
+    /// single-letter `set` options (read fresh from `self.options` on every
+    /// expansion), these three are fixed when the shell is invoked and never
+    /// change during the session.
+    ///
+    /// `command_string` is the `c` letter (`-c` / `--command`), `reading_stdin`
+    /// is the `s` letter (commands read from stdin: `-s` or a shell with no
+    /// `-c` and no script file), and `dash_interactive` is the `i` letter.
+    /// `dash_interactive` is deliberately separate from `self.interactive`:
+    /// wash turns the latter on even for piped (non-tty) input, while bash's
+    /// `$-` must NOT show `i` in that case.
+    pub command_string: bool,
+    pub reading_stdin: bool,
+    pub dash_interactive: bool,
+
     /// The `expand_aliases` shell option (bash's `shopt -s expand_aliases`).
     /// When it is on, aliases are expanded even in non-interactive shells.
     pub expand_aliases: bool,
@@ -496,6 +511,9 @@ impl Shell {
             dollar_zero: "wash".to_string(),
             persistent_redirs: false,
             interactive: false,
+            command_string: false,
+            reading_stdin: false,
+            dash_interactive: false,
             expand_aliases: false,
             sourcepath: true,
             return_requested: None,
@@ -519,6 +537,40 @@ impl Shell {
         };
         Self::populate_internal_variables(&mut sh);
         sh
+    }
+
+    /// The value of `$-`: the single-letter shell option flags in bash's
+    /// canonical order `a b e f h i k m p t u v x B C E H P T c s`, followed
+    /// by the fixed startup letters `c` and `s`.  The mutable option letters
+    /// are read fresh from `self.options` on every call, so `set` / `set +o`
+    /// changes are reflected immediately instead of being cached in a stale
+    /// string.  Measured against MSYS2 bash 5.3 (`set -abefhkmptuvxBCEHPT`
+    /// yields `abefhkmptuvxBCEHPTc`).
+    pub fn dash_flags(&self) -> String {
+        let o = &self.options;
+        let mut s = String::new();
+        if o.allexport { s.push('a'); }
+        if o.notify { s.push('b'); }
+        if o.errexit { s.push('e'); }
+        if o.noglob { s.push('f'); }
+        if o.hashall { s.push('h'); }
+        if self.dash_interactive { s.push('i'); }
+        if o.keyword { s.push('k'); }
+        if o.monitor { s.push('m'); }
+        if o.privileged { s.push('p'); }
+        if o.onecmd { s.push('t'); }
+        if o.nounset { s.push('u'); }
+        if o.verbose { s.push('v'); }
+        if o.xtrace { s.push('x'); }
+        if o.braceexpand { s.push('B'); }
+        if o.noclobber { s.push('C'); }
+        if o.errtrace { s.push('E'); }
+        if o.histexpand { s.push('H'); }
+        if o.physical { s.push('P'); }
+        if o.functrace { s.push('T'); }
+        if self.command_string { s.push('c'); }
+        if self.reading_stdin { s.push('s'); }
+        s
     }
 
     /// Install bash's internal variables that are not shell-instance specific

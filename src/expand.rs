@@ -94,6 +94,11 @@ pub struct ExpandCtx<'a> {
     /// the assignments are collected here and written back to the shell by
     /// the executor once the expansion is done.
     pub pending_assign: Option<&'a RefCell<Vec<(String, String)>>>,
+    /// The current value of `$-`, snapshotted from the shell's option state
+    /// and startup flags when this expansion context is built.  It is kept as
+    /// an owned String (not injected into `env`) so it stays in sync with
+    /// `set` across separate commands.
+    pub shell_flags: String,
 }
 
 /// The result of evaluating a parameter expansion.
@@ -449,7 +454,7 @@ fn eval_var(name: &str, ctx: &ExpandCtx) -> Expansion {
                 Expansion::Scalar(ctx.bg_pid.to_string())
             }
         }
-        "-" => Expansion::Scalar(String::new()), // shell options (Phase 4+)
+        "-" => Expansion::Scalar(ctx.shell_flags.clone()),
         _ => {
             if let Some(idx) = name.parse::<usize>().ok() {
                 if idx >= 1 && idx <= ctx.positional.len() {
