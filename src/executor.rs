@@ -26,7 +26,7 @@ use crate::arith;
 use crate::builtins;
 use crate::expand::{expand_argv, expand_scalar, expand_word, ExpandCtx};
 use crate::lexer::WordPart;
-use crate::parser::{AndOr, AndOrOp, CommandList, Compound, Pipeline, Redir};
+use crate::parser::{AndOr, AndOrOp, CommandList, Compound, Pipeline, Redir, SimpleCommand};
 use crate::posix;
 use crate::shell::{SetOptions, Shell};
 
@@ -1418,19 +1418,23 @@ fn expand_alias_in_pipeline(
     Some(out)
 }
 
-/// Expand the words of every command of a pipeline.
+/// Expand the words of ONE pipeline stage and build the environments it runs
+/// with.
 ///
-/// The expansion happens in two steps: first the words are expanded (the
-/// expander only reads the environment), then the assignments the expansion
-/// requested (`${var=word}`) are written back to the shell and the
-/// environments of the commands are built.
-fn prepare(p: &Pipeline, sh: &mut Shell) -> Vec<Prepared> {
+/// This is called for a single stage, either in the parent (the one-stage
+/// pipeline, which bash runs in the current shell) or -- for a multi-stage
+/// pipeline -- inside each forked child, so that every stage expands its OWN
+/// words in its OWN process (the bash subshell-per-stage model).  When the
+/// expander reports a fatal expansion error (`set -u` unbound variable,
+/// `${var?word}` or a failed arithmetic expansion) it sets a thread-local
+/// flag; the caller then aborts *this* stage (exit 127 / 1) instead of the
+/// whole command line.
+fn prepare_stage(c: &SimpleCommand, sh: &mut Shell) -> Prepared {
     let attrs = sh.attrs();
     let pending: RefCell<Vec<(String, String)>> = RefCell::new(Vec::new());
 
-    // Step 1: expand the words of every command.
-    let mut expanded: Vec<(Vec<String>, Vec<ExpRedir>)> = Vec::new();
-    {
+    // Expand the stage's words.  The expander only reads the environment.
+    let (argv, redirs) = {
         let ctx = ExpandCtx {
             env: &sh.env,
             positional: &sh.positional,
@@ -1438,29 +1442,26 @@ fn prepare(p: &Pipeline, sh: &mut Shell) -> Vec<Prepared> {
             self_pid: sh.self_pid,
             noglob: sh.options.noglob,
             nounset: sh.options.nounset,
-        shell_flags: sh.dash_flags(),
-        bg_pid: sh.bg_pid,
+            shell_flags: sh.dash_flags(),
+            bg_pid: sh.bg_pid,
             dollar_zero: &sh.dollar_zero,
             attrs: &attrs,
             functions: &sh.functions,
             arrays: &sh.arrays,
             pending_assign: Some(&pending),
         };
-        for c in &p.commands {
-            let argv = expand_argv(&c.argv, &ctx);
-            let redirs = expand_redirs(&c.redirs, &ctx);
-            expanded.push((argv, redirs));
-        }
-    }
+        let argv = expand_argv(&c.argv, &ctx);
+        let redirs = expand_redirs(&c.redirs, &ctx);
+        (argv, redirs)
+    };
 
-    // Step 2: apply the assignments the expansion requested.
+    // Apply the assignments the expansion requested (`${var=word}`).
     for (name, value) in pending.borrow_mut().drain(..) {
         sh.env.insert(name, value);
     }
 
-    // Step 3: build the environment of every command.
-    let mut out = Vec::new();
-    {
+    // Build the environments of the stage.
+    let (cmd_env, shell_env) = {
         let ctx = ExpandCtx {
             env: &sh.env,
             positional: &sh.positional,
@@ -1468,36 +1469,73 @@ fn prepare(p: &Pipeline, sh: &mut Shell) -> Vec<Prepared> {
             self_pid: sh.self_pid,
             noglob: sh.options.noglob,
             nounset: sh.options.nounset,
-        shell_flags: sh.dash_flags(),
-        bg_pid: sh.bg_pid,
+            shell_flags: sh.dash_flags(),
+            bg_pid: sh.bg_pid,
             dollar_zero: &sh.dollar_zero,
             attrs: &attrs,
             functions: &sh.functions,
             arrays: &sh.arrays,
             pending_assign: Some(&pending),
         };
-        for (c, (argv, redirs)) in p.commands.iter().zip(expanded.into_iter()) {
-            // Only the exported variables are passed on to the program ...
-            let cmd_env = build_cmd_env(&sh.child_env(), &c.assignments, &ctx);
-            // ... but a forked child shell inherits every shell variable.
-            let shell_env = build_cmd_env(&sh.env, &c.assignments, &ctx);
-            out.push(Prepared {
-                argv,
-                redirs,
-                assigns: c.assignments.clone(),
-                array_assigns: c.array_assignments.clone(),
-                compound: c.compound.clone(),
-                env: cmd_env,
-                shell_env,
-            });
-        }
-    }
+        // Only the exported variables are passed on to the program ...
+        let cmd_env = build_cmd_env(&sh.child_env(), &c.assignments, &ctx);
+        // ... but a forked child shell inherits every shell variable.
+        let shell_env = build_cmd_env(&sh.env, &c.assignments, &ctx);
+        (cmd_env, shell_env)
+    };
     // The expansion of the assignments themselves may have requested further
     // assignments; they are applied to the shell as well.
     for (name, value) in pending.borrow_mut().drain(..) {
         sh.env.insert(name, value);
     }
-    out
+    Prepared {
+        argv,
+        redirs,
+        assigns: c.assignments.clone(),
+        array_assigns: c.array_assignments.clone(),
+        compound: c.compound.clone(),
+        env: cmd_env,
+        shell_env,
+    }
+}
+
+/// Expand and run a single pipeline stage in the current (already forked)
+/// child process.
+///
+/// Each stage is its own subshell in bash, so it must expand its OWN words;
+/// a `set -u` unbound variable or a failed arithmetic expansion only kills
+/// this stage (the child exits 127 / 1 after printing the diagnostic) while
+/// the other stages and the rest of the command line keep running.
+fn child_prepare_and_run(c: &SimpleCommand, sh: &mut Shell, path: &str, noclobber: bool) -> ! {
+    let pr = prepare_stage(c, sh);
+    // A fatal parameter-expansion error (`set -u`, `${var?word}`) aborts only
+    // this stage, with status 127.  A failed arithmetic expansion aborts only
+    // this stage, with status 1.
+    if crate::expand::expansion_aborted() {
+        posix::exit(127);
+    }
+    if crate::expand::arith_failed() {
+        posix::exit(1);
+    }
+    apply_exp_redirs(&pr.redirs, noclobber);
+    let attrs = sh.attrs();
+    let program = if pr.argv.is_empty() || builtins::is_builtin(&pr.argv[0]) {
+        None
+    } else {
+        find_program(&pr.argv[0], path)
+    };
+    let ctx = ChildContext {
+        env: &pr.env,
+        shell_env: &pr.shell_env,
+        arrays: &sh.arrays,
+        options: &sh.options,
+        positional: &sh.positional,
+        dollar_zero: &sh.dollar_zero,
+        attrs: &attrs,
+        compound: pr.compound.as_ref(),
+        program: program.as_ref().map(|(exe, _)| exe),
+    };
+    child_run_exp(&pr.argv, path, &ctx);
 }
 
 fn execute_pipeline(p: &Pipeline, sh: &mut Shell, path: &str) -> i32 {
@@ -1506,21 +1544,26 @@ fn execute_pipeline(p: &Pipeline, sh: &mut Shell, path: &str) -> i32 {
     }
     let noclobber = sh.options.noclobber;
     let pipefail = sh.options.pipefail;
-    let prepared = prepare(p, sh);
-    // A failed arithmetic expansion (or a negative-length array slice) is
-    // fatal for the whole command line: bash never runs `echo` when one of
-    // its own arguments failed to expand.
-    // A `set -u` unbound variable or a failed `${var?word}` is fatal for the
-    // whole line (status 127), just like a bad arithmetic expansion (status 1).
-    if crate::expand::expansion_aborted() {
-        return 127;
-    }
-    if crate::expand::arith_failed() {
-        return 1;
-    }
-    let n = prepared.len();
+    let n = p.commands.len();
     if n == 1 {
-        let pr = &prepared[0];
+        // A one-stage pipeline is run in the current shell (bash does the
+        // same when job control is off), so its words are expanded here in the
+        // parent.  A `set -u` unbound variable or a failed arithmetic
+        // expansion is therefore fatal for the whole command line, exactly
+        // like a standalone command.
+        let pr = prepare_stage(&p.commands[0], sh);
+        // A failed arithmetic expansion (or a negative-length array slice) is
+        // fatal for the whole command line: bash never runs `echo` when one of
+        // its own arguments failed to expand.
+        // A `set -u` unbound variable or a failed `${var?word}` is fatal for
+        // the whole line (status 127), just like a bad arithmetic expansion
+        // (status 1).
+        if crate::expand::expansion_aborted() {
+            return 127;
+        }
+        if crate::expand::arith_failed() {
+            return 1;
+        }
         return run_standalone_exp(
             &pr.argv,
             &pr.redirs,
@@ -1540,7 +1583,7 @@ fn execute_pipeline(p: &Pipeline, sh: &mut Shell, path: &str) -> i32 {
     let shell_pgrp = if job_ctl { posix::getpgrp() } else { -1 };
     let mut job_pgid: Option<i32> = None;
 
-    for (idx, pr) in prepared.iter().enumerate() {
+    for (idx, c) in p.commands.iter().enumerate() {
         let make_pipe = idx < n - 1;
         let (this_read, this_write) = if make_pipe {
             let fds = posix::pipe();
@@ -1549,14 +1592,11 @@ fn execute_pipeline(p: &Pipeline, sh: &mut Shell, path: &str) -> i32 {
             (None, None)
         };
 
-        // Resolve the program of the stage in the parent, so that the hash
-        // table can record it.
-        let program = if pr.argv.is_empty() || builtins::is_builtin(&pr.argv[0]) {
-            None
-        } else {
-            find_program(&pr.argv[0], path)
-        };
-
+        // Each stage is a separate subshell that expands its OWN words (the
+        // bash subshell-per-stage model).  The expansion -- and any fatal
+        // `set -u` / arithmetic error it triggers -- is confined to the child,
+        // so an unbound variable in one stage only kills that stage while the
+        // rest of the command line keeps running.
         let pid = fork_child();
         if pid == 0 {
             if job_ctl {
@@ -1574,20 +1614,7 @@ fn execute_pipeline(p: &Pipeline, sh: &mut Shell, path: &str) -> i32 {
             if let Some(fd) = this_read {
                 posix::close(fd);
             }
-            apply_exp_redirs(&pr.redirs, noclobber);
-            let attrs = sh.attrs();
-            let ctx = ChildContext {
-                env: &pr.env,
-                shell_env: &pr.shell_env,
-                arrays: &sh.arrays,
-                options: &sh.options,
-                positional: &sh.positional,
-                dollar_zero: &sh.dollar_zero,
-                attrs: &attrs,
-                compound: pr.compound.as_ref(),
-                program: program.as_ref().map(|(exe, _)| exe),
-            };
-            child_run_exp(&pr.argv, path, &ctx);
+            child_prepare_and_run(c, sh, path, noclobber);
         } else {
             // The stage runs in a subshell, so its hash entry is lost --
             // exactly like in bash.
