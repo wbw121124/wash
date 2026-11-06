@@ -124,15 +124,15 @@ fn main() {
     }
 
     if let Some(cmd) = command {
-        // bash tags parse errors from a command string with `-c: line N:`
-        // and echoes the offending line; run_str needs to know it is in
-        // that mode (the interactive REPL keeps the plain one-line form).
-        sh.command_string_mode = true;
+        // bash names the input source in parse errors: `-c` for the command
+        // string, `exit trap` for an EXIT trap action. Nested run_str calls
+        // (eval / source / signal traps) swap the context themselves.
+        sh.error_context = Some(shell::ErrorContext::command_string());
         let code = sh.run_str(&cmd);
         // 退出前触发 EXIT trap（bash 就在退出前做这件事）。
         if let Some(action) = sh.traps.get("EXIT").cloned() {
             if action != "-" {
-                sh.run_str(&action);
+                sh.run_in_error_context(shell::ErrorContext::exit_trap(), &action);
             }
         }
         exit(code);

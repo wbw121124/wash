@@ -1431,7 +1431,10 @@ pub fn run(shell: &mut Shell) {
     let saved_exit = shell.exit_requested;
     if let Some(action) = shell.traps.get("EXIT").cloned() {
         if action != "-" {
-            shell.run_str(&action);
+            shell.run_in_error_context(
+                crate::shell::ErrorContext::exit_trap(),
+                &action,
+            );
         }
     }
     shell.exit_requested = saved_exit;

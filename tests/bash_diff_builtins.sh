@@ -90,6 +90,10 @@ printf 'return 3\n'                > "$SANDBOX/ret3.sh"
 # -> 1); `return 0` leaves the sourced script successfully.
 printf 'false\nreturn\n'          > "$SANDBOX/retlast.sh"
 printf 'return 0\n'                > "$SANDBOX/ret0.sh"
+# Syntax-error fixtures for nested input sources (source / eval / traps).
+# bash labels these errors with the input source, not with `-c`.
+printf '}\n'                       > "$SANDBOX/bad_tok.sh"
+printf '{ echo hi\n'               > "$SANDBOX/bad_eof.sh"
 ln -s sub "$SANDBOX/link" 2>/dev/null || true
 
 # `timeout` guards against a hanging case; degrade gracefully if absent.
@@ -1233,6 +1237,26 @@ run_case D mapfile           'mapfile -t ARR < @SANDBOX@/in.txt; echo "rc=$?"; d
 run_case D readarray         'readarray -t ARR < @SANDBOX@/in.txt; echo "rc=$?"; declare -p ARR; readarray -t E < /dev/null; declare -p E'
 run_case D coproc            'coproc; echo "rc=$?"'
 run_case D array-assign      'ARR=(a b); echo "rc=$?"'
+
+# --- syntax errors from NESTED input sources ----------------------------------
+# bash 5.3 用「输入源名」标注解析错误，而不是一律 `-c`：
+#   -c          -> `bash: -c: line N: ...`
+#   eval        -> `bash: eval: line N: ...`
+#   source      -> `<脚本路径>: line N: ...`（不带 shell 名）
+#   EXIT trap   -> `bash: exit trap: line N: ...`
+#   信号 trap   -> `bash: trap: line N: ...`
+# unexpected-token 类还会在第二行回显出错的输入行；EOF 类只有一行，但带
+# `on line N` 后缀且行号 = 输入行数 + 1。此前这 5 类上下文全被 `-c:` 覆盖，
+# 是 476 条全绿下的真实盲区；以下全部为逐字节断言（非 run_case_sem）。
+# 期望值均由 MSYS2 bash 5.3 实测生成。
+run_case D synerr-eval-token     "eval '}'"
+run_case D synerr-eval-coproc    "eval 'coproc; echo x'"
+run_case D synerr-eval-eof       "eval '{ echo hi'"
+run_case D synerr-source-token   ". @SANDBOX@/bad_tok.sh"
+run_case D synerr-source-eof     ". @SANDBOX@/bad_eof.sh"
+run_case D synerr-exit-trap      "trap '}' EXIT; echo ok"
+run_case D synerr-exit-trap-eof  "trap '{ echo hi' EXIT; echo ok"
+run_case D synerr-sig-trap       "trap '}' USR1; kill -USR1 \$\$; echo after"
 
 # --- completion / key bindings ----------------------------------------------
 # compgen -c 不能用于逐字节对拍：它枚举 PATH 下全部命令，实测输出 6132 行且

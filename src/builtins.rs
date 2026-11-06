@@ -3225,7 +3225,8 @@ fn builtin_source(argv: &[String], sh: &mut Shell) -> i32 {
     // invoked with, both in the default mode and in --posix mode.
     let saved_positional = std::mem::replace(&mut sh.positional, argv[2..].to_vec());
     sh.sourcing_depth += 1;
-    let code = sh.run_str(&content);
+    let code =
+        sh.run_in_error_context(crate::shell::ErrorContext::sourced(&path), &content);
     sh.sourcing_depth -= 1;
     sh.positional = saved_positional;
     // A `return` inside the sourced script stops it and becomes its exit code.
@@ -3290,7 +3291,7 @@ fn builtin_eval(argv: &[String], sh: &mut Shell) -> i32 {
     if command.trim().is_empty() {
         return 0;
     }
-    sh.run_str(&command)
+    sh.run_in_error_context(crate::shell::ErrorContext::eval(), &command)
 }
 
 // ---------------------------------------------------------------------------
@@ -5049,7 +5050,7 @@ fn builtin_kill(argv: &[String], sh: &mut Shell) -> i32 {
             let canon = signal_to_name(sig);
             if let Some(action) = sh.traps.get(&canon).cloned() {
                 if action != "-" {
-                    sh.run_str(&action);
+                    sh.run_in_error_context(crate::shell::ErrorContext::signal_trap(), &action);
                 }
                 continue;
             }
@@ -5224,7 +5225,7 @@ pub fn dispatch_signal_trap(sh: &mut Shell, signo: i32) -> bool {
     match sh.traps.get(&canon).cloned() {
         Some(action) => {
             if action != "-" {
-                sh.run_str(&action);
+                sh.run_in_error_context(crate::shell::ErrorContext::signal_trap(), &action);
             }
             true
         }

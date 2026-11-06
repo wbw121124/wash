@@ -249,6 +249,49 @@ pub struct JobInfo {
     pub done: bool,
 }
 
+/// bash names the input source in parse-error prefixes: `-c` for a command
+/// string, `eval` for the eval builtin, `exit trap` / `trap` for trap
+/// actions, and the script's own path for `source`. Sourced scripts omit
+/// the shell-name prefix entirely; every other source prints it.
+#[derive(Clone, Debug)]
+pub struct ErrorContext {
+    pub label: String,
+    pub with_shell_name: bool,
+}
+
+impl ErrorContext {
+    pub fn command_string() -> Self {
+        ErrorContext {
+            label: "-c".to_string(),
+            with_shell_name: true,
+        }
+    }
+    pub fn eval() -> Self {
+        ErrorContext {
+            label: "eval".to_string(),
+            with_shell_name: true,
+        }
+    }
+    pub fn exit_trap() -> Self {
+        ErrorContext {
+            label: "exit trap".to_string(),
+            with_shell_name: true,
+        }
+    }
+    pub fn signal_trap() -> Self {
+        ErrorContext {
+            label: "trap".to_string(),
+            with_shell_name: true,
+        }
+    }
+    pub fn sourced(path: &str) -> Self {
+        ErrorContext {
+            label: path.to_string(),
+            with_shell_name: false,
+        }
+    }
+}
+
 pub struct Shell {
     pub env: HashMap<String, String>,
     pub cwd: String,
@@ -360,11 +403,11 @@ pub struct Shell {
     /// 下也是"干净"的输出）。
     pub quiet_errors: bool,
 
-    /// True when the shell was started with `-c CMD` / `--command CMD`.
-    /// bash prints parse errors from a command string in a distinctive
-    /// two-line form (`-c: line N: <msg>` plus an echo of the offending
-    /// input line); interactive and sourced input use a plain one-liner.
-    pub command_string_mode: bool,
+    /// Name of the input source currently being parsed. bash puts it in
+    /// every parse-error prefix, and it changes for nested `run_str` calls
+    /// (`eval`, `source`, trap actions). `None` is the interactive REPL,
+    /// where bash prints a plain one-line error with no line number.
+    pub error_context: Option<ErrorContext>,
 }
 
 impl Shell {
@@ -472,7 +515,7 @@ impl Shell {
             history: Vec::new(),
             fatal_error: None,
             quiet_errors: false,
-            command_string_mode: false,
+            error_context: None,
         };
         Self::populate_internal_variables(&mut sh);
         sh
@@ -558,40 +601,69 @@ impl Shell {
         self.integer_vars = attrs.integer_vars.clone();
     }
 
-    /// Report a lex/parse error the way bash does for the current input source.
-    ///
-    /// `bash -c CMD` uses a distinctive two-line form:
+    /// Run a nested command string (`eval`, `source`, a trap action) with
+    /// bash's matching parse-error prefix, restoring the caller's context
+    /// afterwards. Without the save/restore a `-c` invocation would keep
+    /// labelling every nested error as `-c:`.
+    pub fn run_in_error_context(&mut self, ctx: ErrorContext, s: &str) -> i32 {
+        let saved = self.error_context.replace(ctx);
+        let code = self.run_str(s);
+        self.error_context = saved;
+        code
+    }
+
+    /// Report a lex/parse error the way bash does for the current input
+    /// source. `bash -c CMD` prints:
     ///     bash: -c: line 1: syntax error near unexpected token `;'
     ///     bash: -c: line 1: `coproc; echo "rc=$?"'
-    /// The second line echoes the offending input line; end-of-input errors
-    /// (and lexer errors) have no echo line, and their line number is one
-    /// past the last input line. Interactive and sourced input is a plain
-    /// one-liner. The diff harness strips only the `wash:` / `bash:` name
-    /// prefix, so the `-c: line N:` part and the echo line must be present
-    /// on both sides for the comparison to be byte-for-byte equal.
+    /// The label changes with the input source (`eval`, `exit trap`, `trap`,
+    /// or the sourced script's path, which drops the shell-name prefix).
+    /// End-of-input errors have a single line and no echo. The diff harness
+    /// strips only the shell-name prefix, so the label, line number and echo
+    /// line all have to match byte-for-byte.
     fn report_parse_error(&self, source: &str, message: &str) {
         if self.quiet_errors {
             return;
         }
-        if !self.command_string_mode {
-            eprintln!("wash: {}", message);
-            return;
-        }
+        let ctx = match &self.error_context {
+            Some(c) => c,
+            None => {
+                // Interactive REPL: bash prints a plain one-liner with no
+                // line number and no echo of the input.
+                eprintln!("wash: {}", message);
+                return;
+            }
+        };
         let at_eof = message.starts_with("syntax error: unexpected end of file")
             || message.starts_with("unexpected EOF");
-        // Our grammar does not carry token positions yet, so "unexpected
-        // token" errors report line 1 / the first input line. Single-line
-        // `-c` strings -- what the oracle harness uses -- are exact.
+        // `str::lines()` does not treat a trailing newline as an extra line,
+        // which is what bash does for a sourced script ending in `\n`.
+        // Our grammar has no token positions yet, so "unexpected token"
+        // errors report line 1; single-line inputs are exact.
         let line_no = if at_eof {
-            source.split('\n').count() + 1
+            source.lines().count() + 1
         } else {
             1
         };
-        eprintln!("wash: -c: line {}: {}", line_no, message);
+        let prefix = if ctx.with_shell_name {
+            format!("wash: {}: line {}: ", ctx.label, line_no)
+        } else {
+            format!("{}: line {}: ", ctx.label, line_no)
+        };
+        // bash names the line where the unterminated compound started:
+        // `syntax error: unexpected end of file from `{' command on line 1`.
+        // For a single-line input that line is always 1. (Multi-line inputs
+        // need token positions, which the grammar does not carry yet.)
+        let body = if at_eof && message.ends_with(" command") {
+            format!("{} on line 1", message)
+        } else {
+            message.to_string()
+        };
+        eprintln!("{}{}", prefix, body);
         // bash echoes the offending line only for "unexpected token" errors.
         if message.starts_with("syntax error near unexpected token") {
             let echo = source.split('\n').next().unwrap_or(source);
-            eprintln!("wash: -c: line {}: `{}'", line_no, echo);
+            eprintln!("{}`{}'", prefix, echo);
         }
     }
 
