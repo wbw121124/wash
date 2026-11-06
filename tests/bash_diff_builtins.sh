@@ -732,6 +732,15 @@ run_case A ns4-cmdsub-status-false 'v=$(false); echo $?'          # 1
 run_case A ns4-cmdsub-status-true  'v=$(true); echo $?'           # 0
 run_case A ns4-cmdsub-rhs-once   'v=$(printf OOPS >&2); echo done'  # 只打 1 条 OOPS, stdout done
 run_case A ns4-cmdsub-unbound-status 'set -u; out=$(echo $UNSET); echo "rc=$?"'  # rc=1, stderr "UNSET: unbound variable"
+# --- 差异 5 修复：$! / ${!} 在 set -u 下须 FATAL unbound variable（rc 127）---
+# 这是差异 2 修复（f07ae61）的「反例」：$* $@ $# $? $- $0 $_ 等 special param
+# 在 set -u 下不报 unbound，但 $! / ${!} / ${!*} / ${!@} 仍须 fatal，与 bash 一致。
+run_case A ns5-bang-unbound        'set -u; echo "x$!y"'            # rc=127, 无 stdout, stderr "$!: unbound variable"
+run_case A ns5-bang-braced-unbound 'set -u; echo "${!}"'            # rc=127, stderr "!: unbound variable"
+run_case A ns5-bang-star-unbound   'set -u; echo "${!*}"'           # rc=127, stderr "!*: unbound variable"
+run_case A ns5-bang-at-unbound     'set -u; echo "${!@}"'           # rc=127, stderr "!@: unbound variable"
+run_case A ns5-bang-empty          'set +u; echo "x$!y"'            # rc=0, stdout xy（无 bg job 时展开为空）
+run_case A ns5-bang-braced-empty   'set +u; echo "${!}"'            # rc=0, 无 stdout（展开为空）
 # GROUP B -- KNOWN-DEFECT.
 # (Now empty: every case that used to live here has been fixed and promoted
 # to GROUP A, where it serves as a regression fence.)

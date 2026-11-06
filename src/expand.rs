@@ -446,9 +446,16 @@ fn eval_var(name: &str, ctx: &ExpandCtx) -> Expansion {
         }
         "0" => Expansion::Scalar(ctx.dollar_zero.to_string()),
         "!" => {
-            // `$!` is the pid of the most recent background job; it is empty
-            // when no background job has been started.
+            // `$!` is the pid of the most recent background job.  Unlike the
+            // other special parameters, it is NOT always considered set: when
+            // no background job has been started `bg_pid` is 0, and bash treats
+            // `$!` as unbound under `set -u` (rc 127) — exactly like an
+            // ordinary unset variable.  When a job exists it expands to that
+            // pid (which is never "unset"), so no diagnostic is emitted.
             if ctx.bg_pid == 0 {
+                if ctx.nounset {
+                    unbound_variable("$!");
+                }
                 Expansion::Scalar(String::new())
             } else {
                 Expansion::Scalar(ctx.bg_pid.to_string())
@@ -537,7 +544,26 @@ fn eval_braced(body: &str, ctx: &ExpandCtx) -> Expansion {
     {
         // indirect expansion ${!VAR}
         let name = &body[1..];
+        // `${!}`, `${!*}` and `${!@}` are NOT valid indirect expansions.  Under
+        // `set -u` bash reports them as unbound variables (`!: unbound
+        // variable`, `!*: unbound variable`, `!@: unbound variable`); without
+        // `set -u` they expand to the empty string.  The diagnostic label is the
+        // full body minus the leading `$`, matching bash.
+        if name.is_empty() || name == "*" || name == "@" {
+            if ctx.nounset {
+                unbound_variable(body);
+            }
+            return Expansion::Scalar(String::new());
+        }
+        // `${!VAR}`: indirect expansion.  When VAR is unset or empty bash emits
+        // "VAR: invalid indirect expansion" with rc 1; wash's expander only has
+        // an rc-127 abort path today, so this stays a known gap — we return the
+        // empty string rather than crashing.  TODO(wash): emit rc-1
+        // "invalid indirect expansion".
         let target = ctx.env.get(name).cloned().unwrap_or_default();
+        if target.is_empty() {
+            return Expansion::Scalar(String::new());
+        }
         return Expansion::Scalar(ctx.env.get(&target).cloned().unwrap_or_default());
     }
 
