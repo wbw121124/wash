@@ -69,6 +69,23 @@ pub(crate) fn execve(path: &CString, argv: &[*const c_char], envp: &[*const c_ch
     posix::execve(path, argv, envp)
 }
 
+// 前台作业控制：只有主 shell 在「交互式 + tty」执行前台命令时才接管终端
+// 进程组。命令替换（capture_command 用 Shell::from_env，interactive=false）、
+// exec_external（子进程直接 execve，不递归回 execute）天然不参与；后台作业
+// 的子进程沿用父 Shell（interactive 仍为 true），需显式置位排除，否则它
+// 内部的 execute_pipeline 会误把终端前台组抢走。fork 后子进程是独立地址
+// 空间，置位不影响主 shell，孙进程继承该值。
+static SUPPRESS_JOB_CONTROL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 是否接管终端前台进程组：仅交互式 + tty + 非后台作业子进程。
+/// `-c` / piped（isatty 判假）在此判假，整段跳过 setpgid/tcsetpgrp。
+fn job_control_active(sh: &Shell) -> bool {
+    sh.interactive
+        && posix::isatty(0)
+        && !SUPPRESS_JOB_CONTROL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Fork a command child, restoring default signal dispositions in the child.
 ///
 /// The interactive shell installs handlers for SIGINT/SIGQUIT/SIGTERM/... so
@@ -77,12 +94,11 @@ pub(crate) fn execve(path: &CString, argv: &[*const c_char], envp: &[*const c_ch
 /// interruptible by the terminal-generated SIGINT, and a builtin running in a
 /// forked pipeline stage must not leave a pending-signal flag behind.
 ///
-/// We deliberately do *not* move the foreground child into its own process
-/// group here. Shell and child staying in the terminal's foreground group is
-/// what makes Ctrl-C reach both: the shell's handler records the signal (and
-/// the REPL dispatches the SIGINT trap), while the child takes the default
-/// action and dies. `setpgid` + `tcsetpgrp` would hide the signal from the
-/// shell and break trap dispatch; proper job control needs both halves at once.
+/// `fork_child` 本身不碰进程组（命令替换 / 后台作业 / exec 也走它）。前台
+/// 命令的 setpgid + tcsetpgrp 由 run_standalone_exp / execute_pipeline 在
+/// 「交互式 + tty」时成对完成：子进程建立独立进程组，父进程先交出终端前台
+/// 组、wait 完毕再恢复。这样终端产生的 SIGINT 只到达 job，shell 自身收不到，
+/// 与 bash 的作业控制一致（提示符处的 Ctrl-C 仍由 repl.rs 的字节路径派发）。
 fn fork_child() -> i32 {
     let pid = posix::fork();
     if pid == 0 {
@@ -1193,8 +1209,16 @@ fn run_standalone_exp(
     // command; we apply it temporarily and restore it afterwards.
     let array_saves = apply_array_assignments(array_assigns, sh);
     let program = find_program(&argv[0], path);
+    // 前台作业控制：仅交互式 + tty 的主 shell 接管终端。job_ctl / shell_pgrp
+    // 都在 fork 前算好，子进程继承同一份值；-c / piped（isatty 判假）整段跳过。
+    let job_ctl = job_control_active(sh);
+    let shell_pgrp = if job_ctl { posix::getpgrp() } else { -1 };
     let pid = fork_child();
     if pid == 0 {
+        if job_ctl {
+            // 子进程自立门户（pgid = 自身 pid），脱离 shell 的进程组。
+            posix::setpgid(0, 0);
+        }
         apply_exp_redirs(redirs, sh.options.noclobber);
         let attrs = sh.attrs();
         let ctx = ChildContext {
@@ -1213,7 +1237,18 @@ fn run_standalone_exp(
         if let Some((_, reported)) = &program {
             record_hash_entry(sh, &argv[0], reported);
         }
+        if job_ctl {
+            // 父进程也设置一次，消除父子竞态（谁先执行都不影响结果）。
+            posix::setpgid(pid, pid);
+            // wait 之前把终端前台进程组交给 job：此后 Ctrl-C 只到 job。
+            posix::tcsetpgrp(0, pid);
+        }
         let status = posix::wait_pid(pid);
+        if job_ctl {
+            // 硬要求：恢复 shell 为终端前台进程组，否则 shell 之后读 stdin
+            // 会收到 SIGTTIN 被挂起。
+            posix::tcsetpgrp(0, shell_pgrp);
+        }
         update_underscore(sh, argv);
         restore_array_assignments(array_saves, sh);
         status
@@ -1488,6 +1523,10 @@ fn execute_pipeline(p: &Pipeline, sh: &mut Shell, path: &str) -> i32 {
 
     let mut prev_read: Option<i32> = None;
     let mut pids: Vec<i32> = Vec::new();
+    // 管道所有阶段共用一个 job 进程组（第一个阶段的 pid），不要一阶段一组。
+    let job_ctl = job_control_active(sh);
+    let shell_pgrp = if job_ctl { posix::getpgrp() } else { -1 };
+    let mut job_pgid: Option<i32> = None;
 
     for (idx, pr) in prepared.iter().enumerate() {
         let make_pipe = idx < n - 1;
@@ -1508,6 +1547,11 @@ fn execute_pipeline(p: &Pipeline, sh: &mut Shell, path: &str) -> i32 {
 
         let pid = fork_child();
         if pid == 0 {
+            if job_ctl {
+                // 第一个阶段建立新进程组（pgid = 自身 pid），其余阶段加入
+                // 同一个组；job_pgid 是 fork 时从父进程继承来的快照。
+                posix::setpgid(0, job_pgid.unwrap_or(0));
+            }
             if let Some(fd) = prev_read {
                 posix::dup2(fd, 0);
                 posix::close(fd);
@@ -1544,12 +1588,25 @@ fn execute_pipeline(p: &Pipeline, sh: &mut Shell, path: &str) -> i32 {
             if let Some(fd) = this_read {
                 prev_read = Some(fd);
             }
+            if job_ctl {
+                // 第一个 fork 的 pid 就是整条管道的 job 组 id；父进程也设置
+                // 一次以消除竞态。
+                let pg = *job_pgid.get_or_insert(pid);
+                posix::setpgid(pid, pg);
+            }
             pids.push(pid);
         }
     }
 
     if let Some(fd) = prev_read {
         posix::close(fd);
+    }
+
+    if job_ctl {
+        if let Some(pg) = job_pgid {
+            // 所有阶段 fork 完毕、wait 之前，把终端前台进程组交给整条管道。
+            posix::tcsetpgrp(0, pg);
+        }
     }
 
     let mut last = 0;
@@ -1560,6 +1617,10 @@ fn execute_pipeline(p: &Pipeline, sh: &mut Shell, path: &str) -> i32 {
         if status != 0 {
             failure = status;
         }
+    }
+    if job_ctl {
+        // 硬要求：所有子进程 wait 完毕后恢复 shell 的终端前台进程组。
+        posix::tcsetpgrp(0, shell_pgrp);
     }
     // With `set -o pipefail` the pipeline fails when any stage failed; the
     // status is then the one of the rightmost failing stage.
@@ -1581,6 +1642,9 @@ fn execute_pipeline(p: &Pipeline, sh: &mut Shell, path: &str) -> i32 {
 fn execute_background(p: &Pipeline, sh: &mut Shell, path: &str) -> i32 {
     let pid = fork_child();
     if pid == 0 {
+        // 后台作业的子进程沿用父 Shell（interactive 仍为 true），但它不该
+        // 接管终端前台进程组；置位后其内部的 execute_pipeline 会跳过接线。
+        SUPPRESS_JOB_CONTROL.store(true, std::sync::atomic::Ordering::Relaxed);
         // 子进程：像前台一样跑完整个流水线（每个阶段会再 fork 一次并等待），
         // 然后用该流水线的状态退出。
         let mut p2 = p.clone();

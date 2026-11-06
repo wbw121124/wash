@@ -135,7 +135,23 @@ int wash_setsid(void) { return setsid(); }
 int wash_setpgid(int pid, int pgid) { return setpgid(pid, pgid); }
 
 // 把前台进程组交给终端（作业控制）。pid_t 由 <sys/types.h> 提供。
-int wash_tcsetpgrp(int fd, int pgrp) { return tcsetpgrp(fd, (pid_t)pgrp); }
+//
+// 前台 job 的 wait 结束后，shell 已经处于「后台」进程组，此时再调用
+// tcsetpgrp 恢复自己会被 tty 发 SIGTTOU、默认动作把 shell 停住。这里临时
+// 忽略 SIGTTOU 再恢复原处置，保证恢复动作不会挂起 shell；调用方拿到的
+// 仍是 tcsetpgrp 本身的返回值。
+int wash_tcsetpgrp(int fd, int pgrp) {
+    struct sigaction ign, old;
+    int saved;
+    memset(&ign, 0, sizeof(ign));
+    ign.sa_handler = SIG_IGN;
+    sigemptyset(&ign.sa_mask);
+    ign.sa_flags = 0;
+    saved = (sigaction(SIGTTOU, &ign, &old) == 0);
+    int r = tcsetpgrp(fd, (pid_t)pgrp);
+    if (saved) sigaction(SIGTTOU, &old, NULL);
+    return r;
+}
 
 // 当前进程组 ID：前台命令 wait 结束后用它恢复终端的前台进程组。
 int wash_getpgrp(void) { return getpgrp(); }
