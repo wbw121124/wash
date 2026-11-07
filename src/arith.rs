@@ -161,6 +161,9 @@ fn parse_unsigned(t: &str) -> Result<i64, ArithError> {
     Ok(v)
 }
 
+use std::cell::RefCell;
+use std::sync::Arc;
+
 #[derive(Debug, Clone, PartialEq)]
 enum Tok {
     Num(i64),
@@ -173,11 +176,17 @@ enum Tok {
     Colon,
 }
 
+/// A cursor over a shared, CACHED token stream.
+///
+/// Hot shell loops re-evaluate the same tiny expressions (`i+1`, `i<2000`)
+/// thousands of times, so the tokenization is memoized by the expression
+/// string (see `tokenize_cached`): an evaluation then only walks the cached
+/// token vector instead of re-scanning characters and re-allocating
+/// `Tok::Ident` strings.  The old per-expression `last_text` is derivable from
+/// the final token, so it is gone.
 struct Lexer {
-    toks: Vec<Tok>,
+    toks: Arc<Vec<Tok>>,
     pos: usize,
-    /// The token text used for error messages ("error token is ...").
-    last_text: String,
 }
 
 const OPS: &[&str] = &[
@@ -194,113 +203,133 @@ fn is_ident_char(c: char) -> bool {
 }
 
 impl Lexer {
-    fn new(src: &str) -> Result<Lexer, ArithError> {
-        let chars: Vec<char> = src.chars().collect();
-        let mut toks = Vec::new();
-        let mut i = 0usize;
-        let mut last_text = String::new();
-        while i < chars.len() {
-            let c = chars[i];
-            if c.is_whitespace() {
-                i += 1;
-                continue;
-            }
-            if c.is_ascii_digit() {
-                let start = i;
-                // Collect a numeric literal, possibly with base#digits.
-                while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '#') {
-                    if chars[i] == '#' {
-                        // base#digits: only digits and letters allowed after
+    fn new(toks: Arc<Vec<Tok>>) -> Lexer {
+        Lexer { toks, pos: 0 }
+    }
+}
+
+/// Memoized tokenization: hot loops re-tokenize the same tiny expression
+/// strings thousands of times.  The cache is capped; when full it is simply
+/// cleared (the working set of a loop is a handful of expressions, so a full
+/// clear cannot evict it mid-loop).
+const ARITH_TOK_CACHE_MAX: usize = 512;
+
+thread_local! {
+    static TOK_CACHE: RefCell<HashMap<String, Arc<Vec<Tok>>>> =
+        RefCell::new(HashMap::new());
+}
+
+fn tokenize_cached(src: &str) -> Result<Arc<Vec<Tok>>, ArithError> {
+    if let Some(hit) = TOK_CACHE.with(|c| c.borrow().get(src).cloned()) {
+        return Ok(hit);
+    }
+    let toks = Arc::new(tokenize(src)?);
+    TOK_CACHE.with(|c| {
+        let mut map = c.borrow_mut();
+        if map.len() >= ARITH_TOK_CACHE_MAX {
+            map.clear();
+        }
+        map.insert(src.to_string(), Arc::clone(&toks));
+    });
+    Ok(toks)
+}
+
+/// Scan an arithmetic expression into its token vector (uncached cold path).
+fn tokenize(src: &str) -> Result<Vec<Tok>, ArithError> {
+    let chars: Vec<char> = src.chars().collect();
+    let mut toks = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        if c.is_ascii_digit() {
+            let start = i;
+            // Collect a numeric literal, possibly with base#digits.
+            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '#') {
+                if chars[i] == '#' {
+                    // base#digits: only digits and letters allowed after
+                    i += 1;
+                    while i < chars.len()
+                        && (chars[i].is_ascii_alphanumeric() || chars[i] == '_' || chars[i] == '@')
+                    {
                         i += 1;
-                        while i < chars.len()
-                            && (chars[i].is_ascii_alphanumeric() || chars[i] == '_' || chars[i] == '@')
-                        {
-                            i += 1;
-                        }
-                        break;
                     }
-                    i += 1;
+                    break;
                 }
-                let text: String = chars[start..i].iter().collect();
-                let v = parse_unsigned(&text)
-                    .map_err(|e| ArithError::new(&e.message))?;
-                last_text = text;
-                toks.push(Tok::Num(v));
-                continue;
+                i += 1;
             }
-            if is_ident_start(c) {
-                let start = i;
-                while i < chars.len() && is_ident_char(chars[i]) {
-                    i += 1;
+            let text: String = chars[start..i].iter().collect();
+            let v = parse_unsigned(&text)
+                .map_err(|e| ArithError::new(&e.message))?;
+            toks.push(Tok::Num(v));
+            continue;
+        }
+        if is_ident_start(c) {
+            let start = i;
+            while i < chars.len() && is_ident_char(chars[i]) {
+                i += 1;
+            }
+            // array subscript a[1] is not supported; treat as identifier
+            let text: String = chars[start..i].iter().collect();
+            toks.push(Tok::Ident(text));
+            continue;
+        }
+        if c == '(' {
+            toks.push(Tok::LParen);
+            i += 1;
+            continue;
+        }
+        if c == ')' {
+            toks.push(Tok::RParen);
+            i += 1;
+            continue;
+        }
+        if c == ',' {
+            // Emit an operator token so `parse_comma`'s eat_op(",")
+            // recognises it. `Tok::Comma` was never matchable by eat_op,
+            // which made every comma expression a syntax error.
+            toks.push(Tok::Op(","));
+            i += 1;
+            continue;
+        }
+        if c == '?' {
+            toks.push(Tok::Question);
+            i += 1;
+            continue;
+        }
+        if c == ':' {
+            toks.push(Tok::Colon);
+            i += 1;
+            continue;
+        }
+        // operators
+        let mut matched = false;
+        for op in OPS {
+            let n = op.chars().count();
+            if i + n <= chars.len() {
+                let slice: String = chars[i..i + n].iter().collect();
+                if slice == *op {
+                    toks.push(Tok::Op(op));
+                    i += n;
+                    matched = true;
+                    break;
                 }
-                // array subscript a[1] is not supported; treat as identifier
-                let text: String = chars[start..i].iter().collect();
-                last_text = text.clone();
-                toks.push(Tok::Ident(text));
-                continue;
-            }
-            if c == '(' {
-                last_text = "(".to_string();
-                toks.push(Tok::LParen);
-                i += 1;
-                continue;
-            }
-            if c == ')' {
-                last_text = ")".to_string();
-                toks.push(Tok::RParen);
-                i += 1;
-                continue;
-            }
-            if c == ',' {
-                // Emit an operator token so `parse_comma`'s eat_op(",")
-                // recognises it. `Tok::Comma` was never matchable by eat_op,
-                // which made every comma expression a syntax error.
-                last_text = ",".to_string();
-                toks.push(Tok::Op(","));
-                i += 1;
-                continue;
-            }
-            if c == '?' {
-                last_text = "?".to_string();
-                toks.push(Tok::Question);
-                i += 1;
-                continue;
-            }
-            if c == ':' {
-                last_text = ":".to_string();
-                toks.push(Tok::Colon);
-                i += 1;
-                continue;
-            }
-            // operators
-            let mut matched = false;
-            for op in OPS {
-                let n = op.chars().count();
-                if i + n <= chars.len() {
-                    let slice: String = chars[i..i + n].iter().collect();
-                    if slice == *op {
-                        last_text = slice;
-                        toks.push(Tok::Op(op));
-                        i += n;
-                        matched = true;
-                        break;
-                    }
-                }
-            }
-            if !matched {
-                return Err(ArithError::new(&format!(
-                    "syntax error in expression (error token is \"{}\")",
-                    c
-                )));
             }
         }
-        Ok(Lexer {
-            toks,
-            pos: 0,
-            last_text,
-        })
+        if !matched {
+            return Err(ArithError::new(&format!(
+                "syntax error in expression (error token is \"{}\")",
+                c
+            )));
+        }
     }
+    Ok(toks)
+}
 
+impl Lexer {
     fn peek(&self) -> Option<&Tok> {
         self.toks.get(self.pos)
     }
@@ -328,7 +357,13 @@ impl Lexer {
             Some(Tok::Comma) => ",".to_string(),
             Some(Tok::Question) => "?".to_string(),
             Some(Tok::Colon) => ":".to_string(),
-            None => self.last_text.clone(),
+            // Position exhausted: the old lexer reported the LAST SCANNED
+            // token's text, which is exactly the final token of the stream.
+            None => self
+                .toks
+                .last()
+                .map(|t| token_text(&Some(t.clone())))
+                .unwrap_or_default(),
         }
     }
 }
@@ -342,7 +377,8 @@ fn operand_expected(lex: &Lexer) -> ArithError {
 
 /// Evaluate an arithmetic expression.
 pub fn eval(src: &str, env: &mut dyn ArithEnv) -> Result<i64, ArithError> {
-    let mut lex = Lexer::new(src)?;
+    let toks = tokenize_cached(src)?;
+    let mut lex = Lexer::new(toks);
     if lex.toks.is_empty() {
         return Err(ArithError::new("expression expected"));
     }
@@ -365,55 +401,61 @@ fn parse_comma(lex: &mut Lexer, env: &mut dyn ArithEnv) -> Result<i64, ArithErro
 }
 
 fn parse_assign(lex: &mut Lexer, env: &mut dyn ArithEnv) -> Result<i64, ArithError> {
-    let start = lex.pos;
-    // Detect `name op= ...` but not `==`, `!=`, `<=`, `>=`.
-    if let Some(Tok::Ident(name)) = lex.peek().cloned() {
-        if let Some(Tok::Op(op)) = lex.toks.get(lex.pos + 1).cloned() {
-            let assign_op = match op {
-                "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "<<=" | ">>=" | "&=" | "^=" | "|=" => Some(op),
+    // Detect `name op= ...` but not `==`, `!=`, `<=`, `>=`.  The (cached)
+    // tokens are only cloned on the real assignment path; plain expressions
+    // like `i+1` fall through with zero clones.
+    let mut assign: Option<(String, &'static str)> = None;
+    if let Some(Tok::Ident(n)) = lex.peek() {
+        if let Some(Tok::Op(op)) = lex.toks.get(lex.pos + 1) {
+            let aop = match *op {
+                "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "<<=" | ">>=" | "&=" | "^=" | "|=" => {
+                    Some(*op)
+                }
                 _ => None,
             };
-            if let Some(aop) = assign_op {
-                lex.pos += 2;
-                let divisor_tok = lex.peek().cloned();
-                let rhs = parse_assign(lex, env)?;
-                let cur = env.get(&name, aop != "=").unwrap_or(0);
-                let newv = match aop {
-                    "=" => rhs,
-                    "+=" => cur.wrapping_add(rhs),
-                    "-=" => cur.wrapping_sub(rhs),
-                    "*=" => cur.wrapping_mul(rhs),
-                    "/=" => {
-                        if rhs == 0 {
-                            return Err(ArithError {
-                                message: "division by 0".to_string(),
-                                token: token_text(&divisor_tok),
-                            });
-                        }
-                        cur.wrapping_div(rhs)
-                    }
-                    "%=" => {
-                        if rhs == 0 {
-                            return Err(ArithError {
-                                message: "division by 0".to_string(),
-                                token: token_text(&divisor_tok),
-                            });
-                        }
-                        cur.wrapping_rem(rhs)
-                    }
-                    "<<=" => cur.wrapping_shl(rhs as u32),
-                    ">>=" => cur.wrapping_shr(rhs as u32),
-                    "&=" => cur & rhs,
-                    "^=" => cur ^ rhs,
-                    "|=" => cur | rhs,
-                    _ => unreachable!(),
-                };
-                env.set(&name, newv);
-                return Ok(newv);
+            if let Some(aop) = aop {
+                assign = Some((n.clone(), aop));
             }
         }
     }
-    let _ = start;
+    if let Some((name, aop)) = assign {
+        lex.pos += 2;
+        let divisor_tok = lex.peek().cloned();
+        let rhs = parse_assign(lex, env)?;
+        let cur = env.get(&name, aop != "=").unwrap_or(0);
+        let newv = match aop {
+            "=" => rhs,
+            "+=" => cur.wrapping_add(rhs),
+            "-=" => cur.wrapping_sub(rhs),
+            "*=" => cur.wrapping_mul(rhs),
+            "/=" => {
+                if rhs == 0 {
+                    return Err(ArithError {
+                        message: "division by 0".to_string(),
+                        token: token_text(&divisor_tok),
+                    });
+                }
+                cur.wrapping_div(rhs)
+            }
+            "%=" => {
+                if rhs == 0 {
+                    return Err(ArithError {
+                        message: "division by 0".to_string(),
+                        token: token_text(&divisor_tok),
+                    });
+                }
+                cur.wrapping_rem(rhs)
+            }
+            "<<=" => cur.wrapping_shl(rhs as u32),
+            ">>=" => cur.wrapping_shr(rhs as u32),
+            "&=" => cur & rhs,
+            "^=" => cur ^ rhs,
+            "|=" => cur | rhs,
+            _ => unreachable!(),
+        };
+        env.set(&name, newv);
+        return Ok(newv);
+    }
     parse_conditional(lex, env)
 }
 
@@ -666,14 +708,22 @@ fn parse_postfix(lex: &mut Lexer, env: &mut dyn ArithEnv) -> Result<i64, ArithEr
 }
 
 fn parse_primary(lex: &mut Lexer, env: &mut dyn ArithEnv) -> Result<i64, ArithError> {
+    // Zero-clone hot path: the identifier is borrowed straight out of the
+    // cached token vector.  Disjoint field borrows (`lex.toks` immutable,
+    // `lex.pos` mutated) are fine with direct field access.
+    let is_ident = matches!(lex.peek(), Some(Tok::Ident(_)));
+    if is_ident {
+        let name: &str = match &lex.toks[lex.pos] {
+            Tok::Ident(n) => n,
+            _ => unreachable!(),
+        };
+        lex.pos += 1;
+        return Ok(env.get(name, true).unwrap_or(0));
+    }
     match lex.peek().cloned() {
         Some(Tok::Num(v)) => {
             lex.pos += 1;
             Ok(v)
-        }
-        Some(Tok::Ident(name)) => {
-            lex.pos += 1;
-            Ok(env.get(&name, true).unwrap_or(0))
         }
         Some(Tok::LParen) => {
             lex.pos += 1;

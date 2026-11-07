@@ -1135,7 +1135,7 @@ fn run_standalone_exp(
     assigns: &[(String, Vec<WordPart>, bool)],
     array_assigns: &[(String, Vec<Vec<WordPart>>, bool)],
     compound: Option<&Compound>,
-    env: &HashMap<String, String>,
+    env_values: Option<&[(String, String, bool)]>,
     sh: &mut Shell,
     path: &str,
 ) -> i32 {
@@ -1299,8 +1299,12 @@ fn run_standalone_exp(
         }
         apply_exp_redirs(redirs, sh.options.noclobber);
         let attrs = sh.attr_refs();
+        // The command environment (exported vars + this command's own
+        // assignments) is built here only -- the builtin / function /
+        // assignment / compound paths above never needed it.
+        let cmd_env = build_cmd_env(env_values, sh);
         let ctx = ChildContext {
-            env,
+            env: &cmd_env,
             shell_env: &sh.env,
             arrays: &sh.arrays,
             options: &sh.options,
@@ -1335,7 +1339,15 @@ fn run_standalone_exp(
 }
 
 /// A fully prepared (expanded) command: argv, redirections, the assignments
-/// it carried, and its private environments.
+/// it carried, and its (lazily built) private environments.
+///
+/// The two private environments (`cmd_env`: exported vars + the command's
+/// own assignments, for `execve`; `shell_env`: the full table a forked child
+/// shell starts with) are NOT materialized here.  Cloning two ~30-entry
+/// `HashMap`s of `String`s per simple command cost more than the command
+/// itself (a `[` builtin never uses either map), so only the expanded
+/// assignment values are kept and the maps are built on demand by the
+/// paths that actually fork/exec.
 struct Prepared {
     argv: Vec<String>,
     redirs: Vec<ExpRedir>,
@@ -1344,10 +1356,55 @@ struct Prepared {
     array_assigns: Vec<(String, Vec<Vec<WordPart>>, bool)>,
     /// The compound command (`if ... fi`) this command stands for.
     compound: Option<Compound>,
-    /// The environment the command's program receives.
-    env: HashMap<String, String>,
+    /// The expanded `(name, value, append)` assignment values.  `None` when
+    /// the command has no words (a standalone assignment / compound), which
+    /// the old code represented by an empty `cmd_env` + a value-less
+    /// `sh.env.clone()` as `shell_env`.
+    env_values: Option<Vec<(String, String, bool)>>,
+}
+
+impl Prepared {
+    /// The environment the command's program receives (`execve`).
+    fn build_cmd_env(&self, sh: &Shell) -> HashMap<String, String> {
+        build_cmd_env(self.env_values.as_deref(), sh)
+    }
+
     /// The variable table a forked child shell starts with.
-    shell_env: HashMap<String, String>,
+    fn build_shell_env(&self, sh: &Shell) -> HashMap<String, String> {
+        let mut shell_env = sh.env.clone();
+        if let Some(values) = &self.env_values {
+            for (n, v, ap) in values {
+                if *ap {
+                    let cur = shell_env.get(n).cloned().unwrap_or_default();
+                    shell_env.insert(n.clone(), cur + v);
+                } else {
+                    shell_env.insert(n.clone(), v.clone());
+                }
+            }
+        }
+        shell_env
+    }
+}
+
+/// Build the environment a program receives: the exported variables plus the
+/// command's own (already expanded) assignments.  `None` (a command without
+/// words) yields an empty map, faithful to the pre-lazy behavior.
+fn build_cmd_env(values: Option<&[(String, String, bool)]>, sh: &Shell) -> HashMap<String, String> {
+    match values {
+        None => HashMap::new(),
+        Some(values) => {
+            let mut cmd_env = sh.child_env();
+            for (n, v, ap) in values {
+                if *ap {
+                    let cur = cmd_env.get(n).cloned().unwrap_or_default();
+                    cmd_env.insert(n.clone(), cur + v);
+                } else {
+                    cmd_env.insert(n.clone(), v.clone());
+                }
+            }
+            cmd_env
+        }
+    }
 }
 
 /// The maximum alias expansion depth (guards against an alias whose body
@@ -1534,19 +1591,15 @@ fn prepare_stage(c: &SimpleCommand, sh: &mut Shell) -> Prepared {
         sh.env.insert(name, value);
     }
 
-    // Build the environments of the stage.
-    //
-    // The assignment RHSes (`v=$(...)` etc.) must be expanded EXACTLY once: a
-    // previous version called `build_cmd_env` twice (once for the exported-only
-    // command environment and once for the full child-shell environment), and
-    // STILL again in `run_standalone_exp` for a standalone assignment, so a
-    // `$(...)` inside an assignment ran two-to-three times.  We now expand the
-    // values once and reuse them for both environments.  When there is no
-    // command word to execute (a standalone assignment or a compound command),
-    // the environments built here are never consumed by the caller, so we skip
-    // the expansion entirely to avoid the extra command-substitution runs.
-    let (cmd_env, shell_env) = if argv.is_empty() {
-        (HashMap::new(), sh.env.clone())
+    // Expand the assignment RHSes (`v=$(...)` etc.) exactly once.  The two
+    // env MAPS that used to be built here (the exported-only `cmd_env` and a
+    // full `shell_env` clone) are now built LAZILY by the consumers that
+    // actually fork or exec: a `[` builtin never reads either map, and the
+    // two ~30-entry HashMap deep clones dominated the cost of every simple
+    // command.  `None` = no command word (standalone assignment / compound),
+    // matching the old "(empty cmd_env, value-less sh.env.clone())" pair.
+    let env_values = if argv.is_empty() {
+        None
     } else {
         let attrs = sh.attr_refs();
         let value_ctx = ExpandCtx {
@@ -1569,27 +1622,7 @@ fn prepare_stage(c: &SimpleCommand, sh: &mut Shell) -> Prepared {
             .iter()
             .map(|(n, vp, ap)| (n.clone(), expand_scalar(vp, &value_ctx), *ap))
             .collect();
-        // Only the exported variables are passed on to the program ...
-        let mut cmd_env = sh.child_env();
-        for (n, v, ap) in &values {
-            if *ap {
-                let cur = cmd_env.get(n).cloned().unwrap_or_default();
-                cmd_env.insert(n.clone(), cur + v);
-            } else {
-                cmd_env.insert(n.clone(), v.clone());
-            }
-        }
-        // ... but a forked child shell inherits every shell variable.
-        let mut shell_env = sh.env.clone();
-        for (n, v, ap) in &values {
-            if *ap {
-                let cur = shell_env.get(n).cloned().unwrap_or_default();
-                shell_env.insert(n.clone(), cur + v);
-            } else {
-                shell_env.insert(n.clone(), v.clone());
-            }
-        }
-        (cmd_env, shell_env)
+        Some(values)
     };
     // The expansion of the assignments themselves may have requested further
     // assignments; they are applied to the shell as well.
@@ -1602,8 +1635,7 @@ fn prepare_stage(c: &SimpleCommand, sh: &mut Shell) -> Prepared {
         assigns: c.assignments.clone(),
         array_assigns: c.array_assignments.clone(),
         compound: c.compound.clone(),
-        env: cmd_env,
-        shell_env,
+        env_values,
     }
 }
 
@@ -1632,9 +1664,13 @@ fn child_prepare_and_run(c: &SimpleCommand, sh: &mut Shell, path: &str, noclobbe
     } else {
         find_program(&pr.argv[0], path)
     };
+    // This stage runs in an already-forked child: it always needs both
+    // private environments, so they are built here on demand.
+    let cmd_env = pr.build_cmd_env(sh);
+    let shell_env = pr.build_shell_env(sh);
     let ctx = ChildContext {
-        env: &pr.env,
-        shell_env: &pr.shell_env,
+        env: &cmd_env,
+        shell_env: &shell_env,
         arrays: &sh.arrays,
         options: &sh.options,
         positional: &sh.positional,
@@ -1679,7 +1715,7 @@ fn execute_pipeline(p: &Pipeline, sh: &mut Shell, path: &str) -> i32 {
             &pr.assigns,
             &pr.array_assigns,
             pr.compound.as_ref(),
-            &pr.env,
+            pr.env_values.as_deref(),
             sh,
             path,
         );
