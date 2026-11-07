@@ -28,6 +28,11 @@ fn main() {
     }
 
     build.file("src/posix_shim.c").compile("washposix");
+    // 故意不 emit `cargo:rustc-link-lib=dl`：P0 spike（docs/spike-dlopen.md）
+    // 已证实 MSYS2(Cygwin) 与 WSL/glibc 的默认链接都直接提供
+    // dlopen/dlsym/dlclose/dlerror，加 -ldl 反而可能引入不存在的 libdl 依赖。
+    // 若将来某平台最终链接报 "undefined reference to dlopen"，再按
+    // CARGO_CFG_TARGET_OS 分支加回（不要用 cfg!(unix)，该 target 下为假）。
     println!("cargo:rerun-if-changed=src/posix_shim.c");
     println!("cargo:rerun-if-changed=build.rs");
 }

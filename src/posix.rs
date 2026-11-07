@@ -76,6 +76,12 @@ extern "C" {
     fn wash_getpgrp() -> c_int;
     // 本地时间格式化（PS1 的 \d \t \T \A \@）
     fn wash_strftime(buf: *mut c_char, n: usize, fmt: *const c_char) -> c_int;
+
+    // 动态加载（二进制插件系统，见 posix_shim.c）
+    fn wash_dlopen(path: *const c_char) -> c_int;
+    fn wash_dlclose(slot: c_int) -> c_int;
+    fn wash_dlsym(slot: c_int, name: *const c_char, out: *mut usize) -> c_int;
+    fn wash_dlerror() -> *const c_char;
 }
 
 pub const X_OK: c_int = 1;
@@ -666,3 +672,52 @@ pub fn strftime_local(fmt: &str) -> String {
     let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     String::from_utf8_lossy(&buf[..len]).into_owned()
 }
+
+// --- 动态加载（二进制插件系统）-------------------------------------------
+
+/// 打开共享库，成功返回 shim 句柄槽位（>= 0），失败返回带诊断的 Err。
+pub fn dl_open(path: &str) -> Result<i32, String> {
+    let c = CString::new(path).unwrap_or_default();
+    let slot = unsafe { wash_dlopen(c.as_ptr()) };
+    if slot < 0 {
+        Err(dl_error())
+    } else {
+        Ok(slot)
+    }
+}
+
+/// 关闭一个句柄槽位。
+pub fn dl_close(slot: i32) -> Result<(), String> {
+    let r = unsafe { wash_dlclose(slot) };
+    if r != 0 {
+        Err(dl_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// 查符号地址，返回可 transmute 成函数指针的 `usize`（对应 C `uintptr_t`）。
+pub fn dl_sym(slot: i32, name: &str) -> Result<usize, String> {
+    let c = CString::new(name).unwrap_or_default();
+    let mut addr: usize = 0;
+    let r = unsafe { wash_dlsym(slot, c.as_ptr(), &mut addr) };
+    if r != 0 {
+        Err(dl_error())
+    } else {
+        Ok(addr)
+    }
+}
+
+/// 最近一次 dl* 错误；立刻把 C 侧 static 缓冲拷成 Rust 自有 String
+/// （dlerror() 的原生内存在下次 dl* 调用后即失效，不能留存指针）。
+pub fn dl_error() -> String {
+    unsafe {
+        let p = wash_dlerror();
+        if p.is_null() {
+            String::new()
+        } else {
+            std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+        }
+    }
+}
+

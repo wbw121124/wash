@@ -28,6 +28,8 @@
 #include <poll.h>
 #include <limits.h>
 #include <time.h>
+#include <dlfcn.h>
+#include <stdint.h>
 
 // --- 交互 shell 的信号捕获 -------------------------------------------------
 //
@@ -653,3 +655,89 @@ int wash_poll_readable(int fd, int ms) {
     pfd.revents = 0;
     return poll(&pfd, 1, ms);
 }
+
+// --- 动态加载（二进制插件系统）-------------------------------------------
+//
+// Rust 侧不直接声明 dlopen/dlsym/dlerror：dlerror() 返回的指针在「下一次
+// dl* 调用」后即失效，所以必须在 C 侧把错误字符串拷进 static 缓冲，Rust
+// 拿到指针后立刻 CStr→String。句柄存在 256 槽 static 表里，Rust 只持有
+// 槽位索引（fork 后随 COW 继承，索引与地址仍有效）。两平台 dl* 都不需要
+// 额外的 -ldl（见 docs/spike-dlopen.md）。
+#define WASH_DL_MAX 256
+#define WASH_DL_ERRBUF 4096
+static void *g_dl_handles[WASH_DL_MAX];
+static char g_dl_err[WASH_DL_ERRBUF];
+
+static void wash_copy_dlerror(void) {
+    const char *e = dlerror();
+    if (e == NULL) {
+        g_dl_err[0] = '\0';
+    } else {
+        strncpy(g_dl_err, e, sizeof(g_dl_err) - 1);
+        g_dl_err[sizeof(g_dl_err) - 1] = '\0';
+    }
+}
+
+// 打开共享库，成功返回槽位索引（>=0），失败返回 -1。
+int wash_dlopen(const char *path) {
+    void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (h == NULL) {
+        wash_copy_dlerror();
+        return -1;
+    }
+    int i;
+    for (i = 0; i < WASH_DL_MAX; i++) {
+        if (g_dl_handles[i] == NULL) {
+            g_dl_handles[i] = h;
+            g_dl_err[0] = '\0';
+            return i;
+        }
+    }
+    dlclose(h);
+    snprintf(g_dl_err, sizeof(g_dl_err), "plugin handle table full (%d)", WASH_DL_MAX);
+    return -1;
+}
+
+// 关闭槽位，成功 0，失败 -1（沿用 wash_* 风格）。
+int wash_dlclose(int slot) {
+    if (slot < 0 || slot >= WASH_DL_MAX || g_dl_handles[slot] == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (dlclose(g_dl_handles[slot]) != 0) {
+        wash_copy_dlerror();
+        return -1;
+    }
+    g_dl_handles[slot] = NULL;
+    g_dl_err[0] = '\0';
+    return 0;
+}
+
+// 查符号地址。用 memcpy 把 dlsym 的 void* 位模式写进 uintptr_t，避开
+// void*↔函数指针直接转换的实现定义行为（两平台二者同宽）。先 dlerror()
+// 清错，再据 dlerror() 是否为 NULL 判成败。成功 0，失败 -1。
+int wash_dlsym(int slot, const char *name, uintptr_t *out) {
+    if (slot < 0 || slot >= WASH_DL_MAX || g_dl_handles[slot] == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    dlerror(); /* clear any stale error */
+    void *p = dlsym(g_dl_handles[slot], name);
+    const char *e = dlerror();
+    if (e != NULL) {
+        strncpy(g_dl_err, e, sizeof(g_dl_err) - 1);
+        g_dl_err[sizeof(g_dl_err) - 1] = '\0';
+        return -1;
+    }
+    uintptr_t bits = 0;
+    memcpy(&bits, &p, sizeof(bits));
+    *out = bits;
+    g_dl_err[0] = '\0';
+    return 0;
+}
+
+// 最近一次 dl* 错误的 C 字符串（static 缓冲，永不为 NULL）。
+const char *wash_dlerror(void) {
+    return g_dl_err;
+}
+
