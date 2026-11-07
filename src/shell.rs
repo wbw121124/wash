@@ -104,6 +104,11 @@ pub const SET_O_ORDER: &[&str] = &[
     "hashall",
     "histexpand",
     "history",
+    // `igncr` exists only in the Cygwin fork of bash (CRLF handling on
+    // Windows). Real Linux bash 5.3.0 does not list it in `set -o` and
+    // rejects `set -o igncr` with "invalid option name" (rc 2) -- verified
+    // against both oracles.
+    #[cfg(target_os = "cygwin")]
     "igncr",
     "ignoreeof",
     "interactive-comments",
@@ -138,7 +143,7 @@ impl SetOptions {
             "hashall" => self.hashall,
             "histexpand" => self.histexpand,
             "history" => self.history,
-            "igncr" => self.igncr,
+            "igncr" if cfg!(target_os = "cygwin") => self.igncr,
             "ignoreeof" => self.ignoreeof,
             "interactive-comments" => self.interactive_comments,
             "keyword" => self.keyword,
@@ -173,7 +178,7 @@ impl SetOptions {
             "hashall" => self.hashall = value,
             "histexpand" => self.histexpand = value,
             "history" => self.history = value,
-            "igncr" => self.igncr = value,
+            "igncr" if cfg!(target_os = "cygwin") => self.igncr = value,
             "ignoreeof" => self.ignoreeof = value,
             "interactive-comments" => self.interactive_comments = value,
             "keyword" => self.keyword = value,

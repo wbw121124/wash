@@ -358,6 +358,12 @@ run_case A unset-noarg       'unset; echo "rc=$?"'
 # --- set --------------------------------------------------------------------
 run_case A set-o             'set -o'
 run_case A set-plus-o        'set +o'
+# `igncr` is a Cygwin-only option: the Cygwin bash oracle accepts it (rc 0)
+# and lists it in `set -o`; real Linux bash 5.3.0 rejects it ("invalid option
+# name", rc 2) and omits it.  wash must match ITS OWN platform's bash, so
+# these cases compare against whatever oracle runs the suite.
+run_case A set-o-igncr       'set -o igncr; echo "rc=$?"'
+run_case A set-o-igncr-count 'set -o | grep -c igncr'
 run_case A set-dashdash      'set -- a b c; echo "n=$# 1=$1 3=$3"'
 run_case A set-clear         'set -- a b c; set --; echo "n=$#"'
 run_case A set-empty-dashdash 'set --; echo "n=$#"'
