@@ -520,6 +520,21 @@ run_case_sem A group-unclosed   '{ echo hi' '[ "$RC" -eq 2 ] && [ ! -s "$OUT" ] 
 run_case_sem A group-empty      '{ }' '[ "$RC" -eq 2 ] && [ ! -s "$OUT" ] && grep -q "syntax error" "$ERR"'
 run_case_sem A group-no-semi    '{ echo a }' '[ "$RC" -eq 2 ] && [ ! -s "$OUT" ] && grep -q "unexpected end of file" "$ERR"'
 run_case_sem A group-stray-close '}' '[ "$RC" -eq 2 ] && [ ! -s "$OUT" ] && grep -q "syntax error" "$ERR"'
+# --- code review P3：实现 ( ) 子 shell 语法（fork 一个 shell 副本执行 LIST，
+#     内部赋值 / cd / fd 变化不回写父 shell）---
+run_case A subshell-basic          '( echo inner )'
+run_case A subshell-isolate-var    'x=outer; ( x=inner ); echo "x=$x"'
+run_case A subshell-isolate-cd     'cd @SANDBOX@; ( cd sub; pwd ); pwd'
+run_case A subshell-redir          '( echo hi ) > @SANDBOX@/ss; cat @SANDBOX@/ss'
+run_case A subshell-pipeline       '( echo a; echo b ) | tr a-z A-Z'
+run_case A subshell-status         '( false ); echo "rc=$?"'
+run_case A subshell-nested         '( ( echo deep ) )'
+run_case A subshell-andor          '( echo a ) && ( echo b )'
+run_case A subshell-func-isolated  'f() { echo fn; }; ( f ); echo "r=$?"'
+run_case A subshell-bg-internal    '( true & wait "$!"; echo "done" )'
+# 空子 shell / 括号不匹配属语法错误：语义不变量锁 rc=2、stdout 空、真的报语法错。
+run_case_sem A subshell-empty      '( )' '[ "$RC" -eq 2 ] && [ ! -s "$OUT" ] && grep -q "syntax error" "$ERR"'
+run_case_sem A subshell-unclosed   '( echo hi' '[ "$RC" -eq 2 ] && [ ! -s "$OUT" ] && grep -q "unexpected end of file" "$ERR"'
 # 第二/三轮 review P1 #7 / #11 / P3 #30：自定义 IFS 分词、未引号 $@/$* 的
 # 二次分词、以及多字段展开时「前缀只接首字段、后缀只接末字段」。
 # 旧实现 split_ifs 硬编码空格/tab/换行、At/Star 不分词、且给每个字段都拼前缀。
@@ -748,6 +763,23 @@ run_case A ns5-bang-with-job       'set -u; true & wait "$!"; echo "rc=$?"'   # 
 run_case A ns5-bang-braced-with-job 'set -u; true & wait "${!}"; echo "rc=$?"' # rc=0, stdout rc=0（${!}≡$!）
 run_case A ns5-bang-cmdsub         'set -u; true & v=$([ -n "$!" ] && echo set); echo "v=$v"' # rc=0, stdout v=set（穿透到 $(...)）
 run_case A ns5-bang-pipeline       'set -u; true & : | if [ -n "$!" ]; then echo yes; fi; echo "p=$?"' # rc=0, stdout yes / p=0（穿透到 fork 复合命令）
+# --- code review P3：修复 ${!VAR} / ${!prefix@} / ${!prefix*} / ${!#} 此前被「间接展开分支」
+#     静默吞成空串（rc 也错）的三类缺口 ---
+# ${!prefix@} / ${!prefix*}：列出所有以 prefix 开头（标量或数组）的变量名，排序后用空格（@）
+# 或 $IFS 首字符（*）连接。用罕见前缀 MYV 避免与环境变量碰撞；并列 Bash 自身为 oracle。
+run_case A bang-prefix-at-space    'MYV=1; MYVA=2; MYVB=3; echo "[${!MYV@}]"'        # [MYV MYVA MYVB]
+run_case A bang-prefix-star-ifs    'IFS=:; MYV=1; MYVA=2; MYVB=3; echo "[${!MYV*}]"' # [MYV:MYVA:MYVB]
+run_case A bang-prefix-at-array    'MYA=1; MYAR=(x y); echo "[${!MYA@}]"'           # [MYA MYAR]
+# ${!#} 是 $0 的另一种写法：对 bash / wash 各自成立（语义不变量，不比字面量）。
+run_case_sem A bang-hash-eq-zero   'echo "${!#}"; echo "$0"' '[ "$(sed -n 1p "$OUT")" = "$(sed -n 2p "$OUT")" ]'
+# ${!VAR} 间接展开（rc 1，非 set -u 的 127）：非法时打印 "VAR: invalid indirect expansion" /
+# "VAR: invalid variable name" / ": invalid variable name"，且 stdout 为空。
+run_case A bang-indirect-unset     'unset U; echo "x${!U}y"'      # rc=1, 空 stdout, "U: invalid indirect expansion"
+run_case A bang-indirect-empty-name 'FOO=""; echo "x${!FOO}y"'    # rc=1, 空 stdout, ": invalid variable name"
+run_case A bang-indirect-bad-name   'BAR=1bad; FOO=BAR; echo "x${!FOO}y"' # rc=1, "1bad: invalid variable name"
+run_case A bang-indirect-valid     'BAR=hello; FOO=BAR; echo "[${!FOO}]"' # [hello] rc=0
+run_case A bang-indirect-empty-target 'FOO=bar; echo "[${!FOO}]"'          # [  ] rc=0（bar 未设置，间接展开为空）
+run_case A bang-indirect-set-u     'set -u; unset U2; echo "x${!U2}y"'    # rc=1, 与 set -u 无关，仍是 invalid indirect
 # GROUP B -- KNOWN-DEFECT.
 # (Now empty: every case that used to live here has been fixed and promoted
 # to GROUP A, where it serves as a regression fence.)

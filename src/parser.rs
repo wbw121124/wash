@@ -77,6 +77,10 @@ pub enum Compound {
     /// `{ LIST; }` — a brace group: LIST runs in the current shell (no
     /// subshell), so variable assignments and `cd` inside it persist.
     Group { body: CommandList },
+    /// `( LIST )` — a subshell: LIST runs in a forked copy of the shell, so
+    /// variable assignments, `cd` and file-descriptor changes inside it do not
+    /// leak back to the parent process.
+    Subshell { body: CommandList },
 }
 
 /// One arm of a `case` command: a set of patterns and the body to run.
@@ -217,6 +221,13 @@ fn parse_compounds(tokens: &[Token]) -> Result<(Vec<Token>, Vec<FuncDef>)> {
                     let (group, end) = parse_group_compound(tokens, i)?;
                     out.push(Token::Compound(group));
                     i = end;
+                } else if at_command_position(&out) && is_word_text(tokens.get(i), "(") {
+                    // `( LIST )` — a subshell.  Like the brace group it may
+                    // only begin where a command may start; elsewhere `(` stays
+                    // an ordinary word (bash then reports a syntax error).
+                    let (subshell, end) = parse_subshell_compound(tokens, i)?;
+                    out.push(Token::Compound(subshell));
+                    i = end;
                 } else if at_command_position(&out) && is_word_text(tokens.get(i), "}") {
                     // A stray `}` in command position is a syntax error, not a
                     // command name (bash: `syntax error near unexpected token }').
@@ -303,6 +314,44 @@ fn parse_group_compound(tokens: &[Token], start: usize) -> Result<(Compound, usi
         ));
     }
     Ok((Compound::Group { body }, close + 1))
+}
+
+/// Parse a `( LIST )` subshell whose opener is at `start`.
+///
+/// Returns the compound and the index just after the matching `)`.  Nested
+/// subshells are tracked with a depth counter over standalone `(` / `)` words
+/// (arithmetic / command substitutions never reach this layer as bare tokens —
+/// the lexer folds `$(( ))` and `$( )` into `WordPart`s — so they cannot be
+/// mistaken for subshell delimiters).  An empty subshell (`( )`) is a syntax
+/// error, matching bash (`syntax error near unexpected token ')'`).
+fn parse_subshell_compound(tokens: &[Token], start: usize) -> Result<(Compound, usize)> {
+    let mut depth = 0i32;
+    let mut j = start + 1;
+    let mut close = None;
+    while j < tokens.len() {
+        if is_word_text(tokens.get(j), "(") {
+            depth += 1;
+        } else if is_word_text(tokens.get(j), ")") {
+            if depth > 0 {
+                depth -= 1;
+            } else {
+                // The first `)` at depth 0 closes this subshell.
+                close = Some(j);
+                break;
+            }
+        }
+        j += 1;
+    }
+    let close = close.ok_or_else(|| {
+        WashError::syntax("syntax error: unexpected end of file from `(' command")
+    })?;
+    let body = parse_command_list(&tokens[start + 1..close])?;
+    if body.andors.is_empty() {
+        return Err(WashError::syntax(
+            "syntax error near unexpected token `)'",
+        ));
+    }
+    Ok((Compound::Subshell { body }, close + 1))
 }
 
 /// The name of the reserved word at `index`, if the token is one.

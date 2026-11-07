@@ -26,6 +26,11 @@ thread_local! {
     /// instead of 1. A non-interactive shell exits with 127; an interactive
     /// REPL only aborts the current line so the session survives.
     static EXPANSION_ABORT: Cell<bool> = Cell::new(false);
+    /// A non-fatal parameter expansion error that still fails the command with
+    /// status 1 (NOT the 127 reserved for `set -u`).  Currently only used for
+    /// `${!VAR}` "invalid indirect expansion" / "invalid variable name", which
+    /// bash reports with rc 1 and an empty stdout (the command is aborted).
+    static EXPANSION_ABORT_RC1: Cell<bool> = Cell::new(false);
 }
 
 /// Whether the current command line hit a fatal arithmetic expansion error.
@@ -51,9 +56,29 @@ pub fn expansion_aborted() -> bool {
     EXPANSION_ABORT.with(|c| c.get())
 }
 
-/// Reset the fatal-parameter-expansion flag for each top-level command line.
+/// Reset the fatal-parameter-expansion flags for each top-level command line.
 pub fn clear_expansion_abort() {
-    EXPANSION_ABORT.with(|c| c.set(false))
+    EXPANSION_ABORT.with(|c| c.set(false));
+    EXPANSION_ABORT_RC1.with(|c| c.set(false));
+}
+
+/// Whether the current command line hit the rc-1 `invalid indirect expansion`
+/// error (distinct from the rc-127 `set -u` path).
+pub fn expansion_aborted_rc1() -> bool {
+    EXPANSION_ABORT_RC1.with(|c| c.get())
+}
+
+/// Return the abort status code if parameter expansion failed on this command
+/// line, distinguishing the rc-127 `set -u` / `${var?word}` path from the rc-1
+/// `invalid indirect expansion` path.  Returns `None` when expansion succeeded.
+pub fn expansion_abort_code() -> Option<i32> {
+    if EXPANSION_ABORT_RC1.with(|c| c.get()) {
+        Some(1)
+    } else if EXPANSION_ABORT.with(|c| c.get()) {
+        Some(127)
+    } else {
+        None
+    }
 }
 
 /// Print bash's diagnostic once and mark this command line as aborted. The
@@ -63,6 +88,17 @@ fn flag_expansion_abort(message: &str) {
     if !expansion_aborted() {
         eprintln!("wash: {}", message);
         EXPANSION_ABORT.with(|c| c.set(true));
+    }
+}
+
+/// Report an `invalid indirect expansion` / `invalid variable name` error the
+/// way bash does: print the diagnostic and abort the command line with status
+/// 1 (NOT the 127 reserved for `set -u`).  The executor reads the abort via
+/// `expansion_aborted_rc1` / `expansion_abort_code`.
+fn flag_invalid_indirect(message: &str) {
+    if !expansion_aborted() && !expansion_aborted_rc1() {
+        eprintln!("wash: {}", message);
+        EXPANSION_ABORT_RC1.with(|c| c.set(true));
     }
 }
 
@@ -455,6 +491,29 @@ fn eval_bang(ctx: &ExpandCtx, label: &str) -> Expansion {
     }
 }
 
+/// True when `s` is a valid shell variable name (the rule bash uses for
+/// indirect-expansion targets).
+fn is_valid_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// `${!prefix@}` / `${!prefix*}`: list, in sorted order, the names of every
+/// variable (scalar or array) whose name starts with `prefix`.  `@` joins with a
+/// single space; `*` joins with the first character of `$IFS` (bash semantics).
+fn list_prefix_vars(ctx: &ExpandCtx, prefix: &str, sep: &str) -> String {
+    let mut names: Vec<String> = Vec::new();
+    names.extend(ctx.env.keys().filter(|k| k.starts_with(prefix)).cloned());
+    names.extend(ctx.arrays.keys().filter(|k| k.starts_with(prefix)).cloned());
+    names.sort();
+    names.dedup();
+    names.join(sep)
+}
+
 fn eval_var(name: &str, ctx: &ExpandCtx) -> Expansion {
     match name {
         "" => Expansion::Scalar(String::new()),
@@ -559,7 +618,7 @@ fn eval_braced(body: &str, ctx: &ExpandCtx) -> Expansion {
         );
     }
     if body.starts_with('!') && !body.contains(':') && !body.contains('/') && !body.contains('%')
-        && !body.contains('#')
+        && (!body.contains('#') || body == "!#")
     {
         // indirect expansion ${!VAR}
         let name = &body[1..];
@@ -585,25 +644,43 @@ fn eval_braced(body: &str, ctx: &ExpandCtx) -> Expansion {
                 unbound_variable(body);
             }
             return Expansion::Scalar(String::new());
+        } else if name == "#" {
+            // `${!#}` is bash's spelling of `$0` (the shell / script name).
+            return Expansion::Scalar(ctx.dollar_zero.to_string());
         }
-        // `${!VAR}`: indirect expansion.  When VAR is unset or empty bash emits
-        // "VAR: invalid indirect expansion" with rc 1; wash's expander only has
-        // an rc-127 abort path today, so this stays a known gap — we return the
-        // empty string rather than crashing.  TODO(wash): emit rc-1
-        // "invalid indirect expansion".
-        //
-        // Other `${!...}` forms not yet implemented (known gaps, P3):
-        //   * `${!prefix@}` / `${!prefix*}` — list the names of variables whose
-        //     name starts with `prefix` (dash-prefixed forms are NOT indirect
-        //     expansion).  Today this silently falls through to the indirect
-        //     path and returns the empty string.
-        //   * `${!#}` — bash expands this to `$0`; wash currently routes it into
-        //     the indirect path and returns the empty string.
-        let target = ctx.env.get(name).cloned().unwrap_or_default();
-        if target.is_empty() {
-            return Expansion::Scalar(String::new());
+        // `${!prefix@}` / `${!prefix*}`: list the names of every variable
+        // (scalar or array) whose name starts with `prefix`, sorted, joined by a
+        // space (`@`) or the first character of `$IFS` (`*`).  This is the
+        // variable-name form of indirect expansion, NOT a synonym of `$!`.
+        if let Some(prefix) = name.strip_suffix('@') {
+            return Expansion::Scalar(list_prefix_vars(ctx, prefix, " "));
+        } else if let Some(prefix) = name.strip_suffix('*') {
+            return Expansion::Scalar(list_prefix_vars(ctx, prefix, &ifs_join_sep(ctx)));
         }
-        return Expansion::Scalar(ctx.env.get(&target).cloned().unwrap_or_default());
+        // `${!VAR}`: indirect expansion.  The value of `VAR` names the variable
+        // to read.  bash's rules, all reported with **rc 1** (a non-fatal
+        // command failure, empty stdout — the command is aborted):
+        //   * VAR unset            -> "VAR: invalid indirect expansion"
+        //   * VAR empty           -> ": invalid variable name"
+        //   * VAR = valid name    -> the named variable's value (empty if unset)
+        //   * VAR = invalid name  -> "VAR: invalid variable name"
+        return match ctx.env.get(name) {
+            None => {
+                flag_invalid_indirect(&format!("{}: invalid indirect expansion", name));
+                Expansion::Scalar(String::new())
+            }
+            Some(target) => {
+                if target.is_empty() {
+                    flag_invalid_indirect(": invalid variable name");
+                    Expansion::Scalar(String::new())
+                } else if is_valid_name(target) {
+                    Expansion::Scalar(ctx.env.get(target).cloned().unwrap_or_default())
+                } else {
+                    flag_invalid_indirect(&format!("{}: invalid variable name", target));
+                    Expansion::Scalar(String::new())
+                }
+            }
+        };
     }
 
     let (rawname, op, arg) = split_braced(body);

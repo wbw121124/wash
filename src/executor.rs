@@ -424,7 +424,11 @@ pub fn capture_command(
         // Inside a command substitution, an unbound variable under `set -u`
         // (or a failed `${var?word}`) fails the substitution with status 1,
         // NOT the 127 reserved for a fatal top-level error.
-        let code = if crate::expand::expansion_aborted() { 1 } else { code };
+        let code = if crate::expand::expansion_aborted() || crate::expand::expansion_aborted_rc1() {
+            1
+        } else {
+            code
+        };
         let _ = std::io::stdout().flush();
         posix::exit(code);
     }
@@ -509,6 +513,26 @@ fn execute_compound(compound: &Compound, sh: &mut Shell) -> i32 {
         // the executor already forked, which matches bash too.
         Compound::Group { body } => {
             let status = execute(body, sh);
+            sh.last_status = status;
+            status
+        }
+        // `( LIST )` runs LIST in a forked copy of the shell.  Because we fork,
+        // every variable / fd / cwd change stays inside the child and never
+        // leaks back to the parent.  `run_standalone_exp` has already applied
+        // the subshell's own redirections in the parent, so the child inherits
+        // them (just like bash's subshell applies them before the copy).
+        Compound::Subshell { body } => {
+            let pid = fork_child();
+            if pid == 0 {
+                // The child is an exact fork of `sh`; reset the per-command
+                // expansion / arithmetic flags and run the body in this copy.
+                crate::expand::clear_expansion_abort();
+                crate::expand::clear_arith_failed();
+                let code = execute(body, sh);
+                let _ = std::io::stdout().flush();
+                posix::exit(code);
+            }
+            let status = posix::wait_pid(pid);
             sh.last_status = status;
             status
         }
@@ -1594,8 +1618,8 @@ fn child_prepare_and_run(c: &SimpleCommand, sh: &mut Shell, path: &str, noclobbe
     // A fatal parameter-expansion error (`set -u`, `${var?word}`) aborts only
     // this stage, with status 127.  A failed arithmetic expansion aborts only
     // this stage, with status 1.
-    if crate::expand::expansion_aborted() {
-        posix::exit(127);
+    if let Some(code) = crate::expand::expansion_abort_code() {
+        posix::exit(code);
     }
     if crate::expand::arith_failed() {
         posix::exit(1);
@@ -1642,8 +1666,8 @@ fn execute_pipeline(p: &Pipeline, sh: &mut Shell, path: &str) -> i32 {
         // A `set -u` unbound variable or a failed `${var?word}` is fatal for
         // the whole line (status 127), just like a bad arithmetic expansion
         // (status 1).
-        if crate::expand::expansion_aborted() {
-            return 127;
+        if let Some(code) = crate::expand::expansion_abort_code() {
+            return code;
         }
         if crate::expand::arith_failed() {
             return 1;
@@ -1827,7 +1851,7 @@ fn execute_andor(andor: &AndOr, sh: &mut Shell, path: &str, last: &mut i32) -> b
         sh.last_status = *last;
         // A fatal expansion error stops the AND-OR list as well: bash does
         // not run the fallback in `echo $((1/0)) || echo fallback`.
-        if crate::expand::arith_failed() || crate::expand::expansion_aborted() {
+        if crate::expand::arith_failed() || crate::expand::expansion_abort_code().is_some() {
             return true;
         }
         // `exit` stops the shell, `set -e` stops it on a failure.
@@ -1859,7 +1883,7 @@ pub fn execute(list: &CommandList, sh: &mut Shell) -> i32 {
         let aborted = execute_andor(andor, sh, &path, &mut last);
         // A fatal expansion error aborts every enclosing command list,
         // including `if` / loop / function bodies that called us.
-        if crate::expand::arith_failed() || crate::expand::expansion_aborted() {
+        if crate::expand::arith_failed() || crate::expand::expansion_abort_code().is_some() {
             break;
         }
         // `exit` stops the shell; `return` / `break` / `continue` stop the
@@ -1887,8 +1911,8 @@ pub fn execute(list: &CommandList, sh: &mut Shell) -> i32 {
     // command: `if echo $((1/0)); then ...; fi` has no `else` and would
     // otherwise report success, while bash reports 1 for the whole line.
     // Parameter-expansion failures carry 127 (`set -u`, `${var?word}`).
-    if crate::expand::expansion_aborted() {
-        127
+    if let Some(code) = crate::expand::expansion_abort_code() {
+        code
     } else if crate::expand::arith_failed() {
         1
     } else {
