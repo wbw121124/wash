@@ -377,6 +377,36 @@ fn take_cmdsub_status() -> Option<i32> {
 /// a subshell that inherits the parent's options, so an unbound variable inside
 /// `$(...)` must trigger the same `unbound variable` diagnostic (and failure)
 /// as at the top level.
+/// Memoized parse of command-substitution bodies.
+///
+/// Hot loops re-run the same `$(...)` (e.g. `s=$(echo x)`) hundreds of times;
+/// re-lexing and re-parsing the identical text each call dominated the cmdsub
+/// benchmark.  The cache maps the body text to a shared parsed `CommandList`
+/// (`execute` only reads it).  Capped; a full cache is simply cleared.
+const CMDSUB_PARSE_CACHE_MAX: usize = 256;
+
+thread_local! {
+    static CMDSUB_PARSE_CACHE: std::cell::RefCell<HashMap<String, std::sync::Arc<CommandList>>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+fn parse_cmdsub_cached(cmd: &str) -> Option<std::sync::Arc<CommandList>> {
+    if let Some(hit) = CMDSUB_PARSE_CACHE.with(|c| c.borrow().get(cmd).cloned()) {
+        return Some(hit);
+    }
+    let tokens = crate::lexer::tokenize(cmd).ok()?;
+    let list = crate::parser::parse_command_list(&tokens).ok()?;
+    let arc = std::sync::Arc::new(list);
+    CMDSUB_PARSE_CACHE.with(|c| {
+        let mut map = c.borrow_mut();
+        if map.len() >= CMDSUB_PARSE_CACHE_MAX {
+            map.clear();
+        }
+        map.insert(cmd.to_string(), std::sync::Arc::clone(&arc));
+    });
+    Some(arc)
+}
+
 pub fn capture_command(
     cmd: &str,
     env: &HashMap<String, String>,
@@ -386,13 +416,9 @@ pub fn capture_command(
     nounset: bool,
     bg_pid: i32,
 ) -> String {
-    let tokens = match crate::lexer::tokenize(cmd) {
-        Ok(t) => t,
-        Err(_) => return String::new(),
-    };
-    let list = match crate::parser::parse_command_list(&tokens) {
-        Ok(l) => l,
-        Err(_) => return String::new(),
+    let list = match parse_cmdsub_cached(cmd) {
+        Some(list) => list,
+        None => return String::new(),
     };
     let fds = posix::pipe();
     let r = fds[0];
