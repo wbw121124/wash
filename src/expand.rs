@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use crate::lexer::WordPart;
 use crate::parser;
-use crate::shell::VarAttrs;
+use crate::shell::AttrRefs;
 
 thread_local! {
     /// Set when a `$(( ))` / `$[ ]` expansion fails.  Bash treats a failed
@@ -114,8 +114,9 @@ pub struct ExpandCtx<'a> {
     /// The value of `$0` (the shell name, or the script path while a script
     /// is being sourced).
     pub dollar_zero: &'a str,
-    /// The variable attributes a command substitution inherits.
-    pub attrs: &'a VarAttrs,
+    /// The variable attributes a command substitution inherits (borrowed —
+    /// see `AttrRefs`; expansion only reads, never mutates, these sets).
+    pub attrs: &'a AttrRefs<'a>,
     /// The function table a command substitution inherits.  Like bash, a
     /// `$(...)` subshell can call functions defined in the parent shell, which
     /// is what makes recursive functions (e.g. `fact`) work through

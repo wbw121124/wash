@@ -200,14 +200,39 @@ impl SetOptions {
 
 /// The variable attributes a subshell inherits from its parent: which
 /// variables are exported, which have no value at all, and which carry the
-/// readonly / integer attributes. A forked child needs them so that
-/// `export -p` prints the same declarations as in the parent.
-#[derive(Clone, Debug, Default)]
-pub struct VarAttrs {
-    pub exported: HashSet<String>,
-    pub null_exported: HashSet<String>,
-    pub readonly: HashSet<String>,
-    pub integer_vars: HashSet<String>,
+/// readonly / integer attributes.
+///
+/// `AttrRefs` is the zero-cost borrowed view used while EXPANDING a command:
+/// building an owned `VarAttrs` clones four `HashSet`s for every simple
+/// command (hundreds of thousands of node clones inside a tight loop), while
+/// expansion only ever needs to look names up.  `VarAttrs` remains the owned
+/// form for the places that genuinely need a copy.
+pub struct AttrRefs<'a> {
+    pub exported: &'a HashSet<String>,
+    pub null_exported: &'a HashSet<String>,
+    pub readonly: &'a HashSet<String>,
+    pub integer_vars: &'a HashSet<String>,
+}
+
+impl Shell {
+    /// The borrowed view of this shell's variable attributes (no clone).
+    pub fn attr_refs(&self) -> AttrRefs<'_> {
+        AttrRefs {
+            exported: &self.exported,
+            null_exported: &self.null_exported,
+            readonly: &self.readonly,
+            integer_vars: &self.integer_vars,
+        }
+    }
+
+    /// Copy the variable attributes referred to by `attrs` into this shell
+    /// (the owned counterpart of [`Shell::attr_refs`]).
+    pub fn apply_attr_refs(&mut self, attrs: &AttrRefs<'_>) {
+        self.exported = attrs.exported.clone();
+        self.null_exported = attrs.null_exported.clone();
+        self.readonly = attrs.readonly.clone();
+        self.integer_vars = attrs.integer_vars.clone();
+    }
 }
 
 /// The `shopt` options wash understands, in bash's display order
@@ -633,24 +658,6 @@ impl Shell {
         // PWD is always exported (bash keeps it in sync).
         e.insert("PWD".to_string(), self.cwd.clone());
         e
-    }
-
-    /// The variable attributes a subshell must inherit.
-    pub fn attrs(&self) -> VarAttrs {
-        VarAttrs {
-            exported: self.exported.clone(),
-            null_exported: self.null_exported.clone(),
-            readonly: self.readonly.clone(),
-            integer_vars: self.integer_vars.clone(),
-        }
-    }
-
-    /// Copy the parent's variable attributes into a subshell.
-    pub fn apply_attrs(&mut self, attrs: &VarAttrs) {
-        self.exported = attrs.exported.clone();
-        self.null_exported = attrs.null_exported.clone();
-        self.readonly = attrs.readonly.clone();
-        self.integer_vars = attrs.integer_vars.clone();
     }
 
     /// Run a nested command string (`eval`, `source`, a trap action) with

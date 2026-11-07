@@ -380,7 +380,7 @@ fn take_cmdsub_status() -> Option<i32> {
 pub fn capture_command(
     cmd: &str,
     env: &HashMap<String, String>,
-    attrs: &crate::shell::VarAttrs,
+    attrs: &crate::shell::AttrRefs,
     functions: &HashMap<String, crate::parser::CommandList>,
     arrays: &HashMap<String, Vec<String>>,
     nounset: bool,
@@ -413,7 +413,7 @@ pub fn capture_command(
         // job started *before* the substitution (bash behaviour).  `bg_pid` is
         // threaded through explicitly for the same reason `nounset` is.
         sh.bg_pid = bg_pid;
-        sh.apply_attrs(attrs);
+        sh.apply_attr_refs(attrs);
         // A command substitution inherits the parent's function table, so a
         // function can recurse through `$(...)`.
         sh.functions = functions.clone();
@@ -545,7 +545,7 @@ fn execute_compound(compound: &Compound, sh: &mut Shell) -> i32 {
 /// fields (so globs and brace expansions work), and `NAME` is bound to each
 /// field in turn before the body runs once.
 fn execute_for(var: &str, words: &[Vec<WordPart>], body: &CommandList, sh: &mut Shell) -> i32 {
-    let attrs = sh.attrs();
+    let attrs = sh.attr_refs();
     let ctx = ExpandCtx {
         env: &sh.env,
         positional: &sh.positional,
@@ -662,7 +662,7 @@ fn execute_loop_body(body: &CommandList, sh: &mut Shell) -> i32 {
 /// glob semantics: `*`/`?`/`[...]`, `|`-separated alternatives) runs its body
 /// and the construct returns its status.  With no match the status is 0.
 fn execute_case(word: &[WordPart], arms: &[crate::parser::CaseArm], sh: &mut Shell) -> i32 {
-    let attrs = sh.attrs();
+    let attrs = sh.attr_refs();
     let ctx = ExpandCtx {
         env: &sh.env,
         positional: &sh.positional,
@@ -875,7 +875,7 @@ struct ChildContext<'a> {
     options: &'a SetOptions,
     positional: &'a [String],
     dollar_zero: &'a str,
-    attrs: &'a crate::shell::VarAttrs,
+    attrs: &'a crate::shell::AttrRefs<'a>,
     /// The pid of the most recent background job in the parent.  A forked
     /// child (subshell) inherits the parent's background-job table, so `$!`
     /// inside the child refers to that job the same way it would in the
@@ -906,7 +906,7 @@ fn child_run_exp(argv: &[String], path: &str, ctx: &ChildContext) -> ! {
             // Inherit the parent's background-job table so `$!` works inside
             // a forked compound command (e.g. `sleep & ( if ...; fi )`).
             sub.bg_pid = ctx.bg_pid;
-            sub.apply_attrs(ctx.attrs);
+            sub.apply_attr_refs(ctx.attrs);
             sub.arrays = ctx.arrays.clone();
             sub.positional = ctx.positional.to_vec();
             sub.options = ctx.options.clone();
@@ -923,7 +923,7 @@ fn child_run_exp(argv: &[String], path: &str, ctx: &ChildContext) -> ! {
     // Inherit the parent's background-job table so `$!` works inside a forked
     // subshell / builtin-in-child context.
     sub.bg_pid = ctx.bg_pid;
-    sub.apply_attrs(ctx.attrs);
+    sub.apply_attr_refs(ctx.attrs);
     sub.arrays = ctx.arrays.clone();
     sub.positional = ctx.positional.to_vec();
     sub.options = ctx.options.clone();
@@ -990,7 +990,7 @@ fn apply_command_assignments(
     if assigns.is_empty() {
         return Vec::new();
     }
-    let attrs = sh.attrs();
+    let attrs = sh.attr_refs();
     let pending: RefCell<Vec<(String, String)>> = RefCell::new(Vec::new());
     let applied: Vec<(String, String, bool)> = {
         let ctx = ExpandCtx {
@@ -1047,7 +1047,7 @@ fn apply_array_assignments(
     if arrays.is_empty() {
         return Vec::new();
     }
-    let attrs = sh.attrs();
+    let attrs = sh.attr_refs();
     // Expand every element first (immutable borrow of `sh`), then mutate
     // `sh.arrays` once the borrow is released.
     let expanded: Vec<(String, Vec<String>, bool)> = {
@@ -1167,7 +1167,7 @@ fn run_standalone_exp(
             // assignment expanded, not a stale value from a previous command).
             reset_cmdsub_status();
             let mut assign_failed = false;
-            let attrs = sh.attrs();
+            let attrs = sh.attr_refs();
             let pending: RefCell<Vec<(String, String)>> = RefCell::new(Vec::new());
             // Expand all RHS values first (immutable borrow of sh.env), then
             // mutate sh.env once the borrow is released.
@@ -1298,7 +1298,7 @@ fn run_standalone_exp(
             posix::setpgid(0, 0);
         }
         apply_exp_redirs(redirs, sh.options.noclobber);
-        let attrs = sh.attrs();
+        let attrs = sh.attr_refs();
         let ctx = ChildContext {
             env,
             shell_env: &sh.env,
@@ -1504,11 +1504,11 @@ fn expand_alias_in_pipeline(
 /// flag; the caller then aborts *this* stage (exit 127 / 1) instead of the
 /// whole command line.
 fn prepare_stage(c: &SimpleCommand, sh: &mut Shell) -> Prepared {
-    let attrs = sh.attrs();
     let pending: RefCell<Vec<(String, String)>> = RefCell::new(Vec::new());
 
     // Expand the stage's words.  The expander only reads the environment.
     let (argv, redirs) = {
+        let attrs = sh.attr_refs();
         let ctx = ExpandCtx {
             env: &sh.env,
             positional: &sh.positional,
@@ -1548,6 +1548,7 @@ fn prepare_stage(c: &SimpleCommand, sh: &mut Shell) -> Prepared {
     let (cmd_env, shell_env) = if argv.is_empty() {
         (HashMap::new(), sh.env.clone())
     } else {
+        let attrs = sh.attr_refs();
         let value_ctx = ExpandCtx {
             env: &sh.env,
             positional: &sh.positional,
@@ -1625,7 +1626,7 @@ fn child_prepare_and_run(c: &SimpleCommand, sh: &mut Shell, path: &str, noclobbe
         posix::exit(1);
     }
     apply_exp_redirs(&pr.redirs, noclobber);
-    let attrs = sh.attrs();
+    let attrs = sh.attr_refs();
     let program = if pr.argv.is_empty() || builtins::is_builtin(&pr.argv[0]) {
         None
     } else {
@@ -1877,8 +1878,18 @@ pub fn execute(list: &CommandList, sh: &mut Shell) -> i32 {
     let path = sh.env.get("PATH").cloned().unwrap_or_default();
 
     let mut last = 0;
-    // Aliases are expanded before the commands run.
-    let expanded = expand_aliases(list, sh, 0);
+    // Aliases are expanded before the commands run.  When aliases cannot
+    // apply (non-interactive and `expand_aliases` off -- the common `-c` /
+    // script case) we use the list in place: `expand_aliases` otherwise
+    // deep-clones the whole AST for EVERY `execute` call, which made each
+    // iteration of a shell loop re-allocate its entire body.
+    let expanded_owned;
+    let expanded: &CommandList = if sh.interactive || sh.expand_aliases {
+        expanded_owned = expand_aliases(list, sh, 0);
+        &expanded_owned
+    } else {
+        list
+    };
     for andor in &expanded.andors {
         let aborted = execute_andor(andor, sh, &path, &mut last);
         // A fatal expansion error aborts every enclosing command list,
