@@ -770,6 +770,16 @@ run_case A ns5-bang-pipeline       'set -u; true & : | if [ -n "$!" ]; then echo
 run_case A bang-prefix-at-space    'MYV=1; MYVA=2; MYVB=3; echo "[${!MYV@}]"'        # [MYV MYVA MYVB]
 run_case A bang-prefix-star-ifs    'IFS=:; MYV=1; MYVA=2; MYVB=3; echo "[${!MYV*}]"' # [MYV:MYVA:MYVB]
 run_case A bang-prefix-at-array    'MYA=1; MYAR=(x y); echo "[${!MYA@}]"'           # [MYA MYAR]
+# ${!arr[@]} / ${!arr[*]}：数组键（下标）列表 —— 不是前缀变量名列表。bash 规则（全部 rc0，
+# 且**不受 set -u 影响**：未设置的名字展开为空串）：数组 N 元素 -> "0 1 ... N-1"（升序），
+# 标量 -> "0"（标量即单元素数组），未设置 -> 空。[@] 恒用空格连接，[*] 用 $IFS 首字符。
+run_case A bang-arr-keys-basic     'A=(x y z); echo "[${!A[@]}]"'                   # [0 1 2]
+run_case A bang-arr-keys-star-ifs  'A=(x y); IFS=:; echo "[${!A[*]}]"'              # [0:1]
+run_case A bang-arr-keys-at-ifs    'A=(x y); IFS=:; echo "[${!A[@]}]"'              # [0 1]（[@] 不受 IFS 影响）
+run_case A bang-arr-keys-empty     'A=(); echo "[${!A[@]}]"'                        # []（空数组 -> 空）
+run_case A bang-arr-keys-unset     'echo "[${!U[@]}]"'                              # []（未设置 -> 空 rc0）
+run_case A bang-arr-keys-set-u     'set -u; echo "[${!U[@]}]"'                      # []（set -u 下仍 rc0，不报 unbound）
+run_case A bang-arr-keys-scalar    'A=hello; echo "[${!A[@]}]"'                     # [0]（标量即第 0 元素）
 # ${!#} 是 $0 的另一种写法：对 bash / wash 各自成立（语义不变量，不比字面量）。
 run_case_sem A bang-hash-eq-zero   'echo "${!#}"; echo "$0"' '[ "$(sed -n 1p "$OUT")" = "$(sed -n 2p "$OUT")" ]'
 # ${!VAR} 间接展开（rc 1，非 set -u 的 127）：非法时打印 "VAR: invalid indirect expansion" /

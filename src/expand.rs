@@ -648,6 +648,29 @@ fn eval_braced(body: &str, ctx: &ExpandCtx) -> Expansion {
             // `${!#}` is bash's spelling of `$0` (the shell / script name).
             return Expansion::Scalar(ctx.dollar_zero.to_string());
         }
+        // `${!name[@]}` / `${!name[*]}`: the index list of array `name` --
+        // NOT a prefix-name list.  bash's rules (all rc 0, and NOT subject to
+        // `set -u`: an unset name expands to the empty string even with
+        // `set -u` on):
+        //   * name is an array with N elements -> "0 1 ... N-1" (ascending),
+        //     joined by a space (`[@]`) or the first character of `$IFS` (`[*]`)
+        //   * name is a scalar  -> "0" (a scalar is a one-element array)
+        //   * name is unset     -> empty
+        if let Some(arr_name) = name.strip_suffix("[@]").or_else(|| name.strip_suffix("[*]")) {
+            if is_valid_name(arr_name) {
+                let sep = if name.ends_with("[@]") {
+                    " ".to_string()
+                } else {
+                    ifs_join_sep(ctx)
+                };
+                let keys: Vec<String> = match ctx.arrays.get(arr_name) {
+                    Some(elems) => (0..elems.len()).map(|i| i.to_string()).collect(),
+                    None if ctx.env.contains_key(arr_name) => vec!["0".to_string()],
+                    None => Vec::new(),
+                };
+                return Expansion::Scalar(keys.join(&sep));
+            }
+        }
         // `${!prefix@}` / `${!prefix*}`: list the names of every variable
         // (scalar or array) whose name starts with `prefix`, sorted, joined by a
         // space (`@`) or the first character of `$IFS` (`*`).  This is the
