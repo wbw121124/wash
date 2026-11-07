@@ -384,6 +384,7 @@ pub fn capture_command(
     functions: &HashMap<String, crate::parser::CommandList>,
     arrays: &HashMap<String, Vec<String>>,
     nounset: bool,
+    bg_pid: i32,
 ) -> String {
     let tokens = match crate::lexer::tokenize(cmd) {
         Ok(t) => t,
@@ -407,6 +408,11 @@ pub fn capture_command(
         // `$(...)`.  `Shell::from_env` can only build default options, so the
         // parent's `nounset` flag is threaded through explicitly here.
         sh.options.nounset = nounset;
+        // A command substitution also inherits the parent's background-job
+        // table, so `$!` inside `$(...)` refers to the most recent background
+        // job started *before* the substitution (bash behaviour).  `bg_pid` is
+        // threaded through explicitly for the same reason `nounset` is.
+        sh.bg_pid = bg_pid;
         sh.apply_attrs(attrs);
         // A command substitution inherits the parent's function table, so a
         // function can recurse through `$(...)`.
@@ -846,6 +852,12 @@ struct ChildContext<'a> {
     positional: &'a [String],
     dollar_zero: &'a str,
     attrs: &'a crate::shell::VarAttrs,
+    /// The pid of the most recent background job in the parent.  A forked
+    /// child (subshell) inherits the parent's background-job table, so `$!`
+    /// inside the child refers to that job the same way it would in the
+    /// parent.  `Shell::from_env` can only build a default `bg_pid` of 0, so
+    /// the parent's value is threaded through here.
+    bg_pid: i32,
     /// The compound command (`if ... fi`) the child has to run, if any.
     compound: Option<&'a Compound>,
     /// The program the child has to execute, already resolved by the
@@ -867,6 +879,9 @@ fn child_run_exp(argv: &[String], path: &str, ctx: &ChildContext) -> ! {
         // inside the child.
         if let Some(compound) = ctx.compound {
             let mut sub = Shell::from_env(ctx.shell_env.clone());
+            // Inherit the parent's background-job table so `$!` works inside
+            // a forked compound command (e.g. `sleep & ( if ...; fi )`).
+            sub.bg_pid = ctx.bg_pid;
             sub.apply_attrs(ctx.attrs);
             sub.arrays = ctx.arrays.clone();
             sub.positional = ctx.positional.to_vec();
@@ -881,6 +896,9 @@ fn child_run_exp(argv: &[String], path: &str, ctx: &ChildContext) -> ! {
     // The redirections have already been applied by the caller (pipes and the
     // command's own redirections), so the builtins can simply write to stdout.
     let mut sub = Shell::from_env(ctx.shell_env.clone());
+    // Inherit the parent's background-job table so `$!` works inside a forked
+    // subshell / builtin-in-child context.
+    sub.bg_pid = ctx.bg_pid;
     sub.apply_attrs(ctx.attrs);
     sub.arrays = ctx.arrays.clone();
     sub.positional = ctx.positional.to_vec();
@@ -1265,6 +1283,7 @@ fn run_standalone_exp(
             positional: &sh.positional,
             dollar_zero: &sh.dollar_zero,
             attrs: &attrs,
+            bg_pid: sh.bg_pid,
             compound: None,
             program: program.as_ref().map(|(exe, _)| exe),
         };
@@ -1596,6 +1615,7 @@ fn child_prepare_and_run(c: &SimpleCommand, sh: &mut Shell, path: &str, noclobbe
         positional: &sh.positional,
         dollar_zero: &sh.dollar_zero,
         attrs: &attrs,
+        bg_pid: sh.bg_pid,
         compound: pr.compound.as_ref(),
         program: program.as_ref().map(|(exe, _)| exe),
     };

@@ -741,6 +741,13 @@ run_case A ns5-bang-star-unbound   'set -u; echo "${!*}"'           # rc=127, st
 run_case A ns5-bang-at-unbound     'set -u; echo "${!@}"'           # rc=127, stderr "!@: unbound variable"
 run_case A ns5-bang-empty          'set +u; echo "x$!y"'            # rc=0, stdout xy（无 bg job 时展开为空）
 run_case A ns5-bang-braced-empty   'set +u; echo "${!}"'            # rc=0, 无 stdout（展开为空）
+# 差异 5 的正向锚点（有后台作业时 $! / ${!} 必须展开为 pid，不得再报 unbound）。
+# 这些用例用纯内建（true & + wait / [ -n ] / $(...）触发，避免打印随机 pid 导致
+# 字节不等；用 wait "$!" / wait "${!}" 消费掉 pid，或用 [ -n "$!" ] 判定其非空。
+run_case A ns5-bang-with-job       'set -u; true & wait "$!"; echo "rc=$?"'   # rc=0, stdout rc=0
+run_case A ns5-bang-braced-with-job 'set -u; true & wait "${!}"; echo "rc=$?"' # rc=0, stdout rc=0（${!}≡$!）
+run_case A ns5-bang-cmdsub         'set -u; true & v=$([ -n "$!" ] && echo set); echo "v=$v"' # rc=0, stdout v=set（穿透到 $(...)）
+run_case A ns5-bang-pipeline       'set -u; true & : | if [ -n "$!" ]; then echo yes; fi; echo "p=$?"' # rc=0, stdout yes / p=0（穿透到 fork 复合命令）
 # GROUP B -- KNOWN-DEFECT.
 # (Now empty: every case that used to live here has been fixed and promoted
 # to GROUP A, where it serves as a regression fence.)

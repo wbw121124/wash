@@ -151,6 +151,7 @@ pub fn expand_scalar(parts: &[WordPart], ctx: &ExpandCtx) -> String {
                     ctx.functions,
                     ctx.arrays,
                     ctx.nounset,
+                    ctx.bg_pid,
                 ));
             }
             WordPart::Arith(body, _) => out.push_str(&eval_arith(body, ctx)),
@@ -254,6 +255,7 @@ pub fn expand_word(parts: &[WordPart], ctx: &ExpandCtx) -> Vec<String> {
                     ctx.functions,
                     ctx.arrays,
                     ctx.nounset,
+                    ctx.bg_pid,
                 );
                 candidates = apply_value(candidates, Expansion::Scalar(val), *quoted, ctx);
             }
@@ -431,6 +433,28 @@ fn expansion_to_scalar(exp: Expansion, ctx: &ExpandCtx) -> String {
 // Parameter evaluation
 // ---------------------------------------------------------------------------
 
+/// The expansion logic shared by `$!` and `${!}` (the empty braced form).
+///
+/// Both denote the pid of the most recent background job.  When no job has
+/// been started `bg_pid` is 0 and bash treats the parameter as unbound under
+/// `set -u` (rc 127); otherwise it expands to that pid.  The caller supplies
+/// the diagnostic `label` — `$!` for the bare form, `!` for the braced form —
+/// so each matches bash's own message (`$!: unbound variable` vs
+/// `!: unbound variable`).
+///
+/// Keeping this in one place is what stops the two spellings from drifting
+/// apart (the original 0211a63 bug was exactly such a divergence).
+fn eval_bang(ctx: &ExpandCtx, label: &str) -> Expansion {
+    if ctx.bg_pid == 0 {
+        if ctx.nounset {
+            unbound_variable(label);
+        }
+        Expansion::Scalar(String::new())
+    } else {
+        Expansion::Scalar(ctx.bg_pid.to_string())
+    }
+}
+
 fn eval_var(name: &str, ctx: &ExpandCtx) -> Expansion {
     match name {
         "" => Expansion::Scalar(String::new()),
@@ -452,14 +476,9 @@ fn eval_var(name: &str, ctx: &ExpandCtx) -> Expansion {
             // `$!` as unbound under `set -u` (rc 127) — exactly like an
             // ordinary unset variable.  When a job exists it expands to that
             // pid (which is never "unset"), so no diagnostic is emitted.
-            if ctx.bg_pid == 0 {
-                if ctx.nounset {
-                    unbound_variable("$!");
-                }
-                Expansion::Scalar(String::new())
-            } else {
-                Expansion::Scalar(ctx.bg_pid.to_string())
-            }
+            // `${!}` (empty braced form) shares this exact logic via
+            // `eval_bang`.
+            eval_bang(ctx, "$!")
         }
         "-" => Expansion::Scalar(ctx.shell_flags.clone()),
         _ => {
@@ -544,12 +563,24 @@ fn eval_braced(body: &str, ctx: &ExpandCtx) -> Expansion {
     {
         // indirect expansion ${!VAR}
         let name = &body[1..];
-        // `${!}`, `${!*}` and `${!@}` are NOT valid indirect expansions.  Under
-        // `set -u` bash reports them as unbound variables (`!: unbound
-        // variable`, `!*: unbound variable`, `!@: unbound variable`); without
-        // `set -u` they expand to the empty string.  The diagnostic label is the
-        // full body minus the leading `$`, matching bash.
-        if name.is_empty() || name == "*" || name == "@" {
+        // `${!}` (empty name) is the braced synonym of `$!`; `${!*}` and
+        // `${!@}` are neither valid indirect expansions nor a synonym of `$!`.
+        // Each is handled separately below.
+        if name.is_empty() {
+            // `${!}` is the braced form of `$!` (the pid of the most recent
+            // background job).  It follows exactly the same rules as `$!`:
+            // when no background job has been started `bg_pid` is 0 and bash
+            // treats `${!}` as unbound under `set -u` (rc 127, label
+            // `!: unbound variable`); when a job exists it expands to that pid.
+            // The diagnostic label is `!` (the body minus the leading `$`),
+            // matching bash's `!: unbound variable`.  `eval_bang` is the single
+            // source of truth shared with `eval_var`'s `"!"` arm.
+            return eval_bang(ctx, "!");
+        } else if name == "*" || name == "@" {
+            // `${!*}` / `${!@}`: NOT a synonym of `$!`.  Under `set -u` bash
+            // reports them as unbound variables (`!*: unbound variable` /
+            // `!@: unbound variable`); without `set -u` they expand to the
+            // empty string.  These are NOT background-job aware.
             if ctx.nounset {
                 unbound_variable(body);
             }
@@ -560,6 +591,14 @@ fn eval_braced(body: &str, ctx: &ExpandCtx) -> Expansion {
         // an rc-127 abort path today, so this stays a known gap — we return the
         // empty string rather than crashing.  TODO(wash): emit rc-1
         // "invalid indirect expansion".
+        //
+        // Other `${!...}` forms not yet implemented (known gaps, P3):
+        //   * `${!prefix@}` / `${!prefix*}` — list the names of variables whose
+        //     name starts with `prefix` (dash-prefixed forms are NOT indirect
+        //     expansion).  Today this silently falls through to the indirect
+        //     path and returns the empty string.
+        //   * `${!#}` — bash expands this to `$0`; wash currently routes it into
+        //     the indirect path and returns the empty string.
         let target = ctx.env.get(name).cloned().unwrap_or_default();
         if target.is_empty() {
             return Expansion::Scalar(String::new());
