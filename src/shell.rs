@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use crate::executor;
 use crate::lexer;
 use crate::parser;
+use crate::plugin;
 use crate::posix;
 
 /// The absolute path of the running shell binary.
@@ -217,6 +218,11 @@ pub struct AttrRefs<'a> {
     pub null_exported: &'a HashSet<String>,
     pub readonly: &'a HashSet<String>,
     pub integer_vars: &'a HashSet<String>,
+    /// `enable -n` disabled builtins.  A subshell (pipeline stage / command
+    /// substitution / forked compound command) inherits this table from its
+    /// parent, so `enable -a | grep ...` sees the same disabled entries that
+    /// `enable -a` does in the parent shell (verified against MSYS2 bash 5.3).
+    pub disabled_builtins: &'a HashSet<String>,
 }
 
 impl Shell {
@@ -227,6 +233,7 @@ impl Shell {
             null_exported: &self.null_exported,
             readonly: &self.readonly,
             integer_vars: &self.integer_vars,
+            disabled_builtins: &self.disabled_builtins,
         }
     }
 
@@ -237,6 +244,7 @@ impl Shell {
         self.null_exported = attrs.null_exported.clone();
         self.readonly = attrs.readonly.clone();
         self.integer_vars = attrs.integer_vars.clone();
+        self.disabled_builtins = attrs.disabled_builtins.clone();
     }
 }
 
@@ -343,6 +351,10 @@ pub struct Shell {
     /// the `hash' listing).
     pub hash_hits: HashMap<String, u32>,
     pub disabled_builtins: HashSet<String>,
+
+    /// 动态插件注册表（进程全局状态的 per-Shell 快照，见 crate::plugin）。
+    /// `disabled_builtins` 保持 per-Shell 语义，与此处的插件注册表正交。
+    pub plugins: plugin::PluginState,
 
     /// Exported variables that have no value at all (`export NAME` without an
     /// assignment). bash prints them as `declare -x NAME` instead of
@@ -537,6 +549,7 @@ impl Shell {
             hash_table: HashMap::new(),
             hash_hits: HashMap::new(),
             disabled_builtins: HashSet::new(),
+            plugins: plugin::PluginState::default(),
             null_exported: HashSet::new(),
             dollar_zero: "wash".to_string(),
             persistent_redirs: false,
@@ -610,6 +623,9 @@ impl Shell {
     /// process and `$_` loses its export attribute as soon as a command
     /// runs).
     fn populate_internal_variables(sh: &mut Shell) {
+        // 动态插件注册表：Shell::new 与 from_env 两条构造路径的公共落点，
+        // 在此一处注入全局快照即可覆盖全部构造路径。
+        sh.plugins = plugin::current_state();
         sh.env
             .insert("BASH_VERSION".to_string(), "wash 0.0.1".to_string());
         sh.env.insert("BASH".to_string(), sh.dollar_zero.clone());

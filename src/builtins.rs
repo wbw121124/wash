@@ -30,7 +30,7 @@ use crate::tr;
 // ---------------------------------------------------------------------------
 
 /// Every builtin name understood by `run_builtin`.
-const BUILTINS: &[&str] = &[
+pub const BUILTINS: &[&str] = &[
     ".",
     ":",
     "[",
@@ -90,8 +90,11 @@ const BUILTINS: &[&str] = &[
 ];
 
 /// True when `name` is the name of a builtin command.
-pub fn is_builtin(name: &str) -> bool {
-    BUILTINS.contains(&name)
+///
+/// 先查静态 `BUILTINS`（热路径 O(1)），miss 才查动态注册表；无插件时动态表
+/// 为空，零新增开销。`disabled_builtins` 由各调用点自行判定。
+pub fn is_builtin(sh: &Shell, name: &str) -> bool {
+    BUILTINS.contains(&name) || sh.plugins.dynamic.contains_key(name)
 }
 
 /// Run a builtin command in the given shell.
@@ -99,6 +102,10 @@ pub fn is_builtin(name: &str) -> bool {
 /// See the module comment for the `Option` contract.
 pub fn run_builtin(argv: &[String], sh: &mut Shell) -> Option<i32> {
     let name = argv.first()?.as_str();
+    // 动态插件内建：加载时已拒绝与静态表同名，故此处命中必为插件内建。
+    if let Some(db) = crate::plugin::lookup_dynamic_builtin(sh, name) {
+        return Some(crate::plugin::invoke(&db, argv, sh));
+    }
     let code = match name {
         "cd" => builtin_cd(argv, sh),
         "exit" => builtin_exit(argv, sh),
@@ -1666,7 +1673,7 @@ fn describe_command(name: &str, flags: DescFlags, sh: &Shell) -> bool {
     }
 
     // A shell builtin.
-    if !flags.force_path && is_builtin(name) && !sh.disabled_builtins.contains(name) {
+    if !flags.force_path && is_builtin(sh, name) && !sh.disabled_builtins.contains(name) {
         match flags.mode {
             DescMode::Type => println!("builtin"),
             DescMode::ShortDesc => println!("{} is a shell builtin", name),
@@ -2005,7 +2012,7 @@ fn builtin_command(argv: &[String], sh: &mut Shell) -> i32 {
         }
         None => {
             // Run the command: a builtin first, then the `$PATH`.
-            if is_builtin(&rest[0]) && !sh.disabled_builtins.contains(&rest[0]) {
+            if is_builtin(sh, &rest[0]) && !sh.disabled_builtins.contains(&rest[0]) {
                 return run_builtin(rest, sh).unwrap_or(0);
             }
             crate::executor::exec_external(rest, sh)
@@ -2027,7 +2034,7 @@ fn builtin_builtin(argv: &[String], sh: &mut Shell) -> i32 {
     }
 
     let name = argv[i].clone();
-    if !is_builtin(&name) || sh.disabled_builtins.contains(&name) {
+    if !is_builtin(sh, &name) || sh.disabled_builtins.contains(&name) {
         eprintln!("wash: builtin: {}: not a shell builtin", name);
         return 1;
     }
@@ -2934,7 +2941,8 @@ fn builtin_compgen(argv: &[String], sh: &mut Shell) -> i32 {
             );
         }
         Some('b') => {
-            candidates.extend(BUILTINS.iter().map(|b| (*b).to_string()));
+            // 统一名单：静态内建 + 动态插件内建。
+            candidates.extend(crate::plugin::all_builtin_names(sh));
         }
         Some('W') => {
             if let Some(wl) = &wordlist {
@@ -4395,18 +4403,34 @@ fn builtin_let(argv: &[String], sh: &mut Shell) -> i32 {
 // enable
 // ---------------------------------------------------------------------------
 
-/// The `enable` builtin: enable or disable shell builtins.
+/// POSIX special builtins，按 bash 5.3 `enable -s` 的实测顺序（16 项）。
+/// 与动态加载无关，`-s` 永远只列这 16 个。
+const POSIX_SPECIAL_BUILTINS: &[&str] = &[
+    ".", ":", "break", "continue", "eval", "exec", "exit", "export", "readonly",
+    "return", "set", "shift", "source", "times", "trap", "unset",
+];
+
+/// The `enable` builtin: enable/disable shell builtins, load/unload plugins.
 ///
-///   * `enable NAME`          → ensure NAME is enabled.
-///   * `enable -n NAME`       → disable NAME (falls back to a file lookup).
-///   * `enable -n`            → list the disabled builtins.
-///   * `enable` / `enable -a` → list every builtin with its status/path.
-///   * `enable BAD`           → `not a shell builtin` (rc 1).
-///   * `enable -z`            → usage error (rc 2).
+/// 已按 MSYS2 bash 5.3.20 实测定型（见计划 §oracle 实测事实）：
+///   * `enable` / `enable -p`      → 列全部 **enabled** 内建，`enable <name>` 行
+///                                （`-p` 带 NAME 仍打印全表，NAME 被忽略）；
+///   * `enable -a`                → 列**全部**内建，disabled 显示 `enable -n <name>`；
+///   * `enable -n`                → 列 disabled 内建，`enable -n <name>` 行；
+///   * `enable -s`                → 列 16 个 POSIX special builtins；
+///   * `enable -n NAME`           → disable；`enable NAME` / `-a NAME` → enable；
+///   * `enable -f FILE [NAME...]` → 加载插件；`enable -d NAME...` → 卸载；
+///   * `enable -z` / 未知选项     → usage error (rc 2)；
+///   * `enable BAD` / `-d 未知名` → `not a shell builtin` (rc 1)。
 fn builtin_enable(argv: &[String], sh: &mut Shell) -> i32 {
     let mut disable = false;
     let mut all = false;
+    let mut print_reusable = false;
+    let mut special = false;
+    let mut delete = false;
+    let mut load_file: Option<String> = None;
     let mut i = 1usize;
+
     while i < argv.len() {
         let a = &argv[i];
         if a == "--" {
@@ -4414,17 +4438,39 @@ fn builtin_enable(argv: &[String], sh: &mut Shell) -> i32 {
             break;
         }
         if a.len() > 1 && a.starts_with('-') {
-            for c in a.chars().skip(1) {
-                match c {
+            let cl: Vec<char> = a.chars().skip(1).collect();
+            let mut k = 0usize;
+            while k < cl.len() {
+                match cl[k] {
                     'n' => disable = true,
                     'a' => all = true,
-                    's' => {} // shared library builtins (none here)
+                    'p' => print_reusable = true,
+                    's' => special = true,
+                    'd' => delete = true,
+                    'f' => {
+                        // `-f filename`：本串剩余部分，或下一个参数。
+                        let rem: String = cl[k + 1..].iter().collect();
+                        if !rem.is_empty() {
+                            load_file = Some(rem);
+                        } else {
+                            i += 1;
+                            if i >= argv.len() {
+                                eprintln!("wash: enable: -f: option requires an argument");
+                                eprintln!("enable: usage: enable [-a] [-dnps] [-f filename] [name ...]");
+                                return 2;
+                            }
+                            load_file = Some(argv[i].clone());
+                        }
+                        k = cl.len();
+                        continue;
+                    }
                     _ => {
                         eprintln!("wash: enable: {}: invalid option", a);
                         eprintln!("enable: usage: enable [-a] [-dnps] [-f filename] [name ...]");
                         return 2;
                     }
                 }
+                k += 1;
             }
             i += 1;
             continue;
@@ -4434,38 +4480,81 @@ fn builtin_enable(argv: &[String], sh: &mut Shell) -> i32 {
 
     let names: Vec<String> = argv[i..].to_vec();
 
-    if names.is_empty() {
-        if disable {
-            // List disabled builtins.
-            let mut v: Vec<&String> = sh.disabled_builtins.iter().collect();
+    // 1) -f FILE [NAME ...] —— 加载插件（NAME 仅语法兼容，wash ABI 自带名单）。
+    if let Some(file) = load_file {
+        return match crate::plugin::load_plugin(&file, &names, sh) {
+            Ok(()) => 0,
+            Err(e) => {
+                // wash 自有诊断，不冒充 bash 的 "dynamic loading not available"。
+                eprintln!("wash: enable: cannot load {}: {}", file, e);
+                1
+            }
+        };
+    }
+
+    // 2) -d NAME... —— 按名字卸载动态内建；未知名 rc=1（受控扩展，对齐 WSL）。
+    if delete {
+        if names.is_empty() {
+            // 无参：列当前已加载的动态内建（reusable 行）。
+            let mut v: Vec<&String> = sh.plugins.dynamic.keys().collect();
             v.sort();
             for n in v {
-                println!("{}", n);
+                println!("enable {}", n);
             }
             return 0;
         }
-        // List every builtin (bash's `enable` / `enable -a`).
-        let mut v: Vec<&str> = BUILTINS.to_vec();
-        v.sort_unstable();
+        let mut status = 0;
+        for name in &names {
+            if let Err(e) = crate::plugin::unload_plugin(name, sh) {
+                eprintln!("wash: enable: {}", e);
+                status = 1;
+            }
+        }
+        return status;
+    }
+
+    // 3) -s —— 16 个 POSIX special builtins（与动态加载无关）。
+    if special {
+        for n in POSIX_SPECIAL_BUILTINS {
+            println!("enable {}", n);
+        }
+        return 0;
+    }
+
+    // 4) 列表模式。
+    let list_disabled = disable && names.is_empty() && !print_reusable;
+    let list_all = all && names.is_empty() && !print_reusable;
+    let list_enabled = (names.is_empty() && !disable && !all) || print_reusable;
+
+    if list_disabled {
+        let mut v: Vec<&String> = sh.disabled_builtins.iter().collect();
+        v.sort();
         for n in v {
-            if all {
-                if sh.disabled_builtins.contains(n) {
-                    println!("{}", n);
-                } else {
-                    println!("{}", n);
+            println!("enable -n {}", n);
+        }
+        return 0;
+    }
+
+    if list_all || list_enabled {
+        let mut all_names = crate::plugin::all_builtin_names(sh);
+        all_names.sort();
+        for n in all_names {
+            let is_disabled = sh.disabled_builtins.contains(&n);
+            if is_disabled {
+                if list_all {
+                    println!("enable -n {}", n);
                 }
-            } else if sh.disabled_builtins.contains(n) {
-                println!("{}", n);
             } else {
-                println!("{}", n);
+                println!("enable {}", n);
             }
         }
         return 0;
     }
 
+    // 5) enable / disable 动作（带 NAME）。
     let mut status = 0;
     for name in &names {
-        if !BUILTINS.contains(&name.as_str()) {
+        if !is_builtin(sh, name) {
             eprintln!("wash: enable: {}: not a shell builtin", name);
             status = 1;
             continue;
@@ -6222,7 +6311,7 @@ fn print_columns(entries: &[String]) {
 ///
 /// 说明文本按当前 locale 本地化（参见 `src/i18n.rs`）：`LC_ALL=C` 下是英文，
 /// `zh_CN.UTF-8` 下是中文。
-fn builtin_help(argv: &[String], _sh: &mut Shell) -> i32 {
+fn builtin_help(argv: &[String], sh: &mut Shell) -> i32 {
     let names: Vec<&str> = argv.iter().skip(1).map(|s| s.as_str()).collect();
     if names.is_empty() {
         // 抬头：诚实标注 wash 自己的版本，不冒充 bash 的 `GNU bash, version ...`。
@@ -6238,10 +6327,16 @@ fn builtin_help(argv: &[String], _sh: &mut Shell) -> i32 {
         // bash 的 `help` 把内建命令与保留字（关键字）混在一起、按字母序排成双栏。
         // 这里对齐该布局：先收集内建（带用法摘要）再加保留字。
         let mut entries: Vec<String> = Vec::new();
-        for b in BUILTINS {
-            let s = match BUILTIN_HELP.iter().find(|(n, _, _)| n == b) {
-                Some((_, usage, _)) => (*usage).to_string(),
-                None => (*b).to_string(),
+        for b in crate::plugin::all_builtin_names(sh) {
+            // 静态项沿用 BUILTIN_HELP 的 usage 摘要；动态项用插件自带的 help。
+            let s = if let Some((_, usage, _)) =
+                BUILTIN_HELP.iter().find(|(n, _, _)| *n == b.as_str())
+            {
+                (*usage).to_string()
+            } else if let Some(db) = sh.plugins.dynamic.get(&b) {
+                db.help.clone().unwrap_or_else(|| b.clone())
+            } else {
+                b.clone()
             };
             entries.push(s);
         }
@@ -6255,7 +6350,7 @@ fn builtin_help(argv: &[String], _sh: &mut Shell) -> i32 {
 
     let mut status = 0;
     for name in names {
-        if !is_builtin(name) {
+        if !is_builtin(sh, name) {
             // bash 的写法是 "help: no help topics match `foo'."，并附带
             // "Try `help help' or `man -k foo' or `info foo'." 提示，退出码 1。
             // （诊断文本本地化为后续增强，C locale 下需逐字节等于 bash 英文。）
@@ -6267,6 +6362,13 @@ fn builtin_help(argv: &[String], _sh: &mut Shell) -> i32 {
             );
             eprintln!("wash: help: {}{}", with_name, suffix);
             status = 1;
+            continue;
+        }
+        // 动态插件内建：显示插件自带的 help / short_doc（格式与静态项一致）。
+        if let Some(db) = sh.plugins.dynamic.get(name) {
+            println!("{}: {}", name, db.help.clone().unwrap_or_else(|| name.to_string()));
+            println!("    {}", db.short_doc.clone().unwrap_or_default());
+            println!();
             continue;
         }
         match BUILTIN_HELP.iter().find(|(n, _, _)| *n == name) {

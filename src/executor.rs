@@ -1281,7 +1281,7 @@ fn run_standalone_exp(
     }
 
     // Builtins run in the current shell so that their side effects survive.
-    if builtins::is_builtin(&argv[0]) {
+    if builtins::is_builtin(sh, &argv[0]) {
         sh.persistent_redirs = false;
         let saved = match apply_redirs_in_parent(redirs, sh.options.noclobber) {
             Ok(saved) => saved,
@@ -1685,7 +1685,7 @@ fn child_prepare_and_run(c: &SimpleCommand, sh: &mut Shell, path: &str, noclobbe
     }
     apply_exp_redirs(&pr.redirs, noclobber);
     let attrs = sh.attr_refs();
-    let program = if pr.argv.is_empty() || builtins::is_builtin(&pr.argv[0]) {
+    let program = if pr.argv.is_empty() || builtins::is_builtin(sh, &pr.argv[0]) {
         None
     } else {
         find_program(&pr.argv[0], path)

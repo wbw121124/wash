@@ -1018,17 +1018,17 @@ const COMPLETE_CAP: usize = 1000;
 
 fn complete_command(word: &str) -> Vec<(String, String, String)> {
     let mut cands: Vec<(String, String, String)> = Vec::new();
-    const BUILTINS: &[&str] = &[
-        "echo", "printf", "cd", "exit", "export", "set", "unset", "read", "source", ".", "alias",
-        "unalias", "true", "false", "pwd", "test", "[", "kill", "wait", "jobs", "fg", "bg", "eval",
-        "exec", "break", "continue", "return", "local", "declare", "typeset", "mapfile", "readarray",
-        "trap", "shift", "times", "umask", "shopt", "help", "let", "bind", "builtin", "command",
-        "dirs", "popd", "pushd", "fc", "disown", "enable", "history", "complete",
-    ];
+    // 统一名单：静态内建表 + 动态插件内建（用全局快照，免给补全函数加 sh 参数）。
     // 内建命令标注为 Builtin（按当前 locale 本地化）。
-    for b in BUILTINS {
+    for b in crate::builtins::BUILTINS {
         if b.starts_with(word) {
             cands.push(((*b).to_string(), tr!("Builtin"), String::new()));
+        }
+    }
+    let plugin_state = crate::plugin::current_state();
+    for name in plugin_state.dynamic.keys() {
+        if name.starts_with(word) {
+            cands.push((name.clone(), tr!("Builtin"), String::new()));
         }
     }
     // PATH 里的可执行文件：只收集名字（不在此处 stat——否则 System32 下数千文件的

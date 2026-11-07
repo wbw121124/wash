@@ -1200,6 +1200,24 @@ run_case C enable-bad         'enable nosuchbuiltin; echo "rc=$?"'
 run_case C enable-disable-restore 'enable -n echo; type -t echo; enable echo; type -t echo'
 run_case C enable-already-on  'enable echo; echo "rc=$?"'
 
+# --- enable: reusable 列表 / POSIX special builtins（与内建集合无关）-------
+# `enable -p` 会忽略 NAME 打印全表，而 wash 的静态内建集合比 bash 少
+# caller/compopt/getopts/logout/suspend，全表无法整段逐字节对拍；故用 grep
+# 单行断言 reusable 行的格式，只钉住「与内建集合无关」的行为。
+run_case C enable-p-reusable  'enable -p echo | grep -x "enable echo"'
+# `-n` 无参（未 disable 任何内建）=> 空列 + rc=0。
+run_case C enable-n-empty     'enable -n; echo "rc=$?"'
+# `-z` 未知选项 => usage 诊断两行 + rc=2。
+run_case C enable-z           'enable -z; echo "rc=$?"'
+# disabled 项在 `-a` 里显示 `enable -n <name>`；同 case 内重新启用。
+run_case C enable-a-disabled  'enable -n echo; enable -a | grep -x "enable -n echo"; enable echo'
+# `-n` 无参列 disabled 同为 `enable -n <name>`；同 case 内重新启用。
+run_case C enable-n-list      'enable -n echo; enable -n | grep -x "enable -n echo"; enable echo'
+# 无参 `enable` 同样打印 `enable <name>`（reusable）。
+run_case C enable-noarg-reusable 'enable | grep -x "enable echo"'
+# `-s` = 16 个 POSIX special builtins，wash 静态表全含，可整段逐字节对拍。
+run_case C enable-s           'enable -s'
+
 # --- return -----------------------------------------------------------------
 # `return` is only legal inside a function or a SOURCED script.  The
 # sourced-script form needs no function support, so it is used here; the

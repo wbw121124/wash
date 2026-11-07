@@ -15,6 +15,7 @@ mod expand;
 mod i18n;
 mod lexer;
 mod parser;
+mod plugin;
 mod posix;
 mod repl;
 mod shell;
