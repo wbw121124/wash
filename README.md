@@ -23,6 +23,7 @@ bash 的交互体验长期落后于 fish/zsh，而 fish 又有自己的非 POSIX
 | 4    | 高级内建与特性：数组、`[[ ]]`、`(( ))`、`declare`、`mapfile`、`trap`、`eval` 等（内建 `printf`/`echo` 已在 Phase 1 提前实现） | 进行中/部分（数组赋值已落地；`declare -a`/索引/`mapfile` 待补）                                                 |
 | 5    | 长尾 100% 兼容：边缘语义、locale、shopt 等（locale 维度测试见 `tests/bash_diff_i18n.sh`）                                                                                    | 进行中/部分（`help` 头部已本地化（zh_CN 下出中文、C 下出英文）；内建正文/用法摘要与内建集合待内建实现对齐后增强；`tests/bash_diff_i18n.sh` 的「轴 2 结构」用例 FAIL 源于内建集合差异，属预期（进行中），非本地化缺失）                                                 |
 | 6    | 交互式 REPL（fish 风格）：语法高亮、历史命令自动建议、Tab 补全、多行编辑                                                      | 已完成（自研 termios+ANSI 行编辑器，见 `src/repl.rs`） |
+| 7    | 二进制插件系统（wash C ABI）与 0.2.0 发布                                                                                          | 已完成（v0.2.0，见下方「二进制插件」）               |
 
 验证方式（oracle 测试）：同一条命令分别跑 MSYS2 bash 与 wash，逐字节比对
 stdout 与退出码。
@@ -81,7 +82,49 @@ Win32 控制台 API、也不使用带 Win32 后端的行编辑器 crate（如 ru
 ./tests/oracle_phase1.sh   # Phase 1：展开系统
 ./tests/bash_diff_echo_printf.sh   # echo / printf 逐字节对齐 bash
 ./tests/bash_diff_builtins.sh      # 全部内建逐字节对齐 bash（见下方矩阵）
+./tests/bash_diff_cli.sh           # CLI 参数形态
+./tests/plugin_contract.sh         # 0.2.0：二进制插件 ABI 契约（MSYS2 / WSL 各跑）
+./tests/plugin_second_oracle.sh    # 0.2.0：WSL bash 5.3.0 能力等价对拍
+./tests/check_version.sh           # 0.2.0：版本串一致性闸门
 ```
+
+## 发布 0.2.0
+
+0.2.0 引入二进制插件系统并完成一次完整发布。版本号以 `Cargo.toml` 为唯一真源，
+`--version`、`help` 抬头、`$BASH_VERSION`、PS1 `\v` 全部由
+`env!("CARGO_PKG_VERSION")` 生成；`tests/check_version.sh` 会同时做静态与运行时
+校验。升级与兼容边界详见 `CHANGELOG.md`；两平台动态加载能力的技术验证见
+`docs/spike-dlopen.md`。
+
+**兼容性说明**：MSYS2 主 oracle 的 bash 5.3.20 编译时关闭了动态加载，而 wash
+全平台启用插件，因此 `enable -f/-d` 属受控扩展，矩阵中标 `wash-extension`，
+由插件契约套件与 WSL 第二 oracle 验证，不参与 MSYS2 逐字节对拍。
+
+## 二进制插件（wash C ABI）
+
+插件是导出 `wash_plugin_init` 的共享库（MSYS2 与 Linux 均可用 `.so` 后缀）。
+宿主通过 `WashPluginApi` 函数指针表向插件提供 stdout/stderr 输出、shell 变量
+读写与内建状态查询；插件可以一次注册多个内建，每个内建可带 `help` / `short_doc`。
+C 头文件是 `include/wash_plugin.h`，可编译示例见 `tests/fixtures/`。
+
+```bash
+# 编译示例插件（MSYS2 用 /usr/bin/gcc.exe，Linux 用 gcc）
+gcc -shared -fPIC -Iinclude -o /path/to/plugins/plugin_hello.so \
+    tests/fixtures/plugin_hello.c
+
+# 从 BASH_LOADABLES_PATH 白名单目录加载，调用，再热卸载
+BASH_LOADABLES_PATH=/path/to/plugins ./target/debug/wash -c \
+  'enable -f plugin_hello.so plhello; plhello; enable -d plhello'
+```
+
+- 搜索路径：未设 `BASH_LOADABLES_PATH` 时用 bash 5.3 的默认 5 段路径并丢弃
+  `.` / 空段 / 相对段；文件名不含 `/` 时按该路径搜索，含 `/` 时 realpath 后的
+  父目录也必须命中白名单；符号链接一律拒绝。
+- ABI 版本双向协商：版本或 `struct_size` 不符时立即拒绝并卸载，不调用任何插件函数。
+- `enable -a/-p/-s` 的列表语义、`type` / `compgen -b` / `help` / Tab 补全中的
+  动态内建联动，由 `tests/plugin_contract.sh` 做 golden 契约验证。
+- **安全模型**：插件与宿主同权限、同崩溃域（进程内加载），插件自身崩溃会拖垮
+  shell；只加载可信目录中的可信插件。本期不提供子进程隔离。
 
 ## 内建兼容性矩阵
 
@@ -129,7 +172,8 @@ stderr + 退出码）跑出来，或由针对该内建的定向探针实测得�
 | `trap`                             | partial  | 已实现；`trap` 无参列出已设陷阱与 bash 一致。差异：信号说明符解析/`-p`/`-l`/`-P` 覆盖不完整                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `dirs` / `pushd` / `popd`          | partial  | 已实现；`dirs`/`pushd dir` 与 bash 逐字节一致。差异：`popd` 空栈 wash 报英文（rc=1，bash 中文 rc=1，rc 已对齐）                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `help`                             | partial  | 已实现并注册为内建（commit 57ec1c7，rc=0），头部 3 句已本地化（zh_CN 中文/C 英文）；内建正文/集合待对齐 bash，i18n「轴 2 结构」用例 FAIL 属预期（进行中）。详情见 AGENTS.md `help` 行 |
-| `enable`                           | partial  | 已实现；`enable` 无参列出 wash 内建（rc=0）。差异：清单不含 bash 的 jobs/mapfile/bind/fc/history 等                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `enable`                           | partial  | `-a` / `-n` / `-p` / `-s` 的静态语义、`-z` 用法错误、未知名报错按 oracle 实测对齐（GROUP C 逐字节对拍）；**差异**：①全量清单内建集合与 bash 不同（bash 有 `jobs`/`mapfile`/`bind`/`fc`/`history` 等 wash 未实现的内建）；②`-f`/`-d` 及插件加载是下述 `wash-extension` 能力，MSYS2 主 oracle 编译为「dynamic loading not available」（rc=2），无法逐字节对拍 |
+| 二进制插件（wash C ABI）           | wash-extension | `enable -f/-d`、`BASH_LOADABLES_PATH` 白名单、ABI 协商、多内建注册与热卸载、变量读写；MSYS2 与 WSL 由 `tests/plugin_contract.sh` golden 契约验证，WSL bash 5.3.0 由 `tests/plugin_second_oracle.sh` 做能力等价对拍。**不与 bash 官方 loadable .so 二进制兼容**，不标 `full` |
 
 ### 本阶段显式延后的内建（有意排期，不是「忘记做」）
 
@@ -155,6 +199,7 @@ stderr + 退出码）跑出来，或由针对该内建的定向探针实测得�
 词法 lexer.rs   ->  解析 parser.rs  ->  展开 expand.rs  ->  执行 executor.rs
                                          （fork/execve，管道，重定向，命令替换）
         Shell 状态 shell.rs + 交互 repl.rs  |  POSIX 垫片 posix.rs + posix_shim.c
+                                            |  二进制插件 plugin.rs + include/wash_plugin.h
 ```
 
 - `lexer.rs` 把命令行切成由 `WordPart` 组成的词，保留引号上下文（决定后续

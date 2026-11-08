@@ -56,7 +56,7 @@ fn main() {
                     exit(0);
                 }
                 "--version" => {
-                    println!("wash 0.0.1");
+                    println!("wash {}", env!("CARGO_PKG_VERSION"));
                     exit(0);
                 }
                 "--command" => {

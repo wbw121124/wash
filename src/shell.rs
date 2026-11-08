@@ -627,7 +627,7 @@ impl Shell {
         // 在此一处注入全局快照即可覆盖全部构造路径。
         sh.plugins = plugin::current_state();
         sh.env
-            .insert("BASH_VERSION".to_string(), "wash 0.0.1".to_string());
+            .insert("BASH_VERSION".to_string(), format!("wash {}", env!("CARGO_PKG_VERSION")));
         sh.env.insert("BASH".to_string(), sh.dollar_zero.clone());
         sh.env.insert("BASHOPTS".to_string(), String::new());
         sh.env.insert("SHELLOPTS".to_string(), String::new());

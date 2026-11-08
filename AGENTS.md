@@ -99,6 +99,7 @@ build.rs       编译 posix_shim.c 为 washposix 静态库；从 rustc --print s
 | 4    | 高级内建/数组/`[[ ]]`/`(( ))`/`declare`/`mapfile`/`trap`/`eval` 等                                                                               | 进行中/部分（数组赋值已落地，见 GROUP D `array-assign`；`declare -a`/索引/`mapfile` 待补）                                             |
 | 5    | 长尾 100% 兼容：边缘语义、locale、shopt 等（locale 维度测试见 `tests/bash_diff_i18n.sh`）                                                                                                       | 进行中/部分（`help` 头部已本地化——zh_CN.UTF-8 下出中文、C 下出英文，满足「轴 1 本地化」；内建正文/用法摘要与内建集合待内建实现对齐后增强；`tests/bash_diff_i18n.sh` 的「轴 2 结构」用例当前 FAIL 源于内建集合差异，属预期（进行中），非本地化缺失） |
 | 6    | 交互式 REPL（fish 风格）：语法高亮、历史命令自动建议（ghost text）、Tab 补全、多行编辑、友好报错                                                 | 已完成（自研 termios+ANSI 行编辑器，见 `repl.rs`） |
+| 7    | 二进制插件系统（wash C ABI、`enable -f/-d`、白名单、ABI 协商）+ 0.2.0 完整发布                                                           | 已提交（v0.2.0）；`enable -f/-d` 为受控扩展，见 `CHANGELOG.md` / `docs/spike-dlopen.md` |
 
 ### Phase 1 残余问题（已解决）
 
@@ -195,7 +196,8 @@ stderr + 退出码）跑出来，或由针对该内建的定向探针实测得�
 | `trap`                             | partial  | 已实现；`trap`（无参列出已设陷阱，无陷阱时输出空、rc=0）与 bash 一致。**差异**：信号说明符解析、`-p` / `-l` / `-P` 等选项覆盖不完整，复杂陷阱语义未全量对齐                                                                                                                                                                                  |
 | `dirs` / `pushd` / `popd`          | partial  | 已实现；`dirs`（打印目录栈）、`pushd dir`（切换并压栈，输出栈）与 bash **逐字节一致**。**差异**：`popd` 在空栈时报 `wash: popd: directory stack empty`（rc=1，英文），bash 是中文 `popd: 目录栈为空`（rc=1）——rc 对齐，仅语言不同                                                                                                |
 | `help`                             | partial  | 已实现并注册为内建（commit 57ec1c7，rc=0）。**头部 3 句已通过 `tr!` 本地化**：zh_CN.UTF-8 下输出中文、C 下输出英文，满足 i18n「轴 1 本地化」（`tests/bash_diff_i18n.sh` 对应用例已转绿）。**当前差异**：内建正文/用法摘要与内建集合尚未对齐 bash（故 i18n「轴 2 结构」用例 FAIL，属预期——进行中，非本地化缺失）；此前上报的「回退 Windows help.exe」缺陷已随内置 `help` 内建落地而消除 |
-| `enable`                           | partial  | 已实现；`enable`（无参列出 wash 内建清单，rc=0）可用。**差异**：清单仅含 wash 已实现的约 40 个内建，不含 bash 的 `jobs` / `mapfile` / `bind` / `fc` / `history` 等（这些 wash 尚未实现），故清单内容必然与 bash 不同                                                                                                |
+| `enable`                           | partial  | `-a`/`-n`/`-p`/`-s` 的静态语义按两个 oracle 实测对齐（`-s` = 16 个 POSIX special builtins、disabled 输出 `enable -n <name>`），GROUP C 逐字节对拍。**差异**：①全量清单内建集合与 bash 不同（bash 有 `jobs`/`mapfile`/`bind`/`fc`/`history` 等）；②`-f`/`-d` 插件加载是下一行的 `wash-extension`，MSYS2 主 oracle 编译为「dynamic loading not available」（rc=2），无法逐字节对拍 |
+| 二进制插件（wash C ABI）           | wash-extension | `enable -f/-d`、`BASH_LOADABLES_PATH` 白名单（realpath 校验）、ABI 版本协商、一个 .so 多内建注册与热卸载、变量读写；由 `tests/plugin_contract.sh`（MSYS2 + WSL golden 契约）与 `tests/plugin_second_oracle.sh`（WSL bash 5.3.0 能力等价）验证。**不兼容 bash 官方 loadable .so 二进制**，不标 `full` |
 
 ### 本阶段显式延后的内建（不属于「忘记做」，是有意排期）
 
@@ -206,6 +208,7 @@ stderr + 退出码）跑出来，或由针对该内建的定向探针实测得�
 | 数组 `-a` / `-A`（索引 / 展开）     | 数组**赋值** `ARR=(a b)` 已落地并通过 GROUP D `array-assign`（partial）；`declare -a`/`-A`、下标展开 `${arr[@]}`、嵌套下标等尚未全量对齐，待补                                      | **Phase 4**（高级内建 / 数组）       |
 | `compgen` / `complete` / `bind`                       | 补全与键绑定属于交互式 REPL 层。wash 的 Phase 6 REPL 已有自研 Tab 补全（命令名查 `PATH` + 文件路径补全），但那是 REPL 内部逻辑，尚未暴露成 bash 风格的 `complete` / `bind` 内建 | **Phase 4** 之后（与 REPL 补全对接） |
 | `fc` / `history`                                      | 命令历史由 REPL 持久化到 `~/.wash_history`，但 `history` 内建需要把历史列表以 bash 格式暴露，`fc` 还需要历史范围展开与编辑。两者都与 REPL 的历史存储格式强耦合                  | **Phase 4** 之后（与 REPL 历史对接） |
+| 直接加载 bash 官方 loadable .so（`struct builtin` / `WORD_LIST`） | 需模拟 bash 内部符号与结构体布局（`builtin_error`、`make_builtin_argv`、`WORD_LIST` 等），宿主为 Rust 二进制、无 bash 内部 ABI；且 MSYS2 主 oracle 根本没有动态加载能力与示例库 | 不计划（wash 走自有稳定 C ABI，见 `include/wash_plugin.h`） |
 
 ### 已知缺陷（实测复现，待修）
 
@@ -241,6 +244,9 @@ stderr + 退出码）跑出来，或由针对该内建的定向探针实测得�
 - 按阶段提交，commit message 用 `feat: Phase N ...` 风格（英文，简洁）。
 - 已提交：`1fe796c feat: Phase 0 bootstrap ...`。
 - Phase 1 已提交（含展开系统与 echo/printf 内建，oracle 9/9 + 20/20）。
+- Phase 7（二进制插件系统 + 0.2.0 发布）：按 P0 spike → P1 平台层/ABI 头 →
+  P2 注册表与 enable 重写 → P3 契约套件 → P4 发布 → P5 全量验收分阶段提交；
+  版本与兼容边界见 `CHANGELOG.md`，发布检查用 `tests/check_version.sh`。
 
 ## 阶段 6：交互式 REPL（fish 风格）实现说明
 

@@ -6,7 +6,7 @@
 # strings.
 msgid ""
 msgstr ""
-"Project-Id-Version: wash 0.0.1\n"
+"Project-Id-Version: wash 0.2.0\n"
 "PO-Revision-Date: 2026-01-01 00:00+0800\n"
 "Last-Translator: wash i18n <wash@example.invalid>\n"
 "Language-Team: wash <wash@example.invalid>\n"

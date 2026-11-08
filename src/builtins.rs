@@ -6315,7 +6315,7 @@ fn builtin_help(argv: &[String], sh: &mut Shell) -> i32 {
     let names: Vec<&str> = argv.iter().skip(1).map(|s| s.as_str()).collect();
     if names.is_empty() {
         // 抬头：诚实标注 wash 自己的版本，不冒充 bash 的 `GNU bash, version ...`。
-        println!("wash, version 0.0.1");
+        println!("wash, version {}", env!("CARGO_PKG_VERSION"));
         // 与 bash `help` 一致的英文抬头（LC_ALL=C 下的逐字节文本）。
         println!("These shell commands are defined internally.  Type `help' to see this list.");
         println!("Type `help name' to find out more about the function `name'.");
