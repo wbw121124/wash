@@ -44,3 +44,8 @@ msgstr "可执行链接, %s"
 
 msgid "rows %d to %d of %d"
 msgstr "第 %d 到 %d 行，共 %d 行"
+
+# bash 5.3 `help` 清单里唯一连主题名一起本地化的条目；
+# 其余主题名（alias / bg / bind / ...）在 bash 中文清单中仍是英文。
+msgid "job_spec [&]"
+msgstr "任务说明符 [&]"

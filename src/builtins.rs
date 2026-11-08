@@ -6248,30 +6248,94 @@ const BUILTIN_HELP: &[(&str, &str, &str)] = &[
     ("bind", "bind [-lpsvPSVX] [-m keymap] [-f filename] [-q name] [-u name] [-r keyseq] [-x keyseq:shell-command] [keyseq:readline-function or readline-command]", "Set Readline key bindings and variables."),
 ];
 
-/// bash `help` 列出的保留字（关键字）及其用法摘要，按字母序与内建命令混排成双栏。
-const RESERVED_WORDS: &[&str] = &[
-    "! pipeline",
-    "(( expression ))",
-    "[[ expression ]]",
-    "case WORD in [PATTERN ...]",
-    "coproc [NAME] command",
-    "do",
-    "done",
-    "elif COMMANDS; then COMMANDS;",
-    "else COMMANDS;",
-    "esac",
-    "fi",
-    "for NAME [in WORDS ... ] ; do COMMANDS; done",
-    "function NAME () { COMMANDS ; }",
-    "if COMMANDS; then COMMANDS; [ elif ...] [ else COMMANDS; ] fi",
-    "in",
-    "select NAME [in WORDS ... ;] do COMMANDS; done",
-    "then",
-    "time [-p] pipeline",
-    "until COMMANDS; do COMMANDS; done",
-    "while COMMANDS; do COMMANDS; done",
-    "{",
-    "}",
+/// GNU bash 5.3 `help` 不带参数时列出的 77 个帮助主题（短摘要）。
+///
+/// 数组顺序即 bash 内部清单的顺序：排版按「列优先」分半，前 `nrow` 项进左列、
+/// 其余进右列（见 `print_help_columns`）。文本取 MSYS2 bash 5.3.20 在
+/// `LC_ALL=C` 下的清单显示值——超过列宽的条目已被 bash 自己截断并以 `>` 结尾，
+/// 这里按原样保存，运行时只做定宽填充，不再二次截断。
+///
+/// 这是**帮助主题清单**（文档），不是 wash 已实现内建的能力清单：bash 的清单
+/// 同样包含保留字、`job_spec`、`variables` 等非内建项，也包含 wash 尚未实现的
+/// `caller` / `compopt` / `getopts` 等主题。
+const HELP_TOPICS: &[&str] = &[
+    r#"! PIPELINE"#,
+    r#"job_spec [&]"#,
+    r#"(( expression ))"#,
+    r#". [-p path] filename [arguments]"#,
+    r#":"#,
+    r#"[ arg... ]"#,
+    r#"[[ expression ]]"#,
+    r#"alias [-p] [name[=value] ... ]"#,
+    r#"bg [job_spec ...]"#,
+    r#"bind [-lpsvPSVX] [-m keymap] [-f file>"#,
+    r#"break [n]"#,
+    r#"builtin [shell-builtin [arg ...]]"#,
+    r#"caller [expr]"#,
+    r#"case WORD in [PATTERN [| PATTERN]...)>"#,
+    r#"cd [-L|[-P [-e]]] [-@] [dir]"#,
+    r#"command [-pVv] command [arg ...]"#,
+    r#"compgen [-V varname] [-abcdefgjksuv] >"#,
+    r#"complete [-abcdefgjksuv] [-pr] [-DEI]>"#,
+    r#"compopt [-o|+o option] [-DEI] [name .>"#,
+    r#"continue [n]"#,
+    r#"coproc [NAME] command [redirections]"#,
+    r#"declare [-aAfFgiIlnrtux] [name[=value>"#,
+    r#"dirs [-clpv] [+N] [-N]"#,
+    r#"disown [-h] [-ar] [jobspec ... | pid >"#,
+    r#"echo [-neE] [arg ...]"#,
+    r#"enable [-a] [-dnps] [-f filename] [na>"#,
+    r#"eval [arg ...]"#,
+    r#"exec [-cl] [-a name] [command [argume>"#,
+    r#"exit [n]"#,
+    r#"export [-fn] [name[=value] ...] or ex>"#,
+    r#"false"#,
+    r#"fc [-e ename] [-lnr] [first] [last] o>"#,
+    r#"fg [job_spec]"#,
+    r#"for NAME [in WORDS ... ] ; do COMMAND>"#,
+    r#"for (( exp1; exp2; exp3 )); do COMMAN>"#,
+    r#"function name { COMMANDS ; } or name >"#,
+    r#"getopts optstring name [arg ...]"#,
+    r#"hash [-lr] [-p pathname] [-dt] [name >"#,
+    r#"help [-dms] [pattern ...]"#,
+    r#"history [-c] [-d offset] [n] or hist>"#,
+    r#"if COMMANDS; then COMMANDS; [ elif C>"#,
+    r#"jobs [-lnprs] [jobspec ...] or jobs >"#,
+    r#"kill [-s sigspec | -n signum | -sigs>"#,
+    r#"let arg [arg ...]"#,
+    r#"local [option] name[=value] ..."#,
+    r#"logout [n]"#,
+    r#"mapfile [-d delim] [-n count] [-O or>"#,
+    r#"popd [-n] [+N | -N]"#,
+    r#"printf [-v var] format [arguments]"#,
+    r#"pushd [-n] [+N | -N | dir]"#,
+    r#"pwd [-LPW]"#,
+    r#"read [-Eers] [-a array] [-d delim] [>"#,
+    r#"readarray [-d delim] [-n count] [-O >"#,
+    r#"readonly [-aAf] [name[=value] ...] o>"#,
+    r#"return [n]"#,
+    r#"select NAME [in WORDS ... ;] do COMM>"#,
+    r#"set [-abefhkmnptuvxBCEHPT] [-o optio>"#,
+    r#"shift [n]"#,
+    r#"shopt [-pqsu] [-o] [optname ...]"#,
+    r#"source [-p path] filename [arguments>"#,
+    r#"suspend [-f]"#,
+    r#"test [expr]"#,
+    r#"time [-p] pipeline"#,
+    r#"times"#,
+    r#"trap [-Plp] [[action] signal_spec ..>"#,
+    r#"true"#,
+    r#"type [-afptP] name [name ...]"#,
+    r#"typeset [-aAfFgiIlnrtux] name[=value>"#,
+    r#"ulimit [-SHabcdefiklmnpqrstuvxPRT] [>"#,
+    r#"umask [-p] [-S] [mode]"#,
+    r#"unalias [-a] name [name ...]"#,
+    r#"unset [-f] [-v] [-n] [name ...]"#,
+    r#"until COMMANDS; do COMMANDS-2; done"#,
+    r#"variables - Names and meanings of so>"#,
+    r#"wait [-fn] [-p var] [id ...]"#,
+    r#"while COMMANDS; do COMMANDS-2; done"#,
+    r#"{ COMMANDS ; }"#,
 ];
 
 /// `help` 的 stdout 统一从这里落地。
@@ -6294,83 +6358,72 @@ fn help_emit(block: &str) {
     }
 }
 
-/// 把候选名按终端宽度排成多栏（列优先，与 bash `help` 的版面一致）。
+/// 把帮助主题排成 GNU bash `help` 的双栏版面（列优先）。
+///
+/// bash 5.3 非交互输出固定 80 列：`" " + 左列(39 定宽) + " " + 右列`，
+/// 前半进左列、后半进右列（`nrow = ceil(n/2)`）。最后一行右列为空时左列
+/// **不做定宽补齐**——实测 `help [-dms] [pattern ...]` 行尾没有空格。
+///
+/// 条目的终端显示宽度：ASCII 记 1 列，非 ASCII（CJK 全角等）记 2 列。
+/// bash 清单按显示列定宽，中文译文若按字符数补齐会多出空格。
+fn display_width(s: &str) -> usize {
+    s.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum()
+}
+
 /// 结果写进 `out`，最终由 `help_emit` 一次性输出，避免逐行 `println!`。
-fn print_columns(entries: &[String], out: &mut String) {
+fn print_help_columns(entries: &[String], out: &mut String) {
     if entries.is_empty() {
         return;
     }
-    let width = entries.iter().map(|e| e.chars().count()).max().unwrap_or(0);
-    let term_w = std::env::var("COLUMNS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(80);
-    let col_w = width + 4;
-    let ncol = (term_w / col_w).max(1);
-    let nrow = (entries.len() + ncol - 1) / ncol;
+    let nrow = (entries.len() + 1) / 2;
     for r in 0..nrow {
-        let mut line = String::new();
-        for c in 0..ncol {
-            let idx = c * nrow + r;
-            if idx >= entries.len() {
-                break;
-            }
-            line.push_str(&entries[idx]);
-            if c + 1 < ncol && idx + nrow < entries.len() {
-                let pad = col_w.saturating_sub(entries[idx].chars().count());
-                line.push_str(&" ".repeat(pad));
-            }
+        let left = &entries[r];
+        out.push(' ');
+        out.push_str(left);
+        if let Some(right) = entries.get(nrow + r) {
+            let pad = 39usize.saturating_sub(display_width(left));
+            out.push_str(&" ".repeat(pad + 1));
+            out.push_str(right);
         }
-        out.push_str(&line);
         out.push('\n');
     }
 }
 
-/// `help` 内建：列出 wash 自己支持的内建命令。
+/// `help` 内建：打印与 bash 5.3 一致的双栏帮助主题清单。
 ///
-///   * `help`          —— 打印全部内建命令的清单；
+///   * `help`          —— 打印全部帮助主题（双栏）；
 ///   * `help NAME ...` —— 打印指定内建命令的用法。
 ///
 /// `help` 必须走内建表：如果把它当成外部命令，Windows 上会落到 `help.exe`
 /// ——在 `LC_ALL=C` 下会挂起，在中文 locale 下还会输出 GBK 乱码。
 ///
-/// 说明文本按当前 locale 本地化（参见 `src/i18n.rs`）：`LC_ALL=C` 下是英文，
-/// `zh_CN.UTF-8` 下是中文。
+/// 抬头与清单文本目前是 `LC_ALL=C` 下的英文；非 C locale 的本地化尚未实现。
 fn builtin_help(argv: &[String], sh: &mut Shell) -> i32 {
     let names: Vec<&str> = argv.iter().skip(1).map(|s| s.as_str()).collect();
     if names.is_empty() {
         let mut block = String::new();
         // 抬头：诚实标注 wash 自己的版本，不冒充 bash 的 `GNU bash, version ...`。
+        // 其余句子逐字节取 bash 5.3 `LC_ALL=C` 下 `help` 的英文原文。
         block.push_str(&format!("wash, version {}\n", env!("CARGO_PKG_VERSION")));
-        // 与 bash `help` 一致的英文抬头（LC_ALL=C 下的逐字节文本）。
         block.push_str("These shell commands are defined internally.  Type `help' to see this list.\n");
         block.push_str("Type `help name' to find out more about the function `name'.\n");
-        block.push_str("Use `info bash' to learn more about the shell in general.\n");
-        block.push_str("Use `man -k' or `info' to learn about commands not in this list.\n");
+        block.push_str("Use `info bash' to find out more about the shell in general.\n");
+        block.push_str("Use `man -k' or `info' to find out more about commands not in this list.\n");
         block.push('\n');
-        block.push_str("A star (*) next to a name indicates that the command is disabled.\n");
+        block.push_str("A star (*) next to a name means that the command is disabled.\n");
         block.push('\n');
-        // bash 的 `help` 把内建命令与保留字（关键字）混在一起、按字母序排成双栏。
-        // 这里对齐该布局：先收集内建（带用法摘要）再加保留字。
-        let mut entries: Vec<String> = Vec::new();
+        // 清单主体：77 个 bash 帮助主题，按列优先排成双栏。
+        // 动态插件内建（bash 无此概念）追加在末尾；未加载插件时 HELP_TOPICS
+        // 原样输出，与 oracle 除版本行外逐字节一致。
+        // 主题走 gettext：zh_CN 下 bash 把 `job_spec` 主题名译为「任务说明符」，
+        // 其余主题名 bash 也不翻译（只译参数描述），查不到译文即回退英文原文。
+        let mut entries: Vec<String> = HELP_TOPICS.iter().map(|s| tr!(*s)).collect();
         for b in crate::plugin::all_builtin_names(sh) {
-            // 静态项沿用 BUILTIN_HELP 的 usage 摘要；动态项用插件自带的 help。
-            let s = if let Some((_, usage, _)) =
-                BUILTIN_HELP.iter().find(|(n, _, _)| *n == b.as_str())
-            {
-                (*usage).to_string()
-            } else if let Some(db) = sh.plugins.dynamic.get(&b) {
-                db.help.clone().unwrap_or_else(|| b.clone())
-            } else {
-                b.clone()
-            };
-            entries.push(s);
+            if let Some(db) = sh.plugins.dynamic.get(&b) {
+                entries.push(db.help.clone().unwrap_or(b));
+            }
         }
-        for kw in RESERVED_WORDS {
-            entries.push((*kw).to_string());
-        }
-        entries.sort();
-        print_columns(&entries, &mut block);
+        print_help_columns(&entries, &mut block);
         help_emit(&block);
         return 0;
     }

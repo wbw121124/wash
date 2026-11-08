@@ -47,3 +47,6 @@ msgstr "Executable link, %s"
 
 msgid "rows %d to %d of %d"
 msgstr "rows %d to %d of %d"
+
+msgid "job_spec [&]"
+msgstr "job_spec [&]"
