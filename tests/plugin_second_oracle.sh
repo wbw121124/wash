@@ -8,9 +8,16 @@
 #
 # The two ABIs are DIFFERENT (bash's builtins.h vs wash's wash_plugin.h) and
 # are intentionally NOT byte-compatible.  What is compared here is behaviour:
-# output, exit-code pass-through, variable read/write, four builtins from ONE
+# the `enable -f` / `enable -d` / `enable -s` command surface, output,
+# exit-code pass-through, variable read/write, four builtins from ONE
 # `enable -f`, and per-name hot unload.  Each side is asserted against exact
 # rc + stdout bytes + stderr bytes, and the two sides must also be identical.
+#
+# Where the two ABIs genuinely disagree (e.g. `enable -f` on a missing file:
+# bash prefixes diagnostics with its own path + "line 1", wash reports
+# "cannot load <file>: <file>: cannot stat"), pair_golden() gives EACH side
+# its own exact stderr golden and still demands identical rc + stdout.  The
+# divergence itself is asserted too, so stderr is never silently ignored.
 # Any mismatch, missing tool or unusable WSL exits 1 -- nothing is skipped.
 set -u
 export LC_ALL=C LANG=C
@@ -173,6 +180,38 @@ pair() { # label, exp_rc, exp_stdout, exp_stderr, bash_script, wash_script
     fi
 }
 
+# Like pair(), but the two ABIs' stderr diagnostics are DIFFERENT.  Each side
+# still gets its own byte-exact rc + stdout + stderr golden (check_one), so
+# nothing is relaxed; only the "stderr must be equal" requirement is replaced
+# by "stderr must really differ", plus identical rc and stdout.  This keeps
+# the enable -f failure paths inside the oracle instead of skipping them.
+pair_golden() { # label, rc, stdout, bash_stderr, wash_stderr, bash_script, wash_script
+    local label="$1" erc="$2" eo eb ew bs="$6" ws="$7"
+    local brc bo be bot bet wrc wo we wot wet
+    eo="$(hex_of "$3")"
+    eb="$(hex_of "$4")"
+    ew="$(hex_of "$5")"
+
+    run_shell bash "$bs"
+    brc="$RC" bo="$OUT_HEX" be="$ERR_HEX" bot="$OUT_TXT" bet="$ERR_TXT"
+    run_shell wash "$ws"
+    wrc="$RC" wo="$OUT_HEX" we="$ERR_HEX" wot="$OUT_TXT" wet="$ERR_TXT"
+
+    check_one "$label/bash" "$erc" "$eo" "$eb" "$brc" "$bo" "$be" "$bot" "$bet"
+    check_one "$label/wash" "$erc" "$eo" "$ew" "$wrc" "$wo" "$we" "$wot" "$wet"
+
+    total=$((total + 1))
+    if [ "$brc" = "$wrc" ] && [ "$bo" = "$wo" ] && [ "$be" != "$we" ]; then
+        printf 'PASS %s/semantics\n' "$label"
+        pass=$((pass + 1))
+    else
+        printf 'FAIL %s/semantics\n' "$label"
+        printf '  bash rc=%s stdout_hex=%s stderr_hex=%s\n' "$brc" "$bo" "$be"
+        printf '  wash rc=%s stdout_hex=%s stderr_hex=%s\n' "$wrc" "$wo" "$we"
+        fail=$((fail + 1))
+    fi
+}
+
 env_case() { # label, precondition rc
     total=$((total + 1))
     if [ "$2" = 0 ]; then
@@ -233,6 +272,57 @@ pair 'unloaded_name_disappears' 0 $'T=1\n' '' \
 pair 'unload_all_reload' 0 $'HELLO_FROM_PLUGIN\n' '' \
     "$B_LOAD >/dev/null 2>&1; enable -d hello hset hget hecho; $B_LOAD >/dev/null 2>&1; hello" \
     "$W_LOAD >/dev/null 2>&1; enable -d plhello plset plget plecho; $W_LOAD >/dev/null 2>&1; plhello"
+
+# --- 8. the enable -f/-d/-s command surface ---------------------------------
+# Goldens were measured from /usr/local/bin/bash 5.3.0 and wash 0.2.0 with a
+# one-off probe.  The temporary path is interpolated, never hard-coded.
+B_BARE="${BSO##*/}"
+W_BARE="${WSO##*/}"
+B_LOAD_BARE="enable -f $B_BARE hello hset hget hecho"
+W_LOAD_BARE="enable -f $W_BARE x"
+MISS="$TMP/nonexistent_plugin.so"
+# $(...) strips trailing newlines; append one explicitly so goldens stay byte-exact.
+EXP_S="$(printf 'enable %s\n' . : break continue eval exec exit export readonly return set shift source times trap unset)"$'\n'
+WARN_PREFIX='/usr/local/bin/bash: line 1: enable: warning: '
+BASH_REPEAT_ERR=''
+for n in hello hset hget hecho; do
+    BASH_REPEAT_ERR="${BASH_REPEAT_ERR}${WARN_PREFIX}${n}: dynamic builtin already loaded"$'\n'
+done
+BASH_MISS_ERR="/usr/local/bin/bash: line 1: enable: cannot open shared object $MISS: $MISS: cannot open shared object file: No such file or directory"$'\n'
+WASH_MISS_ERR="wash: enable: cannot load $MISS: $MISS: cannot stat"$'\n'
+BASH_NOSUCH_ERR='/usr/local/bin/bash: line 1: enable: nosuch: not a shell builtin'$'\n'
+WASH_NOSUCH_ERR='wash: enable: nosuch: not a shell builtin'$'\n'
+
+# Both ABIs: a successful -f is silent, rc 0, and registers the builtin.
+pair 'enable_f_load_itself' 0 '' '' "$B_LOAD" "$W_LOAD"
+pair 'enable_f_bare_name_in_loadables_path' 0 '' '' "$B_LOAD_BARE" "$W_LOAD_BARE"
+pair 'enable_s_special_builtins' 0 "$EXP_S" '' \
+    "$B_LOAD; enable -s" \
+    "$W_LOAD; enable -s"
+pair 'enable_f_registers_type_t' 0 $'builtin\n' '' \
+    "$B_LOAD; type -t hello" \
+    "$W_LOAD; type -t plhello"
+pair 'enable_f_compgen_sees_exactly_one' 0 $'1\n' '' \
+    "$B_LOAD; compgen -b | grep -x hello | wc -l" \
+    "$W_LOAD; compgen -b | grep -x plhello | wc -l"
+pair 'enable_d_loaded_name' 0 '' '' \
+    "$B_LOAD; enable -d hello" \
+    "$W_LOAD; enable -d plhello"
+pair 'enable_d_loaded_name_rc' 0 $'D=0\n' '' \
+    "$B_LOAD; enable -d hello; echo D=\$?" \
+    "$W_LOAD; enable -d plhello; echo D=\$?"
+
+# Failure paths: rc + stdout must still agree; each side's stderr is asserted
+# byte-exact against its OWN measured diagnostic (see pair_golden above).
+pair_golden 'enable_f_repeat' 0 '' "$BASH_REPEAT_ERR" '' \
+    "$B_LOAD; $B_LOAD" \
+    "$W_LOAD; $W_LOAD"
+pair_golden 'enable_f_missing_file' 1 '' "$BASH_MISS_ERR" "$WASH_MISS_ERR" \
+    "enable -f $MISS x" \
+    "enable -f $MISS x"
+pair_golden 'enable_d_nosuch' 1 '' "$BASH_NOSUCH_ERR" "$WASH_NOSUCH_ERR" \
+    'enable -d nosuch' \
+    'enable -d nosuch'
 
 # --- verdict ----------------------------------------------------------------
 printf -- '-----------------------------------------\n'

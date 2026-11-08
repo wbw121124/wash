@@ -6271,8 +6271,29 @@ const RESERVED_WORDS: &[&str] = &[
     "}",
 ];
 
+/// `help` 的 stdout 统一从这里落地。
+///
+/// `wash -c 'help' | head -1` 会让下游读完第一行就关闭管道；Rust 的
+/// `println!` 此时会 panic，把 `failed printing to stdout: Broken pipe` 连同
+/// 一段回溯喷到 stderr。实测 MSYS2 bash 5.3.20 在同样场景 stderr 为空，所以
+/// 这里改成一次 `write_all`：EPIPE 静默（Cygwin/MSYS2 上也可能表现为 raw os
+/// error 32），其它 IO 错误仍如实报告，但绝不 panic。
+fn help_emit(block: &str) {
+    use std::io::Write;
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    if let Err(e) = out.write_all(block.as_bytes()) {
+        let epipe = e.kind() == std::io::ErrorKind::BrokenPipe
+            || matches!(e.raw_os_error(), Some(32) | Some(109) | Some(232));
+        if !epipe {
+            let _ = writeln!(std::io::stderr(), "wash: help: write error: {}", e);
+        }
+    }
+}
+
 /// 把候选名按终端宽度排成多栏（列优先，与 bash `help` 的版面一致）。
-fn print_columns(entries: &[String]) {
+/// 结果写进 `out`，最终由 `help_emit` 一次性输出，避免逐行 `println!`。
+fn print_columns(entries: &[String], out: &mut String) {
     if entries.is_empty() {
         return;
     }
@@ -6297,7 +6318,8 @@ fn print_columns(entries: &[String]) {
                 line.push_str(&" ".repeat(pad));
             }
         }
-        println!("{}", line);
+        out.push_str(&line);
+        out.push('\n');
     }
 }
 
@@ -6314,16 +6336,17 @@ fn print_columns(entries: &[String]) {
 fn builtin_help(argv: &[String], sh: &mut Shell) -> i32 {
     let names: Vec<&str> = argv.iter().skip(1).map(|s| s.as_str()).collect();
     if names.is_empty() {
+        let mut block = String::new();
         // 抬头：诚实标注 wash 自己的版本，不冒充 bash 的 `GNU bash, version ...`。
-        println!("wash, version {}", env!("CARGO_PKG_VERSION"));
+        block.push_str(&format!("wash, version {}\n", env!("CARGO_PKG_VERSION")));
         // 与 bash `help` 一致的英文抬头（LC_ALL=C 下的逐字节文本）。
-        println!("These shell commands are defined internally.  Type `help' to see this list.");
-        println!("Type `help name' to find out more about the function `name'.");
-        println!("Use `info bash' to learn more about the shell in general.");
-        println!("Use `man -k' or `info' to learn about commands not in this list.");
-        println!();
-        println!("A star (*) next to a name indicates that the command is disabled.");
-        println!();
+        block.push_str("These shell commands are defined internally.  Type `help' to see this list.\n");
+        block.push_str("Type `help name' to find out more about the function `name'.\n");
+        block.push_str("Use `info bash' to learn more about the shell in general.\n");
+        block.push_str("Use `man -k' or `info' to learn about commands not in this list.\n");
+        block.push('\n');
+        block.push_str("A star (*) next to a name indicates that the command is disabled.\n");
+        block.push('\n');
         // bash 的 `help` 把内建命令与保留字（关键字）混在一起、按字母序排成双栏。
         // 这里对齐该布局：先收集内建（带用法摘要）再加保留字。
         let mut entries: Vec<String> = Vec::new();
@@ -6344,11 +6367,13 @@ fn builtin_help(argv: &[String], sh: &mut Shell) -> i32 {
             entries.push((*kw).to_string());
         }
         entries.sort();
-        print_columns(&entries);
+        print_columns(&entries, &mut block);
+        help_emit(&block);
         return 0;
     }
 
     let mut status = 0;
+    let mut block = String::new();
     for name in names {
         if !is_builtin(sh, name) {
             // bash 的写法是 "help: no help topics match `foo'."，并附带
@@ -6366,21 +6391,26 @@ fn builtin_help(argv: &[String], sh: &mut Shell) -> i32 {
         }
         // 动态插件内建：显示插件自带的 help / short_doc（格式与静态项一致）。
         if let Some(db) = sh.plugins.dynamic.get(name) {
-            println!("{}: {}", name, db.help.clone().unwrap_or_else(|| name.to_string()));
-            println!("    {}", db.short_doc.clone().unwrap_or_default());
-            println!();
+            block.push_str(&format!(
+                "{}: {}\n",
+                name,
+                db.help.clone().unwrap_or_else(|| name.to_string())
+            ));
+            block.push_str(&format!("    {}\n", db.short_doc.clone().unwrap_or_default()));
+            block.push('\n');
             continue;
         }
         match BUILTIN_HELP.iter().find(|(n, _, _)| *n == name) {
             Some((_, usage, desc)) => {
                 // bash 的单条内建帮助格式：首行 `name: usage`，次行 4 空格缩进描述，末行空行。
-                println!("{}: {}", name, usage);
-                println!("    {}", desc);
-                println!();
+                block.push_str(&format!("{}: {}\n", name, usage));
+                block.push_str(&format!("    {}\n", desc));
+                block.push('\n');
             }
-            None => println!("{}", name),
+            None => block.push_str(&format!("{}\n", name)),
         }
     }
+    help_emit(&block);
     status
 }
 

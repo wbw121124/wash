@@ -49,6 +49,11 @@ fi
 # --- isolated sandbox (never touch the real HOME) ---------------------------
 TMP="$(mktemp -d "${CONTRACT_TMP_BASE:-/tmp}/wash-contract.XXXXXX")" || hard_fail 'mktemp -d failed'
 [ -n "$TMP" ] && [ -d "$TMP" ] || hard_fail 'temporary directory is empty or missing'
+# WSL's ext4 can flip to emergency_ro: mktemp may then succeed while every
+# later write fails, leaving each captured output EMPTY -> fake PASS.  Probe
+# writability independently before any assertion is allowed to run.
+touch "$TMP/.writable_probe" 2>/dev/null || hard_fail 'temporary directory is not writable'
+rm -f "$TMP/.writable_probe" || hard_fail 'cannot remove writable probe'
 trap 'rm -rf "$TMP"' EXIT
 export HOME="$TMP/home"
 mkdir -p "$HOME" "$TMP/lib" "$TMP/outside" "$TMP/wbin" || hard_fail 'cannot create sandbox dirs'
@@ -56,6 +61,12 @@ cp "$WASH" "$TMP/wbin/wash" || hard_fail "cannot copy wash binary: $WASH"
 W="$TMP/wbin/wash"
 chmod +x "$W" 2>/dev/null || true
 [ -x "$W" ] || hard_fail 'copied wash binary is not executable'
+
+# Version hard gate: every golden below is calibrated against wash 0.2.0.
+# A stale or wrong binary must abort here, before a single assertion runs,
+# otherwise the suite would silently test a different implementation.
+WASH_VER="$("$W" --version 2>&1)"
+[ "$WASH_VER" = 'wash 0.2.0' ] || hard_fail "wash binary is not 0.2.0: [$WASH_VER]"
 
 # --- compile the three wash-ABI fixtures ------------------------------------
 command -v gcc >/dev/null 2>&1 || hard_fail 'gcc not found'

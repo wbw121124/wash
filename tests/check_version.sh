@@ -65,8 +65,10 @@ fi
 
 # help header must keep the "wash, version ..." comma form: the i18n suite
 # extracts builtin names with ^[a-z_][a-z0-9_]*$ and "wash," is not a token.
-if grep -q 'println!("wash, version {}", env!("CARGO_PKG_VERSION"))' src/builtins.rs; then
-    echo 'ok   help header keeps comma form'
+# The header is now rendered into a buffer and written via help_emit() (the
+# EPIPE-safe writer), so match the literal plus that writer, not println!.
+if grep -q 'wash, version {}' src/builtins.rs && grep -q 'fn help_emit' src/builtins.rs; then
+    echo 'ok   help header keeps comma form (EPIPE-safe writer)'
 else
     echo 'FAIL help header changed (i18n builtin-name extraction coupling)'
     fail=$((fail + 1))
@@ -86,6 +88,11 @@ echo "runtime binary: $WASH"
 check "--version"          "wash $VER"              "$("$WASH" --version)"
 check '$BASH_VERSION'      "wash $VER"              "$("$WASH" -c 'echo "$BASH_VERSION"')"
 check 'help first line'    "wash, version $VER"     "$("$WASH" -c 'help' | head -1)"
+# `help | head -1` used to make println! panic and print
+# "failed printing to stdout: Broken pipe" plus a backtrace on stderr.
+# MSYS2 bash 5.3.20 produces an EMPTY stderr there; assert it byte-for-byte
+# so the P4 noise cannot silently come back.
+check 'help | head -1 stderr' ''                  "$({ "$WASH" -c 'help' | head -1 >/dev/null; } 2>&1)"
 
 echo '-----------------------------------------'
 if [ "$fail" -ne 0 ]; then
