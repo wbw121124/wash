@@ -17,4 +17,6 @@ cc = "1"
 
 [profile.release]
 opt-level = 3
-lto = false
+lto = true
+codegen-units = 1
+strip = true

@@ -626,8 +626,12 @@ impl Shell {
         // 动态插件注册表：Shell::new 与 from_env 两条构造路径的公共落点，
         // 在此一处注入全局快照即可覆盖全部构造路径。
         sh.plugins = plugin::current_state();
-        sh.env
-            .insert("BASH_VERSION".to_string(), format!("wash {}", env!("CARGO_PKG_VERSION")));
+        // 版本号是编译期常量：用 concat! 在编译期拼好，省掉每次构造
+        // Shell 时的一次 format! 堆分配。
+        sh.env.insert(
+            "BASH_VERSION".to_string(),
+            concat!("wash ", env!("CARGO_PKG_VERSION")).to_string(),
+        );
         sh.env.insert("BASH".to_string(), sh.dollar_zero.clone());
         sh.env.insert("BASHOPTS".to_string(), String::new());
         sh.env.insert("SHELLOPTS".to_string(), String::new());

@@ -89,8 +89,10 @@ fn catalog() -> &'static HashMap<String, String> {
 /// catalog 本身是懒加载的（第一次 `translate` 时才载入），这里提前把 locale
 /// 探测出来，让启动阶段的诊断也能用上正确的语言。
 pub fn init() {
+    // 只预热 locale 探测。catalog 保持懒加载：`translate()` 首次被调用时
+    // 会自行 `catalog()`，结果完全一致，但绝大多数非交互 `-c` 进程
+    // （不打印任何本地化消息）从此不再白解析一遍 .po 目录。
     let _ = current_locale();
-    let _ = catalog();
 }
 
 /// 翻译 `msgid`：catalog 里有译文就返回译文，否则回退到原文。

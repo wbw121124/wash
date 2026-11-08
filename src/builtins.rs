@@ -103,8 +103,11 @@ pub fn is_builtin(sh: &Shell, name: &str) -> bool {
 pub fn run_builtin(argv: &[String], sh: &mut Shell) -> Option<i32> {
     let name = argv.first()?.as_str();
     // 动态插件内建：加载时已拒绝与静态表同名，故此处命中必为插件内建。
-    if let Some(db) = crate::plugin::lookup_dynamic_builtin(sh, name) {
-        return Some(crate::plugin::invoke(&db, argv, sh));
+    // 无插件时跳过整次 HashMap 查找（热路径：每个内建命令都走到这里）。
+    if !sh.plugins.dynamic.is_empty() {
+        if let Some(db) = crate::plugin::lookup_dynamic_builtin(sh, name) {
+            return Some(crate::plugin::invoke(&db, argv, sh));
+        }
     }
     let code = match name {
         "cd" => builtin_cd(argv, sh),
