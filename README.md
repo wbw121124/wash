@@ -34,6 +34,27 @@ stdout 与退出码。
 > 对 MSYS2 bash 与 wash 逐字节比对 stdout + 退出码，**100/100 全通过**。交互式 REPL
 > 则借鉴 fish 的手感（语法高亮、历史自动建议、Tab 补全、多行编辑），但语义仍归 bash。
 
+## 产品目标：比 bash 更好
+
+在 `-c` 非交互语义 100% 逐字节兼容（由 `tests/bash_diff_*.sh` 全量闸门守住，
+**任何判定都不放宽**）之外，wash 的一等目标是在四个维度上**超过** GNU bash 5.3：
+
+| 维度 | 现状（2026-11-09 两个独立窗口，MSYS2 公平 A/B） | 守护 |
+|---|---|---|
+| 性能更高 / 速度更快 | 7 项负载 **0.58–0.98x**（全部更快），TOTAL **0.81x**；启动 50 次 **0.38–0.42x** | `tests/perf/better_than_bash.sh` |
+| 内存占用更小 | 阻塞进程 VmRSS **0.65x**（约 5.3 MB vs bash 8.1 MB） | 同上 |
+| UX 更友好 | 语法高亮 / 历史 ghost 建议 / Tab 补全 / 多行编辑（见下节） | `tests/e2e/` pty 套件 |
+
+门禁用两端同目录独立副本（`links=1`）、路径对称性校验、3 条负载的
+rc + stdout sha256 双侧逐字节一致与输出行数硬闸、版本串与生成值一致硬闸、
+ROUNDS 轮交错取最小；阈值 TOTAL ≤ 1.00x / startup ≤ 0.60x / VmRSS ≤ 0.80x。
+工具缺失、二进制缺失、版本串不匹配、对称性越界、负载没真跑起来一律 **FATAL**，
+不静默跳过。测量纪律见 `docs/perf-compare-2026-11-08.md` §10.7。
+
+编译层优化已基本吃满（见该报告 §10.5）：要继续拉大差距需算法级改造
+（fork/exec 子进程状态构造、展开期分配、启动期建表与 FFI），
+不能靠 1–3% 的噪声读数宣称「又变快了」。
+
 ## 平台与工具链（重要）
 
 `wash` 运行在 **Linux**，但开发时使用 **Windows 下的 MSYS2 的 msys 子系统**（`MSYSTEM=MSYS`，
@@ -93,6 +114,8 @@ Win32 控制台 API、也不使用带 Win32 后端的行编辑器 crate（如 ru
 ./tests/plugin_second_oracle.sh    # WSL bash 5.3.0 能力等价对拍
 ./tests/check_version.sh           # 版本串生成与一致性闸门（静态 + 运行时）
 ./tools/wash_version.sh            # 版本串唯一生成规则（Cargo.toml + git tag/HEAD）
+bash tests/perf/better_than_bash.sh target/release/wash.exe
+                                   # 「比 bash 更好」门禁：性能 / 启动 / 内存（需 release + MSYS2）
 ```
 
 ## 发布 0.2.1

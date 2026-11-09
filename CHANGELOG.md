@@ -5,6 +5,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [0.2.1] - 2026-11-09
 
+### Added
+
+- **「比 bash 更好」回归门禁** `tests/perf/better_than_bash.sh`：把产品目标
+  「性能更高 / 速度更快 / 内存占用更小」固化为三项可复测的硬判定
+  （相对 MSYS2 bash 5.3：TOTAL ≤ 1.00x、startup ≤ 0.60x、VmRSS ≤ 0.80x）。
+  两端同目录 `cp` 成 `links=1` 独立副本、路径对称性校验、3 条负载的
+  rc + stdout sha256 双侧逐字节一致与输出行数硬闸、版本串与生成值一致硬闸、
+  ROUNDS 轮交错取最小；工具/二进制/输出缺失、对称性越界一律 FATAL，不 skip。
+  2026-11-09 两个独立窗口基线：TOTAL **0.81x / 0.81x**、startup
+  **0.42x / 0.38x**、VmRSS **0.65x / 0.65x**，7 项负载全部 < 1.00x。
+  UX 维度（语法高亮 / ghost 建议 / Tab 补全 / 多行编辑）由 `tests/e2e/` 覆盖；
+  非交互 `-c` 的逐字节兼容闸门不放宽。
+
 ### Fixed
 
 - **Cargo 版本号补齐并与 git tag 对齐**：`Cargo.toml` / `Cargo.lock` 升到 **0.2.1**
