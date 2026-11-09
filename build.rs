@@ -9,7 +9,58 @@
 
 use std::path::PathBuf;
 
+/// Generate the single version string from Cargo.toml + git tag/HEAD and hand
+/// it to the crate as `WASH_VERSION`.  The rule itself lives in
+/// `tools/wash_version.sh`; build.rs deliberately has NO second copy of it, so
+/// the binary and the test gates can never disagree about what "the version"
+/// means.  A failed git lookup is a hard build error, never a fallback.
+fn emit_version() {
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+    let script = PathBuf::from(&manifest).join("tools/wash_version.sh");
+    let out = std::process::Command::new("bash")
+        .arg(&script)
+        .output()
+        .unwrap_or_else(|e| panic!("cannot run {}: {e}", script.display()));
+    if !out.status.success() {
+        panic!(
+            "wash version generation failed ({:?}):\n{}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let version = String::from_utf8(out.stdout)
+        .expect("wash_version.sh produced non-UTF-8 output")
+        .trim()
+        .to_string();
+    let base = std::env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION");
+    if version != base && !version.starts_with(&format!("{base}-")) {
+        panic!("generated version [{version}] does not start with Cargo.toml version [{base}]");
+    }
+    if version.is_empty() || version.contains(char::is_whitespace) {
+        panic!("generated version is empty or contains whitespace: [{version}]");
+    }
+    println!("cargo:rustc-env=WASH_VERSION={version}");
+    println!("cargo:rerun-if-changed=tools/wash_version.sh");
+    println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rerun-if-env-changed=WASH_GIT_DIR");
+
+    // Re-run when HEAD, a branch ref, a new tag or packed-refs change -- i.e.
+    // whenever the generated string could change.  In WSL the git metadata is
+    // external (WASH_GIT_DIR), so watch that tree's refs instead.
+    if let Ok(g) = std::env::var("WASH_GIT_DIR") {
+        let g = g.trim_end_matches('/');
+        for p in ["HEAD", "refs", "packed-refs"] {
+            println!("cargo:rerun-if-changed={g}/{p}");
+        }
+    } else if PathBuf::from(&manifest).join(".git").exists() {
+        for p in [".git/HEAD", ".git/refs", ".git/packed-refs"] {
+            println!("cargo:rerun-if-changed={p}");
+        }
+    }
+}
+
 fn main() {
+    emit_version();
     let mut build = cc::Build::new();
 
     if let Ok(out) = std::process::Command::new("rustc")

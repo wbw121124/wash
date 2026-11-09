@@ -630,7 +630,7 @@ impl Shell {
         // Shell 时的一次 format! 堆分配。
         sh.env.insert(
             "BASH_VERSION".to_string(),
-            concat!("wash ", env!("CARGO_PKG_VERSION")).to_string(),
+            concat!("wash ", env!("WASH_VERSION")).to_string(),
         );
         sh.env.insert("BASH".to_string(), sh.dollar_zero.clone());
         sh.env.insert("BASHOPTS".to_string(), String::new());

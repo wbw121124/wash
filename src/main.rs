@@ -12,6 +12,7 @@ mod builtins;
 mod error;
 mod executor;
 mod expand;
+mod help_pages;
 mod i18n;
 mod lexer;
 mod parser;
@@ -56,7 +57,7 @@ fn main() {
                     exit(0);
                 }
                 "--version" => {
-                    println!("wash {}", env!("CARGO_PKG_VERSION"));
+                    println!("wash {}", env!("WASH_VERSION"));
                     exit(0);
                 }
                 "--command" => {

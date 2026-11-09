@@ -6,7 +6,7 @@
 # strings.
 msgid ""
 msgstr ""
-"Project-Id-Version: wash 0.2.0\n"
+"Project-Id-Version: wash 0.2.1\n"
 "PO-Revision-Date: 2026-01-01 00:00+0800\n"
 "Last-Translator: wash i18n <wash@example.invalid>\n"
 "Language-Team: wash <wash@example.invalid>\n"
@@ -14,12 +14,6 @@ msgstr ""
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
-
-msgid "These shell commands are defined internally.  Type `help' to see this list."
-msgstr "These shell commands are defined internally.  Type `help' to see this list."
-
-msgid "Type `help name' to find out more about the function `name'."
-msgstr "Type `help name' to find out more about the function `name'."
 
 msgid "no help topics match `%s'."
 msgstr "no help topics match `%s'."
@@ -48,5 +42,272 @@ msgstr "Executable link, %s"
 msgid "rows %d to %d of %d"
 msgstr "rows %d to %d of %d"
 
+msgid "Shell commands matching keyword `%s'"
+msgstr "Shell commands matching keyword `%s'"
+
+msgid "Shell commands matching keywords `%s'"
+msgstr "Shell commands matching keywords `%s'"
+
+msgid "no help topics match `%s'.  Try `help help' or `man -k %s' or `info %s'."
+msgstr "no help topics match `%s'.  Try `help help' or `man -k %s' or `info %s'."
+
+msgid "-%s: invalid option"
+msgstr "-%s: invalid option"
+
+msgid "help: usage: help [-dms] [pattern ...]"
+msgstr "help: usage: help [-dms] [pattern ...]"
+
+# --- BEGIN GENERATED help list (tools/gen_help_pages.py) ---
+# Generated from the MSYS2 bash 5.3 oracle: msgid = LC_ALL=C text,
+# msgstr = the same line under zh_CN.UTF-8 (en.po mirrors msgid).
+# Truncated `...>` entries are bash's own display values, not full
+# sentences, so the ZH side is extracted rather than translated.
+# Do not edit by hand -- run: python3 tools/gen_help_pages.py
+
+msgid "These shell commands are defined internally.  Type `help' to see this list."
+msgstr "These shell commands are defined internally.  Type `help' to see this list."
+
+msgid "Type `help name' to find out more about the function `name'."
+msgstr "Type `help name' to find out more about the function `name'."
+
+msgid "Use `info bash' to find out more about the shell in general."
+msgstr "Use `info bash' to find out more about the shell in general."
+
+msgid "Use `man -k' or `info' to find out more about commands not in this list."
+msgstr "Use `man -k' or `info' to find out more about commands not in this list."
+
+msgid "A star (*) next to a name means that the command is disabled."
+msgstr "A star (*) next to a name means that the command is disabled."
+
+msgid "! PIPELINE"
+msgstr "! PIPELINE"
+
 msgid "job_spec [&]"
 msgstr "job_spec [&]"
+
+msgid "(( expression ))"
+msgstr "(( expression ))"
+
+msgid ". [-p path] filename [arguments]"
+msgstr ". [-p path] filename [arguments]"
+
+msgid ":"
+msgstr ":"
+
+msgid "[ arg... ]"
+msgstr "[ arg... ]"
+
+msgid "[[ expression ]]"
+msgstr "[[ expression ]]"
+
+msgid "alias [-p] [name[=value] ... ]"
+msgstr "alias [-p] [name[=value] ... ]"
+
+msgid "bg [job_spec ...]"
+msgstr "bg [job_spec ...]"
+
+msgid "bind [-lpsvPSVX] [-m keymap] [-f file>"
+msgstr "bind [-lpsvPSVX] [-m keymap] [-f file>"
+
+msgid "break [n]"
+msgstr "break [n]"
+
+msgid "builtin [shell-builtin [arg ...]]"
+msgstr "builtin [shell-builtin [arg ...]]"
+
+msgid "caller [expr]"
+msgstr "caller [expr]"
+
+msgid "case WORD in [PATTERN [| PATTERN]...)>"
+msgstr "case WORD in [PATTERN [| PATTERN]...)>"
+
+msgid "cd [-L|[-P [-e]]] [-@] [dir]"
+msgstr "cd [-L|[-P [-e]]] [-@] [dir]"
+
+msgid "command [-pVv] command [arg ...]"
+msgstr "command [-pVv] command [arg ...]"
+
+msgid "compgen [-V varname] [-abcdefgjksuv] >"
+msgstr "compgen [-V varname] [-abcdefgjksuv] >"
+
+msgid "complete [-abcdefgjksuv] [-pr] [-DEI]>"
+msgstr "complete [-abcdefgjksuv] [-pr] [-DEI]>"
+
+msgid "compopt [-o|+o option] [-DEI] [name .>"
+msgstr "compopt [-o|+o option] [-DEI] [name .>"
+
+msgid "continue [n]"
+msgstr "continue [n]"
+
+msgid "coproc [NAME] command [redirections]"
+msgstr "coproc [NAME] command [redirections]"
+
+msgid "declare [-aAfFgiIlnrtux] [name[=value>"
+msgstr "declare [-aAfFgiIlnrtux] [name[=value>"
+
+msgid "dirs [-clpv] [+N] [-N]"
+msgstr "dirs [-clpv] [+N] [-N]"
+
+msgid "disown [-h] [-ar] [jobspec ... | pid >"
+msgstr "disown [-h] [-ar] [jobspec ... | pid >"
+
+msgid "echo [-neE] [arg ...]"
+msgstr "echo [-neE] [arg ...]"
+
+msgid "enable [-a] [-dnps] [-f filename] [na>"
+msgstr "enable [-a] [-dnps] [-f filename] [na>"
+
+msgid "eval [arg ...]"
+msgstr "eval [arg ...]"
+
+msgid "exec [-cl] [-a name] [command [argume>"
+msgstr "exec [-cl] [-a name] [command [argume>"
+
+msgid "exit [n]"
+msgstr "exit [n]"
+
+msgid "export [-fn] [name[=value] ...] or ex>"
+msgstr "export [-fn] [name[=value] ...] or ex>"
+
+msgid "false"
+msgstr "false"
+
+msgid "fc [-e ename] [-lnr] [first] [last] o>"
+msgstr "fc [-e ename] [-lnr] [first] [last] o>"
+
+msgid "fg [job_spec]"
+msgstr "fg [job_spec]"
+
+msgid "for NAME [in WORDS ... ] ; do COMMAND>"
+msgstr "for NAME [in WORDS ... ] ; do COMMAND>"
+
+msgid "for (( exp1; exp2; exp3 )); do COMMAN>"
+msgstr "for (( exp1; exp2; exp3 )); do COMMAN>"
+
+msgid "function name { COMMANDS ; } or name >"
+msgstr "function name { COMMANDS ; } or name >"
+
+msgid "getopts optstring name [arg ...]"
+msgstr "getopts optstring name [arg ...]"
+
+msgid "hash [-lr] [-p pathname] [-dt] [name >"
+msgstr "hash [-lr] [-p pathname] [-dt] [name >"
+
+msgid "help [-dms] [pattern ...]"
+msgstr "help [-dms] [pattern ...]"
+
+msgid "history [-c] [-d offset] [n] or hist>"
+msgstr "history [-c] [-d offset] [n] or hist>"
+
+msgid "if COMMANDS; then COMMANDS; [ elif C>"
+msgstr "if COMMANDS; then COMMANDS; [ elif C>"
+
+msgid "jobs [-lnprs] [jobspec ...] or jobs >"
+msgstr "jobs [-lnprs] [jobspec ...] or jobs >"
+
+msgid "kill [-s sigspec | -n signum | -sigs>"
+msgstr "kill [-s sigspec | -n signum | -sigs>"
+
+msgid "let arg [arg ...]"
+msgstr "let arg [arg ...]"
+
+msgid "local [option] name[=value] ..."
+msgstr "local [option] name[=value] ..."
+
+msgid "logout [n]"
+msgstr "logout [n]"
+
+msgid "mapfile [-d delim] [-n count] [-O or>"
+msgstr "mapfile [-d delim] [-n count] [-O or>"
+
+msgid "popd [-n] [+N | -N]"
+msgstr "popd [-n] [+N | -N]"
+
+msgid "printf [-v var] format [arguments]"
+msgstr "printf [-v var] format [arguments]"
+
+msgid "pushd [-n] [+N | -N | dir]"
+msgstr "pushd [-n] [+N | -N | dir]"
+
+msgid "pwd [-LPW]"
+msgstr "pwd [-LPW]"
+
+msgid "read [-Eers] [-a array] [-d delim] [>"
+msgstr "read [-Eers] [-a array] [-d delim] [>"
+
+msgid "readarray [-d delim] [-n count] [-O >"
+msgstr "readarray [-d delim] [-n count] [-O >"
+
+msgid "readonly [-aAf] [name[=value] ...] o>"
+msgstr "readonly [-aAf] [name[=value] ...] o>"
+
+msgid "return [n]"
+msgstr "return [n]"
+
+msgid "select NAME [in WORDS ... ;] do COMM>"
+msgstr "select NAME [in WORDS ... ;] do COMM>"
+
+msgid "set [-abefhkmnptuvxBCEHPT] [-o optio>"
+msgstr "set [-abefhkmnptuvxBCEHPT] [-o optio>"
+
+msgid "shift [n]"
+msgstr "shift [n]"
+
+msgid "shopt [-pqsu] [-o] [optname ...]"
+msgstr "shopt [-pqsu] [-o] [optname ...]"
+
+msgid "source [-p path] filename [arguments>"
+msgstr "source [-p path] filename [arguments>"
+
+msgid "suspend [-f]"
+msgstr "suspend [-f]"
+
+msgid "test [expr]"
+msgstr "test [expr]"
+
+msgid "time [-p] pipeline"
+msgstr "time [-p] pipeline"
+
+msgid "times"
+msgstr "times"
+
+msgid "trap [-Plp] [[action] signal_spec ..>"
+msgstr "trap [-Plp] [[action] signal_spec ..>"
+
+msgid "true"
+msgstr "true"
+
+msgid "type [-afptP] name [name ...]"
+msgstr "type [-afptP] name [name ...]"
+
+msgid "typeset [-aAfFgiIlnrtux] name[=value>"
+msgstr "typeset [-aAfFgiIlnrtux] name[=value>"
+
+msgid "ulimit [-SHabcdefiklmnpqrstuvxPRT] [>"
+msgstr "ulimit [-SHabcdefiklmnpqrstuvxPRT] [>"
+
+msgid "umask [-p] [-S] [mode]"
+msgstr "umask [-p] [-S] [mode]"
+
+msgid "unalias [-a] name [name ...]"
+msgstr "unalias [-a] name [name ...]"
+
+msgid "unset [-f] [-v] [-n] [name ...]"
+msgstr "unset [-f] [-v] [-n] [name ...]"
+
+msgid "until COMMANDS; do COMMANDS-2; done"
+msgstr "until COMMANDS; do COMMANDS-2; done"
+
+msgid "variables - Names and meanings of so>"
+msgstr "variables - Names and meanings of so>"
+
+msgid "wait [-fn] [-p var] [id ...]"
+msgstr "wait [-fn] [-p var] [id ...]"
+
+msgid "while COMMANDS; do COMMANDS-2; done"
+msgstr "while COMMANDS; do COMMANDS-2; done"
+
+msgid "{ COMMANDS ; }"
+msgstr "{ COMMANDS ; }"
+
+# --- END GENERATED help list ---

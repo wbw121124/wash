@@ -6209,134 +6209,22 @@ fn builtin_disown(argv: &[String], sh: &mut Shell) -> i32 {
     0
 }
 
-const BUILTIN_HELP: &[(&str, &str, &str)] = &[
-    ("alias", "alias [-p] [name[=value] ... ]", "Define or display aliases."),
-    ("bg", "bg [job_spec ...]", "Move jobs to the background."),
-    ("builtin", "builtin [shell-builtin [arg ...]]", "Run a shell builtin."),
-    ("cd", "cd [-L|[-P [-e]]] [-@] [dir]", "Change the shell working directory."),
-    ("command", "command [-pVv] command [arg ...]", "Execute a simple command or display information about commands."),
-    ("declare", "declare [-aAfFgilrtux] [-p] [name[=value] ...]", "Set variable values and attributes."),
-    ("dirs", "dirs [-clpv] [+N] [-N]", "Display the list of currently remembered directories."),
-    ("disown", "disown [-h] [-ar] [jobspec ... | pid ...]", "Remove jobs from current shell."),
-    ("enable", "enable [-a] [-dnps] [-f filename] [name ...]", "Enable and disable builtin shell commands."),
-    ("exec", "exec [-a name] [command [arguments ...]] [redirection ...]", "Replace the shell with the given command."),
-    ("export", "export [-fn] [name[=value] ...] or export -p [-f]", "Mark shell variables for export."),
-    ("fg", "fg [job_spec]", "Move job to the foreground."),
-    ("hash", "hash [-lr] [-p pathname] [-dt] [name ...]", "Remember or display program locations."),
-    ("jobs", "jobs [-lnprs] [jobspec ...] or jobs -x command [args]", "Display status of jobs."),
-    ("kill", "kill [-s sigspec | -n signum | -sigspec] pid | jobspec ... or kill -l [sigspec]", "Send a signal to a job or process."),
-    ("popd", "popd [-n] [+N | -N]", "Remove an entry from the directory stack."),
-    ("pushd", "pushd [-n] [+N | -N | dir]", "Add a directory to the top of the directory stack."),
-    ("pwd", "pwd [-LPW]", "Print the current working directory."),
-    ("read", "read [-Eers] [-a array] [-d delim] [-i text] [-n nchars] [-N nchars] [-p prompt] [-t timeout] [-u fd] [name ...]", "Read a line from the standard input and split it into fields."),
-    ("readonly", "readonly [-aAf] [name[=value] ...] or readonly -p", "Mark shell variables as unmodifiable."),
-    ("set", "set [-abefhkmnptuvxBCEHPT] [-o option-name] [--] [-] [arg ...]", "Set or unset values of shell options and positional parameters."),
-    ("shopt", "shopt [-psu] [-o] [option ...]", "Set and unset shell options."),
-    ("source", "source [-p path] filename [arguments]", "Execute commands from a file in the current shell."),
-    ("type", "type [-afptP] name [name ...]", "Display information about command type."),
-    ("umask", "umask [-p] [-S] [mode]", "Display or set file mode mask."),
-    ("ulimit", "ulimit [-SHabcdefiklmnpqrstuvxPRT] [limit]", "Set or display process resource limits."),
-    ("unalias", "unalias [-a] name [name ...]", "Remove each name from the list of defined aliases."),
-    ("wait", "wait [-fn] [-p var] [id ...]", "Wait for job completion and return exit status."),
-    ("unset", "unset [-f] [-v] [-n] [name ...]", "Remove variable or function names."),
-    ("complete", "complete [-abcdefgjksuv] [-pr] [-DEI] [-o option] [-A action] [-G globpat] [-W wordlist] [-F function] [-C command] [-X filterpat] [-P prefix] [-S suffix] [name ...]", "Specify how arguments are to be completed by Readline."),
-    ("fc", "fc [-e ename] [-lnr] [first] [last] or fc -s [pat=rep] [command]", "Display or execute commands from the history list."),
-    ("history", "history [-c] [-d offset] [n] or history -anrw [filename] or history -ps arg [arg...]", "Display or manipulate the history list."),
-    ("mapfile", "mapfile [-d delim] [-n count] [-O origin] [-s count] [-t] [-u fd] [-C callback] [-c quantum] [array]", "Read lines from the standard input into an indexed array variable."),
-    ("readarray", "readarray [-d delim] [-n count] [-O origin] [-s count] [-t] [-u fd] [-C callback] [-c quantum] [array]", "Read lines from a file into an array variable."),
-    ("compgen", "compgen [-V varname] [-abcdefgjksuv] [-o option] [-A action] [-G globpat] [-W wordlist] [-F function] [-C command] [-X filterpat] [-P prefix] [-S suffix] [word]", "Display possible completions depending on the options."),
-    ("bind", "bind [-lpsvPSVX] [-m keymap] [-f filename] [-q name] [-u name] [-r keyseq] [-x keyseq:shell-command] [keyseq:readline-function or readline-command]", "Set Readline key bindings and variables."),
-];
-
-/// GNU bash 5.3 `help` 不带参数时列出的 77 个帮助主题（短摘要）。
-///
-/// 数组顺序即 bash 内部清单的顺序：排版按「列优先」分半，前 `nrow` 项进左列、
-/// 其余进右列（见 `print_help_columns`）。文本取 MSYS2 bash 5.3.20 在
-/// `LC_ALL=C` 下的清单显示值——超过列宽的条目已被 bash 自己截断并以 `>` 结尾，
-/// 这里按原样保存，运行时只做定宽填充，不再二次截断。
-///
-/// 这是**帮助主题清单**（文档），不是 wash 已实现内建的能力清单：bash 的清单
-/// 同样包含保留字、`job_spec`、`variables` 等非内建项，也包含 wash 尚未实现的
-/// `caller` / `compopt` / `getopts` 等主题。
-const HELP_TOPICS: &[&str] = &[
-    r#"! PIPELINE"#,
-    r#"job_spec [&]"#,
-    r#"(( expression ))"#,
-    r#". [-p path] filename [arguments]"#,
-    r#":"#,
-    r#"[ arg... ]"#,
-    r#"[[ expression ]]"#,
-    r#"alias [-p] [name[=value] ... ]"#,
-    r#"bg [job_spec ...]"#,
-    r#"bind [-lpsvPSVX] [-m keymap] [-f file>"#,
-    r#"break [n]"#,
-    r#"builtin [shell-builtin [arg ...]]"#,
-    r#"caller [expr]"#,
-    r#"case WORD in [PATTERN [| PATTERN]...)>"#,
-    r#"cd [-L|[-P [-e]]] [-@] [dir]"#,
-    r#"command [-pVv] command [arg ...]"#,
-    r#"compgen [-V varname] [-abcdefgjksuv] >"#,
-    r#"complete [-abcdefgjksuv] [-pr] [-DEI]>"#,
-    r#"compopt [-o|+o option] [-DEI] [name .>"#,
-    r#"continue [n]"#,
-    r#"coproc [NAME] command [redirections]"#,
-    r#"declare [-aAfFgiIlnrtux] [name[=value>"#,
-    r#"dirs [-clpv] [+N] [-N]"#,
-    r#"disown [-h] [-ar] [jobspec ... | pid >"#,
-    r#"echo [-neE] [arg ...]"#,
-    r#"enable [-a] [-dnps] [-f filename] [na>"#,
-    r#"eval [arg ...]"#,
-    r#"exec [-cl] [-a name] [command [argume>"#,
-    r#"exit [n]"#,
-    r#"export [-fn] [name[=value] ...] or ex>"#,
-    r#"false"#,
-    r#"fc [-e ename] [-lnr] [first] [last] o>"#,
-    r#"fg [job_spec]"#,
-    r#"for NAME [in WORDS ... ] ; do COMMAND>"#,
-    r#"for (( exp1; exp2; exp3 )); do COMMAN>"#,
-    r#"function name { COMMANDS ; } or name >"#,
-    r#"getopts optstring name [arg ...]"#,
-    r#"hash [-lr] [-p pathname] [-dt] [name >"#,
-    r#"help [-dms] [pattern ...]"#,
-    r#"history [-c] [-d offset] [n] or hist>"#,
-    r#"if COMMANDS; then COMMANDS; [ elif C>"#,
-    r#"jobs [-lnprs] [jobspec ...] or jobs >"#,
-    r#"kill [-s sigspec | -n signum | -sigs>"#,
-    r#"let arg [arg ...]"#,
-    r#"local [option] name[=value] ..."#,
-    r#"logout [n]"#,
-    r#"mapfile [-d delim] [-n count] [-O or>"#,
-    r#"popd [-n] [+N | -N]"#,
-    r#"printf [-v var] format [arguments]"#,
-    r#"pushd [-n] [+N | -N | dir]"#,
-    r#"pwd [-LPW]"#,
-    r#"read [-Eers] [-a array] [-d delim] [>"#,
-    r#"readarray [-d delim] [-n count] [-O >"#,
-    r#"readonly [-aAf] [name[=value] ...] o>"#,
-    r#"return [n]"#,
-    r#"select NAME [in WORDS ... ;] do COMM>"#,
-    r#"set [-abefhkmnptuvxBCEHPT] [-o optio>"#,
-    r#"shift [n]"#,
-    r#"shopt [-pqsu] [-o] [optname ...]"#,
-    r#"source [-p path] filename [arguments>"#,
-    r#"suspend [-f]"#,
-    r#"test [expr]"#,
-    r#"time [-p] pipeline"#,
-    r#"times"#,
-    r#"trap [-Plp] [[action] signal_spec ..>"#,
-    r#"true"#,
-    r#"type [-afptP] name [name ...]"#,
-    r#"typeset [-aAfFgiIlnrtux] name[=value>"#,
-    r#"ulimit [-SHabcdefiklmnpqrstuvxPRT] [>"#,
-    r#"umask [-p] [-S] [mode]"#,
-    r#"unalias [-a] name [name ...]"#,
-    r#"unset [-f] [-v] [-n] [name ...]"#,
-    r#"until COMMANDS; do COMMANDS-2; done"#,
-    r#"variables - Names and meanings of so>"#,
-    r#"wait [-fn] [-p var] [id ...]"#,
-    r#"while COMMANDS; do COMMANDS-2; done"#,
-    r#"{ COMMANDS ; }"#,
-];
+// `help NAME` no longer uses a two-line (usage, description) summary table:
+// bash prints the FULL manual page, so the table has been replaced by
+// `src/help_pages.txt` + `crate::help_pages`, which cover all 77 bash 5.3
+// topics byte-for-byte.  Keeping a second, shorter copy here would only be
+// dead data.
+//
+// The no-argument list has NO independent constant here either: its 77 display
+// values are the first column of `crate::help_pages::HELP_LIST_MAP`, the single
+// ordered table that binds each displayed synopsis to its canonical lookup
+// key.  `help_pages::all_en()` hard-asserts that both columns line up with the
+// 77 parsed pages on first access, so a drift cannot silently change output.
+// Display values are LC_ALL=C text (bash itself truncates long ones to `...>`)
+// and double as gettext msgids; the zh_CN values come from the oracle via
+// `tools/gen_help_pages.py`.  They are **documentation**, not a capability
+// list: bash's list also contains reserved words, `job_spec`, `variables` and
+// builtins wash has not ported yet.
 
 /// `help` 的 stdout 统一从这里落地。
 ///
@@ -6371,6 +6259,13 @@ fn display_width(s: &str) -> usize {
 }
 
 /// 结果写进 `out`，最终由 `help_emit` 一次性输出，避免逐行 `println!`。
+///
+/// 截断条（`... >`）的补白有一个实测得来的修正：bash 截断短摘要时按显示列
+/// 累计宽度，一个宽字符（2 列）恰好跨过截断边界时仍按「至少 37 列」记账。
+/// 于是 zh_CN 下 `bind [-lpvsPSVX] [-m 键映射] [-f 文>` 实际只占 36 列，
+/// bash 却按 37 列补白（后面 3 个空格，而非按显示宽度算出的 4 个）。
+/// C locale 下所有截断条都不短于 37 列，此修正不改变英文输出；该规则由
+/// `tools/gen_help_pages.py --check` 对两个 locale 的整段清单逐字节复核。
 fn print_help_columns(entries: &[String], out: &mut String) {
     if entries.is_empty() {
         return;
@@ -6381,43 +6276,104 @@ fn print_help_columns(entries: &[String], out: &mut String) {
         out.push(' ');
         out.push_str(left);
         if let Some(right) = entries.get(nrow + r) {
-            let pad = 39usize.saturating_sub(display_width(left));
-            out.push_str(&" ".repeat(pad + 1));
+            let width = display_width(left);
+            let effective = if left.ends_with('>') { width.max(37) } else { width };
+            let pad = 1 + 39usize.saturating_sub(effective);
+            out.push_str(&" ".repeat(pad));
             out.push_str(right);
         }
         out.push('\n');
     }
 }
 
-/// `help` 内建：打印与 bash 5.3 一致的双栏帮助主题清单。
+/// `help` 内建：与 bash 5.3 一致的双栏清单 + 77 个主题的完整手册页。
 ///
-///   * `help`          —— 打印全部帮助主题（双栏）；
-///   * `help NAME ...` —— 打印指定内建命令的用法。
+///   * `help`                    —— 双栏帮助主题清单；
+///   * `help [-dms] PATTERN ...` —— 打印匹配主题的完整页 / 摘要 / 描述 / man 页。
+///
+/// 手册页文本来自 `src/help_pages.txt`（逐字节取自 MSYS2 bash 5.3.20
+/// `LC_ALL=C` 的 `help` 输出），由 `crate::help_pages` 查表与排版。
+/// 这是**文档**，不是 wash 已实现内建的能力声明：bash 的清单同样包含
+/// 保留字、job_spec、variables 以及 wash 尚未移植的 builtin。
 ///
 /// `help` 必须走内建表：如果把它当成外部命令，Windows 上会落到 `help.exe`
 /// ——在 `LC_ALL=C` 下会挂起，在中文 locale 下还会输出 GBK 乱码。
-///
-/// 抬头与清单文本目前是 `LC_ALL=C` 下的英文；非 C locale 的本地化尚未实现。
 fn builtin_help(argv: &[String], sh: &mut Shell) -> i32 {
-    let names: Vec<&str> = argv.iter().skip(1).map(|s| s.as_str()).collect();
-    if names.is_empty() {
+    use crate::help_pages::{self, Mode};
+
+    // 选项只在第一个非选项参数之前解析（bash 的 internal_getopt 行为）。
+    let (mut saw_d, mut saw_m, mut saw_s) = (false, false, false);
+    let mut i = 1;
+    while i < argv.len() {
+        let a = argv[i].as_str();
+        if a == "--" {
+            i += 1;
+            break;
+        }
+        if a.len() > 1 && a.starts_with('-') {
+            for ch in a[1..].chars() {
+                match ch {
+                    'd' => saw_d = true,
+                    'm' => saw_m = true,
+                    's' => saw_s = true,
+                    _ => {
+                        eprintln!(
+                            "wash: help: {}",
+                            crate::i18n::format_msg("-%s: invalid option", &[ch.to_string()])
+                        );
+                        eprintln!("{}", tr!("help: usage: help [-dms] [pattern ...]"));
+                        return 2;
+                    }
+                }
+            }
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    // 实测 bash 的优先级：-d > -m > -s（`-dms`/`-sd` 输出描述，`-ms` 输出 man）。
+    let mode = if saw_d {
+        Mode::Desc
+    } else if saw_m {
+        Mode::Man
+    } else if saw_s {
+        Mode::Short
+    } else {
+        Mode::Full
+    };
+
+    let patterns: Vec<&str> = argv[i..].iter().map(|s| s.as_str()).collect();
+    if patterns.is_empty() {
         let mut block = String::new();
         // 抬头：诚实标注 wash 自己的版本，不冒充 bash 的 `GNU bash, version ...`。
-        // 其余句子逐字节取 bash 5.3 `LC_ALL=C` 下 `help` 的英文原文。
-        block.push_str(&format!("wash, version {}\n", env!("CARGO_PKG_VERSION")));
-        block.push_str("These shell commands are defined internally.  Type `help' to see this list.\n");
-        block.push_str("Type `help name' to find out more about the function `name'.\n");
-        block.push_str("Use `info bash' to find out more about the shell in general.\n");
-        block.push_str("Use `man -k' or `info' to find out more about commands not in this list.\n");
+        // 下面 5 句的 msgid 是 bash 5.3 `LC_ALL=C` 的英文原文；zh_CN 译文由
+        // `tools/gen_help_pages.py` 从 oracle 抓取写入 po，保证中文逐字节一致。
+        block.push_str(&format!("wash, version {}\n", env!("WASH_VERSION")));
+        for line in [
+            "These shell commands are defined internally.  Type `help' to see this list.",
+            "Type `help name' to find out more about the function `name'.",
+            "Use `info bash' to find out more about the shell in general.",
+            "Use `man -k' or `info' to find out more about commands not in this list.",
+        ] {
+            block.push_str(&tr!(line));
+            block.push('\n');
+        }
         block.push('\n');
-        block.push_str("A star (*) next to a name means that the command is disabled.\n");
-        block.push('\n');
-        // 清单主体：77 个 bash 帮助主题，按列优先排成双栏。
-        // 动态插件内建（bash 无此概念）追加在末尾；未加载插件时 HELP_TOPICS
+        block.push_str(&tr!("A star (*) next to a name means that the command is disabled."));
+        block.push_str("\n\n");
+        // 清单主体：从单一真源 HELP_LIST_MAP 的第一列派生 77 个显示值，
+        // 按列优先排成双栏。第二列（规范名）不参与排版：清单显示值不是
+        // `help NAME` 的查找键，二者由 help_pages::verify_list_binding 硬绑定。
+        // 动态插件内建（bash 无此概念）追加在末尾；未加载插件时清单
         // 原样输出，与 oracle 除版本行外逐字节一致。
-        // 主题走 gettext：zh_CN 下 bash 把 `job_spec` 主题名译为「任务说明符」，
-        // 其余主题名 bash 也不翻译（只译参数描述），查不到译文即回退英文原文。
-        let mut entries: Vec<String> = HELP_TOPICS.iter().map(|s| tr!(*s)).collect();
+        // 每条短摘要是一个 gettext msgid：C 下查不到译文回退英文原文，zh_CN 下
+        // 返回 bash 的中文显示值（含被截断的 `...>` 条目）。截断位置随 locale
+        // 变化，英中并非整句对译，所以译文同样由生成脚本从 oracle 抓取，
+        // 而不是人工翻译。
+        let mut entries: Vec<String> = help_pages::HELP_LIST_MAP
+            .iter()
+            .map(|(display, _)| tr!(*display))
+            .collect();
         for b in crate::plugin::all_builtin_names(sh) {
             if let Some(db) = sh.plugins.dynamic.get(&b) {
                 entries.push(db.help.clone().unwrap_or(b));
@@ -6428,46 +6384,62 @@ fn builtin_help(argv: &[String], sh: &mut Shell) -> i32 {
         return 0;
     }
 
-    let mut status = 0;
     let mut block = String::new();
-    for name in names {
-        if !is_builtin(sh, name) {
-            // bash 的写法是 "help: no help topics match `foo'."，并附带
-            // "Try `help help' or `man -k foo' or `info foo'." 提示，退出码 1。
-            // （诊断文本本地化为后续增强，C locale 下需逐字节等于 bash 英文。）
-            let msg = tr!("no help topics match `%s'.");
-            let with_name = msg.replace("%s", name);
-            let suffix = format!(
-                "  Try `help help' or `man -k {}' or `info {}'.",
-                name, name
-            );
-            eprintln!("wash: help: {}{}", with_name, suffix);
-            status = 1;
-            continue;
-        }
-        // 动态插件内建：显示插件自带的 help / short_doc（格式与静态项一致）。
-        if let Some(db) = sh.plugins.dynamic.get(name) {
+    // bash 只在**第一个** pattern 是 glob 时打印该标题，且列出全部 pattern
+    // （实测 `help zzz 'c*'` 无标题、`help 'c*' zzz` 有 `keywords` 标题）。
+    if help_pages::is_glob(patterns[0]) {
+        // 中文译文不区分单复数，故两个 msgid 分开登记；C locale 下 msgstr
+        // 等于 msgid，输出与 bash 英文原文逐字节一致。
+        let msgid = if patterns.len() > 1 {
+            "Shell commands matching keywords `%s'"
+        } else {
+            "Shell commands matching keyword `%s'"
+        };
+        block.push_str(&crate::i18n::format_msg(msgid, &[patterns.join(", ")]));
+        block.push_str("\n\n");
+    }
+
+    let mut any_hit = false;
+    let mut last_bad: Option<&str> = None;
+    for pat in &patterns {
+        // 动态插件内建（bash 无此概念）：精确名优先，沿用既有两段格式。
+        if let Some(db) = sh.plugins.dynamic.get(*pat) {
+            any_hit = true;
             block.push_str(&format!(
                 "{}: {}\n",
-                name,
-                db.help.clone().unwrap_or_else(|| name.to_string())
+                pat,
+                db.help.clone().unwrap_or_else(|| (*pat).to_string())
             ));
             block.push_str(&format!("    {}\n", db.short_doc.clone().unwrap_or_default()));
             block.push('\n');
             continue;
         }
-        match BUILTIN_HELP.iter().find(|(n, _, _)| *n == name) {
-            Some((_, usage, desc)) => {
-                // bash 的单条内建帮助格式：首行 `name: usage`，次行 4 空格缩进描述，末行空行。
-                block.push_str(&format!("{}: {}\n", name, usage));
-                block.push_str(&format!("    {}\n", desc));
-                block.push('\n');
-            }
-            None => block.push_str(&format!("{}\n", name)),
+        let hits = help_pages::lookup(pat);
+        if hits.is_empty() {
+            last_bad = Some(pat);
+            continue;
+        }
+        any_hit = true;
+        for page in hits {
+            block.push_str(&help_pages::render(page, mode));
         }
     }
     help_emit(&block);
-    status
+
+    // 只要有一个 pattern 命中就 rc=0 且不报任何错；全部失败时 bash 只用
+    // **最后一个** pattern 生成一条诊断（实测 `help aaa bbb` 只报 bbb）。
+    if !any_hit {
+        let name = last_bad.unwrap_or(patterns[0]);
+        // 整句作为 msgid：中文译文的引号样式与词序都与英文不同（bash 用
+        // `"` 而非反引号），无法靠拼接半句还原。C 下 msgstr == msgid。
+        let msg = crate::i18n::format_msg(
+            "no help topics match `%s'.  Try `help help' or `man -k %s' or `info %s'.",
+            &[name.to_string(), name.to_string(), name.to_string()],
+        );
+        eprintln!("wash: help: {}", msg);
+        return 1;
+    }
+    0
 }
 
 // ---------------------------------------------------------------------------

@@ -21,8 +21,10 @@
 # 的抽取器只取行首 $1，bash 右栏主题全部被漏掉，产生「仅 wash 有 40+」的假差集。
 # 现已把 `help` 改为 bash 5.3 的双栏版面、用 77 个主题对齐清单，并按 gettext 把
 # bash 中文清单里唯一连主题名一起翻译的 `job_spec` 译为「任务说明符」。
-# 注意：`run_i18n_case` 轴 1 只断言 bash 侧含非 ASCII 与两侧 rc，未断言 wash 本地化；
-# wash 抬头与清单参数描述的中文翻译仍是缺口（历史遗留，非本用例覆盖范围）。
+# 轴 1 曾只断言 bash 侧含非 ASCII 与两侧 rc，wash 全英文也能 PASS（假 PASS）；
+# 现已改为严格判定：两侧都必须本地化 + wash 输出必须随 locale 变化 + 用
+# tests/help_banner.py 把 oracle 版本行替换为生成值后做完整逐字节对拍
+# （版本行也参与比较，不 skip 任何一行）。wash 的中文抬头与 77 条摘要已对齐。
 #
 # 运行（必须用 MSYS2）：
 #   MSYSTEM=MSYS "/d/msys2/usr/bin/bash.exe" -lc \
@@ -69,10 +71,27 @@ detect_locale() {
 
 LOCALE="$(detect_locale)"
 if [ -z "$LOCALE" ]; then
-    echo "SKIP: 未找到可用的 UTF-8 locale（需要 zh_CN.UTF-8 或 C.utf8），跳过 i18n 维度测试。"
-    exit 0
+    echo "FATAL: 未找到可用的 UTF-8 locale（需要 zh_CN.UTF-8 或 C.utf8）；不做 SKIP，本维度直接判失败。" >&2
+    exit 1
 fi
 echo "i18n 维度测试使用 locale: $LOCALE"
+
+# 工具缺失必须 FATAL，不能让任何一条断言被静默跳过（MSYS2 没有 cmp/diff，
+# 字节比较统一用 sha256sum；python3 供 help_banner.py 使用）。
+for tool in sha256sum python3; do
+    command -v "$tool" >/dev/null 2>&1 || {
+        echo "FATAL: required tool missing: $tool" >&2; exit 1; }
+done
+
+# 版本行也参与逐字节对拍，期望值必须由生成器产生；stale 二进制直接中止。
+[ -f "$REPO_ROOT/tools/wash_version.sh" ] || {
+    echo "FATAL: tools/wash_version.sh missing" >&2; exit 1; }
+WASH_FULL_VER="$(bash "$REPO_ROOT/tools/wash_version.sh")" || {
+    echo "FATAL: version generator failed (git metadata missing?)" >&2; exit 1; }
+ver_got="$("$WASH_BIN" --version 2>&1)"
+[ "$ver_got" = "wash $WASH_FULL_VER" ] || {
+    echo "FATAL: stale wash binary: expected [wash $WASH_FULL_VER] got [$ver_got]" >&2; exit 1; }
+echo "version gate: wash $WASH_FULL_VER"
 echo
 
 # ---------------------------------------------------------------------------
@@ -116,10 +135,28 @@ run_i18n_case() {
     # 轴 1：两边都应成功（rc==0）
     if [ "$rb" -ne 0 ]; then ok=0; why="bash rc=$rb"; fi
     if [ "$rw" -ne 0 ]; then ok=0; why="${why:+$why; }wash rc=$rw"; fi
-    # 轴 2：bash 必须真的本地化（输出含非 ASCII 字节）
+    # 轴 1 严格判定：两侧都必须真的本地化，且 wash 输出必须随 locale 变化，
+    # 最后做完整逐字节对拍（版本行替换为生成值，不丢任何字节）。
     if [ "$expect_localized" = "1" ]; then
         if ! grep -qP '[^\x00-\x7F]' "$out_b" 2>/dev/null; then
             ok=0; why="${why:+$why; }bash 未本地化（无多字节字符）"
+        fi
+        if ! grep -qP '[^\x00-\x7F]' "$out_w" 2>/dev/null; then
+            ok=0; why="${why:+$why; }wash 未本地化（无多字节字符，旧的假 PASS 缺口）"
+        fi
+        LC_ALL=C "${RUNNER[@]}" "$WASH_BIN" -c "$case_text" >"$TMP/wash.c.out" 2>/dev/null </dev/null
+        rc_c=$?
+        if [ "$rc_c" -ne 0 ]; then
+            ok=0; why="${why:+$why; }wash C locale rc=$rc_c"
+        fi
+        h_c="$(sha256sum "$TMP/wash.c.out" | cut -d' ' -f1)"
+        h_w="$(sha256sum "$out_w" | cut -d' ' -f1)"
+        if [ "$h_c" = "$h_w" ]; then
+            ok=0; why="${why:+$why; }wash 输出不随 locale 变化（疑似硬编码译文）"
+        fi
+        if ! banner_note="$(python3 "$REPO_ROOT/tests/help_banner.py" \
+                "$out_b" "$out_w" "$WASH_FULL_VER" 2>&1)"; then
+            ok=0; why="${why:+$why; }stdout 非逐字节一致: $banner_note"
         fi
     fi
 
@@ -178,7 +215,7 @@ echo "================================================================="
 printf "i18n 维度: PASS=%d  FAIL=%d\n" "$pass" "$fail"
 if [ "$fail" -ne 0 ]; then
     echo "NOTE: 若轴 2 FAIL，先核对两侧 help 栏数（bash 双栏 / wash 双栏）与主题名差集；"
-    echo "      不要直接归因于「内建实现进度」。轴 1 只断言 bash 侧本地化，wash 侧仍需人工复核。"
+    echo "      不要直接归因于「内建实现进度」。轴 1 已严格断言 wash 侧本地化与逐字节一致，无需人工复核。"
 fi
 echo "================================================================="
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # WSL "second oracle": capability equivalence between GNU bash 5.3.0
-# loadable builtins and wash 0.2.0 C ABI plugins.
+# loadable builtins and wash C ABI plugins.
 #
 #   MSYSTEM=MSYS "/d/msys2/usr/bin/bash.exe" -lc \
 #     'cd /d/project/WorkBuddy/wash && bash tests/plugin_second_oracle.sh'
@@ -91,11 +91,18 @@ fi
 cp "$WASH_SRC" "$TMP/wash" || hard_fail "cannot copy wash binary: $WASH_SRC"
 W="$TMP/wash"
 chmod +x "$W" || true
+# Version hard gate: generated from Cargo.toml + git tag/HEAD, never hardcoded.
+# The WSL build tree may have no .git of its own; set WASH_GIT_DIR to the
+# source repo when building there (tools/wash_version.sh fails loudly if the
+# metadata is unavailable -- no silent skip).
+[ -f "$REPO_ROOT/tools/wash_version.sh" ] || hard_fail 'version generator missing'
+EXPECTED_VER="$(bash "$REPO_ROOT/tools/wash_version.sh")" \
+    || hard_fail 'version generator failed (git metadata missing?)'
+[ -n "$EXPECTED_VER" ] || hard_fail 'empty generated version'
 WASH_VER="$($W --version 2>&1)"
-case "$WASH_VER" in
-    *0.2.0*) ;;
-    *) hard_fail "wash binary is not 0.2.0: [$WASH_VER]" ;;
-esac
+[ "$WASH_VER" = "wash $EXPECTED_VER" ] \
+    || hard_fail "binary version mismatch: expected [wash $EXPECTED_VER] got [$WASH_VER]"
+echo "version gate: wash $EXPECTED_VER"
 
 # --- compile BOTH sides' plugins from the SAME source tree -------------------
 BSO="$TMP/bash_hello.so"
@@ -274,7 +281,7 @@ pair 'unload_all_reload' 0 $'HELLO_FROM_PLUGIN\n' '' \
     "$W_LOAD >/dev/null 2>&1; enable -d plhello plset plget plecho; $W_LOAD >/dev/null 2>&1; plhello"
 
 # --- 8. the enable -f/-d/-s command surface ---------------------------------
-# Goldens were measured from /usr/local/bin/bash 5.3.0 and wash 0.2.0 with a
+# Goldens were measured from /usr/local/bin/bash 5.3.0 and wash with a
 # one-off probe.  The temporary path is interpolated, never hard-coded.
 B_BARE="${BSO##*/}"
 W_BARE="${WSO##*/}"

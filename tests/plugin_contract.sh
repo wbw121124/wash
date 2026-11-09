@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# wash 0.2.0 binary-plugin C ABI golden contract suite.
+# wash binary-plugin C ABI golden contract suite.
 #
 #   MSYSTEM=MSYS "/d/msys2/usr/bin/bash.exe" -lc \
 #     'cd /d/project/WorkBuddy/wash && bash tests/plugin_contract.sh'
@@ -13,8 +13,9 @@
 # bytes (compared as hex, so trailing newlines count).  Any mismatch exits 1.
 # MSYS2 bash 5.3.20 has "dynamic loading not available", so -f/-d are a
 # controlled wash extension: the goldens below come from directly measuring
-# wash 0.2.0, and the static parts (enable -s, enable -p echo, type -t echo)
-# were separately byte-compared against the primary oracle.
+# wash (none of them contains a version string), and the static parts
+# (enable -s, enable -p echo, type -t echo) were separately byte-compared
+# against the primary oracle.
 set -u
 export LC_ALL=C LANG=C
 
@@ -62,11 +63,18 @@ W="$TMP/wbin/wash"
 chmod +x "$W" 2>/dev/null || true
 [ -x "$W" ] || hard_fail 'copied wash binary is not executable'
 
-# Version hard gate: every golden below is calibrated against wash 0.2.0.
-# A stale or wrong binary must abort here, before a single assertion runs,
-# otherwise the suite would silently test a different implementation.
+# Version hard gate: the expected string is generated from Cargo.toml + git
+# tag/HEAD by tools/wash_version.sh -- no version number is hardcoded here.
+# A stale or wrong binary must abort before a single assertion runs, otherwise
+# the suite would silently test a different implementation.
+[ -f "$REPO_ROOT/tools/wash_version.sh" ] || hard_fail 'version generator missing'
+EXPECTED_VER="$(bash "$REPO_ROOT/tools/wash_version.sh")" \
+    || hard_fail 'version generator failed (git metadata missing?)'
+[ -n "$EXPECTED_VER" ] || hard_fail 'empty generated version'
 WASH_VER="$("$W" --version 2>&1)"
-[ "$WASH_VER" = 'wash 0.2.0' ] || hard_fail "wash binary is not 0.2.0: [$WASH_VER]"
+[ "$WASH_VER" = "wash $EXPECTED_VER" ] \
+    || hard_fail "binary version mismatch: expected [wash $EXPECTED_VER] got [$WASH_VER]"
+echo "version gate: wash $EXPECTED_VER"
 
 # --- compile the three wash-ABI fixtures ------------------------------------
 command -v gcc >/dev/null 2>&1 || hard_fail 'gcc not found'

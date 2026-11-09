@@ -177,7 +177,7 @@ fn render_prompt(template: &str, shell: &Shell) -> String {
                 b'@' => out.push_str(&posix::strftime_local("%I:%M %p")),
                 b'r' => out.push('\r'),
                 // \v 用 wash 自身版本串，绝不冒充 BASH_VERSION。
-                b'v' => out.push_str(env!("CARGO_PKG_VERSION")),
+                b'v' => out.push_str(env!("WASH_VERSION")),
                 b'!' | b'#' => {
                     use std::sync::atomic::Ordering;
                     out.push_str(&(COMMAND_SEQ.load(Ordering::Relaxed) + 1).to_string());

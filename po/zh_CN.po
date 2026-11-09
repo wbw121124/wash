@@ -3,7 +3,7 @@
 # 未翻译的条目会自动回退到英文原文（与 gettext 的行为一致）。
 msgid ""
 msgstr ""
-"Project-Id-Version: wash 0.2.0\n"
+"Project-Id-Version: wash 0.2.1\n"
 "PO-Revision-Date: 2026-01-01 00:00+0800\n"
 "Last-Translator: wash i18n <wash@example.invalid>\n"
 "Language-Team: wash <wash@example.invalid>\n"
@@ -11,12 +11,6 @@ msgstr ""
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
-
-msgid "These shell commands are defined internally.  Type `help' to see this list."
-msgstr "这些 shell 命令是内部定义的。输入 `help' 可以看到这份清单。"
-
-msgid "Type `help name' to find out more about the function `name'."
-msgstr "输入 `help name' 可以查看 `name' 这个内建命令的更多说明。"
 
 msgid "no help topics match `%s'."
 msgstr "没有匹配 `%s' 的帮助主题。"
@@ -45,7 +39,275 @@ msgstr "可执行链接, %s"
 msgid "rows %d to %d of %d"
 msgstr "第 %d 到 %d 行，共 %d 行"
 
-# bash 5.3 `help` 清单里唯一连主题名一起本地化的条目；
-# 其余主题名（alias / bg / bind / ...）在 bash 中文清单中仍是英文。
+# `help PATTERN` 的匹配标题与诊断：中文的引号样式、词序都与英文不同，
+# 因此整句（含 Try 提示）作为单个 msgid 登记，不能靠半句拼接。
+# 中文不分单复数，两个英文 msgid 共用同一译文。
+msgid "Shell commands matching keyword `%s'"
+msgstr "匹配关键字 \"%s\" 的 shell 命令"
+
+msgid "Shell commands matching keywords `%s'"
+msgstr "匹配关键字 \"%s\" 的 shell 命令"
+
+msgid "no help topics match `%s'.  Try `help help' or `man -k %s' or `info %s'."
+msgstr "没有与 \"%s\" 匹配的帮助主题。尝试使用 \"help help\" 或 \"man -k %s\" 或 \"info %s\"。"
+
+msgid "-%s: invalid option"
+msgstr "-%s: 无效的选项"
+
+msgid "help: usage: help [-dms] [pattern ...]"
+msgstr "help: 用法：help [-dms] [模式 ...]"
+
+# --- BEGIN GENERATED help list (tools/gen_help_pages.py) ---
+# Generated from the MSYS2 bash 5.3 oracle: msgid = LC_ALL=C text,
+# msgstr = the same line under zh_CN.UTF-8 (en.po mirrors msgid).
+# Truncated `...>` entries are bash's own display values, not full
+# sentences, so the ZH side is extracted rather than translated.
+# Do not edit by hand -- run: python3 tools/gen_help_pages.py
+
+msgid "These shell commands are defined internally.  Type `help' to see this list."
+msgstr "这些 shell 命令是内部定义的。输入 \"help\" 以获取本列表。"
+
+msgid "Type `help name' to find out more about the function `name'."
+msgstr "输入 \"help 名称\" 以得到有关函数 \"名称\" 的更多信息。"
+
+msgid "Use `info bash' to find out more about the shell in general."
+msgstr "使用 \"info bash\" 来获得关于 shell 的更多一般性信息。"
+
+msgid "Use `man -k' or `info' to find out more about commands not in this list."
+msgstr "使用 \"man -k\" 或 \"info\" 来获取不在本列表中的命令的更多信息。"
+
+msgid "A star (*) next to a name means that the command is disabled."
+msgstr "名称旁边的星号 (*) 表示该命令被禁用。"
+
+msgid "! PIPELINE"
+msgstr "! 流水线"
+
 msgid "job_spec [&]"
 msgstr "任务说明符 [&]"
+
+msgid "(( expression ))"
+msgstr "(( 表达式 ))"
+
+msgid ". [-p path] filename [arguments]"
+msgstr ". [-p 路径] 文件名 [参数]"
+
+msgid ":"
+msgstr ":"
+
+msgid "[ arg... ]"
+msgstr "[ 参数... ]"
+
+msgid "[[ expression ]]"
+msgstr "[[ 表达式 ]]"
+
+msgid "alias [-p] [name[=value] ... ]"
+msgstr "alias [-p] [名称[=值] ... ]"
+
+msgid "bg [job_spec ...]"
+msgstr "bg [任务说明符 ...]"
+
+msgid "bind [-lpsvPSVX] [-m keymap] [-f file>"
+msgstr "bind [-lpvsPSVX] [-m 键映射] [-f 文>"
+
+msgid "break [n]"
+msgstr "break [n]"
+
+msgid "builtin [shell-builtin [arg ...]]"
+msgstr "builtin [shell-内建 [参数 ...]]"
+
+msgid "caller [expr]"
+msgstr "caller [表达式]"
+
+msgid "case WORD in [PATTERN [| PATTERN]...)>"
+msgstr "case 词语 in [模式 [| 模式]...) 命令 >"
+
+msgid "cd [-L|[-P [-e]]] [-@] [dir]"
+msgstr "cd [-L|[-P [-e]]] [-@] [目录]"
+
+msgid "command [-pVv] command [arg ...]"
+msgstr "command [-pVv] 命令 [参数 ...]"
+
+msgid "compgen [-V varname] [-abcdefgjksuv] >"
+msgstr "compgen [-V 变量名] [-abcdefgjksuv] [>"
+
+msgid "complete [-abcdefgjksuv] [-pr] [-DEI]>"
+msgstr "complete [-abcdefgjksuv] [-pr] [-DEI]>"
+
+msgid "compopt [-o|+o option] [-DEI] [name .>"
+msgstr "compopt [-o|+o 选项] [-DEI] [名称 ...>"
+
+msgid "continue [n]"
+msgstr "continue [n]"
+
+msgid "coproc [NAME] command [redirections]"
+msgstr "coproc [名称] 命令 [重定向]"
+
+msgid "declare [-aAfFgiIlnrtux] [name[=value>"
+msgstr "declare [-aAfFgiIlnrtux] [名称[=值] .>"
+
+msgid "dirs [-clpv] [+N] [-N]"
+msgstr "dirs [-clpv] [+N] [-N]"
+
+msgid "disown [-h] [-ar] [jobspec ... | pid >"
+msgstr "disown [-h] [-ar] [任务说明符 ... | p>"
+
+msgid "echo [-neE] [arg ...]"
+msgstr "echo [-neE] [参数 ...]"
+
+msgid "enable [-a] [-dnps] [-f filename] [na>"
+msgstr "enable [-a] [-dnps] [-f 文件名] [名称>"
+
+msgid "eval [arg ...]"
+msgstr "eval [参数 ...]"
+
+msgid "exec [-cl] [-a name] [command [argume>"
+msgstr "exec [-cl] [-a 名称] [命令 [参数 ...]>"
+
+msgid "exit [n]"
+msgstr "exit [n]"
+
+msgid "export [-fn] [name[=value] ...] or ex>"
+msgstr "export [-fn] [名称[=值] ...] 或 expor>"
+
+msgid "false"
+msgstr "false"
+
+msgid "fc [-e ename] [-lnr] [first] [last] o>"
+msgstr "fc [-e 编辑器名] [-lnr] [起始] [终止]>"
+
+msgid "fg [job_spec]"
+msgstr "fg [任务说明符]"
+
+msgid "for NAME [in WORDS ... ] ; do COMMAND>"
+msgstr "for 名称 [in 词语 ... ] ; do 命令; do>"
+
+msgid "for (( exp1; exp2; exp3 )); do COMMAN>"
+msgstr "for (( 表达式1; 表达式2; 表达式3 )); >"
+
+msgid "function name { COMMANDS ; } or name >"
+msgstr "function 名称 { 命令 ; } 或 name () {>"
+
+msgid "getopts optstring name [arg ...]"
+msgstr "getopts 选项字符串 名称 [参数 ...]"
+
+msgid "hash [-lr] [-p pathname] [-dt] [name >"
+msgstr "hash [-lr] [-p 路径名] [-dt] [名称 ..>"
+
+msgid "help [-dms] [pattern ...]"
+msgstr "help [-dms] [模式 ...]"
+
+msgid "history [-c] [-d offset] [n] or hist>"
+msgstr "history [-c] [-d 偏移量] [n] 或 hist>"
+
+msgid "if COMMANDS; then COMMANDS; [ elif C>"
+msgstr "if 命令; then 命令; [ elif 命令; the>"
+
+msgid "jobs [-lnprs] [jobspec ...] or jobs >"
+msgstr "jobs [-lnprs] [任务说明符 ...] 或 jo>"
+
+msgid "kill [-s sigspec | -n signum | -sigs>"
+msgstr "kill [-s 信号说明符 | -n 信号编号 |>"
+
+msgid "let arg [arg ...]"
+msgstr "let 参数 [参数 ...]"
+
+msgid "local [option] name[=value] ..."
+msgstr "local [选项] 名称[=值] ..."
+
+msgid "logout [n]"
+msgstr "logout [n]"
+
+msgid "mapfile [-d delim] [-n count] [-O or>"
+msgstr "mapfile [-d 分隔符] [-n 计数] [-O >"
+
+msgid "popd [-n] [+N | -N]"
+msgstr "popd [-n] [+N | -N]"
+
+msgid "printf [-v var] format [arguments]"
+msgstr "printf [-v var] 格式 [参数]"
+
+msgid "pushd [-n] [+N | -N | dir]"
+msgstr "pushd [-n] [+N | -N | 目录]"
+
+msgid "pwd [-LPW]"
+msgstr "pwd [-LPW]"
+
+msgid "read [-Eers] [-a array] [-d delim] [>"
+msgstr "read [-Eers] [-a 数组] [-d 分隔符] [>"
+
+msgid "readarray [-d delim] [-n count] [-O >"
+msgstr "readarray [-d 分隔符] [-n 计数] [-O>"
+
+msgid "readonly [-aAf] [name[=value] ...] o>"
+msgstr "readonly [-aAf] [名称[=值] ...] 或 r>"
+
+msgid "return [n]"
+msgstr "return [n]"
+
+msgid "select NAME [in WORDS ... ;] do COMM>"
+msgstr "select 名称 [in 词语 ... ;] do 命令;>"
+
+msgid "set [-abefhkmnptuvxBCEHPT] [-o optio>"
+msgstr "set [-abefhkmnptuvxBCEHPT] [-o 选项>"
+
+msgid "shift [n]"
+msgstr "shift [n]"
+
+msgid "shopt [-pqsu] [-o] [optname ...]"
+msgstr "shopt [-pqsu] [-o] [选项名 ...]"
+
+msgid "source [-p path] filename [arguments>"
+msgstr "source [-p 路径] 文件名 [参数]"
+
+msgid "suspend [-f]"
+msgstr "suspend [-f]"
+
+msgid "test [expr]"
+msgstr "test [表达式]"
+
+msgid "time [-p] pipeline"
+msgstr "time [-p] 流水线"
+
+msgid "times"
+msgstr "times"
+
+msgid "trap [-Plp] [[action] signal_spec ..>"
+msgstr "trap [-Plp] [[动作] 信号说明符 ...]"
+
+msgid "true"
+msgstr "true"
+
+msgid "type [-afptP] name [name ...]"
+msgstr "type [-afptP] 名称 [名称 ...]"
+
+msgid "typeset [-aAfFgiIlnrtux] name[=value>"
+msgstr "typeset [-aAfFgiIlnrtux] 名称[=值] .>"
+
+msgid "ulimit [-SHabcdefiklmnpqrstuvxPRT] [>"
+msgstr "ulimit [-SHabcdefiklmnpqrstuvxPRT] >"
+
+msgid "umask [-p] [-S] [mode]"
+msgstr "umask [-p] [-S] [模式]"
+
+msgid "unalias [-a] name [name ...]"
+msgstr "unalias [-a] 名称 [名称 ...]"
+
+msgid "unset [-f] [-v] [-n] [name ...]"
+msgstr "unset [-f] [-v] [-n] [名称 ...]"
+
+msgid "until COMMANDS; do COMMANDS-2; done"
+msgstr "until 命令; do 命令-2; done"
+
+msgid "variables - Names and meanings of so>"
+msgstr "variables - 一些 shell 变量的名称>"
+
+msgid "wait [-fn] [-p var] [id ...]"
+msgstr "wait [-fn] [-p 变量] [id ...]"
+
+msgid "while COMMANDS; do COMMANDS-2; done"
+msgstr "while 命令; do 命令-2; done"
+
+msgid "{ COMMANDS ; }"
+msgstr "{ 命令 ; }"
+
+# --- END GENERATED help list ---

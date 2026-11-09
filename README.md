@@ -83,18 +83,40 @@ Win32 控制台 API、也不使用带 Win32 后端的行编辑器 crate（如 ru
 ./tests/bash_diff_echo_printf.sh   # echo / printf 逐字节对齐 bash
 ./tests/bash_diff_builtins.sh      # 全部内建逐字节对齐 bash（见下方矩阵）
 ./tests/bash_diff_cli.sh           # CLI 参数形态
-./tests/plugin_contract.sh         # 0.2.0：二进制插件 ABI 契约（MSYS2 / WSL 各跑）
-./tests/plugin_second_oracle.sh    # 0.2.0：WSL bash 5.3.0 能力等价对拍
-./tests/check_version.sh           # 0.2.0：版本串一致性闸门
+./tests/bash_diff_help.sh          # help：C / zh_CN 双 locale，77 主题完整页 / -s -d -m /
+                                   # 无参清单（抬头 5 句 + 77 条摘要）/ glob / 错误路径
+                                   # 77 条清单显示值原样当 NAME 对拍 + job_spec/% 孤例锁定；清单↔规范名由 HELP_LIST_MAP 单一真源绑定
+                                   # `-m` 的 wash 身份段由 tests/help_footer.py 做严格替换对拍
+./tools/gen_help_pages.py          # 从 MSYS2 oracle 重生成两份 help 页数据 + po 清单译文段
+                                   # （--check 校验新鲜度，含双 locale 双栏排版逐字节重建）
+./tests/plugin_contract.sh         # 二进制插件 ABI 契约（MSYS2 / WSL 各跑）
+./tests/plugin_second_oracle.sh    # WSL bash 5.3.0 能力等价对拍
+./tests/check_version.sh           # 版本串生成与一致性闸门（静态 + 运行时）
+./tools/wash_version.sh            # 版本串唯一生成规则（Cargo.toml + git tag/HEAD）
 ```
+
+## 发布 0.2.1
+
+**所有用户可见的版本行都由 `tools/wash_version.sh` 生成**，唯一真源是
+`Cargo.toml` 的 `version` 加上构建时的 git 元数据：
+
+- HEAD 恰好有 tag：该 tag（去掉 `v`）**必须**等于 `Cargo.toml` 版本，输出 `<version>`；
+- HEAD 没有 tag：输出 `<version>-<HEAD hash 前 7 位>`；
+- 最近可达 tag 比 `Cargo.toml` 更新（即「打了 tag 却忘了改 Cargo.toml」）、tag 与清单不一致、
+  或 git 元数据缺失：构建与闸门**直接报错**，绝不静默回退到旧版本。
+
+`build.rs` 调该脚本并把结果注入 `WASH_VERSION`；`--version`、`$BASH_VERSION`、
+`help` 抬头、`help -m` 的 IMPLEMENTATION 段、PS1 `\v` 全部使用 `env!("WASH_VERSION")`，
+源码与测试中不含任何硬编码版本号。两个 `.po` 头由 `tools/wash_version.sh --sync-po`
+生成，`--check-po` 校验新鲜度。`tests/check_version.sh` 做静态 + 运行时严格校验；
+`tests/bash_diff_help.sh` 把 oracle 的版本行替换为生成值后做**完整逐字节对拍**，
+不再用 `tail -n +2` 跳过任何一行。
 
 ## 发布 0.2.0
 
-0.2.0 引入二进制插件系统并完成一次完整发布。版本号以 `Cargo.toml` 为唯一真源，
-`--version`、`help` 抬头、`$BASH_VERSION`、PS1 `\v` 全部由
-`env!("CARGO_PKG_VERSION")` 生成；`tests/check_version.sh` 会同时做静态与运行时
-校验。升级与兼容边界详见 `CHANGELOG.md`；两平台动态加载能力的技术验证见
-`docs/spike-dlopen.md`。
+0.2.0 引入二进制插件系统并完成一次完整发布；当时的版本号机制见
+`CHANGELOG.md`，现行机制见上节。升级与兼容边界详见 `CHANGELOG.md`；
+两平台动态加载能力的技术验证见 `docs/spike-dlopen.md`。
 
 **兼容性说明**：MSYS2 主 oracle 的 bash 5.3.20 编译时关闭了动态加载，而 wash
 全平台启用插件，因此 `enable -f/-d` 属受控扩展，矩阵中标 `wash-extension`，

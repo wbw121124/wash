@@ -822,8 +822,10 @@ run_case A bang-indirect-set-u     'set -u; unset U2; echo "x${!U2}y"'    # rc=1
 #   * EUID 为非负整数；
 #   * PPID 为非负整数。
 # 以上对 bash 与 wash 均真实成立（wash 把 BASH_VERSION 设成「自己的版本串」，
-# 而非伪造的 bash 版本）。`set` 的选项处理仍由 GROUP A 的 `set-o` / `set-plus-o`
-# / `set-invalid` / `set-errexit` / `set-noglob` 逐字节覆盖。
+# 而非伪造的 bash 版本）。wash 侧这一行的精确值并未放过：`tests/check_version.sh`
+# 的 `set output BASH_VERSION` 断言逐字节校验它等于 tools/wash_version.sh
+# 从 Cargo.toml + git tag/HEAD 生成的版本串。`set` 的选项处理仍由 GROUP A
+# 的 `set-o` / `set-plus-o` / `set-invalid` / `set-errexit` / `set-noglob` 逐字节覆盖。
 run_case_sem K set-noargs 'set' '
     [ -s "$OUT" ] &&
     grep -q "^BASH_VERSION=" "$OUT" &&

@@ -3,6 +3,27 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.1] - 2026-11-09
+
+### Fixed
+
+- **Cargo 版本号补齐并与 git tag 对齐**：`Cargo.toml` / `Cargo.lock` 升到 **0.2.1**
+  （此前 `v0.2.1` tag 已打，清单却仍写 0.2.0，所有版本行因此输出旧版本）；
+  `po/en.po` / `po/zh_CN.po` 的 `Project-Id-Version` 由生成脚本同步。
+- **版本行改为生成式**：新增 `tools/wash_version.sh`，从 `Cargo.toml` 的 `version`
+  与构建时 git 元数据生成版本串 —— HEAD 有精确 tag 时输出 `<version>`（且 tag 必须与
+  清单一致），无 tag 时输出 `<version>-<HEAD hash 前 7 位>`。`build.rs` 把结果注入
+  `WASH_VERSION`；`--version`、`$BASH_VERSION`、`help` 抬头、`help -m` 的
+  IMPLEMENTATION 段、PS1 `\v` 全部改用 `env!("WASH_VERSION")`。清单落后于最近 tag、
+  tag 与清单不一致、git 元数据缺失一律硬失败，绝不静默回退。
+- **`help` 清单显示值与可查规范名合并为单一真源并加三层闸门**：`src/help_pages.rs` 新增 77 项 `HELP_LIST_MAP`（显示值 ↔ 规范名），`builtins.rs` 删掉独立的 `HELP_TOPICS`；首次访问 `all()` 时硬断言 77↔77 长度/顺序/集合全等且两列无重复，不符直接 panic；`tools/gen_help_pages.py --check` 新增 oracle 实测的规范名/数据标记/逐页 stdout/rc/静态 `ALIASES` 断言，`tests/bash_diff_help.sh` 新增 77×2 条清单显示值对拍与 `job_spec`/`%` 孤例用例。所有 `help` 输出字节不变；bash 自身 `help job_spec` 就是 rc=1，**禁止为它补别名**。
+- **消除版本行的假 PASS / skip**：`tests/bash_diff_help.sh` 的无参清单不再用
+  `help | tail -n +2` 跳过版本行，改由 `tests/help_banner.py` 把 oracle 首行替换为
+  生成值后做**完整逐字节对拍**（含可逆性校验）；`tests/help_footer.py`、
+  `tests/plugin_contract.sh`、`tests/plugin_second_oracle.sh` 中硬编码的 0.2.0
+  golden/硬闸全部改为生成值；`tests/check_version.sh` 重写为静态 + 运行时严格闸门，
+  禁止任何 `CARGO_PKG_VERSION` 快捷路径或硬编码版本字面量。
+
 ## [0.2.0] - 2026-11-07
 
 ### Added
