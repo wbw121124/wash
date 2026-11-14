@@ -3,6 +3,33 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Changed（有意偏离，用户 2026-11-10 裁决）
+
+- **新增单一「有意偏离清单」** `docs/intentional-divergences.md`，登记 wash 相对
+  MSYS2 bash 5.3.20 oracle 的全部 **2 条**有意逐字节例外：既有的 `help -m`
+  IMPLEMENTATION footer（D-001，wash 身份段）与本次新增的 `help job_spec` 可查
+  （D-002）。任何新增 / 删除偏离必须同步该清单、代码真源、生成脚本静态锁、
+  `tests/bash_diff_help.sh` 的固定用例计数与下方登记行。
+- **`help job_spec` / `help 'job_spec [&]'` 现在可查（D-002）**：用户明确要求
+  「无参清单第 2 项列出却查不到」这一 UX 痛点必须修好，**全局生效（含非交互
+  `-c`）**，明确允许为此破坏脚本兼容，并否决了「仅交互模式」方案。这是本轮
+  **唯一新增**的有意逐字节兼容例外。仅当选项解析后的 pattern 列表恰好为 1 个、
+  且字符串精确等于两个登记值时，wash 返回 `%` 页（rc=0、stderr 空、Full / Short /
+  Desc / Man 四种模式与 C / zh_CN 两个 locale 的输出逐字节等于 wash 自己的
+  `help '%'`）；oracle 侧仍 rc=1。实现走 `src/help_pages.rs::JOB_SPEC_DIVERGENCES`
+  + `divergence_page()` 的**单-pattern 精确通道**，不进通用 `ALIASES` /
+  `lookup()`，因此 glob / 多 pattern / 空 pattern / 别名等一切其它路径仍逐字节一致。
+- **闸门只收紧不放宽**：`tests/bash_diff_help.sh` 把旧「wash 必须 rc=1」的 6 条
+  用例改成 `tests/help_divergence.py` 的双侧精确偏离断言（oracle rc + stdout +
+  stderr GOLDEN 含中文 `第 1 行：` 前缀、wash rc=0 + stderr 空 + stdout 逐字节
+  等于 wash `help '%'`、GOLDEN sha256 自检、canonical 链式证明），新增 14×2 条
+  「偏离不扩散」严格对拍，并硬断言偏离用例数 26 / 严格用例数 457 / 清单恰好 2 条。
+  `tools/gen_help_pages.py --check` 的 4 条旧静态锁换成「oracle `help job_spec`
+  仍 rc=1」+「wash 2×2×4 组合精确偏离」+「`ALIASES`=3 且偏离表恰好 2 项」，
+  原有全部结构断言保留。
+
 ## [0.2.1] - 2026-11-09
 
 ### Added

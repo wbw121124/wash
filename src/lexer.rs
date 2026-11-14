@@ -362,85 +362,445 @@ fn read_brace(chars: &[char], i: usize) -> Option<(String, usize)> {
     None
 }
 
-fn brace_alternatives(inner: &str) -> Option<Vec<String>> {
-    if let Some(range) = parse_range(inner) {
-        return Some(range);
-    }
-    if inner.contains(',') {
-        let mut alts = Vec::new();
-        let mut cur = String::new();
-        let mut depth = 0;
-        for c in inner.chars() {
-            match c {
-                ',' if depth == 0 => {
-                    alts.push(std::mem::take(&mut cur));
+// --- brace expansion -------------------------------------------------------
+//
+// bash expands braces textually and **innermost-first**: it scans for the
+// leftmost `{` whose matching `}` encloses a top-level comma list or a
+// `a..b` sequence, replaces that span with each member, and then re-runs the
+// whole thing on every result.  Brackets that do not qualify are stepped over
+// and the *next* `{` is tried, which is why `{{a,b}}` becomes `{a}`/`{b}` and
+// `{a{b,c}d}` becomes `{abd}`/`{acd}`.
+//
+// Quoting participates in two ways (both oracle-verified against bash 5.3.20):
+//   * a comma inside `'...'` / `"..."` does not split, and a `{` inside quotes
+//     is not a brace candidate -- `{a,"{b,c}"}` is `a` + `{b,c}` as two words;
+//   * after the last expansion the resulting word goes through **quote
+//     removal**, which is what makes `{a,"b,c"}` -> `b,c`, `{a,b\ c}` -> `b c`
+//     and `{A..z}`'s 0x5C element an empty word.
+
+/// bash's quote removal for one *unquoted-source* word fragment: drop the
+/// quotes, unescape `\x` (a trailing lone `\` disappears), and inside double
+/// quotes only unescape `\"`, `\\`, `\$` and ``\` ``.
+fn quote_remove(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut it = raw.chars().peekable();
+    while let Some(c) = it.next() {
+        match c {
+            '\\' => {
+                if let Some(n) = it.next() {
+                    out.push(n);
                 }
-                '{' => {
-                    depth += 1;
-                    cur.push(c);
-                }
-                '}' => {
-                    depth -= 1;
-                    cur.push(c);
-                }
-                _ => cur.push(c),
             }
+            '\'' => {
+                for c in it.by_ref() {
+                    if c == '\'' {
+                        break;
+                    }
+                    out.push(c);
+                }
+            }
+            '"' => {
+                while let Some(c) = it.next() {
+                    if c == '"' {
+                        break;
+                    }
+                    if c == '\\' {
+                        match it.peek() {
+                            Some(&n) if n == '"' || n == '\\' || n == '$' || n == '`' => {
+                                out.push(n);
+                                it.next();
+                            }
+                            _ => out.push('\\'),
+                        }
+                    } else {
+                        out.push(c);
+                    }
+                }
+            }
+            _ => out.push(c),
         }
-        alts.push(cur);
-        if alts.len() >= 2 {
-            return Some(alts);
+    }
+    out
+}
+
+/// Index of the `}` that closes the `{` at `open`, or `None` when the brace is
+/// never closed. Quotes and backslash escapes are honoured, so `{a,"b}c"}` and
+/// `{a,\}}` close where bash closes them.
+fn find_brace_span(chars: &[char], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut i = open;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' {
+            i += 2; // escaped char: never structural (overshoot just ends the loop)
+            continue;
+        }
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '\'' | '"' => quote = Some(c),
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Split the inside of one brace span on its top-level commas.
+///
+/// `\,` and commas inside quotes do not separate members; everything (escapes
+/// and quotes included) is kept verbatim so the recursive step can still see
+/// it. Returns `None` when the span holds no top-level comma, i.e. it is not a
+/// comma list (`{abc}`, `{1..a}`, `{a\,b}`).
+fn split_brace_members(inner: &str) -> Option<Vec<String>> {
+    let mut members = Vec::new();
+    let mut cur = String::new();
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for c in inner.chars() {
+        if escaped {
+            // Keep the pair intact: quote removal happens at the very end.
+            cur.push('\\');
+            cur.push(c);
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' => escaped = true,
+            _ if quote == Some(c) => {
+                quote = None;
+                cur.push(c);
+            }
+            '\'' | '"' if quote.is_none() => {
+                quote = Some(c);
+                cur.push(c);
+            }
+            '{' if quote.is_none() => {
+                depth += 1;
+                cur.push(c);
+            }
+            '}' if quote.is_none() => {
+                depth = depth.saturating_sub(1);
+                cur.push(c);
+            }
+            ',' if quote.is_none() && depth == 0 => members.push(std::mem::take(&mut cur)),
+            _ => cur.push(c),
+        }
+    }
+    if escaped {
+        cur.push('\\');
+    }
+    members.push(cur);
+    if members.len() >= 2 {
+        Some(members)
+    } else {
+        None
+    }
+}
+
+/// One textual brace-expansion step: the verbatim prefix, the members of the
+/// leftmost expandable `{...}` span, and the verbatim suffix.
+struct BraceStep {
+    pre: String,
+    members: Vec<String>,
+    post: String,
+}
+
+/// Find the leftmost `{...}` in `raw` that bash would expand, honouring the
+/// same escape / quote skipping as the old scanner. `None` means `raw` is a
+/// leaf: no further brace expansion is possible.
+fn first_brace_expansion(raw: &str) -> Option<BraceStep> {
+    let chars: Vec<char> = raw.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => {
+                i += 2;
+                continue;
+            }
+            '\'' | '"' => {
+                // Skip the quoted run: no brace inside it may expand.
+                let q = chars[i];
+                i += 1;
+                while i < chars.len() && chars[i] != q {
+                    if q == '"' && chars[i] == '\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                i += 1;
+                continue;
+            }
+            '{' => {
+                if let Some(close) = find_brace_span(&chars, i) {
+                    let inner: String = chars[i + 1..close].iter().collect();
+                    let members = match parse_range(&inner) {
+                        Some(words) => Some(words),
+                        None => split_brace_members(&inner),
+                    };
+                    if let Some(members) = members {
+                        return Some(BraceStep {
+                            pre: chars[..i].iter().collect(),
+                            members,
+                            post: chars[close + 1..].iter().collect(),
+                        });
+                    }
+                }
+                // Not an expression: try the next `{` (bash does the same, which
+                // is why `{a{b,c}d}` expands the inner braces only).
+                i += 1;
+                continue;
+            }
+            _ => i += 1,
         }
     }
     None
 }
 
+/// Expand one raw word fragment into its final words: innermost brace
+/// expression first, then quote removal on whatever text remains.
+///
+/// This is bash's `brace_expand()` in miniature; `pre`/`post` are carried
+/// along verbatim so `x{a,{b,c}}y` yields `xay xby xcy`.
+///
+/// The expansion is a **DFS pre-order** walk, but it uses an explicit worklist
+/// instead of Rust recursion: nesting depth equals input length, so a
+/// recursive implementation overflows the 1 MB Windows main-thread stack at
+/// ~1700 nested braces while bash happily expands 3000+ levels. Pushing the
+/// members in reverse onto a LIFO `Vec<String>` reproduces the old call order
+/// exactly -- every member's own subtree is fully expanded before the next
+/// member is popped. Only leaves (words with no expandable brace left) go
+/// through `quote_remove`, once, as before.
+fn expand_brace_text(raw: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut pending: Vec<String> = vec![raw.to_string()];
+    while let Some(current) = pending.pop() {
+        match first_brace_expansion(&current) {
+            Some(step) => {
+                let BraceStep { pre, members, post } = step;
+                for m in members.into_iter().rev() {
+                    let mut word = String::with_capacity(pre.len() + m.len() + post.len());
+                    word.push_str(&pre);
+                    word.push_str(&m);
+                    word.push_str(&post);
+                    pending.push(word);
+                }
+            }
+            None => out.push(quote_remove(&current)),
+        }
+    }
+    out
+}
+
+/// The words one brace span expands to, or `None` when the span is not a brace
+/// expression (the caller then keeps the whole word literal).
+fn brace_alternatives(inner: &str) -> Option<Vec<String>> {
+    let members = match parse_range(inner) {
+        Some(words) => words,
+        None => split_brace_members(inner)?,
+    };
+    let mut alts = Vec::new();
+    for m in members {
+        alts.extend(expand_brace_text(&m));
+    }
+    Some(alts)
+}
+
+/// One endpoint of a `{a..b}` sequence, after bash's classification.
+enum SeqEnd {
+    Int(i64),
+    Char(i32),
+}
+
+/// Classify a sequence endpoint the way bash's `expand_seqterm()` does:
+/// a base-10 integer (optional `+`/`-` sign) or a *single ASCII letter*.
+/// Everything else (`{1..a}`'s `a` is fine on its own, `{1.5..3.5}`'s `1.5`,
+/// `{..3}`'s empty string, `{!..~}`'s punctuation) is not a sequence
+/// endpoint, which makes the whole brace word a literal.
+fn parse_seq_end(text: &str) -> Option<SeqEnd> {
+    if let Ok(v) = text.parse::<i64>() {
+        return Some(SeqEnd::Int(v));
+    }
+    let mut it = text.chars();
+    match (it.next(), it.next()) {
+        // bash requires ISALPHA() && length 1; in the C locale that is
+        // exactly the ASCII letters, so `{é..ê}` stays a literal word.
+        (Some(c), None) if c.is_ascii_alphabetic() => Some(SeqEnd::Char(c as i32)),
+        _ => None,
+    }
+}
+
+/// Whether an endpoint literal asks bash to zero-pad the whole sequence.
+///
+/// bash's test is textual, not numeric: a number whose first digit is `0` and
+/// that has at least one more digit (`{01..05}`, `{010..1}`, `{0..00}`), or a
+/// negative number of that shape (`{-05..5}`). `{0..0}` and `{-0..5}` do NOT
+/// pad, while `{+05..9}` does not either -- bash only looks at a leading `0`
+/// or `-0`, never past a `+`.
+fn seq_needs_pad(lit: &str) -> bool {
+    let b = lit.as_bytes();
+    (b.first() == Some(&b'0') && b.len() > 1)
+        || (b.len() > 2 && b[0] == b'-' && b[1] == b'0')
+}
+
+/// Format one integer element of a zero-padded sequence.
+///
+/// bash formats with `printf("%0*jd", width, v)`, i.e. the width counts the
+/// sign too: `{-05..5}` (width 3) prints `-05 … 000 … 005`, and `{-5..05}`
+/// (width 2) prints `-5 … 00 … 05`. Rust's `{:0w$}` has the same semantics
+/// (zeros go after the sign) and, like printf, never truncates a value that
+/// is wider than the requested field.
+fn pad_int(v: i64, width: usize) -> String {
+    if width == 0 {
+        v.to_string()
+    } else {
+        format!("{:0w$}", v, w = width)
+    }
+}
+
+/// Expand `start..end` / `start..end..step` exactly as bash does.
+///
+/// bash's rules (all oracle-verified, see the brace corpus in
+/// `tests/bash_diff_builtins.sh` GROUP A `brace-*`):
+///
+/// * the direction comes from the endpoints alone (`start <= end` ascends),
+///   and the step is used as its absolute value -- `{3..1..1}` counts down,
+///   `{1..3..-1}` counts up, `{1..-3..2}` yields `1 -1 -3`;
+/// * a step of `0` (also `-0`) means 1, it is not an error;
+/// * a numeric end makes the other end numeric too, letters make a code-point
+///   sequence that also honours the step (`{A..z}` is the 58 code points
+///   `A`..`z`, not 26 letters);
+/// * zero padding only happens when an endpoint literal starts with `0`
+///   (or `-0`) and keeps at least one digit after it; the field width is
+///   `max(len(start), len(end))` of the *raw* literals, sign included, and it
+///   is applied with C `%0*` semantics (zeros after the sign);
+/// * mixed or unparsable endpoints are not a sequence at all.
+///
+/// Acceptance rule worth stating explicitly: an illegal form KEEPS THE WHOLE
+/// WORD -- it never disappears and never expands to zero words. bash 5.3 was
+/// measured on the seven malformed forms `{1..}`, `{..3}`, `{1..3..}`,
+/// `{1.5..3}`, `{1..3..x}`, `{1..a}`, `{a..1}`: every one is exactly one
+/// literal word.
+///
+/// Returns `None` when this is not a sequence: the caller then keeps the word
+/// as a literal. It must NEVER return `Some(vec![])` -- bash never expands a
+/// brace word into zero words, and an empty `Some` would silently delete the
+/// word (that was the `{10..1}` bug: the word vanished from the command line).
 fn parse_range(inner: &str) -> Option<Vec<String>> {
+    // `splitn(3, "..")` leaves a 4-component form's tail in `parts[2]`
+    // ("2..4"), which then fails the step parse below -- exactly bash's
+    // "not a sequence" answer for `{1..3..2..4}`.
     let parts: Vec<&str> = inner.splitn(3, "..").collect();
     if parts.len() < 2 {
         return None;
     }
     let start = parts[0];
     let end = parts[1];
-    let inc: i64 = if parts.len() == 3 {
-        parts[2].parse().ok()?
-    } else {
-        1
+    if start.is_empty() || end.is_empty() {
+        return None; // `{1..}`, `{..3}`
+    }
+
+    // Step: absent means 1; 0 (and -0) also means 1, per bash.
+    let incr: i64 = match parts.get(2) {
+        Some(text) => match text.parse::<i64>() {
+            Ok(v) => v,
+            Err(_) => return None, // `{1..3..x}`, `{1..3..}`, `{1..3..2..4}`
+        },
+        None => 1,
     };
-    if let (Ok(a), Ok(b)) = (start.parse::<i64>(), end.parse::<i64>()) {
-        if inc == 0 {
-            return None;
-        }
-        let mut v = Vec::new();
-        let mut x = a;
-        if inc > 0 {
-            while x <= b {
-                v.push(x.to_string());
-                x += inc;
-            }
-        } else {
-            while x >= b {
-                v.push(x.to_string());
-                x += inc;
-            }
-        }
-        return Some(v);
+    // bash negates a negative step to get its magnitude and cannot negate
+    // INTMAX_MIN, so it gives up and leaves the word alone.
+    if incr == i64::MIN {
+        return None;
     }
-    let sc: Vec<char> = start.chars().collect();
-    let ec: Vec<char> = end.chars().collect();
-    if sc.len() == 1 && ec.len() == 1 {
-        let a = sc[0] as i32;
-        let b = ec[0] as i32;
-        if a <= b {
-            let mut v = Vec::new();
+    let step: i64 = if incr == 0 { 1 } else { incr.abs() };
+
+    match (parse_seq_end(start), parse_seq_end(end)) {
+        (Some(SeqEnd::Int(a)), Some(SeqEnd::Int(b))) => {
+            // Width is taken from the two *literals* (sign included), and only
+            // when one of them is zero-padded: `{1..05}` pads to width 2,
+            // `{05..+900}` to width 4, `{1..200}` not at all.
+            let width = if seq_needs_pad(start) || seq_needs_pad(end) {
+                start.len().max(end.len())
+            } else {
+                0
+            };
+            let delta: i64 = if a <= b { step } else { -step };
+            let mut out = Vec::new();
             let mut x = a;
-            while x <= b {
-                v.push(((x as u8) as char).to_string());
-                x += 1;
+            // Walk value by value. bash stops the sequence as soon as the next
+            // step would overflow its integer type instead of wrapping:
+            // `{9223372036854775807..9223372036854775807}` yields one element
+            // and `{1..10..9223372036854775807}` only `1`. checked_add (never
+            // wrapping_add) keeps that property; do not "optimise" this into
+            // count-then-enumerate, which rounds differently.
+            loop {
+                let within = if delta > 0 { x <= b } else { x >= b };
+                if !within {
+                    break;
+                }
+                out.push(pad_int(x, width));
+                match x.checked_add(delta) {
+                    Some(next) => x = next,
+                    None => break,
+                }
             }
-            return Some(v);
+            Some(out)
         }
+        (Some(SeqEnd::Char(a)), Some(SeqEnd::Char(b))) => {
+            let delta: i64 = if a as i64 <= b as i64 { step } else { -step };
+            let mut out = Vec::new();
+            let mut x = a as i64;
+            loop {
+                let within = if delta > 0 { x <= b as i64 } else { x >= b as i64 };
+                if !within {
+                    break;
+                }
+                // Endpoints are single ASCII letters, so `x` stays in range.
+                match char::from_u32(x as u32) {
+                    Some(c) => out.push(c.to_string()),
+                    None => return None,
+                }
+                match x.checked_add(delta) {
+                    Some(next) => x = next,
+                    None => break,
+                }
+            }
+            Some(out)
+        }
+        // Mixed (`{1..a}`, `{a..1}`) or unparsable (`{1.5..3.5}`) endpoints are
+        // a literal word, not an empty expansion.
+        _ => None,
     }
-    None
+}
+
+/// Whether `c` ends a word, i.e. whether a `{` / `}` followed by it is a token
+/// of its own.
+///
+/// bash only recognises `{` and `}` as reserved words when they are not glued
+/// to another word character: `{ echo hi; }` (separators on both sides) is a
+/// command group, while `{echo hi;}` is the word `{echo` followed by a stray
+/// `}` and therefore a syntax error. The separator set is bash's own word
+/// delimiter set: blanks, newline, and the metacharacters `; & | ( ) < >`.
+fn is_word_separator(c: char) -> bool {
+    matches!(
+        c,
+        ' ' | '\t' | '\n' | '\r' | ';' | '&' | '|' | '(' | ')' | '<' | '>'
+    )
 }
 
 pub fn tokenize(input: &str) -> Result<Vec<Token>> {
@@ -869,24 +1229,36 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                     && word_is_assignment(&parts, &pending);
                 if !assign_word {
                     // Try brace expansion first (works mid-word too, e.g. `a{b,c}`).
-                    if let Some((inner, ni)) = read_brace(&chars, i + 1) {
+                    // The span is located with the quote-aware scanner, so a `}`
+                    // inside quotes (`{a,"b}c"}`) does not close it early.
+                    if let Some(close) = find_brace_span(&chars, i) {
+                        let inner: String = chars[i + 1..close].iter().collect();
                         if let Some(alts) = brace_alternatives(&inner) {
                             flush_text(&mut pending, &mut parts, pending_quoted);
                             parts.push(WordPart::Brace(alts));
-                            i = ni;
+                            i = close + 1;
                             continue;
                         }
                     }
                 }
-                // Not a brace expansion: `{` is a command-group / function-body
-                // opener and a word delimiter.  It only starts a word at a
-                // boundary, so when preceded by other text we keep it literal
-                // (e.g. `a{` -> `a{`, matching bash).
-                if pending.is_empty() && parts.is_empty() {
+                // Not a brace expansion: `{` is a reserved word (command-group /
+                // function-body opener) ONLY when it forms a token of its own,
+                // which in bash means "the next character ends a word".  Glued
+                // to anything else it is an ordinary literal character, so
+                // `{abc}`, `{}`, `{1..a}`, `{echo` each stay ONE word.  That is
+                // what makes `{echo hi;}` a syntax error (the `}` has no
+                // partner) while `{ echo hi; }` runs a group.
+                let complete_token = match chars.get(i + 1) {
+                    None => true,
+                    Some(&next) => is_word_separator(next),
+                };
+                if complete_token && pending.is_empty() && parts.is_empty() {
                     tokens.push(Token::Word(vec![WordPart::Text("{".to_string(), false)]));
                     at_command_start = true;
                     i += 1;
                 } else {
+                    // Literal `{`: keep it in the current word (`a{` -> `a{`,
+                    // `{abc}` -> `{abc}`).
                     pending.push('{');
                     i += 1;
                 }
@@ -909,10 +1281,15 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                 i += 1;
             }
             '}' => {
-                // `}` is a word delimiter (function-body / command-group closer)
-                // when it stands at a word boundary; mid-word it stays literal
-                // (e.g. `a}` -> `a}`).
-                if pending.is_empty() && parts.is_empty() {
+                // `}` mirrors `{`: reserved (function-body / group closer) only
+                // as a token of its own, otherwise a literal character that
+                // stays glued to the word.  So `}}x` is one word, `a}` is
+                // `a}`, and `}` after `;` still closes a group.
+                let complete_token = match chars.get(i + 1) {
+                    None => true,
+                    Some(&next) => is_word_separator(next),
+                };
+                if complete_token && pending.is_empty() && parts.is_empty() {
                     tokens.push(Token::Word(vec![WordPart::Text("}".to_string(), false)]));
                     at_command_start = true;
                     i += 1;

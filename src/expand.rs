@@ -215,16 +215,25 @@ pub fn expand_scalar(parts: &[WordPart], ctx: &ExpandCtx) -> String {
 struct Candidate {
     text: String,
     open: bool,
+    /// 该候选仅由「未加引号的空展开」构成、当前没有任何字面内容，因而当文本
+    /// 最终为空时应被整体丢弃（bash: `$empty`、空的 `"$@"` → 0 个词）。
+    /// 显式空串 `""`、带引号的 `$var`、或已拼接字面量的字段永不 droppable。
+    droppable: bool,
 }
 
 /// Append literal text to every still-open candidate.  Closed fields are
-/// already complete words and stay untouched.
-fn append_literal(candidates: Vec<Candidate>, text: &str) -> Vec<Candidate> {
+/// already complete words and stay untouched.  Quoted text (even an empty
+/// `""`) makes the field explicit and therefore non-droppable.
+fn append_literal(candidates: Vec<Candidate>, text: &str, quoted: bool) -> Vec<Candidate> {
     candidates
         .into_iter()
         .map(|c| {
             if c.open {
-                Candidate { text: format!("{}{}", c.text, text), open: true }
+                Candidate {
+                    text: format!("{}{}", c.text, text),
+                    open: true,
+                    droppable: if quoted { false } else { c.droppable },
+                }
             } else {
                 c
             }
@@ -235,25 +244,32 @@ fn append_literal(candidates: Vec<Candidate>, text: &str) -> Vec<Candidate> {
 /// Expand a single word into 0+ resulting words (splitting + globbing for
 /// unquoted expansions).
 pub fn expand_word(parts: &[WordPart], ctx: &ExpandCtx) -> Vec<String> {
-    let mut candidates: Vec<Candidate> = vec![Candidate { text: String::new(), open: true }];
+    let mut candidates: Vec<Candidate> = vec![Candidate { text: String::new(), open: true, droppable: false }];
     for part in parts {
         match part {
             WordPart::Text(s, quoted) => {
-                let mut next = append_literal(candidates, s);
+                let mut next = append_literal(candidates, s, *quoted);
                 if !*quoted && !ctx.noglob {
                     // Unquoted literal text is still subject to globbing.  A
                     // glob that yields several matches turns all but the last
                     // into complete fields.
                     let mut globbed = Vec::new();
                     for c in next.drain(..) {
-                        if !c.open {
+                        if !c.open || !has_glob(&c.text) {
+                            // On a wildcard-free field `glob()` would just
+                            // return `[text.clone()]` and keep `open`
+                            // unchanged.  Skip that Vec + String allocation:
+                            // the hot path (ordinary words) now allocates
+                            // nothing for globbing.  `has_glob` is exactly
+                            // the guard `glob()` itself uses, so behaviour is
+                            // byte-identical for every field.
                             globbed.push(c);
                             continue;
                         }
                         let matches = glob(&c.text);
                         let n = matches.len();
                         for (k, m) in matches.into_iter().enumerate() {
-                            globbed.push(Candidate { text: m, open: k + 1 == n });
+                            globbed.push(Candidate { text: m, open: k + 1 == n, droppable: false });
                         }
                     }
                     next = globbed;
@@ -269,6 +285,7 @@ pub fn expand_word(parts: &[WordPart], ctx: &ExpandCtx) -> Vec<String> {
                             Candidate {
                                 text: if c.text.is_empty() { home.clone() } else { format!("{}~", c.text) },
                                 open: true,
+                                droppable: false,
                             }
                         } else {
                             c
@@ -298,7 +315,7 @@ pub fn expand_word(parts: &[WordPart], ctx: &ExpandCtx) -> Vec<String> {
             }
             WordPart::Arith(body, _) => {
                 let val = eval_arith(body, ctx);
-                candidates = append_literal(candidates, &val);
+                candidates = append_literal(candidates, &val, false);
             }
             WordPart::Brace(alts) => {
                 // Brace expansion forks the word into several *open* words.
@@ -309,14 +326,20 @@ pub fn expand_word(parts: &[WordPart], ctx: &ExpandCtx) -> Vec<String> {
                         continue;
                     }
                     for a in alts {
-                        next.push(Candidate { text: format!("{}{}", c.text, a), open: true });
+                        next.push(Candidate { text: format!("{}{}", c.text, a), open: true, droppable: false });
                     }
                 }
                 candidates = next;
             }
         }
     }
-    candidates.into_iter().map(|c| c.text).collect()
+    candidates
+        .into_iter()
+        // bash: 未加引号的空展开 / 空 "$@" 产生 0 个词；显式 ""、带引号的
+        // $var、已拼接字面量的字段（droppable=false）必须保留为 1 个词。
+        .filter(|c| !(c.droppable && c.text.is_empty()))
+        .map(|c| c.text)
+        .collect()
 }
 
 /// The value of `$IFS` for word splitting.  An *unset* IFS behaves like the
@@ -393,12 +416,17 @@ fn split_ifs(val: &str, ifs: &str) -> Vec<String> {
 
 /// The final field list produced by one expansion (before the word's prefix
 /// and suffix are attached).
-fn expansion_fields(exp: Expansion, quoted: bool, ctx: &ExpandCtx) -> Vec<String> {
+/// 返回 (字段列表, 空结果是否可丢弃)。
+///
+/// bash 规则：带引号的 `"$var"` / `"$*"` 空时仍产生 1 个空词；但带引号的
+/// `"$@"` / `"${arr[@]}"` 在元素数为 0 时产生 **0 个词**；未加引号的任何
+/// 展开空时都产生 0 个词。第二项让 apply_value 区分这几种情况。
+fn expansion_fields(exp: Expansion, quoted: bool, ctx: &ExpandCtx) -> (Vec<String>, bool) {
     if quoted {
         return match exp {
-            Expansion::Scalar(s) => vec![s],
-            Expansion::At(fs) => fs,
-            Expansion::Star(fs) => vec![fs.join(&ifs_join_sep(ctx))],
+            Expansion::Scalar(s) => (vec![s], false),
+            Expansion::At(fs) => (fs, true),
+            Expansion::Star(fs) => (vec![fs.join(&ifs_join_sep(ctx))], false),
         };
     }
     let ifs = ifs_value(ctx);
@@ -421,14 +449,14 @@ fn expansion_fields(exp: Expansion, quoted: bool, ctx: &ExpandCtx) -> Vec<String
     for f in &fields {
         out.extend(glob_fields("", f, ctx.noglob));
     }
-    out
+    (out, true)
 }
 
 /// Append `exp` to each open candidate.  When it yields several fields, only
 /// the first inherits the word's accumulated prefix and only the last stays
 /// open to receive the suffix — matching bash's `pre$@suf` behaviour.
 fn apply_value(candidates: Vec<Candidate>, exp: Expansion, quoted: bool, ctx: &ExpandCtx) -> Vec<Candidate> {
-    let fields = expansion_fields(exp, quoted, ctx);
+    let (fields, empty_droppable) = expansion_fields(exp, quoted, ctx);
     let mut next = Vec::new();
     for c in candidates {
         if !c.open {
@@ -436,7 +464,14 @@ fn apply_value(candidates: Vec<Candidate>, exp: Expansion, quoted: bool, ctx: &E
             continue;
         }
         if fields.is_empty() {
-            next.push(c);
+            // 展开没有产生任何字段：仅当来源是「可丢弃的空展开」且该候选
+            // 尚无字面内容时，标记为 droppable（末尾统一删除）。带引号的
+            // ""、已有前缀的 `a$empty` 等必须原样保留。
+            if empty_droppable && c.text.is_empty() {
+                next.push(Candidate { text: String::new(), open: true, droppable: true });
+            } else {
+                next.push(c);
+            }
             continue;
         }
         let n = fields.len();
@@ -445,11 +480,13 @@ fn apply_value(candidates: Vec<Candidate>, exp: Expansion, quoted: bool, ctx: &E
                 next.push(Candidate {
                     text: format!("{}{}", c.text, f),
                     open: n == 1,
+                    droppable: false,
                 });
             } else {
                 next.push(Candidate {
                     text: f.clone(),
                     open: k + 1 == n,
+                    droppable: false,
                 });
             }
         }
@@ -1292,7 +1329,10 @@ fn has_glob(p: &str) -> bool {
 /// matches with a space (the old `glob_one`) collapsed them into a single
 /// argument, breaking `x=dir/*.txt; printf "[%s]" $x`, `for f in $x`, etc.
 fn glob_fields(prefix: &str, field: &str, noglob: bool) -> Vec<String> {
-    if noglob {
+    if noglob || !has_glob(field) {
+        // `glob()` on a wildcard-free field returns exactly one element
+        // (the field itself); build that result directly instead of
+        // allocating an intermediate Vec + String first.
         return vec![format!("{}{}", prefix, field)];
     }
     let matches = glob(field);

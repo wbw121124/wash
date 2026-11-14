@@ -62,10 +62,22 @@ MAX_RSS='0.80'
 hard_fail() { echo "FATAL: $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || hard_fail "required tool '$1' is missing (an assertion would be silently skipped)"; }
 
-for t in stat sha256sum awk seq timeout tail date cp basename grep head mktemp dirname wc cat; do need "$t"; done
+for t in stat sha256sum awk seq timeout tail date cp basename grep head mktemp dirname wc cat sleep od tr sort; do need "$t"; done
 [ -f "$BENCH" ] || hard_fail "bench.sh not found at $BENCH"
 [ -f "$VERSION_SH" ] || hard_fail "tools/wash_version.sh not found"
 [ -n "$WASH_BIN" ] || hard_fail "usage: better_than_bash.sh <release-wash-binary>"
+
+# ROUNDS 硬闸：ROUNDS=0 会让 bench.sh 的所有交错循环一次都不跑，mb/mw 保持
+# 99999999 哨兵值，TOTAL = 0/0 -> awk 产出 1.00x，恰好 <= MAX_TOTAL 而空洞
+# PASS；非整数/负数同样会让计时循环退化。ROUNDS 必须是 >= 2 的十进制整数。
+case "$ROUNDS" in
+    ''|*[!0-9]*) hard_fail "ROUNDS must be an integer >= 2, got [$ROUNDS]" ;;
+esac
+# 去掉前导零后再比较，避免 08 被当成八进制；并限制上界防止误输入跑数小时。
+ROUNDS_N=$((10#$ROUNDS))
+[ "$ROUNDS_N" -ge 2 ] || hard_fail "ROUNDS must be >= 2, got [$ROUNDS] (bench would be vacuous)"
+[ "$ROUNDS_N" -le 50 ] || hard_fail "ROUNDS must be <= 50, got [$ROUNDS]"
+echo "hard gate: ROUNDS=$ROUNDS_N is an integer in [2,50] (no vacuous benchmark)"
 
 case "$WASH_BIN" in
     /*) ;;

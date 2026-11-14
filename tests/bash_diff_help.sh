@@ -14,12 +14,24 @@
 # translates page bodies, synopses, glob banners and diagnostics, but NOT the
 # `help -d` short_doc -- see src/help_pages.rs).
 #
-# THE ONE INTENTIONAL EXCEPTION: `help -m` prints wash's own IMPLEMENTATION
-# stanza instead of GNU bash's copyright block.  Those cases are NOT compared
-# directly; tests/help_footer.py substitutes the wash footer golden into the
-# oracle bytes, requires an exact match, requires the substitution to be
-# reversible, and requires equal footer counts.  Any other differing byte is
-# still a hard failure.
+# THE TWO INTENTIONAL DIVERGENCES (single list: docs/intentional-divergences.md):
+#   D-001  `help -m` prints wash's own IMPLEMENTATION stanza instead of GNU
+#          bash's copyright block.  Those cases are NOT compared directly;
+#          tests/help_footer.py substitutes the wash footer golden into the
+#          oracle bytes, requires an exact match, requires the substitution to
+#          be reversible, requires equal footer counts and a GENERATED version.
+#          Any other differing byte is still a hard failure.
+#   D-002  `help job_spec` / `help 'job_spec [&]'` -- when the option-parsed
+#          pattern list is exactly ONE and the string matches exactly -- resolve
+#          to the `%` page: rc=0, empty stderr, stdout byte-identical to wash's
+#          own `help '%'` in the same mode/locale.  The oracle still returns
+#          rc=1 with an exact diagnostic (empty stdout, or one glob banner for
+#          `job_spec [&]`).  User ruling 2026-11-10: this UX enhancement is
+#          GLOBAL (incl. non-interactive -c) and MAY break script compatibility;
+#          the "interactive-only" option was explicitly rejected.  This is the
+#          only newly added intentional byte-compatibility exception.
+#          tests/help_divergence.py asserts BOTH sides exactly
+#          (rc + stdout + stderr), never "contains", never skips a line.
 #
 # Coverage:
 #   * all 77 canonical help topics, individually, in C and zh_CN
@@ -29,9 +41,16 @@
 #     the keys work, it does NOT connect them to what the list actually prints.
 #     The 77 values are extracted from the ORACLE list itself (column-major),
 #     and a hard gate requires them to equal HELP_LIST_MAP's first column, so
-#     this suite keeps no third copy of the strings under test.
-#   * the bash-inherent `job_spec [&]` / `%` orphan in both locales, including
-#     `help job_spec` rc=1 and `help '%'` rc=0 (NO alias may be added)
+#     this suite keeps no third copy of the strings under test.  The single
+#     D-002 row `job_spec [&]` is routed to the strict divergence assertion
+#     instead of an ordinary pair, and the routing count is a hard gate.
+#   * the `%` canonical page in both locales and all four modes (the exact
+#     output D-002 must equal), still proven byte-identical to the oracle
+#   * D-002 fixed case set: 2 patterns x 2 locales x 4 modes = 16, plus 10
+#     orphan-derived cases (echo rc, `--`, `-dms`); the case COUNT is a hard
+#     constant so the divergence cannot silently grow
+#   * a "no leakage" set proving glob / multi-pattern / empty-pattern / alias
+#     paths still never emit the `%` page, byte-compared like every other case
 #   * all 77 topics in each of the four modes via `help '*'` / -s / -d / -m
 #   * the no-argument list in BOTH locales: the version banner itself, the 5
 #     banner sentences and the 77 synopsis lines are ALL byte-compared.  The
@@ -41,6 +60,9 @@
 #     wash's stdout, plus reversibility.  NOTHING is skipped with tail -n +2.
 #   * glob patterns, multi-pattern title rules, aliases, options, errors
 #   * wash-identity man footer (strict substitution, both locales)
+#
+# The final result hard-asserts that ALL remaining cases are still strict
+# rc + stdout + stderr comparisons AND that their count is fixed.
 #
 # Run with:
 #   MSYSTEM=MSYS "/d/msys2/usr/bin/bash.exe" -lc \
@@ -59,10 +81,38 @@ fi
 [ -x "$BASH_BIN" ] || { echo "FATAL: oracle not found: $BASH_BIN"; exit 1; }
 [ -x "$WASH_BIN" ] || { echo "FATAL: wash not found: $WASH_BIN"; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "FATAL: python3 required for help_footer.py"; exit 1; }
+command -v sha256sum >/dev/null 2>&1 || { echo "FATAL: sha256sum required for byte comparisons (no cmp/diff on MSYS2)"; exit 1; }
+command -v grep >/dev/null 2>&1 || { echo "FATAL: grep required for the divergence-list gate"; exit 1; }
+# 每一个参与「字节比较」的工具都必须有硬闸：MSYS2 没有 cmp/diff，且任一工具
+# 缺失而只剩空输出会让两侧比较退化成「空 == 空」的假 PASS。
+for _tool in sed awk cut wc cat mktemp head od; do
+    command -v "$_tool" >/dev/null 2>&1 || {
+        echo "FATAL: required tool '$_tool' is missing (a byte comparison would be silently skipped)"; exit 1; }
+done
+# `python -O` / PYTHONOPTIMIZE=1 会把本套件内联 python 的 assert 全部剥离，
+# 让 locale / 清单显示值硬闸变成静默绿灯。此处显式拒绝优化模式。
+python3 -c 'import sys; sys.exit(0 if __debug__ and sys.flags.optimize == 0 else 1)' || {
+    echo "FATAL: python3 must run without -O / PYTHONOPTIMIZE (hard assertions would be stripped)"; exit 1; }
 [ -f "$REPO_ROOT/tests/help_footer.py" ] || { echo "FATAL: tests/help_footer.py missing"; exit 1; }
+[ -f "$REPO_ROOT/tests/help_divergence.py" ] || { echo "FATAL: tests/help_divergence.py missing"; exit 1; }
+
+# 单一「有意偏离清单」的常量引用：套件不允许偏离悄悄扩散。
+DIVERGENCE_DOC="$REPO_ROOT/docs/intentional-divergences.md"
+[ -f "$DIVERGENCE_DOC" ] || { echo "FATAL: docs/intentional-divergences.md missing"; exit 1; }
+DIV_DOC_ENTRIES="$(grep -c '^| `D-0' "$DIVERGENCE_DOC")"
+[ "$DIV_DOC_ENTRIES" -eq 2 ] || {
+    echo "FATAL: divergence list must register exactly 2 entries, got $DIV_DOC_ENTRIES"; exit 1; }
+grep -Fq 'D-001' "$DIVERGENCE_DOC" || { echo "FATAL: D-001 not registered"; exit 1; }
+grep -Fq 'D-002' "$DIVERGENCE_DOC" || { echo "FATAL: D-002 not registered"; exit 1; }
+grep -Fq -- 'job_spec [&]' "$DIVERGENCE_DOC" || { echo "FATAL: D-002 patterns not registered"; exit 1; }
+grep -Fq 'JOB_SPEC_DIVERGENCES' "$REPO_ROOT/src/help_pages.rs" || {
+    echo "FATAL: code-side divergence table missing"; exit 1; }
+echo "hard gate: DIVERGENCE_DOC registers exactly 2 divergences (D-001, D-002)"
 
 export LC_ALL=C
 export LANG=C
+# 所有 python 断言器都不允许在仓库里留下 __pycache__（import help_footer 会写 .pyc）。
+export PYTHONDONTWRITEBYTECODE=1
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 export HOME="$TMP/home"
@@ -76,7 +126,21 @@ mkdir -p "$HOME"
 WASH_FULL_VER="$(bash "$REPO_ROOT/tools/wash_version.sh")" || {
     echo "FATAL: version generator failed (git metadata missing?)"; exit 1; }
 [ -n "$WASH_FULL_VER" ] || { echo "FATAL: empty generated version"; exit 1; }
-"$WASH_BIN" --version > "$TMP/ver.out" 2>&1
+# ---------------------------------------------------------------------------
+# 启动前置硬闸（在版本比较与任何用例执行之前）
+#
+# PE 加载期 / DLL 解析失败会让 wash 以 rc=127、stdout/stderr 全空退出（QA
+# #10/#11）。原版本门把 stderr 并进 stdout（2>&1），既掩盖「零输出」特征，
+# 又会把启动失败误报成 stale wash binary / rebuild first。这里先分开捕获
+# stdout/stderr，要求 --version 成功且 banner 非空，再交给下方原有的
+# stale-binary 版本比较。不用 `|| true`、不用 `2>/dev/null` 吞 rc 或输出；
+# 此硬闸不替代下方逐例的 rc + stdout + stderr 对拍。
+# ---------------------------------------------------------------------------
+"$WASH_BIN" --version > "$TMP/ver.out" 2> "$TMP/ver.err"; ver_rc=$?
+if [ "$ver_rc" -ne 0 ] || [ ! -s "$TMP/ver.out" ]; then
+    echo "FATAL: binary failed to start (PE loader / DLL resolution): --version rc=$ver_rc" >&2
+    exit 1
+fi
 ver_got="$(cat "$TMP/ver.out")"
 [ "$ver_got" = "wash $WASH_FULL_VER" ] || {
     echo "FATAL: stale wash binary: expected [wash $WASH_FULL_VER] got [$ver_got]"; exit 1; }
@@ -84,6 +148,18 @@ echo "hard gate: generated version [$WASH_FULL_VER] matches binary"
 
 PASS=0
 FAIL=0
+DIVERGE_PASS=0
+DIVERGE_FAIL=0
+LIST_DIVERGE_C=0
+LIST_DIVERGE_ZH=0
+# 固定用例数（单一清单 docs/intentional-divergences.md）：偏离面不许悄悄扩散。
+#   16 = 2 pattern x 2 locale x 4 mode（Full/Short/Desc/Man）
+#   10 = 孤例派生：4 条 `echo rc=$?` 原 label + 2 条 job_spec [&] echo
+#        + 2 条 `--` + 2 条 `-dms`
+DIVERGE_EXPECTED=26
+# 其余普通用例仍严格 rc+stdout+stderr 逐字节相等；数量同样是硬闸。
+#   435（改造前） - 6（改道为精确偏离断言） + 28（14 条 x2 locale 偏离不扩散新增）
+STRICT_EXPECTED=457
 
 # Hard gate: if the zh_CN locale silently falls back to C on either side,
 # both shells would emit English and every Chinese case would pass vacuously.
@@ -107,7 +183,55 @@ python3 -c 'import sys; rows=open(sys.argv[1],"rb").read().splitlines()[8:]; sys
 }
 echo "hard gate: oracle zh_CN help list body localized ($(wc -c < "$TMP/zh_list_gate.out")B)"
 
-sha() { sha256sum "$1" | cut -d' ' -f1; }
+# Hard gate #3（主理人 2026-11-10 核验项）：oracle 的中文 help **诊断本身**
+# 必须真的本地化。前两个硬闸只证明「中文页面 / 清单」含非 ASCII，而
+# `help_divergence.py` 的 ZH GOLDEN_STDERR 断言的是 `第 1 行：` + 中文文案。
+# 若外层调用缺少 MSYSTEM=MSYS / login shell，MSYS2 的 gettext 会回退到 C，
+# 诊断变成英文 `line 1: help: no help topics match ...` —— 那时 GOLDEN 精确
+# 比较本来就会 FAIL，这里再把它提升为**独立于用例的显式环境硬闸**，并额外
+# 断言原始字节含中文行前缀、不含英文前缀，杜绝「靠 normalize 掉 locale 标记
+# 换 PASS」。实测（指定运行环境）：英文回退 sha256 80ddd323…，中文正确
+# sha256 a1e43a9c…。脚本运行方式见文件头：必须经 MSYSTEM=MSYS ... -lc。
+LC_ALL=zh_CN.UTF-8 LANG=zh_CN.UTF-8 "$BASH_BIN" -c 'help job_spec' \
+    > "$TMP/zh_diag_gate.out" 2> "$TMP/zh_diag_gate.err"
+python3 - "$TMP/zh_diag_gate.err" <<'PY'
+import sys
+
+def require(cond, msg=None):
+    # Explicit raise: a bare `assert` would be stripped by python -O.
+    if not cond:
+        raise AssertionError(msg if msg is not None else "hard assertion failed")
+
+d = open(sys.argv[1], "rb").read()
+require(any(b > 127 for b in d),
+    "oracle zh_CN diagnostic is pure ASCII (gettext fell back to C)")
+require("第 1 行：".encode("utf-8") in d,
+    "oracle zh_CN diagnostic lost the `第 1 行：` prefix")
+require("没有与".encode("utf-8") in d,
+    "oracle zh_CN diagnostic text is not localized")
+require(b"job_spec" in d, "oracle diagnostic lost job_spec")
+require(b"line 1: " not in d,
+    "oracle zh_CN diagnostic fell back to the English `line 1: ` prefix")
+PY
+[ "$?" -eq 0 ] || {
+    echo "FATAL: oracle zh_CN 'help job_spec' diagnostic is not localized"
+    echo "       (run this suite via: MSYSTEM=MSYS /d/msys2/usr/bin/bash.exe -lc '...')"
+    exit 1
+}
+echo "hard gate: oracle zh_CN help diagnostic localized (第 1 行：+ 中文文案, $(wc -c < "$TMP/zh_diag_gate.err")B)"
+
+# sha() 必须自己承重：sha256sum/cut 缺失或失败时返回空串会让两侧比较退化成
+# 「空 == 空」的假 PASS。这里把空串 / 非 64 位十六进制一律变成硬 FATAL。
+sha() {
+    local d
+    d="$(sha256sum "$1" 2>/dev/null | cut -d' ' -f1)" || {
+        echo "FATAL: sha256sum failed for $1"; exit 1; }
+    case "$d" in
+        *[!0-9a-f]*) echo "FATAL: non-hex sha256 digest for $1"; exit 1 ;;
+    esac
+    [ "${#d}" -eq 64 ] || { echo "FATAL: empty/short sha256 digest for $1"; exit 1; }
+    printf '%s' "$d"
+}
 normalize_stderr() {
     sed -E 's#^[^:]*bash(\.exe)?: (line [0-9]+: |第 [0-9]+ 行：)?##; s#^wash(\.exe)?: ##' "$1"
 }
@@ -133,10 +257,22 @@ pair() {
         "$BASH_BIN" -c "$text" > "$TMP/b.out" 2> "$TMP/b.err"; rb=$?
         "$WASH_BIN" -c "$text" > "$TMP/w.out" 2> "$TMP/w.err"; rw=$?
     fi
-    normalize_stderr "$TMP/b.err" > "$TMP/b.err.n"
-    normalize_stderr "$TMP/w.err" > "$TMP/w.err.n"
+    # normalize 失败必须立即 FATAL：否则两侧都会得到空文件，比较退化为
+    # 「空 == 空」的假 PASS（与 P1-1 同类的判定空洞）。
+    normalize_stderr "$TMP/b.err" > "$TMP/b.err.n" || {
+        echo "FATAL: cannot normalize bash stderr for [$label]"; exit 1; }
+    normalize_stderr "$TMP/w.err" > "$TMP/w.err.n" || {
+        echo "FATAL: cannot normalize wash stderr for [$label]"; exit 1; }
+    # sha() 必须对两侧各自的文件求值；he_w 绝不能指向 b.err.n（P1-1）。
     ho_b="$(sha "$TMP/b.out")"; ho_w="$(sha "$TMP/w.out")"
-    he_b="$(sha "$TMP/b.err.n")"; he_w="$(sha "$TMP/b.err.n")"
+    he_b="$(sha "$TMP/b.err.n")"; he_w="$(sha "$TMP/w.err.n")"
+    # 哈希本身也必须承重：若 sha256sum 静默失败产生空串，两侧会相等而假 PASS。
+    case "$ho_b$ho_w$he_b$he_w" in
+        *[!0-9a-f]*|'') echo "FATAL: empty/invalid sha256 digest for [$label]"; exit 1 ;;
+    esac
+    [ "${#ho_b}" -eq 64 ] && [ "${#ho_w}" -eq 64 ] && \
+        [ "${#he_b}" -eq 64 ] && [ "${#he_w}" -eq 64 ] || {
+        echo "FATAL: truncated sha256 digest for [$label]"; exit 1; }
 
     local frc=0
     if [ "$mode" = man ]; then
@@ -167,9 +303,69 @@ pair() {
             fi
         fi
         if [ "$he_b" != "$he_w" ]; then
-            echo "    stderr differs:"
+            echo "    stderr differs (sha256 bash=$he_b wash=$he_w):"
             first_diffs "$TMP/b.err.n" "$TMP/w.err.n"
+            # 打印两侧真实内容（不做任何裁剪/容忍），便于定位到具体字节。
+            echo "    --- bash stderr (normalized, full) ---"
+            sed 's/^/      |/' "$TMP/b.err.n"
+            echo "    --- wash stderr (normalized, full) ---"
+            sed 's/^/      |/' "$TMP/w.err.n"
+            echo "    --- bash stderr (raw hex) ---"
+            od -An -v -tx1 "$TMP/b.err" | sed 's/^/      |/'
+            echo "    --- wash stderr (raw hex) ---"
+            od -An -v -tx1 "$TMP/w.err" | sed 's/^/      |/'
         fi
+    fi
+}
+
+# diverge LABEL LOC MODE SUFFIX OPTS PATTERN
+#   LOC    : C | ZH
+#   MODE   : plain | short | desc | man（决定 canonical `%` 页的校验方式）
+#   SUFFIX : 0 = 纯 `help ...`；1 = 追加 `; echo "rc=$?"`（孤例派生）
+#   OPTS   : 传给 help 的选项串（可为空）；pattern 与 canonical 用同一组选项
+#   PATTERN: 必须精确等于 `job_spec` 或 `job_spec [&]`
+#
+# 不做任何「跳过 / 放宽」：oracle 与 wash 的 rc + stdout + stderr 由
+# tests/help_divergence.py 双侧精确断言，wash 的 stdout 还须逐字节等于
+# 同模式同 locale 下 wash 自己的 `help '%'` 输出；canonical 页本身仍由
+# 既有对拍链（本套件 77 主题 + 单主题选项形式 + help_footer.py）证明与 oracle 一致。
+diverge() {
+    local label="$1" loc="$2" mode="$3" suffix="$4" opts="$5" pattern="$6"
+    local pfx="" pat_text canon_text rb rw rcb rcw note frc
+    if [ -n "$opts" ]; then pfx="$opts "; fi
+    if [ "$suffix" = "1" ]; then
+        pat_text="help ${pfx}'${pattern}'; echo \"rc=\$?\""
+        canon_text="help ${pfx}'%'; echo \"rc=\$?\""
+    else
+        pat_text="help ${pfx}'${pattern}'"
+        canon_text="help ${pfx}'%'"
+    fi
+    if [ "$loc" = ZH ]; then
+        LC_ALL=zh_CN.UTF-8 LANG=zh_CN.UTF-8 "$BASH_BIN" -c "$pat_text"   > "$TMP/d.b.out"  2> "$TMP/d.b.err";  rb=$?
+        LC_ALL=zh_CN.UTF-8 LANG=zh_CN.UTF-8 "$WASH_BIN" -c "$pat_text"   > "$TMP/d.w.out"  2> "$TMP/d.w.err";  rw=$?
+        LC_ALL=zh_CN.UTF-8 LANG=zh_CN.UTF-8 "$BASH_BIN" -c "$canon_text" > "$TMP/d.cb.out" 2> "$TMP/d.cb.err"; rcb=$?
+        LC_ALL=zh_CN.UTF-8 LANG=zh_CN.UTF-8 "$WASH_BIN" -c "$canon_text" > "$TMP/d.cw.out" 2> "$TMP/d.cw.err"; rcw=$?
+    else
+        "$BASH_BIN" -c "$pat_text"   > "$TMP/d.b.out"  2> "$TMP/d.b.err";  rb=$?
+        "$WASH_BIN" -c "$pat_text"   > "$TMP/d.w.out"  2> "$TMP/d.w.err";  rw=$?
+        "$BASH_BIN" -c "$canon_text" > "$TMP/d.cb.out" 2> "$TMP/d.cb.err"; rcb=$?
+        "$WASH_BIN" -c "$canon_text" > "$TMP/d.cw.out" 2> "$TMP/d.cw.err"; rcw=$?
+    fi
+    note="$(python3 "$REPO_ROOT/tests/help_divergence.py" \
+        "$loc" "$pattern" "$mode" "$suffix" "$WASH_FULL_VER" \
+        "$rb"  "$TMP/d.b.out"  "$TMP/d.b.err" \
+        "$rw"  "$TMP/d.w.out"  "$TMP/d.w.err" \
+        "$rcb" "$TMP/d.cb.out" "$TMP/d.cb.err" \
+        "$rcw" "$TMP/d.cw.out" "$TMP/d.cw.err" 2>&1)"
+    frc=$?
+    if [ "$frc" -eq 0 ]; then
+        DIVERGE_PASS=$((DIVERGE_PASS+1))
+    else
+        DIVERGE_FAIL=$((DIVERGE_FAIL+1))
+        echo "FAIL [$label] loc=$loc mode=$mode echo=$suffix opts=[$opts] pattern=[$pattern]"
+        echo "    $note"
+        echo "    oracle/wash: $pat_text"
+        echo "    canonical  : $canon_text"
     fi
 }
 
@@ -196,12 +392,17 @@ python3 - "$TMP/oracle_list.out" "$REPO_ROOT/src/help_pages.rs" > "$TMP/list_dis
 import re
 import sys
 
+def require(cond, msg=None):
+    # Explicit raise: a bare `assert` would be stripped by python -O.
+    if not cond:
+        raise AssertionError(msg if msg is not None else "hard assertion failed")
+
 lines = open(sys.argv[1], "rb").read().decode("utf-8").splitlines()
 body = lines[8:]
-assert len(body) == 39, ("expected 39 list rows", len(body))
+require(len(body) == 39, ("expected 39 list rows", len(body)))
 left, right = [], []
 for row in body:
-    assert row.startswith(" "), row
+    require(row.startswith(" "), row)
     m = re.search(r" {2,}", row[1:])
     if m:
         left.append(row[1:1 + m.start()])
@@ -211,19 +412,19 @@ for row in body:
     else:
         left.append(row[1:])
 entries = left + right
-assert len(left) == 39 and len(right) == 38 and len(entries) == 77, \
-    (len(left), len(right), len(entries))
+require(len(left) == 39 and len(right) == 38 and len(entries) == 77,
+    (len(left), len(right), len(entries)))
 
 rust = open(sys.argv[2], encoding="utf-8").read()
 marker = "pub(crate) const HELP_LIST_MAP: &[(&str, &str)] = &["
-assert marker in rust, "HELP_LIST_MAP missing from src/help_pages.rs"
+require(marker in rust, "HELP_LIST_MAP missing from src/help_pages.rs")
 block = rust.split(marker, 1)[1].split("\n];", 1)[0]
 col1 = re.findall(r'\(\s*r#"(.*?)"#,', block)
-assert len(col1) == 77, ("HELP_LIST_MAP first column size", len(col1))
-assert col1 == entries, "HELP_LIST_MAP display column != oracle C list"
+require(len(col1) == 77, ("HELP_LIST_MAP first column size", len(col1)))
+require(col1 == entries, "HELP_LIST_MAP display column != oracle C list")
 for e in entries:
     # A single-quoted literal must be able to carry the whole value unchanged.
-    assert "'" not in e and "\n" not in e, ("unsafe display value", e)
+    require("'" not in e and "\n" not in e, ("unsafe display value", e))
     print(e)
 PY
 [ "$?" -eq 0 ] || { echo "FATAL: cannot derive the 77 list display values"; exit 1; }
@@ -237,15 +438,26 @@ for t in "${TOPICS[@]}"; do
     pair "topic:$t" "help '$t'"
 done
 
-# 77 条清单显示值原样当 NAME：bash 5.3 的清单是短摘要而非查找键，实测
+# 77 条清单显示值原样当 NAME：bash 5.3 的清单是短摘要而非查找键，oracle 实测
 # 72/77 查不到。两侧 rc + stdout + stderr 全量对拍（plain 模式，不切任何行），
 # 差异由 first_diffs 定位。显示值含空格 / `>` / `[` / `;` / `&` / `!` / `{`，
 # 但不含单引号，故整词单引号即可保证一字不差地传成一个 argv。
-echo "=== [C] 清单显示值原样作为 NAME（77 例，rc+stdout+stderr 逐字节对拍）==="
+# 唯一例外 D-002：`job_spec [&]` 走单-pattern 精确偏离通道（plain 模式），
+# 由 help_divergence.py 做双侧精确断言；改道次数是硬闸，防止偏离扩散到
+# 其它 76 条显示值。
+echo "=== [C] 清单显示值原样作为 NAME（77 例，rc+stdout+stderr 逐字节对拍；1 例 D-002 精确偏离）==="
 for i in "${!LIST_DISPLAY[@]}"; do
     d="${LIST_DISPLAY[$i]}"
-    pair "list-name:$((i + 1)):$d" "help '$d'"
+    if [ "$d" = 'job_spec [&]' ]; then
+        diverge "list-name:$((i + 1)):$d" C plain 0 "" "$d"
+        LIST_DIVERGE_C=$((LIST_DIVERGE_C+1))
+    else
+        pair "list-name:$((i + 1)):$d" "help '$d'"
+    fi
 done
+[ "$LIST_DIVERGE_C" -eq 1 ] || {
+    echo "FATAL: [C] list display divergence count != 1 ($LIST_DIVERGE_C)"; exit 1; }
+echo "hard gate: [C] 76/77 清单显示值仍严格对拍，仅 1 例改道 D-002 精确偏离"
 
 echo "=== [C] 四种模式的全量拼接（每例覆盖全部 77 页）==="
 pair 'all:full'      "help '*'"
@@ -300,17 +512,51 @@ pair 'opt:after-name' "help cd -s"
 pair 'opt:-'          "help -; echo \"rc=\$?\""
 pair 'opt:--name'     "help -- cd"
 pair 'err:nosuch'     "help nosuchbuiltin; echo \"rc=\$?\""
-# bash 5.3 固有的「列出≠可查」孤例，**不是 wash 缺陷**：无参清单第 2 项显示
-# `job_spec [&]`，但该页的规范名是 `%`；oracle 自身 `help job_spec` 就是 rc=1。
-# wash 必须保持 rc=1，禁止为 job_spec 补别名（会破坏逐字节兼容）。以下几条
-# 把 rc + stdout + stderr 全量对拍，不裁剪版本行或任何其它输出。
-pair 'err:job_spec'    "help job_spec; echo \"rc=\$?\""
-pair 'orphan:job_spec' "help job_spec; echo \"rc=\$?\""
+# D-002 精确偏离断言（取代旧的「wash 必须 rc=1」普通对拍）。原两条
+# `help job_spec; echo rc=$?` 用例的 label 全部保留，改为
+# tests/help_divergence.py 的双侧精确断言：oracle rc=0（echo 成功）+
+# stdout 精确 `rc=1` + stderr 精确诊断；wash rc=0 + stdout 精确等于
+# wash `help '%'; echo rc=$?` + stderr 空。不许只比 rc、不许「包含」、
+# 不许裁剪版本行或任何输出。
+# `help '%'` 两条仍是普通严格对拍，证明 D-002 所指的规范页本身仍与 oracle 一致。
+diverge 'err:job_spec'    C plain 1 "" 'job_spec'
+diverge 'orphan:job_spec' C plain 1 "" 'job_spec'
 pair 'orphan:pct'      "help '%'; echo \"rc=\$?\""
 pair 'orphan:pct-page' "help '%'"
 pair 'err:upper'      "help CD; echo \"rc=\$?\""
 pair 'err:brace'      "help '}'; echo \"rc=\$?\""
 pair 'err:s-none'     "help -s nosuch; echo \"rc=\$?\""
+
+echo "=== [C] D-002 有意偏离：固定用例集（2 pattern x 4 模式，每 locale 8 条）==="
+# `job_spec` 四种模式 + `job_spec [&]` 的 -s/-d/-m 三种模式；
+# `job_spec [&]` 的 Full 模式已在上面清单显示值循环里精确断言。
+diverge 'div:C:js:full'    C plain 0 ""     'job_spec'
+diverge 'div:C:js:short'   C short 0 "-s"   'job_spec'
+diverge 'div:C:js:desc'    C desc  0 "-d"   'job_spec'
+diverge 'div:C:js:man'     C man   0 "-m"   'job_spec'
+diverge 'div:C:jsd:short'  C short 0 "-s"   'job_spec [&]'
+diverge 'div:C:jsd:desc'   C desc  0 "-d"   'job_spec [&]'
+diverge 'div:C:jsd:man'    C man   0 "-m"   'job_spec [&]'
+# 孤例派生：job_spec [&] 的 echo 形式，以及 `--` / `-dms` 两条同一通道输入。
+diverge 'div:C:jsd:echo'   C plain 1 ""     'job_spec [&]'
+diverge 'div:C:js:dd'      C plain 0 "--"   'job_spec'
+diverge 'div:C:js:dms'     C desc  0 "-dms" 'job_spec'
+
+echo "=== [C] 偏离不扩散：glob / 多 pattern / 空 pattern / 别名路径严格对拍（14 例）==="
+pair 'noleak:C:job*'        "help 'job*'"
+pair 'noleak:C:job_spec*'   "help 'job_spec*'"
+pair 'noleak:C:js+cd'       "help job_spec cd"
+pair 'noleak:C:cd+js'       "help cd job_spec"
+pair 'noleak:C:jsdisp+cd'   "help 'job_spec [&]' cd"
+pair 'noleak:C:cd+jsdisp'   "help cd 'job_spec [&]'"
+pair 'noleak:C:js+js'       "help job_spec job_spec"
+pair 'noleak:C:star'        "help '*'"
+pair 'noleak:C:s-star'      "help -s '*'"
+pair 'noleak:C:s-jobclass'  "help -s 'job[!]*'"
+pair 'noleak:C:d-jobclass'  "help -d 'job[!]*'"
+pair 'noleak:C:empty'       "help ''"
+pair 'noleak:C:s-empty'     "help -s -- ''"
+pair 'noleak:C:two-globs'   "help 'c*' 'z*'"
 
 echo "=== [zh_CN] 每个主题的完整手册页（77 例）==="
 for t in "${TOPICS[@]}"; do
@@ -318,11 +564,21 @@ for t in "${TOPICS[@]}"; do
 done
 
 # 同一组 77 条 C 清单显示值在 zh_CN 下原样当 NAME：诊断译文也被逐字节对拍。
-echo "=== [zh_CN] 清单显示值原样作为 NAME（77 例，rc+stdout+stderr 逐字节对拍）==="
+# 同样只有 `job_spec [&]` 一例改道 D-002 精确偏离（中文期望页取自 wash 自己
+# 已与 oracle 对齐的 `help '%'` ZH 输出，绝不硬编码）。
+echo "=== [zh_CN] 清单显示值原样作为 NAME（77 例；1 例 D-002 精确偏离）==="
 for i in "${!LIST_DISPLAY[@]}"; do
     d="${LIST_DISPLAY[$i]}"
-    pair "zh:list-name:$((i + 1)):$d" "help '$d'" ZH
+    if [ "$d" = 'job_spec [&]' ]; then
+        diverge "zh:list-name:$((i + 1)):$d" ZH plain 0 "" "$d"
+        LIST_DIVERGE_ZH=$((LIST_DIVERGE_ZH+1))
+    else
+        pair "zh:list-name:$((i + 1)):$d" "help '$d'" ZH
+    fi
 done
+[ "$LIST_DIVERGE_ZH" -eq 1 ] || {
+    echo "FATAL: [zh_CN] list display divergence count != 1 ($LIST_DIVERGE_ZH)"; exit 1; }
+echo "hard gate: [zh_CN] 76/77 清单显示值仍严格对拍，仅 1 例改道 D-002 精确偏离"
 
 echo "=== [zh_CN] 四种模式的全量拼接 ==="
 pair 'zh:all:full'    "help '*'" ZH
@@ -373,14 +629,50 @@ pair 'zh:opt:-x'         "help -x cd; echo \"rc=\$?\"" ZH
 pair 'zh:opt:-'          "help -; echo \"rc=\$?\"" ZH
 pair 'zh:opt:--name'     "help -- cd" ZH
 pair 'zh:err:nosuch'     "help nosuchbuiltin; echo \"rc=\$?\"" ZH
-# 孤例在 zh_CN 同样成立（诊断译文也逐字节对拍），见 C 段注释。
-pair 'zh:err:job_spec'     "help job_spec; echo \"rc=\$?\"" ZH
-pair 'zh:orphan:job_spec'  "help job_spec; echo \"rc=\$?\"" ZH
+# D-002 在 zh_CN 同样是精确偏离：oracle 的中文诊断（含 `第 1 行：` 前缀）
+# 与 wash 的 `%` 中文页分别精确断言，见 C 段注释与 help_divergence.py。
+diverge 'zh:err:job_spec'     ZH plain 1 "" 'job_spec'
+diverge 'zh:orphan:job_spec'  ZH plain 1 "" 'job_spec'
 pair 'zh:orphan:pct'       "help '%'; echo \"rc=\$?\"" ZH
 pair 'zh:err:upper'      "help CD; echo \"rc=\$?\"" ZH
 pair 'zh:err:brace'      "help '}'; echo \"rc=\$?\"" ZH
 pair 'zh:err:s-none'     "help -s nosuch; echo \"rc=\$?\"" ZH
 
-echo "=== 结果: PASS=$PASS FAIL=$FAIL ==="
+echo "=== [zh_CN] D-002 有意偏离：固定用例集（2 pattern x 4 模式，8 条）==="
+diverge 'div:ZH:js:full'    ZH plain 0 ""     'job_spec'
+diverge 'div:ZH:js:short'   ZH short 0 "-s"   'job_spec'
+diverge 'div:ZH:js:desc'    ZH desc  0 "-d"   'job_spec'
+diverge 'div:ZH:js:man'     ZH man   0 "-m"   'job_spec'
+diverge 'div:ZH:jsd:short'  ZH short 0 "-s"   'job_spec [&]'
+diverge 'div:ZH:jsd:desc'   ZH desc  0 "-d"   'job_spec [&]'
+diverge 'div:ZH:jsd:man'    ZH man   0 "-m"   'job_spec [&]'
+diverge 'div:ZH:jsd:echo'   ZH plain 1 ""     'job_spec [&]'
+diverge 'div:ZH:js:dd'      ZH plain 0 "--"   'job_spec'
+diverge 'div:ZH:js:dms'     ZH desc  0 "-dms" 'job_spec'
+
+echo "=== [zh_CN] 偏离不扩散：glob / 多 pattern / 空 pattern / 别名路径严格对拍（14 例）==="
+pair 'noleak:ZH:job*'        "help 'job*'" ZH
+pair 'noleak:ZH:job_spec*'   "help 'job_spec*'" ZH
+pair 'noleak:ZH:js+cd'       "help job_spec cd" ZH
+pair 'noleak:ZH:cd+js'       "help cd job_spec" ZH
+pair 'noleak:ZH:jsdisp+cd'   "help 'job_spec [&]' cd" ZH
+pair 'noleak:ZH:cd+jsdisp'   "help cd 'job_spec [&]'" ZH
+pair 'noleak:ZH:js+js'       "help job_spec job_spec" ZH
+pair 'noleak:ZH:star'        "help '*'" ZH
+pair 'noleak:ZH:s-star'      "help -s '*'" ZH
+pair 'noleak:ZH:s-jobclass'  "help -s 'job[!]*'" ZH
+pair 'noleak:ZH:d-jobclass'  "help -d 'job[!]*'" ZH
+pair 'noleak:ZH:empty'       "help ''" ZH
+pair 'noleak:ZH:s-empty'     "help -s -- ''" ZH
+pair 'noleak:ZH:two-globs'   "help 'c*' 'z*'" ZH
+
+echo "=== 结果: 严格对拍 PASS=$PASS FAIL=$FAIL | D-002 精确偏离 PASS=$DIVERGE_PASS FAIL=$DIVERGE_FAIL ==="
+[ "$PASS" -eq "$STRICT_EXPECTED" ] || {
+    echo "FATAL: strict case count drifted: expected $STRICT_EXPECTED got $PASS"; exit 1; }
+[ "$DIVERGE_PASS" -eq "$DIVERGE_EXPECTED" ] || {
+    echo "FATAL: divergence case count drifted: expected $DIVERGE_EXPECTED got $DIVERGE_PASS"; exit 1; }
+echo "hard gate: 其余 $PASS 例仍严格 rc+stdout+stderr 逐字节相等；偏离面固定为 $DIVERGE_PASS 例"
+echo "hard gate: docs/intentional-divergences.md 恰好登记 2 条有意偏离（D-001 / D-002）"
 [ "$FAIL" -eq 0 ] || exit 1
+[ "$DIVERGE_FAIL" -eq 0 ] || exit 1
 exit 0

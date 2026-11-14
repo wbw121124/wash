@@ -106,7 +106,9 @@ Win32 控制台 API、也不使用带 Win32 后端的行编辑器 crate（如 ru
 ./tests/bash_diff_cli.sh           # CLI 参数形态
 ./tests/bash_diff_help.sh          # help：C / zh_CN 双 locale，77 主题完整页 / -s -d -m /
                                    # 无参清单（抬头 5 句 + 77 条摘要）/ glob / 错误路径
-                                   # 77 条清单显示值原样当 NAME 对拍 + job_spec/% 孤例锁定；清单↔规范名由 HELP_LIST_MAP 单一真源绑定
+                                   # 77 条清单显示值原样当 NAME 对拍；清单↔规范名由 HELP_LIST_MAP 单一真源绑定
+                                   # D-002（job_spec 单-pattern 精确偏离）由 tests/help_divergence.py 双侧精确断言
+                                   # + 14x2 条「偏离不扩散」严格对拍；偏离/严格用例数均为硬闸
                                    # `-m` 的 wash 身份段由 tests/help_footer.py 做严格替换对拍
 ./tools/gen_help_pages.py          # 从 MSYS2 oracle 重生成两份 help 页数据 + po 清单译文段
                                    # （--check 校验新鲜度，含双 locale 双栏排版逐字节重建）
@@ -117,6 +119,21 @@ Win32 控制台 API、也不使用带 Win32 后端的行编辑器 crate（如 ru
 bash tests/perf/better_than_bash.sh target/release/wash.exe
                                    # 「比 bash 更好」门禁：性能 / 启动 / 内存（需 release + MSYS2）
 ```
+
+## 有意偏离清单（唯一真源）
+
+wash 以 GNU bash 5.3.20（MSYS2）为主 oracle，非交互 `-c` 的输出默认
+**逐字节一致**。`docs/intentional-divergences.md` 是全部**有意例外**的单一
+清单，当前恰好 2 条，测试套件用常量引用它并硬断言条目数与用例数：
+
+| ID | 例外 | 裁决 |
+| --- | --- | --- |
+| D-001 | `help -m` 的 IMPLEMENTATION 段用 wash 身份而非 GNU bash 版权段 | 项目自始的既有行为；`tests/help_footer.py` 严格替换 + 可逆性 + 生成版本校验 |
+| D-002 | `help job_spec` / `help 'job_spec [&]'`（单 pattern 精确）命中 `%` 页，rc=0 | 用户 2026-11-10 裁决：要、全局生效（含非交互 `-c`）、**允许破坏脚本兼容**、否决「仅交互模式」；唯一新增例外 |
+
+D-002 刻意不进通用别名表：只有「选项解析后恰好 1 个 pattern 且字符串精确
+命中」才生效，glob / 多 pattern / 空 pattern / 其余 76 条清单显示值 / 别名
+路径全部仍与 oracle 严格逐字节对拍。除这 2 条外，任何判定都没有放宽。
 
 ## 发布 0.2.1
 

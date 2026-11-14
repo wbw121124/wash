@@ -63,20 +63,35 @@ fn main() {
     emit_version();
     let mut build = cc::Build::new();
 
-    if let Ok(out) = std::process::Command::new("rustc")
+    // The shim MUST be built by the msys gcc that targets x86_64-pc-cygwin.
+    // Falling back to whatever gcc is first on PATH can silently pick
+    // MinGW-w64 and produce an ABI-incompatible object (see the header
+    // comment).  A probe failure is therefore a hard build error, never a
+    // silent fallback to PATH.
+    let out = std::process::Command::new("rustc")
         .arg("--print")
         .arg("sysroot")
         .output()
-    {
-        if out.status.success() {
-            let sysroot = String::from_utf8_lossy(&out.stdout);
-            let sysroot = sysroot.trim();
-            let candidate: PathBuf = PathBuf::from(sysroot).join("bin/gcc.exe");
-            if candidate.exists() {
-                build.compiler(candidate);
-            }
-        }
+        .unwrap_or_else(|e| {
+            panic!("cannot locate the msys gcc: `rustc --print sysroot` failed ({e})")
+        });
+    if !out.status.success() {
+        panic!(
+            "cannot locate the msys gcc: `rustc --print sysroot` exited with {:?}:\n{}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
+    let sysroot = String::from_utf8_lossy(&out.stdout);
+    let sysroot = sysroot.trim();
+    let candidate: PathBuf = PathBuf::from(sysroot).join("bin/gcc.exe");
+    if !candidate.exists() {
+        panic!(
+            "{} not found; refusing to fall back to whatever gcc is first on PATH (see build.rs header)",
+            candidate.display()
+        );
+    }
+    build.compiler(candidate);
 
     build.file("src/posix_shim.c").compile("washposix");
     // 故意不 emit `cargo:rustc-link-lib=dl`：P0 spike（docs/spike-dlopen.md）

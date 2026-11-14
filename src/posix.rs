@@ -6,7 +6,7 @@
 // are added ahead of the phases that consume them.
 #![allow(dead_code)]
 
-use std::ffi::{c_char, c_int, CString};
+use std::ffi::{c_char, c_int, CStr, CString};
 use std::os::raw::c_int as RawCInt;
 
 extern "C" {
@@ -40,6 +40,7 @@ extern "C" {
     fn wash_wif_signaled(status: c_int) -> c_int;
     fn wash_wtermsig(status: c_int) -> c_int;
     fn wash_errno() -> c_int;
+    fn wash_strerror(code: c_int) -> *const c_char;
     fn wash_read_file(path: *const c_char, buf: *mut c_char, n: usize) -> isize;
     fn wash_stat(path: *const c_char, follow: c_int, out: *mut StatBuf) -> c_int;
     fn wash_geteuid() -> u32;
@@ -355,21 +356,31 @@ pub fn errno() -> i32 {
     unsafe { wash_errno() }
 }
 
-/// A bash-style message for an `errno` value.
+/// A message for an `errno` value.
+///
+/// The text comes straight from libc `strerror(3)` -- the same call bash's
+/// `sys_error()` uses -- so it is byte-identical to bash and cannot drift.
+///
+/// Locale: `strerror` honours `LC_MESSAGES` by definition, but this
+/// platform's libc (msys-2.0 / Cygwin) ships no gettext catalog for the errno
+/// strings, so the text stays English even under `zh_CN.UTF-8` -- exactly as
+/// bash's own strerror-derived text does. The localized *wrapper* bash prints
+/// ("第 1 行：", "无法修改限制") comes from bash's own catalogs, not from
+/// strerror, and wash does not replicate it.
+///
+/// Do NOT reintroduce a hand-written match table. The errno *numbers* are
+/// platform-specific (Cygwin has ENAMETOOLONG = 91 and ELOOP = 92, not Linux's
+/// 36 and 40), so a Linux-numbered table both mislabels codes it does contain
+/// and prints "Unknown error N" for the rest. That was the bug this replaced.
 pub fn errno_message(code: i32) -> String {
-    match code {
-        1 => "Operation not permitted".to_string(),
-        2 => "No such file or directory".to_string(),
-        3 => "No such process".to_string(),
-        13 => "Permission denied".to_string(),
-        17 => "File exists".to_string(),
-        20 => "Not a directory".to_string(),
-        21 => "Is a directory".to_string(),
-        22 => "Invalid argument".to_string(),
-        36 => "File name too long".to_string(),
-        40 => "Too many levels of symbolic links".to_string(),
-        _ => format!("Unknown error {}", code),
+    let ptr = unsafe { wash_strerror(code) };
+    if !ptr.is_null() {
+        if let Ok(text) = unsafe { CStr::from_ptr(ptr) }.to_str() {
+            return text.to_string();
+        }
     }
+    // strerror never returns NULL in practice, but FFI must not assume it.
+    format!("Unknown error {}", code)
 }
 
 /// Read a whole file into memory. Returns `None` when the file cannot be

@@ -456,6 +456,12 @@ fn builtin_export(argv: &[String], sh: &mut Shell) -> i32 {
                     eprintln!("wash: export: `{}': not a valid identifier", arg);
                     return 1;
                 }
+                // A readonly variable must not be reassigned through `export`.
+                // bash prints `Y: readonly variable` (no `export:` prefix).
+                if sh.readonly.contains(name) {
+                    eprintln!("wash: {}: readonly variable", name);
+                    return 1;
+                }
                 if unexport {
                     sh.env.remove(name);
                     sh.exported.remove(name);
@@ -2261,6 +2267,59 @@ fn read_fields(input: &str, ifs: &[char], nvars: usize) -> Vec<String> {
     fields
 }
 
+/// 把 `read` 收集到的**原始字节流**还原成 String。
+///
+/// bash 的 `read` 按字节保真：变量里存的就是 stdin 的原始字节，`LC_ALL=C`
+/// 下尤其明显——多字节 UTF-8 序列并不被当作 Unicode 字符重新解释。因此
+/// 这里优先把整段按合法 UTF-8 还原：合法时 String 的内部字节与原始字节
+/// 逐字节相同，后续 `printf '%s'` 输出自然与 bash 一致，中文不会被二次
+/// 编码成 `c3 xx`。实测 C 与 C.utf8 两种 locale 下 bash 的中文 read 输出
+/// 完全相同，正是这种字节保真语义。
+///
+/// 不能写成逐字节 `out.push(b as char)`：那会把 UTF-8 多字节序列拆成
+/// Latin-1 字符，输出时再编码，正是本项要修的乱码。只有遇到非法/不完整
+/// UTF-8（例如 C locale 下 `read -n` 截断在多字节字符中间）才逐段做
+/// Latin-1 有损回退，且不引入 U+FFFD 替换符。
+fn decode_read_bytes(bytes: &[u8]) -> String {
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        // 内联 UTF-8 首字节长度判定，避免依赖 repl.rs 的私有工具函数。
+        let len = if b < 0x80 {
+            1
+        } else if b >> 5 == 0b110 {
+            2
+        } else if b >> 4 == 0b1110 {
+            3
+        } else if b >> 3 == 0b11110 {
+            4
+        } else {
+            1
+        };
+        if len == 1 {
+            out.push(b as char);
+            i += 1;
+            continue;
+        }
+        let end = (i + len).min(bytes.len());
+        match std::str::from_utf8(&bytes[i..end]) {
+            Ok(s) => {
+                out.push_str(s);
+                i = end;
+            }
+            Err(_) => {
+                out.push(b as char);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 /// The `read` builtin: read a line from the standard input and split it
 /// into the given variables.
 ///
@@ -2364,7 +2423,11 @@ fn builtin_read(argv: &[String], sh: &mut Shell) -> i32 {
     }
 
     // Read the input up to the delimiter.
-    let mut input = String::new();
+    // Collect the RAW bytes first.  `read` is byte-oriented (bash keeps the
+    // original stdin bytes, especially under LC_ALL=C); decoding per byte
+    // with `push(b as char)` would corrupt UTF-8 into Latin-1.  The single
+    // decode below restores the original bytes verbatim for valid UTF-8.
+    let mut input_bytes: Vec<u8> = Vec::new();
     let mut eof = false;
     let mut count = 0usize;
     let mut pass_next = false;
@@ -2385,7 +2448,7 @@ fn builtin_read(argv: &[String], sh: &mut Shell) -> i32 {
                 // A backslash-newline pair disappears from the input.
                 continue;
             }
-            input.push(c as char);
+            input_bytes.push(c);
             count += 1;
             continue;
         }
@@ -2396,13 +2459,14 @@ fn builtin_read(argv: &[String], sh: &mut Shell) -> i32 {
         if c == delim && !exact {
             break;
         }
-        input.push(c as char);
+        input_bytes.push(c);
         count += 1;
     }
     if pass_next {
         // The input ended with a lone backslash: it is dropped.
-        input.pop();
+        input_bytes.pop();
     }
+    let input = decode_read_bytes(&input_bytes);
 
     // bash returns 1 when the end of the file was reached.
     let status = if eof { 1 } else { 0 };
@@ -3357,8 +3421,7 @@ fn builtin_exec(argv: &[String], sh: &mut Shell) -> i32 {
         command[0] = name;
     }
     let path = sh.env.get("PATH").cloned().unwrap_or_default();
-    let env = sh.child_env();
-    let (_cstrings, env_ptrs) = crate::executor::build_env_ptrs(&env);
+    let (_cstrings, env_ptrs) = crate::executor::build_shell_env_ptrs(sh);
     match crate::executor::find_executable(&program, &path) {
         Some(exe) => {
             let argvec = crate::executor::ArgVec::from(&command);
@@ -4685,8 +4748,11 @@ fn builtin_local(argv: &[String], sh: &mut Shell) -> i32 {
             frame.insert(name.to_string(), sh.env.get(name).cloned());
         }
         if let Some(v) = value {
-            if readonly_attr && sh.readonly.contains(name) {
-                eprintln!("wash: {}: readonly variable", name);
+            if sh.readonly.contains(name) {
+                // bash prints `local: Z: readonly variable` (builtin prefix).
+                // Guard applies with or without `-r`, so `local Z=9` can no
+                // longer silently overwrite a readonly variable.
+                eprintln!("wash: local: {}: readonly variable", name);
                 status = 1;
             } else {
                 sh.env.insert(name.to_string(), v);
@@ -4786,14 +4852,16 @@ fn builtin_declare(argv: &[String], sh: &mut Shell, _is_typeset: bool) -> i32 {
                     status = 1;
                     continue;
                 }
-                apply_var_attrs(
+                if !apply_var_attrs(
                     sh,
                     name,
                     Some(value.to_string()),
                     export_attr,
                     readonly_attr,
                     integer_attr,
-                );
+                ) {
+                    status = 1;
+                }
             }
             None => {
                 if !is_valid_ident(arg) {
@@ -4805,14 +4873,16 @@ fn builtin_declare(argv: &[String], sh: &mut Shell, _is_typeset: bool) -> i32 {
                 if array_attr {
                     sh.arrays.entry(arg.clone()).or_insert_with(Vec::new);
                 }
-                apply_var_attrs(
+                if !apply_var_attrs(
                     sh,
                     arg,
                     None,
                     export_attr,
                     readonly_attr,
                     integer_attr,
-                );
+                ) {
+                    status = 1;
+                }
             }
         }
     }
@@ -4882,7 +4952,7 @@ fn builtin_readonly(argv: &[String], sh: &mut Shell) -> i32 {
                     continue;
                 }
                 if sh.readonly.contains(name) {
-                    eprintln!("wash: readonly: {}: readonly variable", name);
+                    eprintln!("wash: {}: readonly variable", name);
                     status = 1;
                     continue;
                 }
@@ -4896,7 +4966,7 @@ fn builtin_readonly(argv: &[String], sh: &mut Shell) -> i32 {
                     continue;
                 }
                 if sh.readonly.contains(arg) {
-                    eprintln!("wash: readonly: {}: readonly variable", arg);
+                    eprintln!("wash: {}: readonly variable", arg);
                     status = 1;
                     continue;
                 }
@@ -4912,6 +4982,8 @@ fn builtin_readonly(argv: &[String], sh: &mut Shell) -> i32 {
 }
 
 /// Apply the requested attributes to `name`, optionally assigning `value`.
+/// Returns false when the assignment was refused because the variable is
+/// readonly (bash: `declare: X: readonly variable`, rc=1, value unchanged).
 fn apply_var_attrs(
     sh: &mut Shell,
     name: &str,
@@ -4919,10 +4991,12 @@ fn apply_var_attrs(
     export_attr: bool,
     readonly_attr: bool,
     integer_attr: bool,
-) {
-    if readonly_attr && sh.readonly.contains(name) {
-        eprintln!("wash: {}: readonly variable", name);
-        return;
+) -> bool {
+    // Guard applies to every assignment path, not just `declare -r`: a plain
+    // `declare X=2` must not silently overwrite a readonly variable either.
+    if sh.readonly.contains(name) && (readonly_attr || value.is_some()) {
+        eprintln!("wash: declare: {}: readonly variable", name);
+        return false;
     }
     if let Some(v) = value {
         let v = if integer_attr {
@@ -4945,6 +5019,7 @@ fn apply_var_attrs(
     if integer_attr {
         sh.integer_vars.insert(name.to_string());
     }
+    true
 }
 
 /// Every variable name the shell knows about (used by `declare -p` with no
@@ -5146,6 +5221,12 @@ fn builtin_kill(argv: &[String], sh: &mut Shell) -> i32 {
             let canon = signal_to_name(sig);
             if let Some(action) = sh.traps.get(&canon).cloned() {
                 if action != "-" {
+                    // bash finishes the `kill` builtin before it dispatches the
+                    // pending trap, so `$?` inside the trap is the builtin's
+                    // status (0 on success), NOT the status of the command that
+                    // ran before `kill`.  Without this, `trap 'exit $?' INT;
+                    // false; kill -INT $$` would exit 1 instead of bash's 0.
+                    sh.last_status = status;
                     sh.run_in_error_context(crate::shell::ErrorContext::signal_trap(), &action);
                 }
                 continue;
@@ -5789,7 +5870,17 @@ fn builtin_ulimit(argv: &[String], _sh: &mut Shell) -> i32 {
                         .find(|(_, c, _)| *c == letter)
                         .map(|(_, _, f)| *f)
                         .unwrap_or(1);
-                    n * factor
+                    // bash rejects a value whose scaled rlimit does not fit in
+                    // rlim_t with `ulimit: <value>: limit out of range` (rc 1).
+                    // checked_mul (never wrapping_mul) avoids both a debug-build
+                    // panic and a silently truncated / wrapped limit.
+                    match n.checked_mul(factor) {
+                        Some(raw) => raw,
+                        None => {
+                            eprintln!("wash: ulimit: {}: limit out of range", v);
+                            return 1;
+                        }
+                    }
                 }
                 Err(_) => {
                     eprintln!("wash: ulimit: {}: invalid number", v);
@@ -5798,7 +5889,17 @@ fn builtin_ulimit(argv: &[String], _sh: &mut Shell) -> i32 {
             }
         };
         if posix::rlimit(letter as u8, raw, raw, true).is_none() {
-            eprintln!("wash: ulimit: {}: cannot modify limit", letter);
+            // bash reports `ulimit: <resource name>: cannot modify limit:
+            // <strerror>`.  Read errno immediately after the failing shim and
+            // use the resource's full name, not the short option letter.
+            let e = posix::errno();
+            let msg = posix::errno_message(e);
+            let desc = RES
+                .iter()
+                .find(|(_, c, _)| *c == letter)
+                .map(|(d, _, _)| *d)
+                .unwrap_or("");
+            eprintln!("wash: ulimit: {}: cannot modify limit: {}", desc, msg);
             return 1;
         }
         return 0;
@@ -6225,6 +6326,11 @@ fn builtin_disown(argv: &[String], sh: &mut Shell) -> i32 {
 // `tools/gen_help_pages.py`.  They are **documentation**, not a capability
 // list: bash's list also contains reserved words, `job_spec`, `variables` and
 // builtins wash has not ported yet.
+//
+// One intentional exception (D-002 in `docs/intentional-divergences.md`): the
+// two enumerated `job_spec` strings are made queryable via the single-pattern
+// channel in `builtin_help`.  It is NOT a general "list value is a lookup key"
+// rule; all other display values still behave exactly like the oracle.
 
 /// `help` 的 stdout 统一从这里落地。
 ///
@@ -6295,6 +6401,8 @@ fn print_help_columns(entries: &[String], out: &mut String) {
 /// `LC_ALL=C` 的 `help` 输出），由 `crate::help_pages` 查表与排版。
 /// 这是**文档**，不是 wash 已实现内建的能力声明：bash 的清单同样包含
 /// 保留字、job_spec、variables 以及 wash 尚未移植的 builtin。
+/// 唯一有意偏离见 `docs/intentional-divergences.md` D-002：两个 `job_spec`
+/// 字符串在单 pattern 精确通道里被重定向到 `%` 页。
 ///
 /// `help` 必须走内建表：如果把它当成外部命令，Windows 上会落到 `help.exe`
 /// ——在 `LC_ALL=C` 下会挂起，在中文 locale 下还会输出 GBK 乱码。
@@ -6362,8 +6470,9 @@ fn builtin_help(argv: &[String], sh: &mut Shell) -> i32 {
         block.push_str(&tr!("A star (*) next to a name means that the command is disabled."));
         block.push_str("\n\n");
         // 清单主体：从单一真源 HELP_LIST_MAP 的第一列派生 77 个显示值，
-        // 按列优先排成双栏。第二列（规范名）不参与排版：清单显示值不是
-        // `help NAME` 的查找键，二者由 help_pages::verify_list_binding 硬绑定。
+        // 按列优先排成双栏。第二列（规范名）不参与排版：清单显示值（除
+        // D-002 登记的两个 `job_spec` 字符串外）不是 `help NAME` 的查找键，
+        // 二者由 help_pages::verify_list_binding 硬绑定。
         // 动态插件内建（bash 无此概念）追加在末尾；未加载插件时清单
         // 原样输出，与 oracle 除版本行外逐字节一致。
         // 每条短摘要是一个 gettext msgid：C 下查不到译文回退英文原文，zh_CN 下
@@ -6381,6 +6490,22 @@ fn builtin_help(argv: &[String], sh: &mut Shell) -> i32 {
         }
         print_help_columns(&entries, &mut block);
         help_emit(&block);
+        return 0;
+    }
+
+    // 唯一有意偏离 D-002（`docs/intentional-divergences.md`）：仅当选项解析后
+    // 的 pattern 列表恰好为 1 个、且字符串精确等于 `JOB_SPEC_DIVERGENCES`
+    // 登记值时，直接渲染 `%` 页并 rc=0、stderr 为空。
+    //
+    // 必须在**任何** glob banner 与失败诊断之前短路：`job_spec [&]` 里的
+    // `[&]` 会被 `is_glob()` 当成字符类，若不短路就会先打印
+    // "Shell commands matching keyword" 标题，导致 wash 输出与 `help '%'`
+    // 不再逐字节相等。同时该通道不进入 `lookup()`，因此 glob / 多 pattern /
+    // 空 pattern / 别名查找等所有其它路径都不可能多输出 `%` 页。
+    // 四种模式（无选项 / -s / -d / -m）沿用同一个 `render`，`-m` 自然带上
+    // wash 身份 footer，`-d` 自然使用英文 short_doc，两个 locale 由 `all()` 决定。
+    if let Some(page) = help_pages::divergence_page(&patterns) {
+        help_emit(&help_pages::render(page, mode));
         return 0;
     }
 

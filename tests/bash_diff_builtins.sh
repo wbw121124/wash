@@ -26,9 +26,13 @@
 #       'cd /d/project/WorkBuddy/wash && bash tests/bash_diff_builtins.sh'
 #
 # Optional: ONLY_GROUP=A|K|B|C|D runs a single group.
-#   A = core semantics + finished builtins  -> MUST stay green (regressions)
+#   A = core semantics + finished builtins (413 cases: 340 + 33 brace-range
+#       + 24 brace word-boundary + 15 brace nest/escape/quote-removal
+#       + 1 brace deep-nesting stack guard)
+#       -> MUST stay green (regressions)
+#       -> MUST stay green (regressions)
 #   K = KNOWN-DIFF: cannot be byte-equal by design (documented, not fixed)
-#   B = KNOWN-DEFECT: known bugs being fixed (currently empty)
+#   B = regression fence for already-fixed defects (GROUP B, 21 cases, green today)
 #   C = third-priority builtins (may not be implemented yet)
 #   D = extended builtins / compatibility-matrix evidence
 # ---------------------------------------------------------------------------
@@ -94,7 +98,30 @@ printf 'return 0\n'                > "$SANDBOX/ret0.sh"
 # bash labels these errors with the input source, not with `-c`.
 printf '}\n'                       > "$SANDBOX/bad_tok.sh"
 printf '{ echo hi\n'               > "$SANDBOX/bad_eof.sh"
-ln -s sub "$SANDBOX/link" 2>/dev/null || true
+# Fixture for the GROUP A cd-logical / cd-physical / cd-logical-flag cases
+# (the three `cd` cases that resolve $SANDBOX/link logically vs physically).
+# A bare MSYS2 `ln -s` silently degrades to a DIRECTORY COPY when native
+# symlink privileges are unavailable.  A copy turns those cases into a
+# false PASS: both sides just cd into a plain directory, so the logical
+# (`cd -L`) vs physical (`cd -P`) resolution they must test is never used.
+# Force a real MSYS symlink with MSYS=winsymlinks:lnk (no admin rights,
+# unlike nativestrict), then HARD-GATE on it with the `[ -L ... ]` check
+# below: a degraded or missing fixture is a loud FATAL, never a silent green.
+#
+# PREREQUISITE / DESIGN INTENT (do not "fix" a FATAL by weakening the gate):
+# MSYS=winsymlinks:lnk only takes effect in an MSYS2 *login* shell
+# (MSYSTEM=MSYS "/d/msys2/usr/bin/bash.exe" -lc ...) whose PATH resolves the
+# MSYS2-provided `ln`.  In a non-login `-c` shell, or on a machine whose
+# PATH/toolchain differs, the very same command degrades to a directory copy
+# and the hard gate below FATALs.  That is BY DESIGN: the three cd cases are
+# only meaningful against a real symlink.  NEVER delete or relax the hard
+# gate just to make this suite run green under a non-login shell or on some
+# other machine -- provide a genuinely-symlink-capable fixture instead.
+MSYS=winsymlinks:lnk ln -s sub "$SANDBOX/link" 2>/dev/null || true
+[ -L "$SANDBOX/link" ] || {
+    echo "FATAL: sandbox symlink fixture is not a real symlink (ln -s degraded to a directory copy or creation failed)" >&2
+    exit 1
+}
 
 # `timeout` guards against a hanging case; degrade gracefully if absent.
 RUNNER=()
@@ -704,6 +731,113 @@ run_case A brace-plain-still     'echo {a,b}; echo pre{a,b}suf'
 run_case A brace-quoted-still    'x="pre{a,b}"; echo "$x"'
 run_case A brace-cmdsub-still    'x=$(echo {a,b}); echo "$x"'
 
+# --- brace range 语义（#17a）------------------------------------------------
+# 来源：QA 的 brace oracle 语料（92 条，/d/msys2/tmp/qa21/brace_matrix*.tsv）。
+# 旧 parse_range 的 5 类缺陷在这里各有代表用例：
+#   A 方向：{10..1} 曾展开成 0 个词（整词消失）、{1..3..-1}/{3..1..1} 零个词；
+#   B step=0：{1..3..0} 曾不展开（bash 视为 step=1）；
+#   C 字符 step：{a..c..2} 曾忽略 step 吐全量；
+#   D 类型不一致：{1..a} 曾走字符分支吐 49 个词（该项要等 #17b 的 {/} 词边界
+#     修完才能入闸，当前 wash 输出 `{` + `1..a}` 两个词，故暂不纳入本题）；
+#   E 补零：{01..05} 曾丢前导零，宽度规则 = max(两端字面量长度)（符号计入）。
+# 所有期望值均由 MSYS2 bash 5.3 实测（printf 包裹，逐字节比 stdout）。
+run_case A brace-range-desc        'printf "<%s>|" {10..1}; echo'
+run_case A brace-range-negstep     'printf "<%s>|" {1..3..-1}; echo'
+run_case A brace-range-desc-posstep 'printf "<%s>|" {3..1..1}; echo'
+run_case A brace-range-cross-zero  'printf "<%s>|" {1..-3..2}; echo'
+run_case A brace-range-neg-both    'printf "<%s>|" {-1..-5..-2}; echo'
+run_case A brace-range-step0       'printf "<%s>|" {1..3..0}; echo'
+run_case A brace-range-step-neg0   'printf "<%s>|" {5..1..-0}; echo'
+run_case A brace-range-char-step0  'printf "<%s>|" {a..c..0}; echo'
+run_case A brace-range-char-step2  'printf "<%s>|" {a..c..2}; echo'
+run_case A brace-range-char-step5  'printf "<%s>|" {a..z..5}; echo'
+run_case A brace-range-char-rev    'printf "<%s>|" {z..a}; echo'
+run_case A brace-range-char-mixstep 'printf "<%s>|" {A..Z..7}; echo'
+run_case A brace-range-pad-basic   'printf "<%s>|" {01..05}; echo'
+run_case A brace-range-pad-max     'printf "<%s>|" {1..05}; echo'
+run_case A brace-range-pad-3wide   'printf "<%s>|" {08..010}; echo'
+run_case A brace-range-pad-neg     'printf "<%s>|" {-05..5}; echo'
+run_case A brace-range-pad-zero    'printf "<%s>|" {0..00}; echo'
+run_case A brace-range-pad-desc    'printf "<%s>|" {010..1}; echo'
+run_case A brace-range-pad-b1      'printf "<%s>|" {0001..3}; echo'
+run_case A brace-range-pad-b2      'printf "<%s>|" {1..0009}; echo'
+run_case A brace-range-pad-b3      'printf "<%s>|" {-005..5..2}; echo'
+run_case A brace-range-pad-b4      'printf "<%s>|" {01..010}; echo'
+run_case A brace-range-pad-b5      'printf "<%s>|" {-01..-010}; echo'
+run_case A brace-range-pad-none    'printf "<%s>|" {1..200}; echo'
+run_case A brace-range-pad-plus    'printf "<%s>|" {+05..9}; echo'
+run_case A brace-range-quoted-dq   'printf "<%s>|" "{1..3}"; echo'
+run_case A brace-range-quoted-sq   "printf '<%s>|' '{1..3}'; echo"
+run_case A brace-range-escaped     'printf "<%s>|" \{1..3\}; echo'
+run_case A brace-range-var-quoted  'X="{1..3}"; printf "<%s>|" "$X"; echo'
+run_case A brace-range-export      'export x={1..3}; echo "$x"'
+run_case A brace-range-assign-lit  'x={10..1}; echo "$x"'
+run_case A brace-range-overflow-val 'printf "<%s>|" {9223372036854775807..9223372036854775807}; echo'
+run_case A brace-range-overflow-step 'printf "<%s>|" {1..10..9223372036854775807}; echo'
+
+# --- brace 词边界（#17b）----------------------------------------------------
+# bash 只在 `{` / `}` 自成 token（相邻字符是分词分隔符）时把它当保留字；
+# 与任何字符粘连时它是普通字面字符，整词保留 1 个词。旧 lexer 无条件把词首的
+# `{` 切成独立 Token::Word("{")，于是 `{abc}` 变成 `{ abc}`、`{1..a}` 变成
+# `{ 1..a}`，并且 `{echo hi;}` 被误当成合法命令组（把语法错误当成功执行）。
+run_case A brace-literal-abc      'printf "<%s>|" {abc}; echo'
+run_case A brace-literal-empty    'printf "<%s>|" {}; echo'
+run_case A brace-literal-one      'printf "<%s>|" {a}; echo'
+run_case A brace-literal-float    'printf "<%s>|" {1.5..3.5}; echo'
+run_case A brace-literal-sandwich 'printf "<%s>|" }{1..3}{; echo'
+run_case A brace-literal-mixed    'printf "<%s>|" {1..a}; echo'
+run_case A brace-literal-mixed-rev 'printf "<%s>|" {a..1}; echo'
+run_case A brace-literal-open     'printf "<%s>|" {1..}; echo'
+run_case A brace-literal-close    'printf "<%s>|" {..3}; echo'
+run_case A brace-literal-step-empty 'printf "<%s>|" {1..3..}; echo'
+run_case A brace-literal-step-x   'printf "<%s>|" {1..3..x}; echo'
+run_case A brace-literal-mixed-step 'printf "<%s>|" {1..a..2}; echo'
+run_case A brace-literal-4parts   'printf "<%s>|" {1..3..2..4}; echo'
+run_case A brace-literal-hex      'printf "<%s>|" {0x10..0x12}; echo'
+run_case A brace-glue-close2      'echo }}x'
+run_case A brace-glue-a-close     'echo a}b'
+run_case A brace-glue-open-tail   'echo x{a'
+run_case A brace-glue-arg-close   'echo }'
+# `{echo` 是一个普通词（没有分隔符），所以这里的 `}` 没有配对 -> bash 报语法错误。
+# 期望值含 rc=2 与逐字节 stderr，专门用来证明修的是词法边界而不是打了个特判。
+run_case A brace-group-no-space   '{echo hi;}'
+run_case A brace-group-tight-close '{ echo hi;}'
+run_case A brace-group-semicolon  '{ echo hi ; }; echo rc=$?'
+run_case A brace-group-cmd-word   '{}; echo rc=$?'
+run_case A brace-funcdef-tight    'f(){ echo hi; }; f'
+run_case A brace-funcdef-space    'f() { echo hi; }; f'
+
+# --- brace 嵌套 / 逗号转义 / quote removal（#25）-----------------------------
+# bash 的 brace 展开是「文本式 + 最内层先展开 + 展开后做 quote removal」：
+#   * 由内向外：`{a,{b,c}}` → a b c；`{{a,b}}` → `{a}` `{b}`；`{a{b,c}d}` → `{abd}` `{acd}`；
+#   * 逗号切分尊重 `\,` 与引号：`{a\,b}`（无顶层逗号）是**字面量 1 词** `{a,b}`，
+#     `{a\,b,c}` 切出 `a,b` + `c`，`{a\{b,c\},d}` 切出 `a{b` `c}` `d`；
+#   * 引号内的 `{` 不参与展开：`{a,"{b,c}"}` → `a` + `{b,c}`（2 词）；
+#   * 每个备选词最后过 quote removal：`{a,"b,c"}` → `b,c`、`{a,b\ c}` → `b c`。
+run_case A brace-nest-basic       'printf "<%s>|" {a,{b,c}}; echo'
+run_case A brace-nest-suffix      'printf "<%s>|" {a,{b,c}}d; echo'
+run_case A brace-nest-pairs       'printf "<%s>|" {{a,b},{c,d}}; echo'
+run_case A brace-nest-infix       'printf "<%s>|" {a{b,c}d}; echo'
+run_case A brace-nest-three       'printf "<%s>|" {a,{b,{c,d}}}; echo'
+run_case A brace-nest-three-brace 'printf "<%s>|" {{{a,b}}}; echo'
+run_case A brace-nest-range       'printf "<%s>|" {{1..3},x}; echo'
+run_case A brace-nest-order       'printf "<%s>|" x{a,{b,c}}y{1,2}; echo'
+run_case A brace-nest-quoted      'printf "<%s>|" {a,"{b,c}"}; echo'
+run_case A brace-esc-comma-lit    'printf "<%s>|" {a\,b}; echo'
+run_case A brace-esc-comma-split  'printf "<%s>|" {a\,b,c}; echo'
+run_case A brace-esc-brace-comma  'printf "<%s>|" {a\{b,c\},d}; echo'
+run_case A brace-esc-space        'printf "<%s>|" {a,b\ c}; echo'
+run_case A brace-quoted-comma     'printf "<%s>|" {a,"b,c"}; echo'
+# `{A..z}` 的第 28 个码点是 0x5C：bash 的 quote removal 把它吃掉，元素变成**空词**
+# （词数仍是 58）。这条锁定「展开层 quote removal」而不是「把反斜杠原样留下」。
+run_case A brace-backslash-empty  'set -- {A..z}; printf "n=%d 27=[%s] 28=[%s] 29=[%s]" $# "${27}" "${28}" "${29}"; echo'
+# #30 P0 回归栅栏：嵌套 brace 的展开深度曾等于 Rust 调用栈深度，约 1700 层即
+# 爆栈（rc=139 / `thread 'main' has overflowed its stack`）。迭代化后必须与
+# oracle 展开出**同样多的词**并逐字节相同；这里用 while 循环现场构造 2000 层
+# `{a,` + `z` + 2000 层 `}`，`eval` 触发 brace 展开（4002 字节 / 2001 词）。
+# 承重证据：改前主仓二进制 rc=139 + 0 字节输出，改后与 bash sha256 相同。
+run_case A brace-deep-2000       's=z; i=0; while [ $i -lt 2000 ]; do s="{a,$s}"; i=$((i+1)); done; eval "echo $s"'
+
 # --- 特殊参数 `$-`（当前 shell 选项标志串）-----------------------------------
 # 全部期望值均先用 MSYS2 bash 5.3 实测（本套件固定 `-c`，故末尾恒有 `c`）。
 # 字母固定顺序（实测 `set -abefhkmptuvxBCEHPT` -> `abefhkmptuvxBCEHPTc`）：
@@ -796,10 +930,49 @@ run_case A bang-indirect-bad-name   'BAR=1bad; FOO=BAR; echo "x${!FOO}y"' # rc=1
 run_case A bang-indirect-valid     'BAR=hello; FOO=BAR; echo "[${!FOO}]"' # [hello] rc=0
 run_case A bang-indirect-empty-target 'FOO=bar; echo "[${!FOO}]"'          # [  ] rc=0（bar 未设置，间接展开为空）
 run_case A bang-indirect-set-u     'set -u; unset U2; echo "x${!U2}y"'    # rc=1, 与 set -u 无关，仍是 invalid indirect
-# GROUP B -- KNOWN-DEFECT.
-# (Now empty: every case that used to live here has been fixed and promoted
-# to GROUP A, where it serves as a regression fence.)
+# GROUP B -- regression fence for already-fixed defects (21 cases, green today).
+# (每条用例都曾是真实缺陷，修复后留在这里作为回归栅栏：通过 run_case 同时跑
+#  MSYS2 bash 5.3.20 与 wash，逐字节比较 rc + stdout + stderr（stderr 仅
+#  normalize shell 名前缀）。P1 第一组 4 项的 21 条修复用例就在这里。
+#  当前全绿；一旦 FAIL 即表示某个已修复缺陷回归。)
 ###############################################################################
+
+# --- P1-1 未加引号的空展开字段必须删除（droppable）-----------------------
+# bash: `set -- "$@"` 空时是 0 个词；显式 ""、带引号的 $var、已拼接字面量
+# 的字段必须保留为 1 个空词。修复前 wash 把它们都当成 1 个空词。
+run_case B p1-empty-quoted-at      'set --; set -- "$@"; echo "n=$#"'
+run_case B p1-unquoted-empty-var   'x=; set -- $x; echo "n=$#"'
+run_case B p1-empty-array-at       'arr=(); set -- "${arr[@]}"; echo "n=$#"'
+run_case B p1-quoted-empty-var     'x=; set -- "$x"; echo "n=$#"'
+run_case B p1-explicit-empty       'set -- ""; echo "n=$# [$1]"'
+run_case B p1-mixed-literal        'x=; set -- a"$x"b; echo "n=$# [$1]"'
+run_case B p1-printf-empty-at      'set --; printf "[%s]" "$@"; echo ":n=$#"'
+
+# --- P1-2 管道阶段 / fork 子进程必须继承函数表 ---------------------------
+# 修复前 wash 的 Shell::from_env 重建子 Shell 时 functions 为空 -> 127。
+run_case B p2-func-first-stage     'myfunc() { echo FUNC_OK; }; myfunc | cat'
+run_case B p2-func-second-stage    'myfunc() { cat; echo FUNC_OK; }; echo hi | myfunc'
+run_case B p2-func-three-stage     'f() { echo F3; }; f | cat | cat'
+
+# --- P1-3 子进程重定向失败不得静默吞掉 -----------------------------------
+# bash: 报 `<shell>: line N: FILE: No such file or directory` 且 rc=1；
+# 修复前 wash 继续执行并把 ls 的目录列表漏到 stdout、rc=0。
+run_case B p3-redir-in-fail        'cat < /nonexistent/f; echo "rc=$?"'
+run_case B p3-redir-out-fail       'ls > /nonexistent/f; echo "rc=$?"'
+run_case B p3-redir-append-fail    'echo hi >> /nonexistent/f; echo "rc=$?"'
+
+# --- P1-4 readonly 不得被 declare / export / local 绕过 -------------------
+# 诊断文案逐字节对齐 bash：declare/local 带 builtin 前缀，export/普通赋值
+# 不带；readonly 内建自身也不带 `readonly:` 前缀。
+run_case B p4-declare-readonly     'readonly X=1; declare X=2; echo "X=$X rc=$?"'
+run_case B p4-export-readonly      'readonly Y=1; export Y=2; echo "Y=$Y rc=$?"'
+run_case B p4-local-readonly       'readonly Z=1; f() { local Z=9; }; f; echo "Z=$Z rc=$?"'
+run_case B p4-declare-x-readonly   'readonly W=1; declare -x W=2; echo "W=$W rc=$?"'
+run_case B p4-readonly-builtin     'readonly A=1; readonly A=2; echo "A=$A rc=$?"'
+run_case B p4-declare-r-readonly   'readonly A=1; declare -r A=2; echo "A=$A rc=$?"'
+run_case B p4-local-r-readonly     'readonly Z=1; f() { local -r Z=9; }; f; echo "Z=$Z rc=$?"'
+run_case B p4-export-no-value      'readonly V=1; export V; echo "V=$V rc=$?"'
+
 
 # GROUP K -- KNOWN-DIFF.
 # Cases where bash and wash can NOT be byte-identical BY DESIGN.  These are
@@ -1434,7 +1607,7 @@ printf 'GROUP A (core semantics + done builtins) : %3d pass / %3d fail  (%d case
     "${g_pass[A]:-0}" "${g_fail[A]:-0}" "${g_total[A]:-0}"
 printf 'GROUP K (KNOWN-DIFF, cannot be equal)   : %3d pass / %3d fail  (%d cases)\n' \
     "${g_pass[K]:-0}" "${g_fail[K]:-0}" "${g_total[K]:-0}"
-printf 'GROUP B (KNOWN-DEFECT)                 : %3d pass / %3d fail  (%d cases)\n' \
+printf 'GROUP B (fixed defects)                : %3d pass / %3d fail  (%d cases)\n' \
     "${g_pass[B]:-0}" "${g_fail[B]:-0}" "${g_total[B]:-0}"
 printf 'GROUP C (third priority builtins)      : %3d pass / %3d fail  (%d cases)\n' \
     "${g_pass[C]:-0}" "${g_fail[C]:-0}" "${g_total[C]:-0}"
@@ -1444,7 +1617,7 @@ echo "-----------------------------------------------------------------"
 echo "PASS=$pass FAIL=$fail TOTAL=$((pass + fail))"
 echo "REGRESSION_FAIL=${g_fail[A]:-0}  (group A failures = real regressions)"
 echo "KNOWN_DIFF_FAIL=${g_fail[K]:-0}  (group K failures = by-design differences)"
-echo "KNOWN_DEFECT_FAIL=${g_fail[B]:-0}  (group B failures = already-known bugs)"
+echo "KNOWN_DEFECT_FAIL=${g_fail[B]:-0}  (group B failures = regressions of already-fixed defects)"
 if [ "$fail" -eq 0 ]; then
     echo "ALL CASES MATCH BASH"
     exit 0

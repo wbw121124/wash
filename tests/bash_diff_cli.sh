@@ -175,8 +175,15 @@ wash_only_equivalent() {
 }
 wash_only_equivalent command-long 'echo "0=$0 1=$1 n=$#"' NAME A
 
+# 增删用例必须同步改此常量；这是防 PASS=0/空跑假绿的硬闸，不许改成运行时自算。
+CLI_EXPECTED=22
+
 printf '=================================================================\n'
 printf 'CLI: PASS=%s FAIL=%s TOTAL=%s\n' "$pass" "$fail" "$((pass + fail))"
+if [ "$pass" -ne "$CLI_EXPECTED" ]; then
+    printf 'FATAL: case count drifted: expected %s got %s\n' "$CLI_EXPECTED" "$pass" >&2
+    exit 1
+fi
 if [ "$fail" -eq 0 ]; then
     printf 'ALL CLI CASES MATCH BASH\n'
 else

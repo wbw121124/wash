@@ -17,6 +17,14 @@ BASH_BIN="${BASH_BIN:-/d/msys2/usr/bin/bash.exe}"
 WASH_BIN="${1:-/d/project/WorkBuddy/wash/target/release/wash.exe}"
 [ -x "$WASH_BIN" ] || WASH_BIN="/d/project/WorkBuddy/wash/target/debug/wash.exe"
 ROUNDS="${ROUNDS:-5}"
+# 硬闸：ROUNDS=0 / 非整数会让所有交错计时循环一次都不跑，最小值保持
+# 99999999 哨兵，比值变成 1.00x 而空洞 PASS。计时引擎自身必须拒绝这种输入。
+case "$ROUNDS" in
+    ''|*[!0-9]*) echo "FATAL: ROUNDS must be an integer >= 2, got [$ROUNDS]" >&2; exit 1 ;;
+esac
+_r=$((10#$ROUNDS))
+[ "$_r" -ge 2 ] && [ "$_r" -le 50 ] || {
+    echo "FATAL: ROUNDS must be in [2,50], got [$ROUNDS]" >&2; exit 1; }
 
 SB="$(mktemp -d)"
 trap 'rm -rf "$SB"' EXIT

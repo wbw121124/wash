@@ -266,8 +266,15 @@ run_wash "$WL" "enable -f $CON echo >/dev/null 2>&1; compgen -b | grep -x echo; 
 check 'conflict_failure_leaves_no_half_registration' 0 $'echo\nE=0\n' ''
 
 # --- verdict -----------------------------------------------------------------
+# 增删用例必须同步改此常量；这是防 PASS=0/空跑假绿的硬闸，不许改成运行时自算。
+PLUGIN_CONTRACT_EXPECTED=35
+
 printf -- '-----------------------------------------\n'
 printf 'PASS=%d FAIL=%d TOTAL=%d\n' "$pass" "$fail" "$total"
+if [ "$pass" -ne "$PLUGIN_CONTRACT_EXPECTED" ]; then
+    echo "FATAL: case count drifted: expected $PLUGIN_CONTRACT_EXPECTED got $pass" >&2
+    exit 1
+fi
 if [ "$fail" -ne 0 ] || [ "$pass" -ne "$total" ]; then
     echo 'PLUGIN CONTRACTS FAILED'
     exit 1

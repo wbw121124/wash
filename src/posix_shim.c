@@ -741,3 +741,14 @@ const char *wash_dlerror(void) {
     return g_dl_err;
 }
 
+// strerror(3) 的只读包装。bash 的错误文案就是 strerror 的输出，直接借
+// libc 才能保证逐字节相同且不会漂移。
+//
+// 注意 errno 数值是平台相关的：Cygwin 的 ENAMETOOLONG = 91、ELOOP = 92，
+// 不是 Linux 的 36/40，所以 Rust 侧一旦写死数值表就必然错位并回退
+// "Unknown error N"。另：本平台 libc 没有 errno 字符串的 gettext 目录，
+// 切到 zh_CN.UTF-8 仍是英文原文（bash 的中文外壳来自 bash 自己的 catalog，
+// 与 strerror 无关）。
+const char *wash_strerror(int code) {
+    return strerror(code);
+}

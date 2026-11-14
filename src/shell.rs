@@ -791,6 +791,35 @@ impl Shell {
         code
     }
 
+    /// Finalise a non-interactive (`-c` / script) invocation: run the EXIT
+    /// trap and return the process exit code bash would use.
+    ///
+    /// The `exit` builtin (including one executed from a signal trap) records
+    /// the requested status in `exit_requested`, while `run_str` returns only
+    /// the status of the last command.  A signal trap such as
+    /// `trap 'exit 42' INT; kill -INT $$` therefore leaves
+    /// `exit_requested = Some(42)` but `run_str` returns 0; bash exits with
+    /// 42, so the explicit request must win over the command status.
+    ///
+    /// The EXIT trap runs after the command finished.  Its own `exit N`
+    /// overrides the status (`trap 'exit 42' EXIT; exit 7` -> 42); when it
+    /// does not call `exit`, the earlier request is kept.  `run_str` clears
+    /// `exit_requested` on entry, so we clear it ourselves before dispatching
+    /// the trap in order to detect a fresh `exit` inside the trap.
+    pub fn finalize_exit(&mut self, command_status: i32) -> i32 {
+        let explicit = self.exit_requested;
+        self.exit_requested = None;
+        if let Some(action) = self.traps.get("EXIT").cloned() {
+            if action != "-" {
+                self.run_in_error_context(ErrorContext::exit_trap(), &action);
+            }
+        }
+        let trap_exit = self.exit_requested;
+        let code = trap_exit.or(explicit).unwrap_or(command_status);
+        // Process exit codes are a single byte, as on the interactive path.
+        code.rem_euclid(256)
+    }
+
     pub fn run_interactive(&mut self) {
         // Aliases are only expanded in interactive shells (bash's
         // `expand_aliases` shell option is off by default elsewhere).

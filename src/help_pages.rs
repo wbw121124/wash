@@ -15,6 +15,13 @@
 //! synopses and long descriptions are gettext-translated.  One exception is
 //! `help -d`: bash uses the builtin's `short_doc`, which is **not** translated,
 //! so `Mode::Desc` always renders the English catalog's description.
+//!
+//! Intentional divergences from the oracle are enumerated in
+//! `docs/intentional-divergences.md` and registered by the test suites.  This
+//! `help` subsystem owns two of them: D-001 (the `help -m` wash-identity
+//! IMPLEMENTATION footer, see `man_footer`) and D-002 (the `job_spec`
+//! single-pattern lookup, see `JOB_SPEC_DIVERGENCES`).  Every other `help`
+//! path stays byte-for-byte identical to the oracle.
 
 use std::collections::HashSet;
 use std::sync::OnceLock;
@@ -91,14 +98,22 @@ pub enum Mode {
 /// 短摘要，把它们原样当 NAME 查不到（oracle 实测 72/77 查不到）；`help NAME`
 /// 只认第二列的规范名，外加 `ALIASES` 里的三个短拼写（`[[` / `((` / `{`）。
 /// 换言之「清单列出了它」并不保证「能用显示值查到它」，这是 bash 5.3 的
-/// 既定行为，wash 必须原样复现，不得为了「好用」而改成互相对应。
+/// 既定行为；除下面登记的唯一有意偏离外，wash 原样复现。
 ///
-/// **孤例（禁止「修好」）**：第 2 项 `job_spec [&]` 的规范名是 `%`（不是
-/// `job_spec`）。oracle bash 5.3 自身 `help job_spec` 就是 rc=1，只有
-/// `help '%'` 命中该页。**禁止为 `job_spec` 补别名**：那会让 wash 的
-/// rc / stdout / stderr 与 oracle 不再逐字节一致。此约束由
-/// `tools/gen_help_pages.py --check`（oracle rc + `ALIASES` 静态检查）与
-/// `tests/bash_diff_help.sh` 的显式孤例用例双向锁死。
+/// **有意偏离 D-002（用户 2026-11-10 裁决，见 `docs/intentional-divergences.md`）**：
+/// 第 2 项 `job_spec [&]` 的规范名是 `%`（不是 `job_spec`），oracle bash 5.3
+/// 自身 `help job_spec` 就是 rc=1。用户要求 wash 提供「列出即可查」的 UX
+/// 增强，且**全局生效（含非交互 `-c`）**，明确允许为此破坏脚本兼容，并否决
+/// 了「仅交互模式」方案。这是本次唯一新增的有意逐字节兼容例外。
+///
+/// 实现刻意**不**放进 `ALIASES` / `lookup()`：那条路径是每个 pattern 都过
+/// 一遍的共享通道，注册别名会让 `help job_spec cd` 等多 pattern 组合静默多
+/// 输出 `%` 页。改由 `JOB_SPEC_DIVERGENCES` + `divergence_page()` 提供
+/// **单 pattern 精确匹配**通道：仅当选项解析后的 pattern 列表恰好为 1 个、
+/// 且字符串精确等于表内登记值时命中；glob / 多 pattern / 空 pattern 一律
+/// 不参与，`[&]` 也不会被当 fnmatch 字符类展开。
+/// `tools/gen_help_pages.py --check` 与 `tests/bash_diff_help.sh` 双向锁死
+/// 该表的条目数与逐字节偏离形状。
 ///
 /// 77 ↔ 77 的一一对应（长度、顺序、集合全等）由 `all_en()` 首次初始化时的
 /// `verify_list_binding` 硬断言保证：映射表第 i 项的规范名必须恰好等于
@@ -296,19 +311,60 @@ fn parse(data: &'static str, en: Option<&'static [Page]>) -> Vec<Page> {
 
 /// bash accepts these short spellings in addition to the canonical topic name.
 /// Verified against the oracle: `help [[` -> `[[ ... ]]`, `help ((` ->
-/// `(( ... ))`, `help {` -> `{ ... }`.  `help job_spec`, `help }` etc. do not
-/// resolve (rc=1).
+/// `(( ... ))`, `help {` -> `{ ... }`.  `help }` etc. do not resolve (rc=1).
 ///
-/// **Do not add `job_spec` here.**  bash 5.3 itself rejects `help job_spec`
-/// with rc=1 even though the no-argument list shows `job_spec [&]`; the page's
-/// canonical key is `%`.  A "helpful" alias would break byte-for-byte
-/// compatibility.  `tools/gen_help_pages.py --check` asserts this table has no
-/// `job_spec` entry and that the built wash binary still returns rc=1.
+/// **Keep this table free of `job_spec`.**  The D-002 divergence is deliberately
+/// NOT an alias: `lookup()` is shared by glob and multi-pattern paths, so an
+/// alias here would make `help job_spec cd` silently emit the `%` page too.
+/// It lives in `JOB_SPEC_DIVERGENCES` below and is reachable only through
+/// `divergence_page()`, which requires exactly one pattern.
+/// `tools/gen_help_pages.py --check` asserts this table holds exactly 3 entries
+/// and that the divergence table holds exactly the 2 enumerated entries.
 const ALIASES: &[(&str, &str)] = &[
     ("[[", "[[ ... ]]"),
     ("((", "(( ... ))"),
     ("{", "{ ... }"),
 ];
+
+/// 单一「有意偏离清单」的代码侧真源（人类可读版见
+/// `docs/intentional-divergences.md` 的 D-002 条目）。
+///
+/// 每行是 (精确 pattern, 目标规范名)。**只有**这两个字符串会在 `help` 的
+/// pattern 列表恰好为 1 个时重定向到 `%` 页；大小写、空白、glob 展开、
+/// 多 pattern、空 pattern 一律不参与。`tools/gen_help_pages.py --check`
+/// 静态断言本表恰好等于这两项；`tests/bash_diff_help.sh` 以固定用例数
+/// 断言偏离面不再扩散。
+pub(crate) const JOB_SPEC_DIVERGENCES: &[(&str, &str)] = &[
+    ("job_spec", "%"),
+    ("job_spec [&]", "%"),
+];
+
+/// 单-pattern 精确偏离通道：命中返回目标页，否则 `None`。
+///
+/// 刻意**不放进** `lookup()`：别名表与 glob 集合是「每个 pattern 都过一遍」的
+/// 共享路径，一旦在那里注册 `job_spec`，`help job_spec cd` / `help cd job_spec`
+/// 之类组合会多输出 `%` 页。这里只由 `builtins.rs::builtin_help` 在选项解析
+/// 之后、glob banner 与失败诊断之前调用，保证偏离面封闭为「1 个 pattern +
+/// 精确字符串」。找不到目标页直接 panic，绝不静默回退到原行为。
+pub fn divergence_page(patterns: &[&str]) -> Option<&'static Page> {
+    if patterns.len() != 1 {
+        return None;
+    }
+    let mut target: Option<&'static str> = None;
+    for (pattern, canonical) in JOB_SPEC_DIVERGENCES {
+        if *pattern == patterns[0] {
+            target = Some(*canonical);
+            break;
+        }
+    }
+    let target = target?;
+    Some(
+        all()
+            .iter()
+            .find(|page| page.name == target)
+            .expect("job_spec divergence target is not a real help page"),
+    )
+}
 
 pub fn lookup(pattern: &str) -> Vec<&'static Page> {
     let pages = all();

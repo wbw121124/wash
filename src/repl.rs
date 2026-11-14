@@ -146,7 +146,99 @@ fn visible_width(s: &str) -> usize {
 /// 编号与命令编号，通常一致；这里用同一个计数器近似，在 submit() 里递增。
 static COMMAND_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// 由 UTF-8 首字节判定字符序列长度（1..=4）；非法首字节按 1 处理。
+fn utf8_seq_len(b: u8) -> usize {
+    if b < 0x80 {
+        1
+    } else if b >> 5 == 0b110 {
+        2
+    } else if b >> 4 == 0b1110 {
+        3
+    } else if b >> 3 == 0b11110 {
+        4
+    } else {
+        1
+    }
+}
+
+/// 把 bytes[i] 处的**完整 UTF-8 字符**压入 out，返回消耗的字节数。
+/// ASCII 直接压入；多字节用 from_utf8 还原后整体 push_str，避免逐字节
+/// `out.push(b as char)` 把中文拆成 Latin-1 乱码。非法序列才走有损回退
+/// （合法 UTF-8 的 PS1 不会触发，因此不会产生 U+FFFD 或 Latin-1 残留）。
+fn push_utf8_char(out: &mut String, bytes: &[u8], i: usize) -> usize {
+    let b = bytes[i];
+    let len = utf8_seq_len(b);
+    if len == 1 {
+        out.push(b as char);
+        return 1;
+    }
+    let end = (i + len).min(bytes.len());
+    match std::str::from_utf8(&bytes[i..end]) {
+        Ok(s) => {
+            out.push_str(s);
+            len
+        }
+        Err(_) => {
+            out.push(b as char); // 有损回退：合法 UTF-8 PS1 不触发
+            1
+        }
+    }
+}
+
+/// 跳过一个 bash 命令替换 `$(...)`，返回配对右括号之后的字节索引。
+/// 括号配对考虑单/双引号、反斜杠转义与嵌套；未闭合时返回 bytes.len()。
+///
+/// 安全约束：**只扫描、绝不执行**。父 bash 的 git-aware PS1 常含
+/// `$(__git_ps1 " (%s)")` 之类，wash 没有 bash 函数体，执行只会报错，
+/// 更会把提示符变成任意命令执行的入口。这里统一折叠为空字符串，
+/// 因此 `$(` / `__git_ps1` 等代码不会作为字面文本泄漏到提示符。
+fn skip_command_substitution(bytes: &[u8], open: usize) -> usize {
+    let mut i = open + 1; // open 指向 '('
+    let mut depth = 1usize;
+    let mut quote: u8 = 0; // 0 表示不在引号内
+    while i < bytes.len() {
+        let b = bytes[i];
+        if quote != 0 {
+            if quote == b'"' && b == b'\\' {
+                i += 2; // 双引号内反斜杠转义下一个字符
+                continue;
+            }
+            if b == quote {
+                quote = 0;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\\' => i += 2,
+            b'\'' | b'"' => {
+                quote = b;
+                i += 1;
+            }
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth -= 1;
+                i += 1;
+                if depth == 0 {
+                    return i;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    bytes.len()
+}
+
 /// 展开 bash 风格提示符模板（支持常见转义与 $VAR 变量展开），用于读取 $PS1/$PS2。
+///
+/// UTF-8 安全：模板里的多字节字符按完整 UTF-8 序列压入（见 push_utf8_char）。
+/// bash PS1 语义：`$?` 展开为上一条命令退出码（Shell::last_status，与 wash
+/// 自身状态同源）；`$(...)` 命令替换整体折叠为空、绝不执行（见
+/// skip_command_substitution）。其余 `\u \h \w \W \$ \v \! \[ \]` 等转义与
+/// `$NAME` 变量展开保持不变。
 fn render_prompt(template: &str, shell: &Shell) -> String {
     let mut out = String::new();
     let bytes = template.as_bytes();
@@ -191,23 +283,39 @@ fn render_prompt(template: &str, shell: &Shell) -> String {
             }
             i += 2;
         } else {
-            // $VAR 变量展开（仅 $NAME 形式，遇非标识符字符停止）。
-            if b == b'$' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_alphabetic() {
-                let start = i + 1;
-                let mut end = start;
-                while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
-                    end += 1;
+            // bash PS1 语义（优先级高于普通文本拷贝）：
+            //   $?     上一条命令退出码，与 Shell::last_status 同源；
+            //   $(...) 命令替换：括号配对扫描后整体折叠为空，绝不执行；
+            //   $NAME  变量展开（保持既有行为，仅 $NAME 形式）。
+            if b == b'$' && i + 1 < bytes.len() {
+                let next = bytes[i + 1];
+                if next == b'?' {
+                    out.push_str(&shell.last_status.to_string());
+                    i += 2;
+                    continue;
                 }
-                let name = std::str::from_utf8(&bytes[start..end]).unwrap_or("");
-                if let Some(v) = shell.env.get(name) {
-                    out.push_str(v);
+                if next == b'(' {
+                    i = skip_command_substitution(bytes, i + 1);
+                    continue;
                 }
-                i = end;
-            } else {
-                // 直接按字节拷贝（模板里的普通文本/ANSI 序列保持原样）。
-                out.push(b as char);
-                i += 1;
+                if next.is_ascii_alphabetic() {
+                    let start = i + 1;
+                    let mut end = start;
+                    while end < bytes.len()
+                        && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_')
+                    {
+                        end += 1;
+                    }
+                    let name = std::str::from_utf8(&bytes[start..end]).unwrap_or("");
+                    if let Some(v) = shell.env.get(name) {
+                        out.push_str(v);
+                    }
+                    i = end;
+                    continue;
+                }
             }
+            // 普通文本（含 ANSI 序列）：UTF-8 安全地整体拷贝，绝不逐字节拆。
+            i += push_utf8_char(&mut out, bytes, i);
         }
     }
     out
@@ -700,6 +808,9 @@ impl Editor {
         if lines_from_end > 0 {
             print!("\x1b[{}A", lines_from_end);
         }
+        // 宽度口径统一：base_col 由 visible_width 计算（跳过 ANSI/OSC，按 UTF-8
+        // 字符显示宽度累加，中文 2 格）；下方 \x1b[NG 直接用 abs_col+1，二者
+        // 同源。render_prompt 修好非 ASCII 拆字节后，中文 PS1 宽度仍为 6。
         let base_col = if cur_line == 0 {
             visible_width(prompt0_last)
         } else {
@@ -1308,6 +1419,15 @@ pub fn run(shell: &mut Shell) {
             println!();
             io::stdout().flush().ok();
             posix::enable_raw_mode();
+            // `trap 'exit' INT`（以及任何在 trap 里执行 `exit` 的动作）会在
+            // dispatch_signal_trap 里置位 exit_requested。必须在下面的 continue
+            // 之前检查：该 continue 会跳过循环末尾的统一退出检查，导致 Ctrl-C
+            // 之后 REPL 不退出（P1 第二组）。命中时直接 break，交给后面的
+            // disable_raw_mode / EXIT trap / save_history 干净收尾，且不再
+            // 重画一个多余提示符。
+            if shell.exit_requested.is_some() {
+                break;
+            }
             editor.cancel_line();
             editor.last_total = 0;
             save_history(&hist_path, &editor.history);

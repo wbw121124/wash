@@ -64,6 +64,31 @@ pub(crate) fn build_env_ptrs(env: &HashMap<String, String>) -> (Vec<CString>, Ve
     (cstrings, ptrs)
 }
 
+/// Build `envp` for a fork/exec directly from `Shell` in a SINGLE pass.
+///
+/// The old `Shell::child_env()` + `build_env_ptrs()` pair walked the whole
+/// variable table twice and allocated an intermediate `HashMap` plus two
+/// String clones per variable.  This fused form iterates `env` once and
+/// allocates exactly one `CString` per exported variable.  `child_env()`
+/// always overwrote `PWD` with `self.cwd`, so `PWD` is skipped in the loop
+/// and appended once from `self.cwd` -- byte-identical `envp` semantics.
+/// `envp` ordering is unspecified (both versions iterate a `HashMap`).
+pub(crate) fn build_shell_env_ptrs(sh: &Shell) -> (Vec<CString>, Vec<*const c_char>) {
+    let mut cstrings: Vec<CString> = Vec::with_capacity(sh.exported.len() + 1);
+    for (k, v) in &sh.env {
+        if k == "PWD" || !sh.exported.contains(k) {
+            continue;
+        }
+        cstrings.push(CString::new(format!("{}={}", k, v)).unwrap_or_default());
+    }
+    cstrings.push(
+        CString::new(format!("PWD={}", sh.cwd)).unwrap_or_default(),
+    );
+    let mut ptrs: Vec<*const c_char> = cstrings.iter().map(|c| c.as_ptr()).collect();
+    ptrs.push(std::ptr::null());
+    (cstrings, ptrs)
+}
+
 /// Replace the current process with `path`. Only returns on failure.
 pub(crate) fn execve(path: &CString, argv: &[*const c_char], envp: &[*const c_char]) -> i32 {
     posix::execve(path, argv, envp)
@@ -99,12 +124,21 @@ fn job_control_active(sh: &Shell) -> bool {
 /// 「交互式 + tty」时成对完成：子进程建立独立进程组，父进程先交出终端前台
 /// 组、wait 完毕再恢复。这样终端产生的 SIGINT 只到达 job，shell 自身收不到，
 /// 与 bash 的作业控制一致（提示符处的 Ctrl-C 仍由 repl.rs 的字节路径派发）。
-fn fork_child() -> i32 {
+fn fork_child() -> Option<i32> {
     let pid = posix::fork();
+    if pid < 0 {
+        // fork failed (EAGAIN / ENOMEM).  Report it once here -- the single
+        // funnel every fork goes through -- so no caller can leak a negative
+        // pid into `wait_pid` / the job table.  bash prints `fork: <strerror>`
+        // and gives the command status 1 while the shell keeps running.
+        let e = posix::errno();
+        eprintln!("wash: fork: {}", posix::errno_message(e));
+        return None;
+    }
     if pid == 0 {
         posix::reset_signals_default();
     }
-    pid
+    Some(pid)
 }
 
 /// Look `name` up in `path` (or directly, when it contains a slash).
@@ -207,32 +241,51 @@ fn expand_redirs(redirs: &[Redir], ctx: &ExpandCtx) -> Vec<ExpRedir> {
         .collect()
 }
 
-/// Apply the redirections in the forked child. Failures are ignored here (the
-/// child cannot report them any better than the shell could).
+/// Report a failed redirection in the forked child and exit(1).
+///
+/// 诊断文案与 `apply_redirs_in_parent` 完全一致（`wash: FILE: strerror(errno)`）。
+/// MSYS2 bash 5.3.20 对 `cmd > /nonexistent/f` 的 stderr 实测为
+/// `<path>/bash: line N: FILE: No such file or directory`，经对拍套件的
+/// normalize_stderr 去掉 shell 前缀后，两边逐字节相同，退出码也都是 1。
+/// 子进程必须在此终止：否则会带着未重定向的 fd 继续执行命令，把输出写到
+/// 错误的地方（旧行为：静默吞掉失败、rc=0、ls 的目录列表漏到 stdout）。
+fn redir_failed(file: &str) {
+    let e = posix::errno();
+    eprintln!("wash: {}: {}", file, posix::errno_message(e));
+    let _ = std::io::stdout().flush();
+    posix::exit(1);
+}
+
+/// Apply the redirections in the forked child.  A failed open() is fatal for
+/// this child: bash reports the errno and exits 1 instead of running the
+/// command with the wrong descriptors.
 fn apply_exp_redirs(redirs: &[ExpRedir], noclobber: bool) {
     for r in redirs {
         match r {
             ExpRedir::In(fd, file) => {
                 let f = posix::open_read(file);
-                if f >= 0 {
-                    posix::dup2(f, *fd);
-                    posix::close(f);
+                if f < 0 {
+                    redir_failed(file);
                 }
+                posix::dup2(f, *fd);
+                posix::close(f);
             }
             ExpRedir::Out(fd, file, append, clobber) => {
                 let f = posix::open_write(file, *append, !*append && !*clobber && noclobber);
-                if f >= 0 {
-                    posix::dup2(f, *fd);
-                    posix::close(f);
+                if f < 0 {
+                    redir_failed(file);
                 }
+                posix::dup2(f, *fd);
+                posix::close(f);
             }
             ExpRedir::Both(file, append) => {
                 let f = posix::open_write(file, *append, false);
-                if f >= 0 {
-                    posix::dup2(f, 1);
-                    posix::dup2(f, 2);
-                    posix::close(f);
+                if f < 0 {
+                    redir_failed(file);
                 }
+                posix::dup2(f, 1);
+                posix::dup2(f, 2);
+                posix::close(f);
             }
             ExpRedir::Dup(fd, target) => {
                 // `N>&M` makes N refer to whatever M currently refers to;
@@ -423,7 +476,17 @@ pub fn capture_command(
     let fds = posix::pipe();
     let r = fds[0];
     let w = fds[1];
-    let pid = fork_child();
+    let pid = match fork_child() {
+        Some(p) => p,
+        None => {
+            // fork failed: close both pipe ends and expose an empty
+            // substitution with status 1 (never block on a nonexistent child).
+            posix::close(w);
+            posix::close(r);
+            LAST_CMDSIB_STATUS.with(|c| *c.borrow_mut() = Some(1));
+            return String::new();
+        }
+    };
     if pid == 0 {
         posix::dup2(w, 1);
         posix::close(w);
@@ -479,10 +542,12 @@ pub fn exec_external(argv: &[String], sh: &Shell) -> i32 {
         return 0;
     }
     let path = sh.env.get("PATH").cloned().unwrap_or_default();
-    let pid = fork_child();
+    let pid = match fork_child() {
+        Some(p) => p,
+        None => return 1,
+    };
     if pid == 0 {
-        let env = sh.child_env();
-        let (_cstrings, env_ptrs) = build_env_ptrs(&env);
+        let (_cstrings, env_ptrs) = build_shell_env_ptrs(sh);
         let argvec = ArgVec::from(argv);
         match find_executable(&argv[0], &path) {
             Some(exe) => {
@@ -548,7 +613,13 @@ fn execute_compound(compound: &Compound, sh: &mut Shell) -> i32 {
         // the subshell's own redirections in the parent, so the child inherits
         // them (just like bash's subshell applies them before the copy).
         Compound::Subshell { body } => {
-            let pid = fork_child();
+            let pid = match fork_child() {
+                Some(p) => p,
+                None => {
+                    sh.last_status = 1;
+                    return 1;
+                }
+            };
             if pid == 0 {
                 // The child is an exact fork of `sh`; reset the per-command
                 // expansion / arithmetic flags and run the body in this copy.
@@ -908,11 +979,22 @@ struct ChildContext<'a> {
     /// parent.  `Shell::from_env` can only build a default `bg_pid` of 0, so
     /// the parent's value is threaded through here.
     bg_pid: i32,
+    /// The parent shell's function table.  A forked pipeline stage / subshell
+    /// must be able to call functions defined in the parent (bash behaviour);
+    /// `Shell::from_env` only builds an empty table, which made `myfunc | cat`
+    /// fail with 127.  Borrowed (no clone) so the pure-external fast path that
+    /// skips `Shell::from_env()` entirely stays untouched.
+    functions: &'a HashMap<String, crate::parser::CommandList>,
     /// The compound command (`if ... fi`) the child has to run, if any.
     compound: Option<&'a Compound>,
     /// The program the child has to execute, already resolved by the
     /// parent.
     program: Option<&'a CString>,
+    /// True when the parent determined the command word may be a builtin
+    /// (static or plugin), which is why `program` was left `None`.  When
+    /// `program` is `Some` AND this is false, the child can exec straight
+    /// away without constructing a full `Shell` first.
+    builtin_candidate: bool,
 }
 
 /// Record an executed program in the shell's hash table.
@@ -933,6 +1015,7 @@ fn child_run_exp(argv: &[String], path: &str, ctx: &ChildContext) -> ! {
             // a forked compound command (e.g. `sleep & ( if ...; fi )`).
             sub.bg_pid = ctx.bg_pid;
             sub.apply_attr_refs(ctx.attrs);
+            sub.functions = ctx.functions.clone();
             sub.arrays = ctx.arrays.clone();
             sub.positional = ctx.positional.to_vec();
             sub.options = ctx.options.clone();
@@ -943,6 +1026,21 @@ fn child_run_exp(argv: &[String], path: &str, ctx: &ChildContext) -> ! {
         }
         posix::exit(0);
     }
+    // Pure external fast path: the parent already resolved `program` and
+    // proved the word is NOT a builtin (static or plugin).  Constructing a
+    // full `Shell` here would deep-copy the whole variable table, rebuild
+    // `exported`, install 15 internal variables (3 uid/ppid FFI calls +
+    // `group_ids()`), and clone arrays / positional / options -- all thrown
+    // away by `execve`.  Go straight to exec.  `run_builtin` would have
+    // returned `None` for this argv, so stdout/stderr/rc are unchanged.
+    if !ctx.builtin_candidate {
+        if let Some(exe) = ctx.program {
+            let (_cstrings, env_ptrs) = build_env_ptrs(ctx.env);
+            let argvec = ArgVec::from(argv);
+            posix::execve(exe, &argvec.ptrs, &env_ptrs);
+            posix::exit(127);
+        }
+    }
     // The redirections have already been applied by the caller (pipes and the
     // command's own redirections), so the builtins can simply write to stdout.
     let mut sub = Shell::from_env(ctx.shell_env.clone());
@@ -950,10 +1048,20 @@ fn child_run_exp(argv: &[String], path: &str, ctx: &ChildContext) -> ! {
     // subshell / builtin-in-child context.
     sub.bg_pid = ctx.bg_pid;
     sub.apply_attr_refs(ctx.attrs);
+    sub.functions = ctx.functions.clone();
     sub.arrays = ctx.arrays.clone();
     sub.positional = ctx.positional.to_vec();
     sub.options = ctx.options.clone();
     sub.dollar_zero = ctx.dollar_zero.to_string();
+    // 管道阶段 / fork 子进程里的 shell 函数：父进程 execute_simple 通过
+    // execute_function 直接执行，但子进程由 Shell::from_env 重建，必须显式
+    // 查（ChildContext 已透传的）函数表执行，否则 `myfunc | cat` 报 127。
+    // 纯 external 快路径在上面已经 return/exec，不经过这里。
+    if sub.functions.contains_key(&argv[0]) {
+        let code = execute_function(&argv[0], argv[1..].to_vec(), &mut sub);
+        let _ = std::io::stdout().flush();
+        posix::exit(code);
+    }
     if let Some(code) = builtins::run_builtin(argv, &mut sub) {
         let _ = std::io::stdout().flush();
         posix::exit(code);
@@ -1317,7 +1425,16 @@ fn run_standalone_exp(
     // 都在 fork 前算好，子进程继承同一份值；-c / piped（isatty 判假）整段跳过。
     let job_ctl = job_control_active(sh);
     let shell_pgrp = if job_ctl { posix::getpgrp() } else { -1 };
-    let pid = fork_child();
+    let pid = match fork_child() {
+        Some(p) => p,
+        None => {
+            // The external command could not be forked: undo the temporary
+            // array assignments, fail this command with status 1 (bash
+            // behaviour), and never record a bogus pid in the job table.
+            restore_array_assignments(array_saves, sh);
+            return 1;
+        }
+    };
     if pid == 0 {
         if job_ctl {
             // 子进程自立门户（pgid = 自身 pid），脱离 shell 的进程组。
@@ -1338,8 +1455,12 @@ fn run_standalone_exp(
             dollar_zero: &sh.dollar_zero,
             attrs: &attrs,
             bg_pid: sh.bg_pid,
+            functions: &sh.functions,
             compound: None,
             program: program.as_ref().map(|(exe, _)| exe),
+            // Builtins and functions were already handled above in this
+            // function, so reaching this fork means the word is external.
+            builtin_candidate: false,
         };
         child_run_exp(argv, path, &ctx);
     } else {
@@ -1589,6 +1710,12 @@ fn expand_alias_in_pipeline(
 fn prepare_stage(c: &SimpleCommand, sh: &mut Shell) -> Prepared {
     let pending: RefCell<Vec<(String, String)>> = RefCell::new(Vec::new());
 
+    // `$-` is derived only from option/startup flags, never from `env`.
+    // Both expansion passes below need the same snapshot, and the only
+    // mutation between them is `pending` assignments into `sh.env`, so build
+    // it ONCE here instead of calling `dash_flags()` twice per command.
+    let shell_flags = sh.dash_flags();
+
     // Expand the stage's words.  The expander only reads the environment.
     let (argv, redirs) = {
         let attrs = sh.attr_refs();
@@ -1599,7 +1726,7 @@ fn prepare_stage(c: &SimpleCommand, sh: &mut Shell) -> Prepared {
             self_pid: sh.self_pid,
             noglob: sh.options.noglob,
             nounset: sh.options.nounset,
-            shell_flags: sh.dash_flags(),
+            shell_flags: shell_flags.clone(),
             bg_pid: sh.bg_pid,
             dollar_zero: &sh.dollar_zero,
             attrs: &attrs,
@@ -1635,7 +1762,7 @@ fn prepare_stage(c: &SimpleCommand, sh: &mut Shell) -> Prepared {
             self_pid: sh.self_pid,
             noglob: sh.options.noglob,
             nounset: sh.options.nounset,
-            shell_flags: sh.dash_flags(),
+            shell_flags,
             bg_pid: sh.bg_pid,
             dollar_zero: &sh.dollar_zero,
             attrs: &attrs,
@@ -1685,7 +1812,15 @@ fn child_prepare_and_run(c: &SimpleCommand, sh: &mut Shell, path: &str, noclobbe
     }
     apply_exp_redirs(&pr.redirs, noclobber);
     let attrs = sh.attr_refs();
-    let program = if pr.argv.is_empty() || builtins::is_builtin(sh, &pr.argv[0]) {
+    // A shell function shadows an external program of the same name (bash:
+    // functions > builtins > PATH).  Count it as a "builtin candidate" so the
+    // pure-external fast path in child_run_exp does not execve the external
+    // file instead of running the function.  Pure externals are unaffected:
+    // their names are not in sh.functions, so the fast path still applies.
+    let builtin_candidate = pr.argv.is_empty()
+        || builtins::is_builtin(sh, &pr.argv[0])
+        || sh.functions.contains_key(&pr.argv[0]);
+    let program = if builtin_candidate {
         None
     } else {
         find_program(&pr.argv[0], path)
@@ -1703,8 +1838,10 @@ fn child_prepare_and_run(c: &SimpleCommand, sh: &mut Shell, path: &str, noclobbe
         dollar_zero: &sh.dollar_zero,
         attrs: &attrs,
         bg_pid: sh.bg_pid,
+        functions: &sh.functions,
         compound: pr.compound.as_ref(),
         program: program.as_ref().map(|(exe, _)| exe),
+        builtin_candidate,
     };
     child_run_exp(&pr.argv, path, &ctx);
 }
@@ -1749,6 +1886,7 @@ fn execute_pipeline(p: &Pipeline, sh: &mut Shell, path: &str) -> i32 {
 
     let mut prev_read: Option<i32> = None;
     let mut pids: Vec<i32> = Vec::new();
+    let mut fork_failed = false;
     // 管道所有阶段共用一个 job 进程组（第一个阶段的 pid），不要一阶段一组。
     let job_ctl = job_control_active(sh);
     let shell_pgrp = if job_ctl { posix::getpgrp() } else { -1 };
@@ -1768,7 +1906,25 @@ fn execute_pipeline(p: &Pipeline, sh: &mut Shell, path: &str) -> i32 {
         // `set -u` / arithmetic error it triggers -- is confined to the child,
         // so an unbound variable in one stage only kills that stage while the
         // rest of the command line keeps running.
-        let pid = fork_child();
+        let pid = match fork_child() {
+            Some(p) => p,
+            None => {
+                // A stage could not be forked: close this stage's own pipe
+                // ends plus the inherited read end, stop spawning stages, and
+                // still reap the stages already forked below (no zombies).
+                if let Some(fd) = prev_read.take() {
+                    posix::close(fd);
+                }
+                if let Some(fd) = this_read {
+                    posix::close(fd);
+                }
+                if let Some(fd) = this_write {
+                    posix::close(fd);
+                }
+                fork_failed = true;
+                break;
+            }
+        };
         if pid == 0 {
             if job_ctl {
                 // 第一个阶段建立新进程组（pgid = 自身 pid），其余阶段加入
@@ -1832,6 +1988,12 @@ fn execute_pipeline(p: &Pipeline, sh: &mut Shell, path: &str) -> i32 {
         // 硬要求：所有子进程 wait 完毕后恢复 shell 的终端前台进程组。
         posix::tcsetpgrp(0, shell_pgrp);
     }
+    // A fork failure fails the whole pipeline with status 1, regardless of
+    // the stages that did run (bash semantics).  The stages already forked
+    // were reaped above and the terminal foreground group was restored.
+    if fork_failed {
+        return 1;
+    }
     // With `set -o pipefail` the pipeline fails when any stage failed; the
     // status is then the one of the rightmost failing stage.
     if pipefail && failure != 0 {
@@ -1850,7 +2012,14 @@ fn execute_pipeline(p: &Pipeline, sh: &mut Shell, path: &str) -> i32 {
 /// REPL stays responsive.  This is the scaffolding the `jobs`/`fg`/`bg`/`wait`
 /// builtins build on.
 fn execute_background(p: &Pipeline, sh: &mut Shell, path: &str) -> i32 {
-    let pid = fork_child();
+    let pid = match fork_child() {
+        Some(p) => p,
+        None => {
+            // The background job could not be forked.  Do NOT register a job,
+            // set `$!`, or print the `[job] pid` line; fail with status 1.
+            return 1;
+        }
+    };
     if pid == 0 {
         // 后台作业的子进程沿用父 Shell（interactive 仍为 true），但它不该
         // 接管终端前台进程组；置位后其内部的 execute_pipeline 会跳过接线。

@@ -170,13 +170,10 @@ fn main() {
         // (eval / source / signal traps) swap the context themselves.
         sh.error_context = Some(shell::ErrorContext::command_string());
         let code = sh.run_str(&cmd);
-        // 退出前触发 EXIT trap（bash 就在退出前做这件事）。
-        if let Some(action) = sh.traps.get("EXIT").cloned() {
-            if action != "-" {
-                sh.run_in_error_context(shell::ErrorContext::exit_trap(), &action);
-            }
-        }
-        exit(code);
+        // `exit N`（含信号 trap 里的 exit）把最终退出码放在 exit_requested，
+        // run_str 返回值只是最后一条命令的状态，不能当进程退出码用。
+        // finalize_exit 还会先派发 EXIT trap，trap 内的 `exit N` 可覆盖该码。
+        exit(sh.finalize_exit(code));
     }
 
     if let Some(path) = script {
@@ -191,12 +188,8 @@ fn main() {
             }
         };
         let code = sh.run_in_error_context(shell::ErrorContext::sourced(&path), &content);
-        if let Some(action) = sh.traps.get("EXIT").cloned() {
-            if action != "-" {
-                sh.run_in_error_context(shell::ErrorContext::exit_trap(), &action);
-            }
-        }
-        exit(code);
+        // 与 -c 路径一致：显式 exit 码优先，EXIT trap 可覆盖。
+        exit(sh.finalize_exit(code));
     }
 
     // 交互路径：仅当 stdin 是真终端时安装信号捕获，让前台命令期间的
