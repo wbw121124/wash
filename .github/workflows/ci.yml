@@ -68,7 +68,21 @@ jobs:
           . "$HOME/.cargo/env"
           cargo build --verbose
 
+      - name: Upload artifact (debug)
+        uses: actions/upload-artifact@v4
+        with:
+          name: wash-debug
+          path: target/debug/wash.exe
+          if-no-files-found: error
+
       - name: Build (release)
         run: |
           . "$HOME/.cargo/env"
           cargo build --release --verbose
+
+      - name: Upload artifact (release)
+        uses: actions/upload-artifact@v4
+        with:
+          name: wash-release
+          path: target/release/wash.exe
+          if-no-files-found: error
