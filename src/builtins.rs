@@ -1776,6 +1776,8 @@ fn render_redir(r: &crate::parser::Redir) -> String {
             if *fd == 0 { "<" } else { ">" },
             render_word(file)
         ),
+        crate::parser::Redir::HereDoc { fd, .. } => format!("{}<<...", if *fd == 0 { String::new() } else { fd.to_string() }),
+        crate::parser::Redir::HereString { .. } => "<<<...".to_string(),
     }
 }
 

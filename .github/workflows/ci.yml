@@ -1,0 +1,45 @@
+name: Build
+
+# Build gate for wash.
+#
+# wash links against the MSYS2 / Cygwin runtime (msys-2.0.dll): its C shim
+# (src/posix_shim.c) is compiled by the *msys* gcc that build.rs probes via
+# `rustc --print sysroot`/bin/gcc.exe. A normal Linux or MSVC cargo build will
+# NOT satisfy build.rs, so this workflow builds inside the MSYS2 environment.
+#
+# The full semantic test suite (tests/bash_diff_*.sh) needs the local MSYS2
+# bash 5.3.20 oracle at /d/msys2/usr/bin/bash.exe and is run locally / on the
+# WSL second oracle, NOT here. This workflow only proves the tree compiles.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: Build (MSYS2 / MINGW64)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-rust
+            mingw-w64-x86_64-gcc
+            bash
+
+      - name: Build (debug)
+        run: cargo build --verbose
+
+      - name: Build (release)
+        run: cargo build --release --verbose

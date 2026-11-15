@@ -14,6 +14,7 @@ extern "C" {
     fn wash_execve(path: *const c_char, argv: *const *const c_char, envp: *const *const c_char) -> c_int;
     fn wash_waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
     fn wash_pipe(fds: *mut c_int) -> c_int;
+    fn wash_heredoc_fd(buf: *const u8, len: usize) -> c_int;
     fn wash_dup2(oldfd: c_int, newfd: c_int) -> c_int;
     fn wash_close(fd: c_int) -> c_int;
     fn wash_exit(code: c_int) -> !;
@@ -203,6 +204,13 @@ pub fn pipe() -> [i32; 2] {
         wash_pipe(fds.as_mut_ptr());
     }
     fds
+}
+
+/// Create an unlinked temp file containing `text`, rewound to offset 0, and
+/// return its descriptor in the msys fd space (the same space `dup2`/`close`
+/// use).  Returns -1 on failure.  See `wash_heredoc_fd` in posix_shim.c.
+pub fn heredoc_fd(text: &str) -> i32 {
+    unsafe { wash_heredoc_fd(text.as_ptr(), text.len()) }
 }
 
 pub fn dup2(oldfd: i32, newfd: i32) -> i32 {

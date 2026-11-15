@@ -10,7 +10,40 @@
 //
 // `2>` vs `2 >` adjacency for fd redirects is preserved (see Phase 0 notes).
 
+use std::cell::Cell;
+
 use crate::error::{Result, WashError};
+
+thread_local! {
+    /// Depth of nested tokenize() calls (command substitutions, alias
+    /// bodies).  Parse-time here-document warnings belong to the OUTER
+    /// command line: a nested parse must not emit a second copy.
+    static NESTED_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Tokenize a nested command string without emitting parse-time heredoc
+/// warnings (the outer `tokenize()` already reported them).
+pub fn tokenize_nested(input: &str) -> Result<Vec<Token>> {
+    NESTED_DEPTH.with(|d| d.set(d.get() + 1));
+    let result = tokenize(input);
+    NESTED_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    result
+}
+
+/// Emit bash's "here-document delimited by end-of-file" warning.
+///
+/// The raw bash line carries a `bash: line N: ` prefix which the diff
+/// suite's normalize_stderr strips; wash prints the message with its own
+/// shell prefix only, so the two are byte-equal after normalization.
+fn emit_heredoc_eof_warning(line: usize, delim: &str) {
+    if NESTED_DEPTH.with(|d| d.get()) != 0 {
+        return;
+    }
+    eprintln!(
+        "wash: warning: here-document at line {} delimited by end-of-file (wanted `{}')",
+        line, delim
+    );
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WordPart {
@@ -37,6 +70,14 @@ pub enum RedirKind {
     /// `N>&M`, `N<&M`, `>&N`, `<&N`, `>&-`: duplicate/close a descriptor.
     /// The target is pushed as the following `Token::Word`.
     Dup,
+    /// `<<DELIM`: here-document.  The body is collected by the lexer at
+    /// tokenize time and carried in `Token::Redirect::heredoc`.
+    HereDoc,
+    /// `<<-DELIM`: here-document that strips leading tabs from body lines
+    /// (and from the terminator comparison).
+    HereDocDash,
+    /// `<<<WORD`: here-string (one line: WORD expanded, plus a newline).
+    HereString,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,7 +101,38 @@ pub enum Token {
     OrOr,
     Semicolon,
     Background,
-    Redirect { kind: RedirKind, fd: Option<i32> },
+    Redirect {
+        kind: RedirKind,
+        fd: Option<i32>,
+        /// `<<`/`<<-` only: the body collected at tokenize time (see
+        /// `HereDocBody`).  `None` for every other redirection kind, and
+        /// until `collect_heredocs` has filled it in.
+        heredoc: Option<HereDocBody>,
+    },
+}
+
+/// The body of a `<<`/`<<-` here-document, collected by the lexer.
+///
+/// bash reads the body as soon as the line holding the operator ends: the
+/// following lines are consumed as raw text until one equals the delimiter
+/// (quote-removed, exact match; `<<-` compares and stores with leading tabs
+/// stripped).  If the input ends first, bash warns and uses what it read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HereDocBody {
+    /// Raw body text: one entry per source line, each terminated by `\n`.
+    /// Leading tabs are already stripped for `<<-`.
+    pub text: String,
+    /// The delimiter after quote removal — what bash's end-of-file warning
+    /// displays (and what the terminator line must equal).
+    pub delim: String,
+    /// False when the delimiter word was quoted (`'EOF'`, `"EOF"`): the body
+    /// must not be expanded at execution time.
+    pub expand: bool,
+    /// 1-based line of the `<<` operator (the end-of-file warning's
+    /// "here-document at line N").
+    pub line: usize,
+    /// True when the input ended before the terminator was found.
+    pub eof: bool,
 }
 
 /// GNU bash 5.3 `compgen -k` 列出的全部 shell 关键字，按 bash 的输出顺序。
@@ -233,7 +305,7 @@ fn read_dup_target(chars: &[char], i: usize) -> (Vec<WordPart>, usize) {
 /// Read the body of a `$( ... )` / `$(( ... ))` up to its matching `)`.
 /// Parentheses inside single or double quotes are literal, so `$(echo ")")`
 /// must not terminate at the quoted `)`.
-fn read_paren(chars: &[char], i: usize) -> Option<(String, usize)> {
+pub(crate) fn read_paren(chars: &[char], i: usize) -> Option<(String, usize)> {
     let mut depth = 1;
     let mut s = String::new();
     let mut j = i;
@@ -329,7 +401,7 @@ fn read_bracket(chars: &[char], i: usize) -> Option<(String, usize)> {
     None
 }
 
-fn read_brace(chars: &[char], i: usize) -> Option<(String, usize)> {
+pub(crate) fn read_brace(chars: &[char], i: usize) -> Option<(String, usize)> {
     let mut depth = 1;
     let mut s = String::new();
     let mut j = i;
@@ -814,6 +886,17 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
     let mut pending_quoted = false;
     let mut in_single = false;
     let mut in_double = false;
+    // 1-based source line number (bash counts every physical line, including
+    // newlines inside quoted strings).
+    let mut line_no: usize = 1;
+    // `<<`/`<<-` operators seen on the current line, waiting for the line to
+    // end so their bodies can be read (see `collect_heredocs`).
+    let mut pending_heredocs: Vec<PendingHeredoc> = Vec::new();
+    // A `$(` whose matching `)` was never found.  bash reports a syntax
+    // error instead of degrading the text to a literal; the error is
+    // deferred until after `collect_heredocs()` so here-document EOF
+    // warnings are still emitted first (see hd-073 / task #33).
+    let mut unclosed_cmdsub = false;
 
     // Whether a command may start at the current position.  Reserved words
     // are only recognised there.
@@ -845,6 +928,9 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                     parts.push(WordPart::Text(String::new(), true));
                 }
             } else {
+                if c == '\n' {
+                    line_no += 1;
+                }
                 pending.push(c);
             }
             i += 1;
@@ -878,10 +964,12 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                             continue;
                         }
                         if let Some((body, ni)) = read_paren(&chars, i + 1) {
+                            register_shadow_heredocs(&body, &chars, i + 1, line_no, &mut pending_heredocs);
                             parts.push(WordPart::CmdSub(body, true));
                             i = ni;
                             continue;
                         }
+                        unclosed_cmdsub = true;
                         parts.push(WordPart::Text("$(".to_string(), true));
                         i += 1;
                         continue;
@@ -948,7 +1036,12 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                     // Else: trailing backslash → the quote is unterminated and the
                     // caller reports the EOF error.
                 }
-                _ => pending.push(c),
+                _ => {
+                    if c == '\n' {
+                        line_no += 1;
+                    }
+                    pending.push(c);
+                }
             }
             i += 1;
             continue;
@@ -1003,9 +1096,15 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                         &mut redirect_target,
                     );
                 }
+                // A here-document operator seen on this line starts reading
+                // its body here: bash consumes the following lines as raw
+                // text until the terminator and tokenization resumes after.
+                let (next_i, body_lines) =
+                    collect_heredocs(&mut tokens, &mut pending_heredocs, &chars, i + 1);
+                line_no += 1 + body_lines;
                 tokens.push(Token::Semicolon);
                 at_command_start = true;
-                i += 1;
+                i = next_i;
             }
             '|' => {
                 flush_text(&mut pending, &mut parts, pending_quoted);
@@ -1063,14 +1162,53 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                     tokens.push(Token::Redirect {
                         kind: RedirKind::Dup,
                         fd: Some(fd.unwrap_or(0)),
+                        heredoc: None,
                     });
                     tokens.push(Token::Word(target));
                     redirect_target = false;
                     i = ni;
+                } else if i + 2 < n && chars[i + 1] == '<' && chars[i + 2] == '<' {
+                    // `<<<word`: here-string.  The word is the string; it is
+                    // expanded at execution time (tilde/param/cmd/arith) but
+                    // never globbed or word-split, and one newline is
+                    // appended.
+                    tokens.push(Token::Redirect {
+                        kind: RedirKind::HereString,
+                        fd,
+                        heredoc: None,
+                    });
+                    redirect_target = true;
+                    i += 3;
+                } else if i + 1 < n && chars[i + 1] == '<' {
+                    // `<<[-]DELIM`: here-document.  The delimiter is the next
+                    // word (quote-removed, never expanded); the body is read
+                    // from the following lines as soon as the current line
+                    // ends (see `collect_heredocs`).
+                    let strip_tabs = i + 2 < n && chars[i + 2] == '-';
+                    tokens.push(Token::Redirect {
+                        kind: if strip_tabs {
+                            RedirKind::HereDocDash
+                        } else {
+                            RedirKind::HereDoc
+                        },
+                        fd,
+                        heredoc: None,
+                    });
+                    pending_heredocs.push(PendingHeredoc {
+                        token_index: tokens.len() - 1,
+                        strip_tabs,
+                        line: line_no,
+                        shadow: false,
+                        start: None,
+                        delim: String::new(),
+                    });
+                    redirect_target = true;
+                    i += if strip_tabs { 3 } else { 2 };
                 } else {
                     tokens.push(Token::Redirect {
                         kind: RedirKind::In,
                         fd,
+                        heredoc: None,
                     });
                     redirect_target = true;
                     i += 1;
@@ -1093,6 +1231,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                     tokens.push(Token::Redirect {
                         kind: RedirKind::Dup,
                         fd: Some(fd.unwrap_or(1)),
+                        heredoc: None,
                     });
                     tokens.push(Token::Word(target));
                     redirect_target = false;
@@ -1107,7 +1246,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                     } else {
                         RedirKind::Out
                     };
-                    tokens.push(Token::Redirect { kind, fd });
+                    tokens.push(Token::Redirect { kind, fd, heredoc: None });
                     redirect_target = true;
                     i += if is_append || is_clobber { 2 } else { 1 };
                 }
@@ -1135,6 +1274,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                             RedirKind::Both
                         },
                         fd: None,
+                        heredoc: None,
                     });
                     redirect_target = true;
                     i += if is_append { 3 } else { 2 };
@@ -1161,10 +1301,12 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                         continue;
                     }
                     if let Some((body, ni)) = read_paren(&chars, i + 1) {
+                        register_shadow_heredocs(&body, &chars, i + 1, line_no, &mut pending_heredocs);
                         parts.push(WordPart::CmdSub(body, false));
                         i = ni;
                         continue;
                     }
+                    unclosed_cmdsub = true;
                     parts.push(WordPart::Text("$(".to_string(), false));
                     i += 1;
                     continue;
@@ -1324,11 +1466,333 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
         );
     }
 
+    // Here-documents on the final line (no trailing newline, or no terminator
+    // at all): collect their bodies from whatever is left of the input.
+    collect_heredocs(&mut tokens, &mut pending_heredocs, &chars, i);
+
+    // An unterminated quote wins over the command substitution: bash
+    // reports an unterminated-double-quote error for `echo "$(echo hi"`.
     if in_single || in_double {
         return Err(WashError::syntax("unexpected EOF while looking for matching quote"));
     }
+    // Deferred `$(` error. `collect_heredocs()` above has already emitted
+    // any here-document EOF warning, so bash's two-line diagnostic order
+    // (warning, then syntax error) is preserved.
+    if unclosed_cmdsub {
+        return Err(WashError::syntax("unexpected EOF while looking for matching `)'"));
+    }
 
     Ok(tokens)
+}
+
+// ---------------------------------------------------------------------------
+// Here-documents (`<<` / `<<-`)
+// ---------------------------------------------------------------------------
+
+/// A `<<`/`<<-` operator waiting for its body.  Recorded by `tokenize` when
+/// the operator is lexed; fulfilled by `collect_heredocs` at the end of the
+/// line (bash reads the body as soon as the line holding the operator ends).
+///
+/// `shadow` entries model heredocs written INSIDE `$(...)`: bash registers
+/// them with the OUTER command line too, whose body is read from the outer
+/// input lines.  They have no `Token::Redirect` here, never consume input
+/// and only decide whether an end-of-file warning is due.
+struct PendingHeredoc {
+    /// Index of the `Token::Redirect` carrying the operator (`usize::MAX`
+    /// for a shadow entry, which has no outer redirect token).
+    token_index: usize,
+    /// `<<-`: strip leading tabs from body lines and the terminator.
+    strip_tabs: bool,
+    /// 1-based line of the operator (the end-of-file warning's line number).
+    line: usize,
+    /// Warning-only entry for a heredoc inside a command substitution.
+    shadow: bool,
+    /// Shadow entries start scanning outer lines here (just after the
+    /// newline ending the line that holds the `<<`).
+    start: Option<usize>,
+    /// Shadow entries carry their quote-removed delimiter here.
+    delim: String,
+}
+
+/// The delimiter of the heredoc whose `Redirect` token sits at `idx`: the
+/// word right after it, flattened to its literal text.  bash does NOT expand
+/// the delimiter word — `cat <<$D` waits for a line reading `$D` — so
+/// variable parts contribute their literal spelling.
+fn heredoc_delim(tokens: &[Token], idx: usize) -> String {
+    match tokens.get(idx + 1) {
+        Some(Token::Word(parts)) => parts.iter().map(delimiter_part_text).collect(),
+        _ => String::new(),
+    }
+}
+
+/// Whether any part of the delimiter word is quoted (`'EOF'`, `"EOF"`,
+/// `E'O'F`).  A quoted delimiter suppresses body expansion at execution time.
+fn heredoc_delim_quoted(tokens: &[Token], idx: usize) -> bool {
+    match tokens.get(idx + 1) {
+        Some(Token::Word(parts)) => parts.iter().any(|p| {
+            matches!(
+                p,
+                WordPart::Text(_, true)
+                    | WordPart::Var(_, true)
+                    | WordPart::Braced(_, true)
+                    | WordPart::CmdSub(_, true)
+                    | WordPart::Backtick(_, true)
+                    | WordPart::Arith(_, true)
+            )
+        }),
+        _ => false,
+    }
+}
+
+/// Literal spelling of one delimiter-word part (see `heredoc_delim`).
+fn delimiter_part_text(p: &WordPart) -> String {
+    match p {
+        WordPart::Text(s, _) => s.clone(),
+        WordPart::Var(name, _) => format!("${}", name),
+        WordPart::Braced(body, _) => format!("${{{}}}", body),
+        WordPart::CmdSub(body, _) => format!("$({})", body),
+        WordPart::Backtick(body, _) => format!("`{}`", body),
+        WordPart::Arith(body, _) => format!("$(({}))", body),
+        WordPart::Tilde => "~".to_string(),
+        WordPart::Brace(alts) => alts.concat(),
+    }
+}
+
+/// Register the heredocs written inside a `$(...)` body with the OUTER
+/// command line.
+///
+/// bash parses the command substitution from its own text (which is what
+/// wash's `WordPart::CmdSub` carries), but it ALSO registers the `<<`
+/// operator with the outer line and reads an outer heredoc body from the
+/// lines following that line.  That outer body is what produces the
+/// "delimited by end-of-file" warning when the terminator is glued to the
+/// closing `)` (e.g. `x=$(cat <<EOF\nhi\nEOF)`), while a standalone `EOF`
+/// line terminates it and no warning is printed.
+///
+/// These entries are warning-only: they never consume input lines and never
+/// attach a body to a token, so the command substitution still runs.
+fn register_shadow_heredocs(
+    body: &str,
+    chars: &[char],
+    from: usize,
+    line_no: usize,
+    pending: &mut Vec<PendingHeredoc>,
+) {
+    let b: Vec<char> = body.chars().collect();
+    let n = b.len();
+    let body_start = chars[from..]
+        .iter()
+        .position(|&c| c == '\n')
+        .map(|p| from + p + 1)
+        .unwrap_or(chars.len());
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut j = 0usize;
+    while j < n {
+        let c = b[j];
+        if in_single {
+            if c == '\'' {
+                in_single = false;
+            }
+            j += 1;
+            continue;
+        }
+        if in_double {
+            if c == '\\' && j + 1 < n {
+                j += 2;
+                continue;
+            }
+            if c == '"' {
+                in_double = false;
+            }
+            j += 1;
+            continue;
+        }
+        if c == '\'' {
+            in_single = true;
+            j += 1;
+            continue;
+        }
+        if c == '"' {
+            in_double = true;
+            j += 1;
+            continue;
+        }
+        if c == '<' && j + 1 < n && b[j + 1] == '<' {
+            if j + 2 < n && b[j + 2] == '<' {
+                // `<<<` is a here-string, not a here-document.
+                j += 3;
+                continue;
+            }
+            let strip_tabs = j + 2 < n && b[j + 2] == '-';
+            let mut k = j + if strip_tabs { 3 } else { 2 };
+            while k < n && (b[k] == ' ' || b[k] == '\t') {
+                k += 1;
+            }
+            // Quote-removed delimiter: stop at any shell word delimiter.
+            let mut delim = String::new();
+            while k < n {
+                let d = b[k];
+                if matches!(d, '\n' | ' ' | '\t' | ';' | '&' | '|' | '(' | ')' | '<' | '>') {
+                    break;
+                }
+                if d == '\'' || d == '"' {
+                    // quote removal only; the quote character itself is not
+                    // part of the delimiter bash compares against.
+                    k += 1;
+                    continue;
+                }
+                if d == '\\' && k + 1 < n {
+                    k += 1;
+                    delim.push(b[k]);
+                    k += 1;
+                    continue;
+                }
+                delim.push(d);
+                k += 1;
+            }
+            if !delim.is_empty() {
+                pending.push(PendingHeredoc {
+                    token_index: usize::MAX,
+                    strip_tabs,
+                    line: line_no,
+                    shadow: true,
+                    start: Some(body_start),
+                    delim,
+                });
+            }
+            j = k;
+            continue;
+        }
+        j += 1;
+    }
+}
+
+/// Is there a line equal to `delim` (after `<<-` tab stripping) at/after
+/// `start`?  Used only by shadow entries; normal heredocs consume their
+/// lines while searching (see `collect_heredocs`).
+fn scan_heredoc_terminator(chars: &[char], start: usize, delim: &str, strip_tabs: bool) -> bool {
+    let n = chars.len();
+    let mut pos = start;
+    while pos < n {
+        let le = chars[pos..n]
+            .iter()
+            .position(|&c| c == '\n')
+            .map(|p| pos + p)
+            .unwrap_or(n);
+        let line: String = chars[pos..le].iter().collect();
+        let candidate: &str = if strip_tabs {
+            line.trim_start_matches('\t')
+        } else {
+            &line
+        };
+        if candidate == delim {
+            return true;
+        }
+        if le >= n {
+            break;
+        }
+        pos = le + 1;
+    }
+    false
+}
+
+/// Collect the bodies of all heredoc operators pending on the line that just
+/// ended, in order (bash: `cat <<A <<B` gives A the first body and B the
+/// second).  Body lines are consumed as raw text — tokenization resumes after
+/// the last terminator line — and each body is stored in its `Token::Redirect`
+/// as a `HereDocBody`.
+///
+/// Parse-time EOF warnings are emitted HERE, not after a successful parse:
+/// bash warns while reading the heredoc, so a later syntax error (an
+/// unclosed `(`, for example) must not swallow the warning.
+///
+/// Returns the input offset where tokenization resumes and the number of
+/// body/terminator lines consumed (for source line numbering).
+fn collect_heredocs(
+    tokens: &mut [Token],
+    pending: &mut Vec<PendingHeredoc>,
+    chars: &[char],
+    mut pos: usize,
+) -> (usize, usize) {
+    let n = chars.len();
+    let mut consumed = 0usize;
+    for op in pending.drain(..) {
+        // Heredocs inside `$(...)`: the outer line either has a standalone
+        // terminator line or warns.  No body, no input consumption.
+        if op.shadow {
+            let start = op.start.unwrap_or(pos);
+            if !scan_heredoc_terminator(chars, start, &op.delim, op.strip_tabs) {
+                emit_heredoc_eof_warning(op.line, &op.delim);
+            }
+            continue;
+        }
+        // A missing delimiter word is a syntax error at the operator: bash
+        // never starts reading a body and therefore never warns.
+        let has_delim_word = matches!(tokens.get(op.token_index + 1), Some(Token::Word(_)));
+        if !has_delim_word {
+            if let Some(Token::Redirect { heredoc, .. }) = tokens.get_mut(op.token_index) {
+                *heredoc = Some(HereDocBody {
+                    text: String::new(),
+                    delim: String::new(),
+                    expand: false,
+                    line: op.line,
+                    eof: false,
+                });
+            }
+            continue;
+        }
+        let delim = heredoc_delim(tokens, op.token_index);
+        let expand = !heredoc_delim_quoted(tokens, op.token_index);
+        let mut body = String::new();
+        let mut eof = true;
+        while pos < n {
+            // One physical line: [pos, le), where `le` is the `\n` (or the
+            // end of input for a last line without trailing newline).
+            let le = chars[pos..n]
+                .iter()
+                .position(|&c| c == '\n')
+                .map(|p| pos + p)
+                .unwrap_or(n);
+            let last_line = le >= n;
+            let line: String = chars[pos..le].iter().collect();
+            // `<<-` compares (and stores) with leading tabs stripped.
+            let candidate: &str = if op.strip_tabs {
+                line.trim_start_matches('\t')
+            } else {
+                &line
+            };
+            if candidate == delim {
+                // Terminator found: the body ends here; tokenization resumes
+                // on the following line.
+                eof = false;
+                pos = if last_line { n } else { le + 1 };
+                consumed += 1;
+                break;
+            }
+            body.push_str(candidate);
+            body.push('\n');
+            consumed += 1;
+            pos = if last_line { n } else { le + 1 };
+            if last_line {
+                // Input ended mid-body: bash warns and uses what it read.
+                break;
+            }
+        }
+        if eof {
+            emit_heredoc_eof_warning(op.line, &delim);
+        }
+        if let Some(Token::Redirect { heredoc, .. }) = tokens.get_mut(op.token_index) {
+            *heredoc = Some(HereDocBody {
+                text: body,
+                delim,
+                expand,
+                line: op.line,
+                eof,
+            });
+        }
+    }
+    (pos, consumed)
 }
 
 /// Decode a bash ANSI-C quoted string (`$'...'`). `chars[i]` must be the `$`
@@ -1411,7 +1875,7 @@ fn read_ansi_c(chars: &[char], i: usize) -> Option<(String, usize)> {
     None
 }
 
-fn read_var_name(chars: &[char], i: usize) -> String {
+pub(crate) fn read_var_name(chars: &[char], i: usize) -> String {
     if i >= chars.len() {
         return String::new();
     }
@@ -1433,7 +1897,7 @@ fn read_var_name(chars: &[char], i: usize) -> String {
 /// (a name, a positional parameter, or one of the special parameters).
 /// Anything else — whitespace, punctuation, EOF — leaves the `$` literal:
 /// bash prints `echo "a$ b"` as `a$ b` and `echo a$` as `a$`.
-fn is_expansion_start(c: char) -> bool {
+pub(crate) fn is_expansion_start(c: char) -> bool {
     c.is_ascii_alphanumeric()
         || c == '_'
         || matches!(c, '*' | '@' | '#' | '?' | '-' | '$' | '!')

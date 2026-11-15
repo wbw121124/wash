@@ -17,7 +17,7 @@
 // their internal structure.
 
 use crate::error::{Result, WashError};
-use crate::lexer::{RedirKind, Token, WordPart};
+use crate::lexer::{HereDocBody, RedirKind, Token, WordPart};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Redir {
@@ -28,6 +28,14 @@ pub enum Redir {
     Both { file: Vec<WordPart>, append: bool },
     /// `N>&M` / `N<&M`: duplicate descriptor M onto N (`-` closes N).
     Dup { fd: i32, file: Vec<WordPart> },
+    /// `<<[-]DELIM` here-document.  `body` is the raw text the lexer
+    /// collected (one line per source line, each terminated by `\n`; for
+    /// `<<-` leading tabs are already stripped).  `expand` is false when the
+    /// delimiter word was quoted: the body must not be expanded.
+    HereDoc { fd: i32, body: String, expand: bool },
+    /// `<<<WORD` here-string: one line with WORD expanded (never globbed or
+    /// word-split, even unquoted) plus a trailing newline.
+    HereString { fd: i32, word: Vec<WordPart> },
 }
 
 /// A shell function definition (`NAME() { ... }` or `function NAME { ... }`).
@@ -904,6 +912,15 @@ fn is_bare_coproc(stage: &[Token]) -> bool {
 }
 
 pub fn parse_command_list(tokens: &[Token]) -> Result<CommandList> {
+    // A trailing `|`, `&&` or `||` has no command after it.  bash reports a
+    // single-line EOF error (no offending-line echo); silently dropping the
+    // operator would execute only the left-hand side with rc=0.
+    if matches!(
+        tokens.last(),
+        Some(Token::Pipe) | Some(Token::AndAnd) | Some(Token::OrOr)
+    ) {
+        return Err(WashError::syntax("syntax error: unexpected end of file"));
+    }
     // Extract compounds + function definitions first: each becomes a single
     // token that carries the parsed branches.
     let (tokens, funcs) = parse_compounds(tokens)?;
@@ -1131,8 +1148,34 @@ fn parse_array_assignment(
     None
 }
 
-fn parse_simple(tokens: &[Token]) -> Result<SimpleCommand> {
-    let mut argv: Vec<Vec<WordPart>> = Vec::new();
+/// The token bash names in `syntax error near unexpected token `X'` when a
+/// heredoc/herestring has no delimiter/string word: the token that follows
+/// the operator (or `newline` at end of input).
+fn unexpected_token_name(tokens: &[Token], i: usize) -> String {
+    match tokens.get(i) {
+        None => "newline".to_string(),
+        Some(Token::Semicolon) => ";".to_string(),
+        Some(Token::Pipe) => "|".to_string(),
+        Some(Token::AndAnd) => "&&".to_string(),
+        Some(Token::OrOr) => "||".to_string(),
+        Some(Token::Background) => "&".to_string(),
+        Some(Token::Reserved(name)) => name.clone(),
+        Some(Token::Redirect { kind, .. }) => match kind {
+            RedirKind::In => "<".to_string(),
+            RedirKind::Out => ">".to_string(),
+            RedirKind::Clobber => ">|".to_string(),
+            RedirKind::Append => ">>".to_string(),
+            RedirKind::Both => "&>".to_string(),
+            RedirKind::BothAppend => "&>>".to_string(),
+            RedirKind::Dup => "<&".to_string(),
+            RedirKind::HereDoc | RedirKind::HereDocDash => "<<".to_string(),
+            RedirKind::HereString => "<<<".to_string(),
+        },
+        Some(_) => "newline".to_string(),
+    }
+}
+
+fn parse_simple(tokens: &[Token]) -> Result<SimpleCommand> {    let mut argv: Vec<Vec<WordPart>> = Vec::new();
     let mut redirs = Vec::new();
     let mut assignments = Vec::new();
     let mut array_assignments = Vec::new();
@@ -1182,16 +1225,43 @@ fn parse_simple(tokens: &[Token]) -> Result<SimpleCommand> {
                     name
                 )));
             }
-            Token::Redirect { kind, fd } => {
+            Token::Redirect { kind, fd, heredoc } => {
+                // Every redirection operator consumes a word.  A missing one
+                // is reported against the token that actually follows the
+                // operator (`newline` at end of input, `;`, `|`, ...), the
+                // way bash does.  Here-docs / here-strings share this path.
                 let file = match tokens.get(i + 1) {
                     Some(Token::Word(parts)) => parts.clone(),
                     _ => {
-                        return Err(WashError::syntax(
-                            "syntax error near unexpected token (expected redirection target)",
-                        ))
+                        return Err(WashError::syntax(format!(
+                            "syntax error near unexpected token `{}'",
+                            unexpected_token_name(tokens, i + 1)
+                        )));
                     }
                 };
                 match kind {
+                    RedirKind::HereDoc | RedirKind::HereDocDash => {
+                        // The lexer always fills the body in before parsing;
+                        // the default only guards non-heredoc call sites.
+                        let hd = heredoc.clone().unwrap_or(HereDocBody {
+                            text: String::new(),
+                            delim: String::new(),
+                            expand: false,
+                            line: 1,
+                            eof: false,
+                        });
+                        redirs.push(Redir::HereDoc {
+                            fd: fd.unwrap_or(0),
+                            body: hd.text,
+                            expand: hd.expand,
+                        });
+                    }
+                    RedirKind::HereString => {
+                        redirs.push(Redir::HereString {
+                            fd: fd.unwrap_or(0),
+                            word: file,
+                        });
+                    }
                     RedirKind::In => redirs.push(Redir::In {
                         fd: fd.unwrap_or(0),
                         file,

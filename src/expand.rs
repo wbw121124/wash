@@ -201,6 +201,119 @@ pub fn expand_scalar(parts: &[WordPart], ctx: &ExpandCtx) -> String {
     out
 }
 
+/// Expand a here-document body the way bash does for an unquoted delimiter:
+/// parameter, command and arithmetic expansion with backslash escapes —
+/// exactly like a double-quoted string.  No word splitting, no globbing, no
+/// tilde/brace expansion, and quote characters are literal.
+///
+/// The body is first scanned into `WordPart`s (all marked quoted, so the
+/// scalar expander below never splits or globs) and then evaluated with
+/// `expand_scalar`, which shares every expansion code path with normal
+/// words.
+pub fn expand_heredoc_body(body: &str, ctx: &ExpandCtx) -> String {
+    let chars: Vec<char> = body.chars().collect();
+    let n = chars.len();
+    let mut parts: Vec<WordPart> = Vec::new();
+    let mut pending = String::new();
+    let mut i = 0usize;
+    // Flush the literal buffer before pushing a structured part.
+    macro_rules! flush {
+        () => {
+            if !pending.is_empty() {
+                parts.push(WordPart::Text(std::mem::take(&mut pending), true));
+            }
+        };
+    }
+    while i < n {
+        let c = chars[i];
+        match c {
+            // Inside a here-document a backslash only escapes `` $ ` \ ``
+            // (and newline, a line continuation); every other occurrence
+            // keeps the backslash.
+            '\\' => {
+                if i + 1 < n {
+                    let nxt = chars[i + 1];
+                    if matches!(nxt, '$' | '`' | '\\') {
+                        pending.push(nxt);
+                    } else if nxt == '\n' {
+                        // line continuation: both characters dropped
+                    } else {
+                        pending.push('\\');
+                        pending.push(nxt);
+                    }
+                    i += 2;
+                } else {
+                    pending.push('\\');
+                    i += 1;
+                }
+            }
+            '$' => {
+                flush!();
+                i += 1;
+                if i < n && chars[i] == '(' {
+                    if i + 1 < n && chars[i + 1] == '(' {
+                        if let Some((expr, ni)) = crate::lexer::read_paren(&chars, i + 2) {
+                            if ni < n && chars[ni] == ')' {
+                                parts.push(WordPart::Arith(expr, true));
+                                i = ni + 1;
+                                continue;
+                            }
+                        }
+                        parts.push(WordPart::Text("$(".to_string(), true));
+                        i += 1;
+                        continue;
+                    }
+                    if let Some((sub, ni)) = crate::lexer::read_paren(&chars, i + 1) {
+                        parts.push(WordPart::CmdSub(sub, true));
+                        i = ni;
+                        continue;
+                    }
+                    parts.push(WordPart::Text("$(".to_string(), true));
+                    i += 1;
+                    continue;
+                } else if i < n && chars[i] == '{' {
+                    if let Some((inner, ni)) = crate::lexer::read_brace(&chars, i + 1) {
+                        parts.push(WordPart::Braced(inner, true));
+                        i = ni;
+                        continue;
+                    }
+                    parts.push(WordPart::Text("${".to_string(), true));
+                    i += 1;
+                    continue;
+                } else if i < n && crate::lexer::is_expansion_start(chars[i]) {
+                    let name = crate::lexer::read_var_name(&chars, i);
+                    i += name.chars().count();
+                    parts.push(WordPart::Var(name, true));
+                    continue;
+                } else {
+                    // `$` is literal here; the next character is handled by
+                    // the following iteration.
+                    pending.push('$');
+                    continue;
+                }
+            }
+            '`' => {
+                flush!();
+                let mut sub = String::new();
+                i += 1;
+                while i < n && chars[i] != '`' {
+                    sub.push(chars[i]);
+                    i += 1;
+                }
+                i += 1;
+                parts.push(WordPart::Backtick(sub, true));
+                continue;
+            }
+            _ => {
+                pending.push(c);
+                i += 1;
+            }
+        }
+    }
+    flush!();
+    expand_scalar(&parts, ctx)
+}
+
 /// A word under construction.
 ///
 /// Bash expands a word left-to-right.  When an unquoted expansion splits into

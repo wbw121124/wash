@@ -23,12 +23,14 @@
 #
 # Run with:
 #   MSYSTEM=MSYS "/d/msys2/usr/bin/bash.exe" -lc \
-#       'cd /d/project/WorkBuddy/wash && bash tests/bash_diff_builtins.sh'
+#       'cd <WASH_REPO> && bash tests/bash_diff_builtins.sh'
 #
 # Optional: ONLY_GROUP=A|K|B|C|D runs a single group.
-#   A = core semantics + finished builtins (413 cases: 340 + 33 brace-range
+#   A = core semantics + finished builtins (472 cases: 340 + 33 brace-range
 #       + 24 brace word-boundary + 15 brace nest/escape/quote-removal
-#       + 1 brace deep-nesting stack guard)
+#       + 1 brace deep-nesting stack guard + 37 heredoc / herestring
+#       + 11 unclosed `$(` syntax-error fence
+#       + 11 redir-no-target / line-wise partial-execution fence)
 #       -> MUST stay green (regressions)
 #       -> MUST stay green (regressions)
 #   K = KNOWN-DIFF: cannot be byte-equal by design (documented, not fixed)
@@ -930,6 +932,190 @@ run_case A bang-indirect-bad-name   'BAR=1bad; FOO=BAR; echo "x${!FOO}y"' # rc=1
 run_case A bang-indirect-valid     'BAR=hello; FOO=BAR; echo "[${!FOO}]"' # [hello] rc=0
 run_case A bang-indirect-empty-target 'FOO=bar; echo "[${!FOO}]"'          # [  ] rc=0（bar 未设置，间接展开为空）
 run_case A bang-indirect-set-u     'set -u; unset U2; echo "x${!U2}y"'    # rc=1, 与 set -u 无关，仍是 invalid indirect
+# --- heredoc / herestring（`<<` / `<<-` / `<<<`）GROUP A 全语义回归栅栏 ------
+# 每一条都先用 MSYS2 bash 5.3.20 oracle 实测，再走主闸门既有 normalize_stderr
+# 口径逐字节比较 rc + stdout + stderr。case 文本用跨行双引号保留真实换行，
+# `\$` 保护内层 shell 的 `$`，`HD_TAB` / `HD_SP` 提供真实 tab / 行尾空格。
+# 覆盖：basic 3 形态 / `<<-` tab / quoted 定界符（含部分引号 E'OF'）/ 未引号
+# 展开 / herestring / 同行多重定向 / heredoc 压管道 stdin / 双 heredoc 后者胜 /
+# 定界符在 body 中间 / 空 body + rc 传播 / 嵌套上下文 EOF 告警（hd-061/062）。
+HD_TAB="$(printf '\t')"
+HD_SP=" "
+
+run_case A heredoc-basic-1 "cat <<EOF
+hello
+EOF"
+run_case A heredoc-basic-multi "cat <<EOF
+a
+b
+c
+EOF"
+run_case A heredoc-basic-empty "cat <<EOF
+EOF"
+run_case A heredoc-empty-rc "cat <<EOF
+EOF
+echo \"rc=\$?\""
+
+run_case A heredoc-minus-tab "cat <<-EOF
+${HD_TAB}tabbed
+EOF"
+run_case A heredoc-minus-spaces "cat <<-EOF
+  spaces
+EOF"
+run_case A heredoc-minus-delim-tab "cat <<-EOF
+x
+${HD_TAB}EOF"
+
+run_case A heredoc-quoted-single "x=VAL; cat <<'EOF'
+\$x
+EOF"
+run_case A heredoc-quoted-double "x=VAL; cat <<\"EOF\"
+\$x
+EOF"
+run_case A heredoc-quoted-partial "x=VAL; cat <<E'OF'
+\$x
+EOF"
+run_case A heredoc-quoted-cmdsub "cat <<'EOF'
+\$(echo hi)
+EOF"
+run_case A heredoc-quoted-backtick "cat <<'EOF'
+\`echo hi\`
+EOF"
+
+run_case A heredoc-unq-var "x=VAL; cat <<EOF
+\$x
+EOF"
+run_case A heredoc-unq-cmdsub "cat <<EOF
+\$(echo hi)
+EOF"
+run_case A heredoc-unq-backtick "cat <<EOF
+\`echo hi\`
+EOF"
+run_case A heredoc-unq-escaped-dollar "x=VAL; cat <<EOF
+\\\$x
+EOF"
+run_case A heredoc-unq-double-backslash "x=VAL; cat <<EOF
+\\\\\$x
+EOF"
+run_case A heredoc-unq-line-cont "cat <<EOF
+one \\
+two
+EOF"
+
+run_case A herestring-simple "cat <<<hello"
+run_case A herestring-quoted-space "x=\"a b\"; cat <<<\"\$x\""
+run_case A herestring-var "x=VAL; cat <<<\$x"
+run_case A herestring-extra-arg "printf '<%s>\\n' <<<one two"
+
+run_case A heredoc-mred-devnull "cat <<EOF >/dev/null
+hi
+EOF"
+run_case A heredoc-mred-file "cat > @SANDBOX@/_hd_f1 <<EOF
+hi
+EOF
+cat @SANDBOX@/_hd_f1"
+run_case A heredoc-mred-wc "wc -c <<EOF > @SANDBOX@/_hd_f1
+hello
+EOF
+cat @SANDBOX@/_hd_f1"
+
+run_case A heredoc-pipe-stdin "cat <<EOF | wc -c
+hello
+EOF"
+run_case A heredoc-pipe-override "printf 'a\\n' | cat <<EOF
+b
+EOF"
+run_case A heredoc-double-last-wins "cat <<A <<B
+first
+A
+second
+B"
+
+run_case A heredoc-delim-in-body-indent "cat <<EOF
+  EOF
+x
+EOF"
+run_case A heredoc-delim-prefix "cat <<EOF
+EOFx
+x
+EOF"
+run_case A heredoc-delim-trailing-space "cat <<EOF
+EOF${HD_SP}
+x
+EOF"
+run_case A heredoc-delim-case "cat <<EOF
+eof
+x
+EOF"
+
+run_case A heredoc-rc-propagate "cat <<EOF
+false
+EOF
+echo \$?"
+run_case A heredoc-rc-devnull "cat <<EOF >/dev/null
+x
+EOF
+echo \$?"
+run_case A herestring-rc "cat <<<hi >/dev/null; echo \$?"
+
+# 第 2 回合修复的回归栅栏：子 shell / 命令替换里未闭合 heredoc 的 EOF 告警。
+# 主闸门 normalize_stderr 剥掉 shell 名 + 可选 `line N:` 前缀后，正文逐字节相等；
+# 若告警被吞掉，这两条会立刻 FAIL，是本回合的承重用例。
+run_case A heredoc-eof-warn-subshell "( cat <<EOF
+hi
+EOF )"
+run_case A heredoc-eof-warn-cmdsub "x=\$(cat <<EOF
+hi
+EOF); echo \"\$x\""
+
+# --- 未闭合 `$(` 语法错（任务板 #33 / 派单 #32）GROUP A 回归栅栏 ------------
+# bash 5.3.20 实测：命令替换 `$(` 缺匹配 `)` 时 rc=2 + 单行诊断
+#   `-c: line N: unexpected EOF while looking for matching `)'`（N = 输入行数 + 1）；
+# hd-073 还会先打 here-document EOF warning，故 stderr 为两行且顺序固定。
+# 对照条目锁定「不许破坏」：闭合 cmdsub / 单引号内 `$(` 字面量 / 双引号内闭合
+# cmdsub / `( )` 子 shell 未闭合的既有 rc=2。case 文本经 round4_probe.sh 按主
+# 闸门 normalize_stderr 口径 oracle 预检后写入。
+run_case A unclosed-cmdsub-echo "echo \$(echo hi"
+run_case A unclosed-cmdsub-assign "x=\$(echo hi"
+run_case A unclosed-cmdsub-heredoc "echo \$(cat <<EOF
+x"
+run_case A unclosed-cmdsub-nested "echo \$(echo \$(echo hi"
+run_case A unclosed-cmdsub-second "echo \$(echo hi) \$(echo bye"
+run_case A unclosed-cmdsub-heredoc-closed "echo \$(cat <<EOF
+hi
+EOF"
+run_case A unclosed-cmdsub-empty "echo \$(
+"
+run_case A cmdsub-closed-control "echo \$(echo hi)"
+run_case A cmdsub-single-quote-literal "echo '\$(echo hi)'"
+run_case A subshell-unclosed-control "( echo hi"
+run_case A cmdsub-double-quote-closed "echo \"\$(echo hi)\""
+
+# --- 重定向无目标语法错 / 逐行部分执行（任务板 #34）GROUP A 回归栅栏 ------
+# 判据：QA syntax_oracle.tsv 类 B sy-b01..b08（只读）；主闸门 normalize_stderr
+# 口径逐字节比较 rc + stdout + stderr。b07 用 @SANDBOX@ 隔离副作用文件。
+# 两套行号：near unexpected token 族用出错行真实行号（b01=1 / b08=2 /
+# b02=3，heredoc body 计入）；unexpected EOF 族用 lines+1（#33，未改）。
+run_case A redir-no-target-out "echo hi >"
+run_case A redir-no-target-heredoc "cat <<EOF >
+x
+EOF"
+run_case A redir-no-target-in "echo x <"
+run_case A redir-no-target-append "echo x >>"
+run_case A redir-no-target-fd "echo x 2>"
+run_case A redir-no-target-pipe "echo x |"
+run_case A redir-standalone-control "> @SANDBOX@/_sy_f1"
+run_case A redir-no-target-partial "echo ok
+echo x >
+echo after"
+# 逐行部分执行根因加固：与 #34 同源的第 4 回合遗留多行 DIFFER，以及三行前缀。
+run_case A redir-partial-cmdsub "echo \$(echo hi)
+echo \$(echo bye"
+run_case A redir-partial-three "echo one
+echo two
+echo x >"
+run_case A redir-trailing-andand "echo hi &&"
+
 # GROUP B -- regression fence for already-fixed defects (21 cases, green today).
 # (每条用例都曾是真实缺陷，修复后留在这里作为回归栅栏：通过 run_case 同时跑
 #  MSYS2 bash 5.3.20 与 wash，逐字节比较 rc + stdout + stderr（stderr 仅

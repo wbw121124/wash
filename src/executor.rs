@@ -220,6 +220,10 @@ enum ExpRedir {
     /// file, append (`&>>`).
     Both(String, bool),
     Dup(i32, String), // `N>&M` / `N<&M` / `>&-`
+    /// fd, text: a here-document body or here-string after expansion.  Both
+    /// are fed to the descriptor the same way (bash spools them to a temp
+    /// file too).
+    HereDoc(i32, String),
 }
 
 fn expand_file(file: &[WordPart], ctx: &ExpandCtx) -> String {
@@ -237,6 +241,24 @@ fn expand_redirs(redirs: &[Redir], ctx: &ExpandCtx) -> Vec<ExpRedir> {
             }
             Redir::Both { file, append } => ExpRedir::Both(expand_file(file, ctx), *append),
             Redir::Dup { fd, file } => ExpRedir::Dup(*fd, expand_file(file, ctx)),
+            Redir::HereDoc { fd, body, expand } => ExpRedir::HereDoc(
+                *fd,
+                if *expand {
+                    crate::expand::expand_heredoc_body(body, ctx)
+                } else {
+                    // Quoted delimiter: the body is used verbatim.
+                    body.clone()
+                },
+            ),
+            Redir::HereString { fd, word } => {
+                // bash: the word gets tilde/parameter/command/arithmetic
+                // expansion but is never globbed or word-split (even
+                // unquoted — `cat <<< *` stays literal), and one newline is
+                // appended.  `expand_scalar` is exactly those semantics.
+                let mut text = crate::expand::expand_scalar(word, ctx);
+                text.push('\n');
+                ExpRedir::HereDoc(*fd, text)
+            }
         })
         .collect()
 }
@@ -295,6 +317,14 @@ fn apply_exp_redirs(redirs: &[ExpRedir], noclobber: bool) {
                 } else if let Ok(src) = target.parse::<i32>() {
                     posix::dup2(src, *fd);
                 }
+            }
+            ExpRedir::HereDoc(fd, text) => {
+                let f = heredoc_fd(text);
+                if f < 0 {
+                    redir_failed("here-document");
+                }
+                posix::dup2(f, *fd);
+                posix::close(f);
             }
         }
     }
@@ -372,6 +402,20 @@ fn apply_redirs_in_parent(
                     return Err(format!("wash: {}: ambiguous redirect", target));
                 }
             }
+            ExpRedir::HereDoc(fd, text) => {
+                // Builtins (`read x <<EOF`) run in the parent: spool the body
+                // and swap the descriptor like a regular `< file`.
+                let f = heredoc_fd(text);
+                if f < 0 {
+                    let e = posix::errno();
+                    restore_fds(&saved);
+                    return Err(format!("wash: here-document: {}", posix::errno_message(e)));
+                }
+                let backup = posix::dup(*fd);
+                saved.push((*fd, backup));
+                posix::dup2(f, *fd);
+                posix::close(f);
+            }
         }
     }
     Ok(saved)
@@ -383,6 +427,19 @@ fn restore_fds(saved: &[(i32, i32)]) {
         posix::dup2(*backup, *fd);
         posix::close(*backup);
     }
+}
+
+/// Materialize here-document / here-string text as a readable file
+/// descriptor.
+///
+/// The whole operation (create/write/rewind/unlink) is delegated to
+/// `posix::heredoc_fd`, i.e. the C shim: Rust std's raw fds are NOT in the
+/// msys fd table that `apply_exp_redirs` uses for dup2/close.  A temp file
+/// (not a pipe) means the writer can never block on a small pipe buffer.
+///
+/// Returns -1 on failure; the caller reports it like a failed `open()`.
+fn heredoc_fd(text: &str) -> i32 {
+    posix::heredoc_fd(text)
 }
 
 /// Print the command that is about to run, the way bash's `set -x` does.
@@ -447,7 +504,7 @@ fn parse_cmdsub_cached(cmd: &str) -> Option<std::sync::Arc<CommandList>> {
     if let Some(hit) = CMDSUB_PARSE_CACHE.with(|c| c.borrow().get(cmd).cloned()) {
         return Some(hit);
     }
-    let tokens = crate::lexer::tokenize(cmd).ok()?;
+    let tokens = crate::lexer::tokenize_nested(cmd).ok()?;
     let list = crate::parser::parse_command_list(&tokens).ok()?;
     let arc = std::sync::Arc::new(list);
     CMDSUB_PARSE_CACHE.with(|c| {
@@ -1668,7 +1725,7 @@ fn expand_alias_in_pipeline(
     let first = pipeline.commands.first()?;
     let name = alias_name(first.argv.first()?)?;
     let value = sh.aliases.get(&name)?.clone();
-    let tokens = crate::lexer::tokenize(&value).ok()?;
+    let tokens = crate::lexer::tokenize_nested(&value).ok()?;
     let list = crate::parser::parse_command_list(&tokens).ok()?;
     if list.andors.is_empty() {
         return None;

@@ -122,6 +122,52 @@ int wash_pipe(int fds[2]) { return pipe(fds); }
 
 int wash_dup2(int oldfd, int newfd) { return dup2(oldfd, newfd); }
 
+// Materialize here-document / here-string text as a readable file descriptor
+// that lives in the SAME msys fd table as wash_dup2/wash_close.
+//
+// std::fs::File's raw fd is NOT usable here: the binary links msys-2.0.dll
+// for all POSIX calls, while Rust std's file descriptors come from a
+// different C runtime's fd table.  Everything below (open/write/lseek/
+// close/unlink) is therefore done by the C shim, via plain POSIX syscalls.
+//
+// The file is unlinked while still open: POSIX keeps its data until the last
+// descriptor closes, so no cleanup pass is needed.  A real file (not a pipe)
+// also means an arbitrarily large heredoc cannot deadlock the writer.
+// The offset is rewound to 0 before returning: write() leaves it at EOF and
+// dup2() shares the same open file description, so a reader would otherwise
+// see an empty stream immediately.
+int wash_heredoc_fd(const unsigned char *buf, size_t len) {
+    const char *tmpdir = getenv("TMPDIR");
+    if (!tmpdir || tmpdir[0] != '/') tmpdir = "/tmp";
+    char path[PATH_MAX];
+    if (snprintf(path, sizeof(path), "%s/wash-here-XXXXXX", tmpdir) >= (int)sizeof(path)) {
+        return -1;
+    }
+    int fd = mkstemp(path);
+    if (fd < 0) return -1;
+    unlink(path);
+
+    size_t off = 0;
+    while (off < len) {
+        ssize_t w = write(fd, buf + off, len - off);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            close(fd);
+            return -1;
+        }
+        if (w == 0) {
+            close(fd);
+            return -1;
+        }
+        off += (size_t)w;
+    }
+    if (lseek(fd, 0, SEEK_SET) < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
 int wash_close(int fd) { return close(fd); }
 
 void wash_exit(int code) { _exit(code); }

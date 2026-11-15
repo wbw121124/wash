@@ -705,7 +705,107 @@ impl Shell {
     /// End-of-input errors have a single line and no echo. The diff harness
     /// strips only the shell-name prefix, so the label, line number and echo
     /// line all have to match byte-for-byte.
-    fn report_parse_error(&self, source: &str, message: &str) {
+    /// Number of source lines consumed by here-document bodies / terminators.
+    /// bash reads the whole command line (including all heredoc bodies)
+    /// before diagnosing a missing redirection target, so those lines add
+    /// to the reported line number.
+    fn heredoc_consumed_lines(tokens: &[lexer::Token]) -> usize {
+        let mut total = 0usize;
+        for t in tokens {
+            if let lexer::Token::Redirect {
+                heredoc: Some(hd), ..
+            } = t
+            {
+                // A heredoc whose delimiter word is missing never starts
+                // reading a body: collect_heredocs() stores an empty
+                // placeholder with delim == "". Those lines must not be
+                // counted (e.g. `cat <<` reports line 1, not line 2).
+                if hd.delim.is_empty() && hd.text.is_empty() {
+                    continue;
+                }
+                let body_lines = hd.text.lines().count();
+                total += body_lines + if hd.eof { 0 } else { 1 };
+            }
+        }
+        total
+    }
+
+    /// Largest `k` such that the first `k` lines form a complete command list.
+    /// bash parses and executes line by line: commands that are already
+    /// complete keep their output and side effects when a later line has a
+    /// syntax error.  `tokenize_nested` suppresses parse-time heredoc warnings
+    /// for these speculative prefix parses.
+    fn largest_parseable_prefix(s: &str) -> usize {
+        let lines: Vec<&str> = s.split('\n').collect();
+        let mut best = 0usize;
+        for k in 1..lines.len() {
+            let prefix = lines[..k].join("\n");
+            let ok = lexer::tokenize_nested(&prefix)
+                .ok()
+                .and_then(|t| parser::parse_command_list(&t).ok())
+                .is_some();
+            if ok {
+                best = k;
+            }
+        }
+        best
+    }
+
+    /// Execute the completed prefix of a command string that failed to parse.
+    fn execute_completed_prefix(&mut self, s: &str, k: usize) {
+        if k == 0 {
+            return;
+        }
+        let lines: Vec<&str> = s.split('\n').collect();
+        let prefix = lines[..k].join("\n");
+        if let Ok(tokens) = lexer::tokenize_nested(&prefix) {
+            if let Ok(list) = parser::parse_command_list(&tokens) {
+                executor::execute(&list, self);
+            }
+        }
+    }
+
+    /// Report a lex/parse error with bash's two line-numbering rules and
+    /// execute any command lines that were already complete.
+    ///
+    ///   * `unexpected EOF ...` / `syntax error: unexpected end of file`
+    ///     use the virtual line just past end of input (`lines + 1`).
+    ///   * `syntax error near unexpected token ...` uses the real 1-based
+    ///     line of the offending command, plus any heredoc body lines bash
+    ///     had to read before diagnosing it, and echoes that line.
+    fn report_command_error(
+        &mut self,
+        s: &str,
+        tokens: Option<&[lexer::Token]>,
+        message: &str,
+    ) {
+        if self.quiet_errors {
+            return;
+        }
+        let lines: Vec<&str> = s.split('\n').collect();
+        let k = Self::largest_parseable_prefix(s);
+        self.execute_completed_prefix(s, k);
+
+        let at_eof = message.starts_with("syntax error: unexpected end of file")
+            || message.starts_with("unexpected EOF");
+        let near_token = message.starts_with("syntax error near unexpected token");
+        let line_no = if at_eof {
+            s.lines().count() + 1
+        } else if near_token {
+            let consumed = tokens.map(Self::heredoc_consumed_lines).unwrap_or(0);
+            k + 1 + consumed
+        } else {
+            1
+        };
+        let echo: Option<&str> = if near_token {
+            Some(lines.get(k).copied().unwrap_or(""))
+        } else {
+            None
+        };
+        self.report_parse_error(message, line_no, echo);
+    }
+
+    fn report_parse_error(&self, message: &str, line_no: usize, echo: Option<&str>) {
         if self.quiet_errors {
             return;
         }
@@ -720,15 +820,6 @@ impl Shell {
         };
         let at_eof = message.starts_with("syntax error: unexpected end of file")
             || message.starts_with("unexpected EOF");
-        // `str::lines()` does not treat a trailing newline as an extra line,
-        // which is what bash does for a sourced script ending in `\n`.
-        // Our grammar has no token positions yet, so "unexpected token"
-        // errors report line 1; single-line inputs are exact.
-        let line_no = if at_eof {
-            source.lines().count() + 1
-        } else {
-            1
-        };
         let prefix = if ctx.with_shell_name {
             format!("wash: {}: line {}: ", ctx.label, line_no)
         } else {
@@ -736,18 +827,14 @@ impl Shell {
         };
         // bash names the line where the unterminated compound started:
         // `syntax error: unexpected end of file from `{' command on line 1`.
-        // For a single-line input that line is always 1. (Multi-line inputs
-        // need token positions, which the grammar does not carry yet.)
         let body = if at_eof && message.ends_with(" command") {
             format!("{} on line 1", message)
         } else {
             message.to_string()
         };
         eprintln!("{}{}", prefix, body);
-        // bash echoes the offending line only for "unexpected token" errors.
-        if message.starts_with("syntax error near unexpected token") {
-            let echo = source.split('\n').next().unwrap_or(source);
-            eprintln!("{}`{}'", prefix, echo);
+        if let Some(line) = echo {
+            eprintln!("{}`{}'", prefix, line);
         }
     }
 
@@ -768,12 +855,12 @@ impl Shell {
                     c
                 }
                 Err(e) => {
-                    self.report_parse_error(s, &e.message);
+                    self.report_command_error(s, Some(&tokens), &e.message);
                     2
                 }
             },
             Err(e) => {
-                self.report_parse_error(s, &e.message);
+                self.report_command_error(s, None, &e.message);
                 2
             }
         };
