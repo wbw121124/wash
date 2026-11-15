@@ -46,7 +46,13 @@ latest_tag="$(git_at describe --tags --abbrev=0 2>/dev/null || true)"
 if [ -n "$exact_tags" ]; then
     hit=''
     while IFS= read -r t; do
-        [ "${t#v}" = "$base" ] && hit="$t"
+        # Use an explicit `if` so the loop body always exits 0.  The old
+        # `[ ... ] && hit="$t"` left a non-zero status on the last iteration
+        # when the tag did not match, and under `set -e` that silently aborted
+        # the script with no output (exactly the failure mode this repo forbids).
+        if [ "${t#v}" = "$base" ]; then
+            hit="$t"
+        fi
     done <<< "$exact_tags"
     [ -n "$hit" ] \
         || die "HEAD is tagged [$exact_tags] but Cargo.toml says [$base]; bump Cargo.toml to match the tag"

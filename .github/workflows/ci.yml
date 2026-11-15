@@ -35,6 +35,8 @@ jobs:
   build:
     name: Build (MSYS2 / MSYS, no MinGW)
     runs-on: windows-latest
+    permissions:
+      contents: read
     defaults:
       run:
         shell: msys2 {0}
@@ -72,18 +74,6 @@ jobs:
           # the *msys* gcc. Replace rustup's bundled MinGW gcc with the MSYS one.
           cp -f /usr/bin/gcc.exe "$SYSROOT_U/bin/gcc.exe"
           "$SYSROOT_U/bin/gcc.exe" --version
-
-      - name: Debug wash_version.sh (diagnostic only)
-        run: |
-          export PATH="$(cygpath "$USERPROFILE")/.cargo/bin:$PATH"
-          echo "PATH=$PATH"
-          which bash || echo "NO bash on PATH"
-          which git  || echo "NO git on PATH"
-          bash --version | head -1
-          echo "--- direct run ---"
-          bash tools/wash_version.sh; echo "SCRIPT_RC=$?"
-          echo "--- trace ---"
-          bash -x tools/wash_version.sh; echo "TRACE_RC=$?"
 
       - name: Build (debug)
         run: |

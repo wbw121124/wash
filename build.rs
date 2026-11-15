@@ -16,15 +16,23 @@ use std::path::PathBuf;
 /// means.  A failed git lookup is a hard build error, never a fallback.
 fn emit_version() {
     let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
-    let script = PathBuf::from(&manifest).join("tools/wash_version.sh");
+    // Invoke the script by RELATIVE path from the manifest dir.  Running it the
+    // same way a developer does in an MSYS2 shell (`bash tools/wash_version.sh`,
+    // cwd = repo root) avoids MSYS path-conversion surprises: when cargo spawns
+    // the build script as a native subprocess and we handed it an absolute
+    // Windows path as the script argument, `bash` failed silently (exit 1, empty
+    // stderr) on CI even though the very same script works interactively.
     let out = std::process::Command::new("bash")
-        .arg(&script)
+        .arg("-x")
+        .arg("tools/wash_version.sh")
+        .current_dir(&manifest)
         .output()
-        .unwrap_or_else(|e| panic!("cannot run {}: {e}", script.display()));
+        .unwrap_or_else(|e| panic!("cannot run tools/wash_version.sh: {e}"));
     if !out.status.success() {
         panic!(
-            "wash version generation failed ({:?}):\n{}",
+            "wash version generation failed ({:?}):\n--- stdout ---\n{}\n--- stderr ---\n{}",
             out.status.code(),
+            String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
     }
