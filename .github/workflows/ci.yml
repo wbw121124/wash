@@ -2,10 +2,17 @@ name: Build
 
 # Build gate for wash.
 #
-# wash links against the MSYS2 / Cygwin runtime (msys-2.0.dll): its C shim
-# (src/posix_shim.c) is compiled by the *msys* gcc that build.rs probes via
-# `rustc --print sysroot`/bin/gcc.exe. A normal Linux or MSVC cargo build will
-# NOT satisfy build.rs, so this workflow builds inside the MSYS2 environment.
+# IRON RULE: the toolchain is MSYS2 with MSYSTEM=MSYS ONLY. mingw64 / ucrt64 and
+# the mingw-w64-* MSYS2 packages are FORBIDDEN (see project memory). wash links
+# against the MSYS / Cygwin runtime (msys-2.0.dll): its C shim (src/posix_shim.c)
+# MUST be compiled by the *msys* gcc (targets x86_64-pc-cygwin, links
+# msys-2.0.dll), never the MinGW-w64 gcc.
+#
+# build.rs probes `<rustc --print sysroot>/bin/gcc.exe` and refuses to fall back
+# to whatever gcc is first on PATH, so we point that exact path at the MSYS gcc.
+# Rust itself is installed via rustup (NOT a mingw64 MSYS2 package); the bundled
+# MinGW gcc that rustup ships for the gnu target is replaced by the MSYS gcc so
+# the shim — and the final link — use msys-2.0.dll.
 #
 # The full semantic test suite (tests/bash_diff_*.sh) needs the local MSYS2
 # bash 5.3.20 oracle at /d/msys2/usr/bin/bash.exe and is run locally / on the
@@ -19,7 +26,7 @@ on:
 
 jobs:
   build:
-    name: Build (MSYS2 / MINGW64)
+    name: Build (MSYS2 / MSYS, no MinGW)
     runs-on: windows-latest
     defaults:
       run:
@@ -28,18 +35,40 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up MSYS2
+      - name: Set up MSYS2 (MSYS subsystem, NO mingw64)
         uses: msys2/setup-msys2@v2
         with:
-          msystem: MINGW64
+          msystem: MSYS
           update: true
           install: >-
-            mingw-w64-x86_64-rust
-            mingw-w64-x86_64-gcc
+            gcc
             bash
+            git
+            curl
+
+      - name: Install Rust via rustup (gnu target)
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain stable-x86_64-pc-windows-gnu --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          . "$HOME/.cargo/env"
+          rustc --version
+
+      - name: Bind build.rs to the MSYS gcc (not MinGW)
+        run: |
+          . "$HOME/.cargo/env"
+          SYSROOT="$(rustc --print sysroot)"
+          # build.rs probes <sysroot>/bin/gcc.exe and MUST compile the shim with
+          # the *msys* gcc. Replace rustup's bundled MinGW gcc with the MSYS one.
+          cp -f /usr/bin/gcc.exe "$SYSROOT/bin/gcc.exe"
+          "$SYSROOT/bin/gcc.exe" --version
 
       - name: Build (debug)
-        run: cargo build --verbose
+        run: |
+          . "$HOME/.cargo/env"
+          cargo build --verbose
 
       - name: Build (release)
-        run: cargo build --release --verbose
+        run: |
+          . "$HOME/.cargo/env"
+          cargo build --release --verbose
