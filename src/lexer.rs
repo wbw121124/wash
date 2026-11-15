@@ -12,7 +12,7 @@
 
 use std::cell::Cell;
 
-use crate::error::{Result, WashError};
+use crate::error::{DiagnosticFamily, Result, WashError};
 
 thread_local! {
     /// Depth of nested tokenize() calls (command substitutions, alias
@@ -867,6 +867,25 @@ fn parse_range(inner: &str) -> Option<Vec<String>> {
 /// to another word character: `{ echo hi; }` (separators on both sides) is a
 /// command group, while `{echo hi;}` is the word `{echo` followed by a stray
 /// `}` and therefore a syntax error. The separator set is bash's own word
+/// Kind of unclosed delimiter detected during tokenization, together with the
+/// 1-based line where it started.  Used to build a structured diagnostic so the
+/// shell computes the right line number without re-parsing the message text.
+enum Unclosed {
+    /// `$(` unclosed in command position (unquoted): the `CmdsubEof` rule
+    /// (line number = n_lines + 1).
+    CmdSub(()),
+    /// `$(` unclosed inside a double-quoted context: bash blames the enclosing
+    /// double quote, so this is an `OtherDelimiterEof` at the double quote's
+    /// open line.
+    CmdSubInDouble(usize),
+    /// Unclosed backtick.
+    Backtick(usize),
+    /// Unclosed `${`.
+    Brace(usize),
+    /// Unclosed `$((`.
+    Arith(usize),
+}
+
 /// delimiter set: blanks, newline, and the metacharacters `; & | ( ) < >`.
 fn is_word_separator(c: char) -> bool {
     matches!(
@@ -892,11 +911,16 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
     // `<<`/`<<-` operators seen on the current line, waiting for the line to
     // end so their bodies can be read (see `collect_heredocs`).
     let mut pending_heredocs: Vec<PendingHeredoc> = Vec::new();
-    // A `$(` whose matching `)` was never found.  bash reports a syntax
-    // error instead of degrading the text to a literal; the error is
-    // deferred until after `collect_heredocs()` so here-document EOF
-    // warnings are still emitted first (see hd-073 / task #33).
-    let mut unclosed_cmdsub = false;
+    // An unclosed delimiter (`$(`, backtick, `${`, `$((`, or a quote opened
+    // inside another quoting context).  bash reports a syntax error instead of
+    // degrading the text to a literal; the error is deferred until after
+    // `collect_heredocs()` so here-document EOF warnings are still emitted
+    // first (see hd-073 / task #33).  Each variant carries the 1-based line
+    // where the delimiter started so the shell picks the right line number.
+    let mut unclosed: Option<Unclosed> = None;
+    // 1-based line where the current double/single quote opened; used as the
+    // `open_line` for an unterminated quote (or a delimiter started inside it).
+    let mut open_quote_line: usize = 0;
 
     // Whether a command may start at the current position.  Reserved words
     // are only recognised there.
@@ -959,6 +983,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                                     continue;
                                 }
                             }
+                            unclosed = Some(Unclosed::Arith(line_no));
                             parts.push(WordPart::Text("$(".to_string(), true));
                             i += 1;
                             continue;
@@ -969,7 +994,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                             i = ni;
                             continue;
                         }
-                        unclosed_cmdsub = true;
+                        unclosed = Some(Unclosed::CmdSubInDouble(open_quote_line));
                         parts.push(WordPart::Text("$(".to_string(), true));
                         i += 1;
                         continue;
@@ -979,6 +1004,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                             i = ni;
                             continue;
                         }
+                        unclosed = Some(Unclosed::Brace(line_no));
                         parts.push(WordPart::Text("${".to_string(), true));
                         i += 1;
                         continue;
@@ -1007,12 +1033,20 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                     flush_text(&mut pending, &mut parts, pending_quoted);
                     let mut body = String::new();
                     i += 1;
+                    let mut tick_closed = false;
                     while i < n && chars[i] != '`' {
                         body.push(chars[i]);
                         i += 1;
                     }
+                    if i < n && chars[i] == '`' {
+                        tick_closed = true;
+                    }
                     i += 1;
-                    parts.push(WordPart::Backtick(body, true));
+                    if tick_closed {
+                        parts.push(WordPart::Backtick(body, true));
+                    } else {
+                        unclosed = Some(Unclosed::Backtick(line_no));
+                    }
                     continue;
                 }
                 '\\' => {
@@ -1052,12 +1086,14 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
             '\'' => {
                 flush_text(&mut pending, &mut parts, pending_quoted);
                 pending_quoted = true;
+                open_quote_line = line_no;
                 in_single = true;
                 i += 1;
             }
             '"' => {
                 flush_text(&mut pending, &mut parts, pending_quoted);
                 pending_quoted = true;
+                open_quote_line = line_no;
                 in_double = true;
                 i += 1;
             }
@@ -1296,6 +1332,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                                 continue;
                             }
                         }
+                        unclosed = Some(Unclosed::Arith(line_no));
                         parts.push(WordPart::Text("$(".to_string(), false));
                         i += 1;
                         continue;
@@ -1306,7 +1343,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                         i = ni;
                         continue;
                     }
-                    unclosed_cmdsub = true;
+                    unclosed = Some(Unclosed::CmdSub(()));
                     parts.push(WordPart::Text("$(".to_string(), false));
                     i += 1;
                     continue;
@@ -1316,6 +1353,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                         i = ni;
                         continue;
                     }
+                    unclosed = Some(Unclosed::Brace(line_no));
                     parts.push(WordPart::Text("${".to_string(), false));
                     i += 1;
                     continue;
@@ -1355,12 +1393,20 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                 flush_text(&mut pending, &mut parts, pending_quoted);
                 let mut body = String::new();
                 i += 1;
+                let mut tick_closed = false;
                 while i < n && chars[i] != '`' {
                     body.push(chars[i]);
                     i += 1;
                 }
+                if i < n && chars[i] == '`' {
+                    tick_closed = true;
+                }
                 i += 1;
-                parts.push(WordPart::Backtick(body, false));
+                if tick_closed {
+                    parts.push(WordPart::Backtick(body, false));
+                } else {
+                    unclosed = Some(Unclosed::Backtick(line_no));
+                }
             }
             '{' => {
                 // bash does NOT brace-expand assignment words: `x={a,b}`
@@ -1470,16 +1516,54 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
     // at all): collect their bodies from whatever is left of the input.
     collect_heredocs(&mut tokens, &mut pending_heredocs, &chars, i);
 
-    // An unterminated quote wins over the command substitution: bash
-    // reports an unterminated-double-quote error for `echo "$(echo hi"`.
+    // An unterminated quote wins over any nested unclosed delimiter: bash
+    // reports the outermost quoting context (e.g. `echo "$(echo hi"` is a
+    // double-quote error, not a command-substitution error).
     if in_single || in_double {
-        return Err(WashError::syntax("unexpected EOF while looking for matching quote"));
+        let msg = if in_double {
+            "unexpected EOF while looking for matching `\"'"
+        } else {
+            "unexpected EOF while looking for matching `'"
+        };
+        return Err(WashError::syntax_unclosed(
+            DiagnosticFamily::OtherDelimiterEof,
+            open_quote_line,
+            msg,
+        ));
     }
-    // Deferred `$(` error. `collect_heredocs()` above has already emitted
-    // any here-document EOF warning, so bash's two-line diagnostic order
-    // (warning, then syntax error) is preserved.
-    if unclosed_cmdsub {
-        return Err(WashError::syntax("unexpected EOF while looking for matching `)'"));
+    // Deferred unclosed-delimiter errors. `collect_heredocs()` above has already
+    // emitted any here-document EOF warning, so bash's two-line diagnostic
+    // order (warning, then syntax error) is preserved.  The structured family
+    // and `open_line` let the shell pick the exact line number bash uses.
+    if let Some(u) = unclosed {
+        let (family, line, msg) = match u {
+            Unclosed::CmdSubInDouble(l) => (
+                DiagnosticFamily::OtherDelimiterEof,
+                l,
+                "unexpected EOF while looking for matching `\"'",
+            ),
+            Unclosed::CmdSub(_) => (
+                DiagnosticFamily::CmdsubEof,
+                0,
+                "unexpected EOF while looking for matching `)'",
+            ),
+            Unclosed::Backtick(l) => (
+                DiagnosticFamily::OtherDelimiterEof,
+                l,
+                "unexpected EOF while looking for matching ``'",
+            ),
+            Unclosed::Brace(l) => (
+                DiagnosticFamily::OtherDelimiterEof,
+                l,
+                "unexpected EOF while looking for matching `}'",
+            ),
+            Unclosed::Arith(l) => (
+                DiagnosticFamily::OtherDelimiterEof,
+                l,
+                "unexpected EOF while looking for matching `)'",
+            ),
+        };
+        return Err(WashError::syntax_unclosed(family, line, msg));
     }
 
     Ok(tokens)

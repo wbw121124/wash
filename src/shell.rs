@@ -8,6 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::error::{DiagnosticFamily, WashError};
 use crate::executor;
 use crate::lexer;
 use crate::parser;
@@ -777,7 +778,7 @@ impl Shell {
         &mut self,
         s: &str,
         tokens: Option<&[lexer::Token]>,
-        message: &str,
+        e: &WashError,
     ) {
         if self.quiet_errors {
             return;
@@ -786,23 +787,32 @@ impl Shell {
         let k = Self::largest_parseable_prefix(s);
         self.execute_completed_prefix(s, k);
 
-        let at_eof = message.starts_with("syntax error: unexpected end of file")
-            || message.starts_with("unexpected EOF");
-        let near_token = message.starts_with("syntax error near unexpected token");
-        let line_no = if at_eof {
-            s.lines().count() + 1
-        } else if near_token {
-            let consumed = tokens.map(Self::heredoc_consumed_lines).unwrap_or(0);
-            k + 1 + consumed
-        } else {
-            1
+        // A structured `DiagnosticFamily` disambiguates diagnostics whose message
+        // strings are byte-identical (e.g. an unclosed `$(` vs `$((`) yet need
+        // different line numbers.  `Unspecified` keeps the legacy message-prefix
+        // heuristic for every existing parser/executor error.
+        let (line_no, echo): (usize, Option<&str>) = match e.family {
+            DiagnosticFamily::CmdsubEof => (s.lines().count() + 1, None),
+            DiagnosticFamily::OtherDelimiterEof => (e.open_line, None),
+            DiagnosticFamily::NearToken => {
+                let consumed = tokens.map(Self::heredoc_consumed_lines).unwrap_or(0);
+                (k + 1 + consumed, Some(lines.get(k).copied().unwrap_or("")))
+            }
+            DiagnosticFamily::Unspecified => {
+                let at_eof = e.message.starts_with("syntax error: unexpected end of file")
+                    || e.message.starts_with("unexpected EOF");
+                let near_token = e.message.starts_with("syntax error near unexpected token");
+                if at_eof {
+                    (s.lines().count() + 1, None)
+                } else if near_token {
+                    let consumed = tokens.map(Self::heredoc_consumed_lines).unwrap_or(0);
+                    (k + 1 + consumed, Some(lines.get(k).copied().unwrap_or("")))
+                } else {
+                    (1, None)
+                }
+            }
         };
-        let echo: Option<&str> = if near_token {
-            Some(lines.get(k).copied().unwrap_or(""))
-        } else {
-            None
-        };
-        self.report_parse_error(message, line_no, echo);
+        self.report_parse_error(&e.message, line_no, echo);
     }
 
     fn report_parse_error(&self, message: &str, line_no: usize, echo: Option<&str>) {
@@ -855,12 +865,12 @@ impl Shell {
                     c
                 }
                 Err(e) => {
-                    self.report_command_error(s, Some(&tokens), &e.message);
+                    self.report_command_error(s, Some(&tokens), &e);
                     2
                 }
             },
             Err(e) => {
-                self.report_command_error(s, None, &e.message);
+                self.report_command_error(s, None, &e);
                 2
             }
         };

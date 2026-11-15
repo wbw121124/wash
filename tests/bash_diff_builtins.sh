@@ -26,12 +26,13 @@
 #       'cd <WASH_REPO> && bash tests/bash_diff_builtins.sh'
 #
 # Optional: ONLY_GROUP=A|K|B|C|D runs a single group.
-#   A = core semantics + finished builtins (472 cases: 340 + 33 brace-range
+#   A = core semantics + finished builtins (483 cases: 340 + 33 brace-range
 #       + 24 brace word-boundary + 15 brace nest/escape/quote-removal
 #       + 1 brace deep-nesting stack guard + 37 heredoc / herestring
 #       + 11 unclosed `$(` syntax-error fence
-#       + 11 redir-no-target / line-wise partial-execution fence)
-#       -> MUST stay green (regressions)
+#       + 11 redir-no-target / line-wise partial-execution fence
+#       + 11 unclosed-delimiter family fence (round 6: ` / ${ / $(( / "$( )
+#          single + multiline + closed-control, mirrors syntax_oracle_r6.tsv))
 #       -> MUST stay green (regressions)
 #   K = KNOWN-DIFF: cannot be byte-equal by design (documented, not fixed)
 #   B = regression fence for already-fixed defects (GROUP B, 21 cases, green today)
@@ -1115,6 +1116,28 @@ run_case A redir-partial-three "echo one
 echo two
 echo x >"
 run_case A redir-trailing-andand "echo hi &&"
+
+# --- 未闭合定界符异族（任务板 #33/#34 之后，第 6 回合）GROUP A 回归栅栏 ------
+# 判据：QA syntax_oracle_r6.tsv（只读，26 条，sha 6169e65b...）；主闸门
+# normalize_stderr 口径逐字节比较 rc + stdout + stderr。本回合修 4 类「未闭合
+# 定界符异族」（B 族 other-delimiter-eof）行号：反引号 / `${` / `$((` / 双引号内
+# `$(` 字面量未闭合；行号 = 未闭合构造起始行（open_line），echo=None，诊断正文
+# 逐字节等于 bash。多行变体行号随起始行变化（line1 / line2）。闭合对照锁定
+# 「不许破坏」既有合法行为。case 文本经 round6_oracle.py 按主闸门口径 oracle
+# 预检后写入（26/26 MATCH）。
+run_case A backtick-unclosed-single 'echo `echo hi'
+run_case A brace-unclosed-single   'echo ${foo'
+run_case A arith-unclosed-single   'echo $((1+2'
+run_case A dquote-cmdsub-unclosed  'echo "$(echo hi"'
+run_case A backtick-unclosed-multi 'echo ok
+echo `echo hi'
+run_case A brace-unclosed-multi    'echo ok
+echo ${foo'
+run_case A backtick-closed-control 'echo `echo hi`'
+run_case A brace-closed-control    'echo ${foo}'
+run_case A arith-closed-control    'echo $((1+2))'
+run_case A dquote-cmdsub-closed-control 'echo "$(echo hi)"'
+run_case A brace-assign-closed-control  'x=${y}'
 
 # GROUP B -- regression fence for already-fixed defects (21 cases, green today).
 # (每条用例都曾是真实缺陷，修复后留在这里作为回归栅栏：通过 run_case 同时跑
