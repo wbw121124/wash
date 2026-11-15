@@ -8,22 +8,17 @@ name: Build
 # MUST be compiled by the *msys* gcc (targets x86_64-pc-cygwin, links
 # msys-2.0.dll), never the MinGW-w64 gcc.
 #
-# build.rs probes `<rustc --print sysroot>/bin/gcc.exe` and refuses to fall back
-# to whatever gcc is first on PATH, so we point that exact path at the MSYS gcc.
-# Rust itself is installed via rustup (NOT a mingw64 MSYS2 package); the bundled
-# MinGW gcc that rustup ships for the gnu target is replaced by the MSYS gcc so
-# the shim — and the final link — use msys-2.0.dll.
-#
-# NOTE on PATH: rustup is a Windows binary, so it installs into
-# %USERPROFILE%\.cargo (e.g. C:\Users\runneradmin\.cargo). The MSYS2 shell's
-# $HOME is /home/runneradmin, so `$HOME/.cargo/env` does NOT exist there. We
-# therefore compute the cargo bin via `cygpath "$USERPROFILE"` and export it in
-# every step that needs cargo/rustc (relying on $GITHUB_PATH alone is unreliable
-# because the MSYS2 shell drops Unix-style entries written to it).
+# Use the MSYS2 `rust` package (msys/rust, host x86_64-pc-cygwin), NOT rustup
+# and NOT any mingw-w64 rust package. With that package `rustc --print sysroot`
+# is /usr, so the gcc that build.rs probes (<sysroot>/bin/gcc.exe) is exactly
+# /usr/bin/gcc.exe -- the MSYS gcc, which finds its cc1 under /usr/lib/gcc/...
+# and links msys-2.0.dll. Crucially we do NOT copy/symlink gcc anywhere: a
+# relocated gcc infers its exec prefix from argv[0] (no longer /usr) and then
+# fails with "cannot execute 'cc1': spawn: No such file or directory".
 #
 # The full semantic test suite (tests/bash_diff_*.sh) needs the local MSYS2
-# bash 5.3.20 oracle at /d/msys2/usr/bin/bash.exe and is run locally / on the
-# WSL second oracle, NOT here. This workflow only proves the tree compiles.
+# bash 5.3.20 oracle and is run locally / on the WSL second oracle, NOT here.
+# This workflow only proves the tree compiles on the mandated toolchain.
 
 on:
   push:
@@ -44,46 +39,55 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up MSYS2 (MSYS subsystem, NO mingw64)
+      - name: Set up MSYS2 (MSYS subsystem, NO mingw64/ucrt64)
         uses: msys2/setup-msys2@v2
         with:
           msystem: MSYS
           update: true
           install: >-
+            rust
             gcc
             bash
             git
             curl
 
-      - name: Install Rust via rustup (gnu target)
+      - name: Verify MSYS-only toolchain (hard gates)
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --default-toolchain stable-x86_64-pc-windows-gnu --profile minimal --no-modify-path
-          CARGO_BIN="$(cygpath "$USERPROFILE")/.cargo/bin"
-          echo "CARGO_BIN=$CARGO_BIN"
-          export PATH="$CARGO_BIN:$PATH"
-          cargo --version
-          rustc --version
-
-      - name: Bind build.rs to the MSYS gcc (not MinGW)
-        run: |
-          export PATH="$(cygpath "$USERPROFILE")/.cargo/bin:$PATH"
+          echo "MSYSTEM=$MSYSTEM"
+          test "$MSYSTEM" = MSYS || { echo "FATAL: MSYSTEM must be MSYS" >&2; exit 1; }
+          command -v rustc
+          command -v cargo
+          rustc -vV
+          HOST="$(rustc -vV | sed -n 's/^host: //p')"
+          echo "rustc host=$HOST"
+          case "$HOST" in
+            x86_64-pc-cygwin) ;;
+            *) echo "FATAL: rustc host is not the MSYS/Cygwin target" >&2; exit 1 ;;
+          esac
           SYSROOT="$(rustc --print sysroot)"
-          SYSROOT_U="$(cygpath -u "$SYSROOT")"
-          # build.rs probes <sysroot>/bin/gcc.exe and MUST compile the shim with
-          # the *msys* gcc. Replace rustup's bundled MinGW gcc with the MSYS one.
-          cp -f /usr/bin/gcc.exe "$SYSROOT_U/bin/gcc.exe"
-          "$SYSROOT_U/bin/gcc.exe" --version
-          # build.rs runs tools/wash_version.sh via a native cargo build-script
-          # process, where a bare `bash` resolves to the WSL launcher stub on
-          # windows-latest (prints "WSL has no installed distributions", exit 1).
-          # Pass the exact MSYS bash in Windows form so build.rs never guesses.
+          echo "rustc sysroot=$SYSROOT"
+          # build.rs hard gate: this exact path must exist and be the MSYS gcc.
+          test -x "$SYSROOT/bin/gcc.exe" || { echo "FATAL: no gcc at sysroot" >&2; exit 1; }
+          echo "gcc version: $("$SYSROOT/bin/gcc.exe" --version | head -1)"
+          MACHINE="$("$SYSROOT/bin/gcc.exe" -dumpmachine)"
+          echo "gcc target=$MACHINE"
+          case "$MACHINE" in
+            *-cygwin*) ;;
+            *) echo "FATAL: gcc is not the MSYS/Cygwin gcc" >&2; exit 1 ;;
+          esac
+          # Belt-and-suspenders: build.rs must never resolve a bare `bash` to
+          # the WSL launcher stub on windows-latest. Pass the exact MSYS bash.
           echo "WASH_BASH=$(cygpath -m /usr/bin/bash.exe)" >> "$GITHUB_ENV"
 
       - name: Build (debug)
+        run: cargo build --verbose
+
+      - name: Smoke test (debug binary)
         run: |
-          export PATH="$(cygpath "$USERPROFILE")/.cargo/bin:$PATH"
-          cargo build --verbose
+          test -s target/debug/wash.exe || { echo "FATAL: no debug binary" >&2; exit 1; }
+          OUT="$(./target/debug/wash.exe --version)"
+          echo "wash --version: $OUT"
+          test -n "$OUT" || { echo "FATAL: empty --version output" >&2; exit 1; }
 
       - name: Upload artifact (debug)
         uses: actions/upload-artifact@v4
@@ -93,9 +97,7 @@ jobs:
           if-no-files-found: error
 
       - name: Build (release)
-        run: |
-          export PATH="$(cygpath "$USERPROFILE")/.cargo/bin:$PATH"
-          cargo build --release --verbose
+        run: cargo build --release --verbose
 
       - name: Upload artifact (release)
         uses: actions/upload-artifact@v4
