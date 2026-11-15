@@ -14,6 +14,11 @@ name: Build
 # MinGW gcc that rustup ships for the gnu target is replaced by the MSYS gcc so
 # the shim — and the final link — use msys-2.0.dll.
 #
+# NOTE: rustup is a Windows binary, so it installs into %USERPROFILE%\.cargo
+# (e.g. C:\Users\runneradmin\.cargo). The MSYS2 shell's $HOME is /home/runneradmin,
+# so `$HOME/.cargo/env` does NOT exist there. We therefore expose the real cargo
+# bin via cygpath + $GITHUB_PATH instead of sourcing that env file.
+#
 # The full semantic test suite (tests/bash_diff_*.sh) needs the local MSYS2
 # bash 5.3.20 oracle at /d/msys2/usr/bin/bash.exe and is run locally / on the
 # WSL second oracle, NOT here. This workflow only proves the tree compiles.
@@ -49,24 +54,28 @@ jobs:
       - name: Install Rust via rustup (gnu target)
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --default-toolchain stable-x86_64-pc-windows-gnu --profile minimal
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          . "$HOME/.cargo/env"
+            | sh -s -- -y --default-toolchain stable-x86_64-pc-windows-gnu --profile minimal --no-modify-path
+          # rustup is a Windows binary: it installs into %USERPROFILE%\.cargo,
+          # but the MSYS2 shell $HOME is /home/runneradmin, so $HOME/.cargo/env
+          # is absent. Expose the real cargo bin on PATH for this + later steps.
+          CARGO_BIN="$(cygpath "$USERPROFILE")/.cargo/bin"
+          echo "CARGO_BIN=$CARGO_BIN"
+          export PATH="$CARGO_BIN:$PATH"
+          echo "$CARGO_BIN" >> "$GITHUB_PATH"
+          cargo --version
           rustc --version
 
       - name: Bind build.rs to the MSYS gcc (not MinGW)
         run: |
-          . "$HOME/.cargo/env"
           SYSROOT="$(rustc --print sysroot)"
+          SYSROOT_U="$(cygpath -u "$SYSROOT")"
           # build.rs probes <sysroot>/bin/gcc.exe and MUST compile the shim with
           # the *msys* gcc. Replace rustup's bundled MinGW gcc with the MSYS one.
-          cp -f /usr/bin/gcc.exe "$SYSROOT/bin/gcc.exe"
-          "$SYSROOT/bin/gcc.exe" --version
+          cp -f /usr/bin/gcc.exe "$SYSROOT_U/bin/gcc.exe"
+          "$SYSROOT_U/bin/gcc.exe" --version
 
       - name: Build (debug)
-        run: |
-          . "$HOME/.cargo/env"
-          cargo build --verbose
+        run: cargo build --verbose
 
       - name: Upload artifact (debug)
         uses: actions/upload-artifact@v4
@@ -76,9 +85,7 @@ jobs:
           if-no-files-found: error
 
       - name: Build (release)
-        run: |
-          . "$HOME/.cargo/env"
-          cargo build --release --verbose
+        run: cargo build --release --verbose
 
       - name: Upload artifact (release)
         uses: actions/upload-artifact@v4
