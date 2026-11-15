@@ -16,21 +16,27 @@ use std::path::PathBuf;
 /// means.  A failed git lookup is a hard build error, never a fallback.
 fn emit_version() {
     let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
-    // Invoke the script by RELATIVE path from the manifest dir.  Running it the
-    // same way a developer does in an MSYS2 shell (`bash tools/wash_version.sh`,
-    // cwd = repo root) avoids MSYS path-conversion surprises: when cargo spawns
-    // the build script as a native subprocess and we handed it an absolute
-    // Windows path as the script argument, `bash` failed silently (exit 1, empty
-    // stderr) on CI even though the very same script works interactively.
-    let out = std::process::Command::new("bash")
+    // Pick the shell that runs tools/wash_version.sh.  Locally (inside an MSYS2
+    // login shell) plain `bash` is the real MSYS bash and works.  But GitHub's
+    // windows-latest runner resolves a bare `bash` from a *native* cargo build
+    // script to C:\Windows\System32\bash.exe -- the WSL launcher stub, which
+    // prints "Windows Subsystem for Linux has no installed distributions" to
+    // stdout and exits 1 (no stderr) -- so CI passes the exact MSYS bash via
+    // WASH_BASH.  Never guess: a failed version lookup is a hard error.
+    let shell = std::env::var("WASH_BASH").unwrap_or_else(|_| "bash".to_string());
+    // Invoke the script by RELATIVE path from the manifest dir, mirroring the
+    // interactive `bash tools/wash_version.sh` invocation that is known to work.
+    // `-x` keeps a trace on stderr for future diagnosis; on success only stdout
+    // (the version string) is consumed.
+    let out = std::process::Command::new(&shell)
         .arg("-x")
         .arg("tools/wash_version.sh")
         .current_dir(&manifest)
         .output()
-        .unwrap_or_else(|e| panic!("cannot run tools/wash_version.sh: {e}"));
+        .unwrap_or_else(|e| panic!("cannot run {shell} tools/wash_version.sh: {e}"));
     if !out.status.success() {
         panic!(
-            "wash version generation failed ({:?}):\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            "wash version generation failed ({:?}) using shell [{shell}]:\n--- stdout ---\n{}\n--- stderr ---\n{}",
             out.status.code(),
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
@@ -48,6 +54,7 @@ fn emit_version() {
         panic!("generated version is empty or contains whitespace: [{version}]");
     }
     println!("cargo:rustc-env=WASH_VERSION={version}");
+    println!("cargo:rerun-if-env-changed=WASH_BASH");
     println!("cargo:rerun-if-changed=tools/wash_version.sh");
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-env-changed=WASH_GIT_DIR");

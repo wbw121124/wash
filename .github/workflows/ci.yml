@@ -74,6 +74,11 @@ jobs:
           # the *msys* gcc. Replace rustup's bundled MinGW gcc with the MSYS one.
           cp -f /usr/bin/gcc.exe "$SYSROOT_U/bin/gcc.exe"
           "$SYSROOT_U/bin/gcc.exe" --version
+          # build.rs runs tools/wash_version.sh via a native cargo build-script
+          # process, where a bare `bash` resolves to the WSL launcher stub on
+          # windows-latest (prints "WSL has no installed distributions", exit 1).
+          # Pass the exact MSYS bash in Windows form so build.rs never guesses.
+          echo "WASH_BASH=$(cygpath -m /usr/bin/bash.exe)" >> "$GITHUB_ENV"
 
       - name: Build (debug)
         run: |
