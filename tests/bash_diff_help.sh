@@ -233,7 +233,7 @@ sha() {
     printf '%s' "$d"
 }
 normalize_stderr() {
-    sed -E 's#^[^:]*bash(\.exe)?: (line [0-9]+: |第 [0-9]+ 行：)?##; s#^wash(\.exe)?: ##' "$1"
+    sed -E 's#^[^:]*bash(\.exe)?: (line [0-9]+: |第 [0-9]+ 行：)?##; s#^wash(\.exe)?: (line [0-9]+: )?##' "$1"
 }
 first_diffs() {
     awk 'NR==FNR{a[FNR]=$0;n=FNR;next}{b[FNR]=$0;m=FNR}END{

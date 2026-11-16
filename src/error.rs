@@ -26,6 +26,11 @@ pub enum DiagnosticFamily {
     /// a quoting context): line number is the 1-based line where the
     /// delimiter *started* (`open_line`).
     OtherDelimiterEof,
+    /// Unterminated compound command (`if true; then`): the report line is
+    /// `n_lines + 1` (like `CmdsubEof`) and the message itself already
+    /// carries the innermost opener's line ("... on line N") -- the shell
+    /// must print the message verbatim and never append a second "on line".
+    CompoundEof,
     /// `syntax error near unexpected token ...`: line number is the real
     /// 1-based line of the offending command plus any here-document body
     /// lines, and that line is echoed back.

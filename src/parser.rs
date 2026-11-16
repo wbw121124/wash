@@ -16,7 +16,7 @@
 // that carries the parsed sub-trees, so the flat pass never has to know about
 // their internal structure.
 
-use crate::error::{Result, WashError};
+use crate::error::{DiagnosticFamily, Result, WashError};
 use crate::lexer::{HereDocBody, RedirKind, Token, WordPart};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,29 +176,34 @@ fn parse_compounds(tokens: &[Token]) -> Result<(Vec<Token>, Vec<FuncDef>)> {
     let mut i = 0usize;
     while i < tokens.len() {
         match &tokens[i] {
-            Token::Reserved(name) => match name.as_str() {
+            Token::Reserved(name, kw_line) => match name.as_str() {
                 "if" => {
-                    let (compound, end) = parse_if_compound(tokens, i)?;
+                    let (compound, end) = parse_if_compound(tokens, i)
+                        .map_err(|e| wrap_compound_eof(e, "if", *kw_line))?;
                     out.push(Token::Compound(compound));
                     i = end;
                 }
                 "for" => {
-                    let (compound, end) = parse_for_compound(tokens, i)?;
+                    let (compound, end) = parse_for_compound(tokens, i)
+                        .map_err(|e| wrap_compound_eof(e, "for", *kw_line))?;
                     out.push(Token::Compound(compound));
                     i = end;
                 }
                 "while" => {
-                    let (compound, end) = parse_while_until_compound(tokens, i, false)?;
+                    let (compound, end) = parse_while_until_compound(tokens, i, false)
+                        .map_err(|e| wrap_compound_eof(e, "while", *kw_line))?;
                     out.push(Token::Compound(compound));
                     i = end;
                 }
                 "until" => {
-                    let (compound, end) = parse_while_until_compound(tokens, i, true)?;
+                    let (compound, end) = parse_while_until_compound(tokens, i, true)
+                        .map_err(|e| wrap_compound_eof(e, "until", *kw_line))?;
                     out.push(Token::Compound(compound));
                     i = end;
                 }
                 "case" => {
-                    let (compound, end) = parse_case_compound(tokens, i)?;
+                    let (compound, end) = parse_case_compound(tokens, i)
+                        .map_err(|e| wrap_compound_eof(e, "case", *kw_line))?;
                     out.push(Token::Compound(compound));
                     i = end;
                 }
@@ -265,7 +270,7 @@ fn at_command_position(out: &[Token]) -> bool {
         Some(Token::Semicolon | Token::Pipe | Token::AndAnd | Token::OrOr | Token::Background) => {
             true
         }
-        Some(Token::Reserved(_)) => true,
+        Some(Token::Reserved(..)) => true,
         _ => false,
     }
 }
@@ -365,9 +370,45 @@ fn parse_subshell_compound(tokens: &[Token], start: usize) -> Result<(Compound, 
 /// The name of the reserved word at `index`, if the token is one.
 fn reserved_name(tokens: &[Token], index: usize) -> Option<String> {
     match tokens.get(index) {
-        Some(Token::Reserved(name)) => Some(name.clone()),
+        Some(Token::Reserved(name, _)) => Some(name.clone()),
         _ => None,
     }
+}
+
+/// The name and 1-based physical line of the reserved word at `index`.
+/// The line is what bash's unterminated-compound diagnostic reports as
+/// `... from \`<kw>' command on line <N>` (heredoc body lines are counted
+/// by the lexer, matching bash -- qa9 A13).
+fn reserved_at(tokens: &[Token], index: usize) -> Option<(String, usize)> {
+    match tokens.get(index) {
+        Some(Token::Reserved(name, line)) => Some((name.clone(), *line)),
+        _ => None,
+    }
+}
+
+/// The exact diagnostic bash prints for an unterminated compound command
+/// (qa9 A01/A07-A11): a single line, no offending-line echo, rc=2, reported
+/// at `n_lines + 1` with the *innermost* opener's line.
+fn compound_eof_message(kw: &str, open_line: usize) -> String {
+    format!(
+        "syntax error: unexpected end of file from `{}' command on line {}",
+        kw, open_line
+    )
+}
+
+/// Wrap a bare "unexpected end of file" parser error into the unterminated
+/// compound diagnostic for `kw` opened on `open_line`.  Errors that are NOT
+/// the bare EOF (nested-compound diagnostics, near-token errors) pass
+/// through unchanged so the innermost opener always wins (qa9 A12).
+fn wrap_compound_eof(e: WashError, kw: &str, open_line: usize) -> WashError {
+    if e.message == "syntax error: unexpected end of file" {
+        return WashError::syntax_unclosed(
+            DiagnosticFamily::CompoundEof,
+            0,
+            compound_eof_message(kw, open_line),
+        );
+    }
+    e
 }
 
 /// Collect the tokens from `from` up to the next reserved word whose name is
@@ -387,7 +428,7 @@ fn split_until_reserved(
     let mut out: Vec<Token> = Vec::new();
     let mut i = from;
     while i < tokens.len() {
-        if let Token::Reserved(name) = &tokens[i] {
+        if let Token::Reserved(name, _) = &tokens[i] {
             match name.as_str() {
                 "if" | "for" | "while" | "until" | "case" => {
                     let end = find_matching_closer(tokens, i)?;
@@ -437,7 +478,7 @@ fn find_matching_closer(tokens: &[Token], start: usize) -> Result<usize> {
     let mut stack: Vec<&str> = vec![kind];
     let mut i = start + 1;
     while i < tokens.len() {
-        if let Token::Reserved(name) = &tokens[i] {
+        if let Token::Reserved(name, _) = &tokens[i] {
             match name.as_str() {
                 "if" | "for" | "while" | "until" | "case" => {
                     stack.push(match name.as_str() {
@@ -469,7 +510,16 @@ fn find_matching_closer(tokens: &[Token], start: usize) -> Result<usize> {
         }
         i += 1;
     }
-    Err(WashError::syntax("syntax error: unexpected end of file"))
+    // The compound opened at `start` was never closed.  This function sits
+    // below every nested compound scan, so this error is the *innermost*
+    // unterminated opener -- exactly what bash reports (qa9 A12).
+    let (kw, open_line) = reserved_at(tokens, start)
+        .unwrap_or_else(|| (String::new(), 1));
+    Err(WashError::syntax_unclosed(
+        DiagnosticFamily::CompoundEof,
+        0,
+        compound_eof_message(&kw, open_line),
+    ))
 }
 
 /// Parse the `if` construct that starts at `start` (the `if` token itself).
@@ -537,7 +587,7 @@ fn parse_for_compound(tokens: &[Token], start: usize) -> Result<(Compound, usize
     loop {
         if i >= tokens.len() {
             return Err(WashError::syntax(
-                "syntax error: unexpected end of file from `for' command",
+                "syntax error: unexpected end of file",
             ));
         }
         match &tokens[i] {
@@ -549,7 +599,7 @@ fn parse_for_compound(tokens: &[Token], start: usize) -> Result<(Compound, usize
                 // end of the word list; the `do` keyword follows.
                 i += 1;
             }
-            Token::Reserved(r) if r == "do" => {
+            Token::Reserved(r, _) if r == "do" => {
                 do_index = i;
                 break;
             }
@@ -587,13 +637,12 @@ fn parse_while_until_compound(
         loop {
             if i >= tokens.len() {
                 return Err(WashError::syntax(format!(
-                    "syntax error: unexpected end of file from `{}' command",
-                    if is_until { "until" } else { "while" }
+                    "syntax error: unexpected end of file",
                 )));
             }
             match &tokens[i] {
-                Token::Reserved(r) if r == "do" => break i,
-                Token::Reserved(_) => {
+                Token::Reserved(r, _) if r == "do" => break i,
+                Token::Reserved(..) => {
                     return Err(WashError::syntax(
                         "syntax error near unexpected token (expected `do')",
                     ))
@@ -659,7 +708,7 @@ fn parse_case_compound(tokens: &[Token], start: usize) -> Result<(Compound, usiz
         loop {
             if i >= tokens.len() {
                 return Err(WashError::syntax(
-                    "syntax error: unexpected end of file from `case' command",
+                    "syntax error: unexpected end of file",
                 ));
             }
             match &tokens[i] {
@@ -705,10 +754,10 @@ fn parse_case_compound(tokens: &[Token], start: usize) -> Result<(Compound, usiz
         let mut depth = 0i32;
         while body_end < tokens.len() {
             match &tokens[body_end] {
-                Token::Reserved(r) if matches!(r.as_str(), "if" | "for" | "while" | "until" | "case") => {
+                Token::Reserved(r, _) if matches!(r.as_str(), "if" | "for" | "while" | "until" | "case") => {
                     depth += 1;
                 }
-                Token::Reserved(r)
+                Token::Reserved(r, _)
                     if matches!(r.as_str(), "fi" | "esac" | "done") && depth > 0 =>
                 {
                     depth -= 1;
@@ -720,7 +769,7 @@ fn parse_case_compound(tokens: &[Token], start: usize) -> Result<(Compound, usiz
                 {
                     break;
                 }
-                Token::Reserved(r) if r == "esac" && depth == 0 => break,
+                Token::Reserved(r, _) if r == "esac" && depth == 0 => break,
                 _ => {}
             }
             body_end += 1;
@@ -1159,7 +1208,7 @@ fn unexpected_token_name(tokens: &[Token], i: usize) -> String {
         Some(Token::AndAnd) => "&&".to_string(),
         Some(Token::OrOr) => "||".to_string(),
         Some(Token::Background) => "&".to_string(),
-        Some(Token::Reserved(name)) => name.clone(),
+        Some(Token::Reserved(name, _)) => name.clone(),
         Some(Token::Redirect { kind, .. }) => match kind {
             RedirKind::In => "<".to_string(),
             RedirKind::Out => ">".to_string(),
@@ -1219,7 +1268,7 @@ fn parse_simple(tokens: &[Token]) -> Result<SimpleCommand> {    let mut argv: Ve
                 compound = Some(c.clone());
                 seen_command = true;
             }
-            Token::Reserved(name) => {
+            Token::Reserved(name, _) => {
                 return Err(WashError::syntax(format!(
                     "syntax error near unexpected token `{}'",
                     name

@@ -70,10 +70,13 @@ if grep -q "\[$BASE\]" CHANGELOG.md; then
 else
     echo "FAIL CHANGELOG.md has no [$BASE] entry"; fail=$((fail + 1))
 fi
-if grep -q "发布 $BASE" README.md; then
-    echo 'ok   README.md release section'
+# The release/versioning documentation lives in docs/versioning.md (README is
+# a short overview that links there); the gate checks whichever document the
+# README actually links to, so the rule cannot silently rot in either place.
+if grep -q "docs/versioning.md" README.md && grep -qE "Cargo\.toml|唯一真源" docs/versioning.md; then
+    echo 'ok   versioning doc linked from README'
 else
-    echo "FAIL README.md has no 发布 $BASE section"; fail=$((fail + 1))
+    echo "FAIL README does not link docs/versioning.md or the doc lost its rule text"; fail=$((fail + 1))
 fi
 
 # help header must keep the "wash, version ..." comma form: the i18n suite

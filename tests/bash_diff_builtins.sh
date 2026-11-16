@@ -26,13 +26,17 @@
 #       'cd <WASH_REPO> && bash tests/bash_diff_builtins.sh'
 #
 # Optional: ONLY_GROUP=A|K|B|C|D runs a single group.
-#   A = core semantics + finished builtins (483 cases: 340 + 33 brace-range
+#   A = core semantics + finished builtins (503 cases: 340 + 33 brace-range
 #       + 24 brace word-boundary + 15 brace nest/escape/quote-removal
 #       + 1 brace deep-nesting stack guard + 37 heredoc / herestring
 #       + 11 unclosed `$(` syntax-error fence
 #       + 11 redir-no-target / line-wise partial-execution fence
 #       + 11 unclosed-delimiter family fence (round 6: ` / ${ / $(( / "$( )
 #          single + multiline + closed-control, mirrors syntax_oracle_r6.tsv))
+#       + 20 round-7 fence: unterminated compound commands (if/while/for/
+#          case/{/(), innermost-opener line numbers, heredoc-body line
+#          counting, `>;` near-token, family priority, heredoc-EOF warning)
+#          -- mirrors qa9_oracle.tsv GROUP A)
 #       -> MUST stay green (regressions)
 #   K = KNOWN-DIFF: cannot be byte-equal by design (documented, not fixed)
 #   B = regression fence for already-fixed defects (GROUP B, 21 cases, green today)
@@ -178,7 +182,7 @@ fail=0
 #   has to match.  The message body, the number of lines and the trailing
 #   newline are all left untouched, so the comparison stays byte-for-byte.
 normalize_stderr() {
-    sed -E 's#^[^:]*bash(\.exe)?: (line [0-9]+: )?##; s#^wash(\.exe)?: ##' "$1"
+    sed -E 's#^[^:]*bash(\.exe)?: (line [0-9]+: )?##; s#^wash(\.exe)?: (line [0-9]+: )?##' "$1"
 }
 
 # `cmp` is not available in this MSYS2 installation -> compare hex dumps.
@@ -840,6 +844,52 @@ run_case A brace-backslash-empty  'set -- {A..z}; printf "n=%d 27=[%s] 28=[%s] 2
 # `{a,` + `z` + 2000 层 `}`，`eval` 触发 brace 展开（4002 字节 / 2001 词）。
 # 承重证据：改前主仓二进制 rc=139 + 0 字节输出，改后与 bash sha256 相同。
 run_case A brace-deep-2000       's=z; i=0; while [ $i -lt 2000 ]; do s="{a,$s}"; i=$((i+1)); done; eval "echo $s"'
+
+# --- round 7 fence: unterminated compound commands & `>;` -------------------
+# 20 cases mirroring QA qa9_oracle.tsv GROUP A (bash 5.3.20 oracle, LC_ALL=C).
+# C-family template: `-c: line <n_lines+1>: syntax error: unexpected end of
+# file from `<kw>' command on line <open_line>` (open_line = INNERMOST opener,
+# heredoc body lines counted), single line, no echo, rc=2.  An unterminated
+# heredoc is a warning + rc=0 with the body executed.  Priority: B-family
+# delimiters > CmdsubEof > compound-EOF > near-token; a literal `;` right
+# after a target-less redirection always wins (bash streams the parse).
+run_case A compound-eof-if-single     'if true; then'
+run_case A compound-eof-if-body       'if true; then echo hi'
+run_case A compound-eof-if-multi      'if true; then
+echo hi'
+run_case A near-token-redirect-semi   'echo hi >; echo after'
+run_case A near-token-redirect-eof    'echo hi >'
+run_case A near-token-redirect-multi  'echo a
+ echo hi >; echo after'
+run_case A compound-eof-while         'while true; do'
+run_case A compound-eof-for           'for x in 1; do'
+run_case A compound-eof-case          'case x in'
+run_case A compound-eof-group         '{ echo hi'
+run_case A compound-eof-subshell      '( echo hi'
+run_case A compound-eof-nested-if     'if true; then
+if true; then
+echo hi'
+run_case A compound-eof-hd-then-if    'cat <<EOF
+hello
+EOF
+if true; then'
+run_case A compound-eof-if-hd         'if true; then
+cat <<EOF
+hello
+EOF'
+run_case A heredoc-eof-warning        'cat <<EOF
+hello
+'
+run_case A prio-compound-backtick     'if true; then
+echo `echo hi'
+run_case A prio-compound-cmdsub       'if true; then
+echo $(echo hi'
+run_case A prio-near-token-backtick   'echo hi > `echo x'
+run_case A prio-compound-brace        'while true; do
+echo ${x'
+run_case A compound-closed-control    'if true; then
+  echo ok
+fi'
 
 # --- 特殊参数 `$-`（当前 shell 选项标志串）-----------------------------------
 # 全部期望值均先用 MSYS2 bash 5.3 实测（本套件固定 `-c`，故末尾恒有 `c`）。

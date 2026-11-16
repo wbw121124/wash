@@ -31,18 +31,40 @@ pub fn tokenize_nested(input: &str) -> Result<Vec<Token>> {
 }
 
 /// Emit bash's "here-document delimited by end-of-file" warning.
-///
 /// The raw bash line carries a `bash: line N: ` prefix which the diff
-/// suite's normalize_stderr strips; wash prints the message with its own
-/// shell prefix only, so the two are byte-equal after normalization.
+/// suite's normalize_stderr keeps (only the shell name is stripped), so the
+/// warning must carry the same `line N:` where N is the total number of
+/// input lines (the EOF position).  Warnings are queued here and flushed at
+/// the end of `tokenize`, once the total line count is known and before any
+/// deferred syntax error -- preserving bash's diagnostic order
+/// (warning first, then the syntax error; qa9 A13/A14/A15).
 fn emit_heredoc_eof_warning(line: usize, delim: &str) {
     if NESTED_DEPTH.with(|d| d.get()) != 0 {
         return;
     }
-    eprintln!(
-        "wash: warning: here-document at line {} delimited by end-of-file (wanted `{}')",
-        line, delim
-    );
+    HD_EOF_WARNINGS.with(|w| {
+        w.borrow_mut().push((line, delim.to_string()));
+    });
+}
+
+thread_local! {
+    /// Queued here-document end-of-file warnings: `(operator line, delim)`.
+    static HD_EOF_WARNINGS: std::cell::RefCell<Vec<(usize, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Flush the queued here-document EOF warnings.  `total_lines` is the
+/// 1-based line the input ends on (= number of physical lines), which bash
+/// uses as the warning's own `line N:` position.
+fn flush_heredoc_eof_warnings(total_lines: usize) {
+    HD_EOF_WARNINGS.with(|w| {
+        for (op_line, delim) in w.borrow_mut().drain(..) {
+            eprintln!(
+                "wash: line {}: warning: here-document at line {} delimited by end-of-file (wanted `{}')",
+                total_lines, op_line, delim
+            );
+        }
+    });
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,7 +108,11 @@ pub enum Token {
     /// A reserved word in command position (`if`, `then`, `elif`, `else`,
     /// `fi`).  Bash only recognises a reserved word where a command may
     /// start, so `echo fi` still passes "fi" as an ordinary argument.
-    Reserved(String),
+    /// The usize is the 1-based physical line the reserved word starts on
+    /// (heredoc body lines are counted, matching bash): an unterminated
+    /// compound command must report `... from \`if' command on line N` with
+    /// the line of the *innermost* opener (bash oracle qa9 A12/A13/A14).
+    Reserved(String, usize),
     /// A compound command (`if ... fi`) that has already been parsed.
     Compound(crate::parser::Compound),
     /// A shell function definition (`NAME() { ... }` or `function NAME { ... }`).
@@ -181,9 +207,13 @@ pub const SHELL_KEYWORDS: &[(&str, bool)] = &[
 /// `at_command_start` tells whether a command may start at this position
 /// and `redirect_target` tells whether the word is the target of a
 /// redirection (such a word is neither a command word nor a reserved word).
+/// `line` is the 1-based physical line the word starts on (heredoc body
+/// lines included, matching bash) and is carried by `Reserved` tokens so
+/// unterminated compound diagnostics can name the opener's line.
 fn push_word(
     tokens: &mut Vec<Token>,
     parts: Vec<WordPart>,
+    line: usize,
     at_command_start: &mut bool,
     redirect_target: &mut bool,
 ) {
@@ -205,7 +235,7 @@ fn push_word(
             WordPart::Text(text, _) => text.clone(),
             _ => String::new(),
         };
-        tokens.push(Token::Reserved(name));
+        tokens.push(Token::Reserved(name, line));
         // A reserved word is followed by a command again.
         *at_command_start = true;
         return;
@@ -918,6 +948,11 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
     // first (see hd-073 / task #33).  Each variant carries the 1-based line
     // where the delimiter started so the shell picks the right line number.
     let mut unclosed: Option<Unclosed> = None;
+    // A redirection operator left without a target word right before a
+    // literal `;` (qa9 A04/A06): always the FIRST syntax error in the stream
+    // (any earlier unterminated delimiter would have swallowed the `;` into
+    // its quoting context), so it outranks every deferred EOF-family error.
+    let mut redirect_missing_target = false;
     // 1-based line where the current double/single quote opened; used as the
     // `open_line` for an unterminated quote (or a delimiter started inside it).
     let mut open_quote_line: usize = 0;
@@ -1115,6 +1150,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                     push_word(
                         &mut tokens,
                         std::mem::take(&mut parts),
+                        line_no,
                         &mut at_command_start,
                         &mut redirect_target,
                     );
@@ -1128,6 +1164,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                     push_word(
                         &mut tokens,
                         std::mem::take(&mut parts),
+                        line_no,
                         &mut at_command_start,
                         &mut redirect_target,
                     );
@@ -1148,6 +1185,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                     push_word(
                         &mut tokens,
                         std::mem::take(&mut parts),
+                        line_no,
                         &mut at_command_start,
                         &mut redirect_target,
                     );
@@ -1169,9 +1207,23 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                     push_word(
                         &mut tokens,
                         std::mem::take(&mut parts),
+                        line_no,
                         &mut at_command_start,
                         &mut redirect_target,
                     );
+                }
+                // A redirection left without a target word immediately before
+                // a literal `;`: bash streams the parse and reports the `;`
+                // itself (`echo hi >; echo after` -> `near unexpected token
+                // \`;'`, qa9 A04/A06).  Any unterminated delimiter opened
+                // earlier would have swallowed this `;` into its quoting
+                // context, so this error always predates every EOF-family
+                // diagnostic and is reported first at the end of tokenize.
+                // `echo hi >` at a real end of line never reaches this arm
+                // (no `;` there) and still reports `newline` (qa9 A05).
+                if redirect_target {
+                    redirect_missing_target = true;
+                    redirect_target = false;
                 }
                 tokens.push(Token::Semicolon);
                 at_command_start = true;
@@ -1188,6 +1240,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                     push_word(
                         &mut tokens,
                         std::mem::take(&mut parts),
+                        line_no,
                         &mut at_command_start,
                         &mut redirect_target,
                     );
@@ -1257,6 +1310,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                     push_word(
                         &mut tokens,
                         std::mem::take(&mut parts),
+                        line_no,
                         &mut at_command_start,
                         &mut redirect_target,
                     );
@@ -1293,6 +1347,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                     push_word(
                         &mut tokens,
                         std::mem::take(&mut parts),
+                        line_no,
                         &mut at_command_start,
                         &mut redirect_target,
                     );
@@ -1460,6 +1515,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                     push_word(
                         &mut tokens,
                         std::mem::take(&mut parts),
+                        line_no,
                         &mut at_command_start,
                         &mut redirect_target,
                     );
@@ -1507,6 +1563,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
         push_word(
             &mut tokens,
             std::mem::take(&mut parts),
+            line_no,
             &mut at_command_start,
             &mut redirect_target,
         );
@@ -1515,6 +1572,26 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
     // Here-documents on the final line (no trailing newline, or no terminator
     // at all): collect their bodies from whatever is left of the input.
     collect_heredocs(&mut tokens, &mut pending_heredocs, &chars, i);
+
+    // All here-document EOF warnings are queued during scanning; flush them
+    // now, before any deferred syntax error (bash's diagnostic order: warning
+    // first, then the error -- qa9 A13/A14).  bash names the *last physical
+    // line of the input* as the warning position (`line N:` where N is the
+    // EOF line), which is exactly `input.lines().count()` -- NOT the lexer's
+    // running `line_no`, which ends one past the last line (qa9 A13/A15).
+    flush_heredoc_eof_warnings(input.lines().count());
+
+    // A redirection without a target right before a literal `;` is the first
+    // syntax error in the stream and outranks every EOF-family error (qa9
+    // A04/A06; any earlier unterminated delimiter would have swallowed the
+    // `;` into its quoting context, so the two can never coexist).  The
+    // near-token message goes through the shell's legacy heuristic, which
+    // computes the line number and echoes the offending line like bash.
+    if redirect_missing_target {
+        return Err(WashError::syntax(
+            "syntax error near unexpected token `;'",
+        ));
+    }
 
     // An unterminated quote wins over any nested unclosed delimiter: bash
     // reports the outermost quoting context (e.g. `echo "$(echo hi"` is a

@@ -794,6 +794,10 @@ impl Shell {
         let (line_no, echo): (usize, Option<&str>) = match e.family {
             DiagnosticFamily::CmdsubEof => (s.lines().count() + 1, None),
             DiagnosticFamily::OtherDelimiterEof => (e.open_line, None),
+            // Unterminated compound command: bash reports the virtual line
+            // just past the input (n_lines + 1), no echo; the message itself
+            // already carries "on line N" for the innermost opener (qa9).
+            DiagnosticFamily::CompoundEof => (s.lines().count() + 1, None),
             DiagnosticFamily::NearToken => {
                 let consumed = tokens.map(Self::heredoc_consumed_lines).unwrap_or(0);
                 (k + 1 + consumed, Some(lines.get(k).copied().unwrap_or("")))

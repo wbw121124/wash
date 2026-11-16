@@ -47,7 +47,7 @@ if command -v timeout >/dev/null 2>&1; then
 fi
 
 normalize_stderr() {
-    sed -E 's#^[^:]*bash(\.exe)?: (line [0-9]+: )?##; s#^wash(\.exe)?: ##' "$1"
+    sed -E 's#^[^:]*bash(\.exe)?: (line [0-9]+: )?##; s#^wash(\.exe)?: (line [0-9]+: )?##' "$1"
 }
 
 # MSYS2 没有 cmp，用 hexdump 比较。
