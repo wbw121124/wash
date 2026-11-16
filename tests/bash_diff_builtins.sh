@@ -26,7 +26,7 @@
 #       'cd <WASH_REPO> && bash tests/bash_diff_builtins.sh'
 #
 # Optional: ONLY_GROUP=A|K|B|C|D runs a single group.
-#   A = core semantics + finished builtins (550 cases: 340 + 33 brace-range
+#   A = core semantics + finished builtins (558 cases: 340 + 33 brace-range
 #       + 24 brace word-boundary + 15 brace nest/escape/quote-removal
 #       + 1 brace deep-nesting stack guard + 37 heredoc / herestring
 #       + 11 unclosed `$(` syntax-error fence
@@ -42,6 +42,8 @@
 #       + 22 builtins fence (kill signal-0 probe, ulimit out-of-range/hex,
 #          source directory, builtin write errors, read -n/-N byte counting,
 #          printf empty format)
+#       + 8 stderr-write-failure fence (`fd2` also /dev/full: diagnostics must
+#          be dropped silently, never panic with rc=101)
 #       -> MUST stay green (regressions)
 #   K = KNOWN-DIFF: cannot be byte-equal by design (documented, not fixed)
 #   B = regression fence for already-fixed defects (GROUP B, 21 cases, green today)
@@ -1273,6 +1275,17 @@ run_case A read-n-byte4         'read -n 4 v < @SANDBOX@/execfix/utf8; printf %s
 run_case A read-n-zero          'read -n 0 v < @SANDBOX@/execfix/utf8; echo "[$v] rc=$?"; read w < @SANDBOX@/execfix/utf8; echo "[$w]"'
 run_case A read-N-byte4         'read -N 4 v < @SANDBOX@/execfix/utf8; printf %s "$v" | od -An -tx1; echo "rc=$?"'
 run_case A plain-script         '@SANDBOX@/execfix/plain; echo "rc=$?"'
+# stderr 本身写失败（2>&1 指向 /dev/full）：bash 静默放弃诊断并保留命令自身
+# 的 rc；Rust 的 eprintln!/println! 在写失败时 panic(rc=101)，属逐字节/rc
+# 偏离。所有用户诊断走 safe_eprintln! 宏（写失败忽略，绝不 panic）。
+run_case A stderr-full-echo-n    'echo -n foo > /dev/full 2>&1; echo "rc=$?"'
+run_case A stderr-full-echo      'echo foo > /dev/full 2>&1; echo "rc=$?"'
+run_case A stderr-full-printf    'printf foo > /dev/full 2>&1; echo "rc=$?"'
+run_case A stderr-full-pwd       'pwd > /dev/full 2>&1; echo "rc=$?"'
+run_case A stderr-full-source    'source @SANDBOX@/execfix/pdir1 > /dev/full 2>&1; echo "rc=$?"'
+run_case A stderr-full-kill      'kill -0 999999 > /dev/full 2>&1; echo "rc=$?"'
+run_case A stderr-full-ulimit    'ulimit -f 99999999999999999999 > /dev/full 2>&1; echo "rc=$?"'
+run_case A stderr-full-notfound  'no-such-cmd-xyz-washfix > /dev/full 2>&1; echo "rc=$?"'
 
 # GROUP B -- regression fence for already-fixed defects (21 cases, green today).
 # (每条用例都曾是真实缺陷，修复后留在这里作为回归栅栏：通过 run_case 同时跑

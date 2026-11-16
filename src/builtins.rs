@@ -20,6 +20,7 @@
 use std::io::Write;
 
 use crate::arith;
+use crate::safe_eprintln;
 use crate::posix;
 use crate::shell::{Shell, JobInfo, SET_O_ORDER, SHOPT_ORDER};
 // fish 风格的翻译宏 `tr!("...")`，参见 `src/i18n.rs`。
@@ -206,8 +207,8 @@ fn builtin_cd(argv: &[String], sh: &mut Shell) -> i32 {
                     "-L" => physical = false,
                     "-P" => physical = true,
                     _ => {
-                        eprintln!("wash: cd: {}: invalid option", a);
-                        eprintln!("cd: usage: cd [-L|[-P [-e]]] [-@] [dir]");
+                        safe_eprintln!("wash: cd: {}: invalid option", a);
+                        safe_eprintln!("cd: usage: cd [-L|[-P [-e]]] [-@] [dir]");
                         return 2;
                     }
                 }
@@ -220,7 +221,7 @@ fn builtin_cd(argv: &[String], sh: &mut Shell) -> i32 {
     }
 
     if operands.len() > 1 {
-        eprintln!("wash: cd: too many arguments");
+        safe_eprintln!("wash: cd: too many arguments");
         return 2;
     }
     let target: Option<String> = operands.into_iter().next();
@@ -230,7 +231,7 @@ fn builtin_cd(argv: &[String], sh: &mut Shell) -> i32 {
     let dir: String = match target {
         None => match sh.env.get("HOME") {
             None => {
-                eprintln!("wash: cd: HOME not set");
+                safe_eprintln!("wash: cd: HOME not set");
                 return 1;
             }
             // An empty $HOME is a successful no-op in bash.
@@ -239,11 +240,11 @@ fn builtin_cd(argv: &[String], sh: &mut Shell) -> i32 {
         },
         Some(d) if d == "-" => match sh.env.get("OLDPWD").or(sh.oldpwd.as_ref()) {
             None => {
-                eprintln!("wash: cd: OLDPWD not set");
+                safe_eprintln!("wash: cd: OLDPWD not set");
                 return 1;
             }
             Some(p) if p.is_empty() => {
-                eprintln!("wash: cd: OLDPWD not set");
+                safe_eprintln!("wash: cd: OLDPWD not set");
                 return 1;
             }
             Some(p) => {
@@ -252,7 +253,7 @@ fn builtin_cd(argv: &[String], sh: &mut Shell) -> i32 {
             }
         },
         Some(d) if d.is_empty() => {
-            eprintln!("wash: cd: null directory");
+            safe_eprintln!("wash: cd: null directory");
             return 1;
         }
         Some(d) => d,
@@ -291,7 +292,7 @@ fn builtin_cd(argv: &[String], sh: &mut Shell) -> i32 {
     let chosen = match chosen {
         Some(c) => c,
         None => {
-            eprintln!(
+            safe_eprintln!(
                 "wash: cd: {}: {}",
                 dir,
                 posix::errno_message(last_errno)
@@ -389,7 +390,7 @@ fn builtin_exit(argv: &[String], sh: &mut Shell) -> i32 {
         let arg = &argv[1];
         match parse_bash_number(arg) {
             None => {
-                eprintln!("wash: exit: {}: numeric argument required", arg);
+                safe_eprintln!("wash: exit: {}: numeric argument required", arg);
                 // bash does NOT terminate the shell here: the error is
                 // reported, the status becomes 2 and the next command
                 // still runs.
@@ -426,13 +427,13 @@ fn builtin_export(argv: &[String], sh: &mut Shell) -> i32 {
                 "-p" => print = true,
                 "-n" => unexport = true,
                 "-f" => {
-                    eprintln!("wash: export: -f: not supported");
-                    eprintln!("export: usage: export [-fn] [name[=value] ...] or export -p [-f]");
+                    safe_eprintln!("wash: export: -f: not supported");
+                    safe_eprintln!("export: usage: export [-fn] [name[=value] ...] or export -p [-f]");
                     return 2;
                 }
                 _ => {
-                    eprintln!("wash: export: {}: invalid option", a);
-                    eprintln!("export: usage: export [-fn] [name[=value] ...] or export -p [-f]");
+                    safe_eprintln!("wash: export: {}: invalid option", a);
+                    safe_eprintln!("export: usage: export [-fn] [name[=value] ...] or export -p [-f]");
                     return 2;
                 }
             }
@@ -453,13 +454,13 @@ fn builtin_export(argv: &[String], sh: &mut Shell) -> i32 {
                 let name = &arg[..eq];
                 let value = &arg[eq + 1..];
                 if !is_valid_ident(name) {
-                    eprintln!("wash: export: `{}': not a valid identifier", arg);
+                    safe_eprintln!("wash: export: `{}': not a valid identifier", arg);
                     return 1;
                 }
                 // A readonly variable must not be reassigned through `export`.
                 // bash prints `Y: readonly variable` (no `export:` prefix).
                 if sh.readonly.contains(name) {
-                    eprintln!("wash: {}: readonly variable", name);
+                    safe_eprintln!("wash: {}: readonly variable", name);
                     return 1;
                 }
                 if unexport {
@@ -474,7 +475,7 @@ fn builtin_export(argv: &[String], sh: &mut Shell) -> i32 {
             }
             None => {
                 if !is_valid_ident(arg) {
-                    eprintln!("wash: export: `{}': not a valid identifier", arg);
+                    safe_eprintln!("wash: export: `{}': not a valid identifier", arg);
                     return 1;
                 }
                 if unexport {
@@ -549,8 +550,8 @@ fn builtin_unset(argv: &[String], sh: &mut Shell) -> i32 {
                 // `-n` names a nameref; nothing to do for us.
                 "-n" => {}
                 _ => {
-                    eprintln!("wash: unset: {}: invalid option", a);
-                    eprintln!("unset: usage: unset [-f] [-v] [-n] [name ...]");
+                    safe_eprintln!("wash: unset: {}: invalid option", a);
+                    safe_eprintln!("unset: usage: unset [-f] [-v] [-n] [name ...]");
                     return 2;
                 }
             }
@@ -566,7 +567,7 @@ fn builtin_unset(argv: &[String], sh: &mut Shell) -> i32 {
             sh.functions.remove(name);
         } else if sh.readonly.contains(name) {
             // bash refuses to unset a readonly variable and keeps it intact.
-            eprintln!("wash: unset: {}: cannot unset: readonly variable", name);
+            safe_eprintln!("wash: unset: {}: cannot unset: readonly variable", name);
             status = 1;
         } else {
             sh.env.remove(name);
@@ -651,8 +652,8 @@ fn builtin_set(argv: &[String], sh: &mut Shell) -> i32 {
                 }
                 if !is_valid_short_option(ch) {
                     let sign = if enable { '-' } else { '+' };
-                    eprintln!("wash: set: {}{}: invalid option", sign, ch);
-                    eprintln!(
+                    safe_eprintln!("wash: set: {}{}: invalid option", sign, ch);
+                    safe_eprintln!(
                         "set: usage: set [-abefhkmnptuvxBCEHPT] [-o option-name] [--] [-] [arg ...]"
                     );
                     return if printed_table { 1 } else { 2 };
@@ -705,7 +706,7 @@ fn set_named_option(sh: &mut Shell, name: &str, enable: bool) -> bool {
     if sh.options.set(name, enable) {
         true
     } else {
-        eprintln!("wash: set: {}: invalid option name", name);
+        safe_eprintln!("wash: set: {}: invalid option name", name);
         false
     }
 }
@@ -892,7 +893,7 @@ fn builtin_shift(argv: &[String], sh: &mut Shell) -> i32 {
     }
 
     if args.len() > 1 {
-        eprintln!("wash: shift: too many arguments");
+        safe_eprintln!("wash: shift: too many arguments");
         // bash aborts the shell on this usage error.
         sh.exit_requested = Some(1);
         return 1;
@@ -903,13 +904,13 @@ fn builtin_shift(argv: &[String], sh: &mut Shell) -> i32 {
         Some(arg) => {
             let value = match parse_bash_number(arg) {
                 None => {
-                    eprintln!("wash: shift: {}: numeric argument required", arg);
+                    safe_eprintln!("wash: shift: {}: numeric argument required", arg);
                     return 2;
                 }
                 Some(v) => v,
             };
             if value < 0 {
-                eprintln!("wash: shift: {}: shift count out of range", arg);
+                safe_eprintln!("wash: shift: {}: shift count out of range", arg);
                 return 1;
             }
             value
@@ -958,8 +959,8 @@ fn builtin_shopt(argv: &[String], sh: &mut Shell) -> i32 {
                 "-u" => disable = true,
                 "-o" => show_set_options = true,
                 _ => {
-                    eprintln!("wash: shopt: {}: invalid option", a);
-                    eprintln!("shopt: usage: shopt [-psu] [-o] [option ...]");
+                    safe_eprintln!("wash: shopt: {}: invalid option", a);
+                    safe_eprintln!("shopt: usage: shopt [-psu] [-o] [option ...]");
                     return 2;
                 }
             }
@@ -983,13 +984,13 @@ fn builtin_shopt(argv: &[String], sh: &mut Shell) -> i32 {
 
     if enable || disable {
         if names.is_empty() {
-            eprintln!("wash: shopt: usage: shopt [-psu] [-o] [option ...]");
+            safe_eprintln!("wash: shopt: usage: shopt [-psu] [-o] [option ...]");
             return 2;
         }
         let mut status = 0;
         for name in &names {
             if !sh.shopt_set(name, enable) {
-                eprintln!("wash: shopt: {}: invalid shell option name", name);
+                safe_eprintln!("wash: shopt: {}: invalid shell option name", name);
                 status = 1;
             }
         }
@@ -1007,7 +1008,7 @@ fn builtin_shopt(argv: &[String], sh: &mut Shell) -> i32 {
         for name in &names {
             match sh.shopt_get(name) {
                 None => {
-                    eprintln!("wash: shopt: {}: invalid shell option name", name);
+                    safe_eprintln!("wash: shopt: {}: invalid shell option name", name);
                     return 1;
                 }
                 Some(value) => {
@@ -1521,7 +1522,7 @@ fn builtin_test(argv: &[String], sh: &mut Shell) -> i32 {
                 operands = &operands[..operands.len() - 1];
             }
             _ => {
-                eprintln!("wash: [: missing `]'");
+                safe_eprintln!("wash: [: missing `]'");
                 return 2;
             }
         }
@@ -1538,7 +1539,7 @@ fn builtin_test(argv: &[String], sh: &mut Shell) -> i32 {
     let value = match evaluator.posixtest() {
         Ok(value) => value,
         Err(e) => {
-            eprintln!("wash: {}: {}", name, e.message());
+            safe_eprintln!("wash: {}: {}", name, e.message());
             return 2;
         }
     };
@@ -1552,7 +1553,7 @@ fn builtin_test(argv: &[String], sh: &mut Shell) -> i32 {
         } else {
             "too many arguments".to_string()
         };
-        eprintln!("wash: {}: {}", name, message);
+        safe_eprintln!("wash: {}: {}", name, message);
         return 2;
     }
 
@@ -1929,8 +1930,8 @@ fn builtin_type(argv: &[String], sh: &mut Shell) -> i32 {
                     flags.force_path = true;
                 }
                 _ => {
-                    eprintln!("wash: type: {}: invalid option", a);
-                    eprintln!("type: usage: type [-afptP] name [name ...]");
+                    safe_eprintln!("wash: type: {}: invalid option", a);
+                    safe_eprintln!("type: usage: type [-afptP] name [name ...]");
                     return 2;
                 }
             }
@@ -1951,7 +1952,7 @@ fn builtin_type(argv: &[String], sh: &mut Shell) -> i32 {
             // bash only reports the failure when it did not print a type
             // or a path.
             if !matches!(flags.mode, DescMode::Type | DescMode::PathOnly) {
-                eprintln!("wash: type: {}: not found", name);
+                safe_eprintln!("wash: type: {}: not found", name);
             }
             any_failed = true;
         }
@@ -1982,8 +1983,8 @@ fn builtin_command(argv: &[String], sh: &mut Shell) -> i32 {
                 "-v" => mode = Some(DescMode::Reusable),
                 "-V" => mode = Some(DescMode::ShortDesc),
                 _ => {
-                    eprintln!("wash: command: {}: invalid option", a);
-                    eprintln!("command: usage: command [-pVv] command [arg ...]");
+                    safe_eprintln!("wash: command: {}: invalid option", a);
+                    safe_eprintln!("command: usage: command [-pVv] command [arg ...]");
                     return 2;
                 }
             }
@@ -2011,7 +2012,7 @@ fn builtin_command(argv: &[String], sh: &mut Shell) -> i32 {
                 let found = describe_command(name, flags, sh);
                 // `-v` stays silent when the command is unknown.
                 if !found && mode != DescMode::Reusable {
-                    eprintln!("wash: command: {}: not found", name);
+                    safe_eprintln!("wash: command: {}: not found", name);
                 }
                 any_found |= found;
             }
@@ -2036,8 +2037,8 @@ fn builtin_command(argv: &[String], sh: &mut Shell) -> i32 {
 fn builtin_builtin(argv: &[String], sh: &mut Shell) -> i32 {
     let i = 1usize;
     if i < argv.len() && argv[i].starts_with('-') {
-        eprintln!("wash: builtin: {}: invalid option", argv[i]);
-        eprintln!("builtin: usage: builtin [shell-builtin [arg ...]]");
+        safe_eprintln!("wash: builtin: {}: invalid option", argv[i]);
+        safe_eprintln!("builtin: usage: builtin [shell-builtin [arg ...]]");
         return 2;
     }
     if i >= argv.len() {
@@ -2046,7 +2047,7 @@ fn builtin_builtin(argv: &[String], sh: &mut Shell) -> i32 {
 
     let name = argv[i].clone();
     if !is_builtin(sh, &name) || sh.disabled_builtins.contains(&name) {
-        eprintln!("wash: builtin: {}: not a shell builtin", name);
+        safe_eprintln!("wash: builtin: {}: not a shell builtin", name);
         return 1;
     }
 
@@ -2114,14 +2115,14 @@ fn builtin_hash(argv: &[String], sh: &mut Shell) -> i32 {
                     match argv.get(i) {
                         Some(p) => pathname = Some(p.clone()),
                         None => {
-                            eprintln!("{}", USAGE);
+                            safe_eprintln!("{}", USAGE);
                             return 2;
                         }
                     }
                 }
                 _ => {
-                    eprintln!("wash: hash: {}: invalid option", a);
-                    eprintln!("{}", USAGE);
+                    safe_eprintln!("wash: hash: {}: invalid option", a);
+                    safe_eprintln!("{}", USAGE);
                     return 2;
                 }
             }
@@ -2134,7 +2135,7 @@ fn builtin_hash(argv: &[String], sh: &mut Shell) -> i32 {
 
     // `hash -t' and `hash -d' need at least one name.
     if names.is_empty() && (delete || list_targets) {
-        eprintln!(
+        safe_eprintln!(
             "wash: hash: {}: option requires an argument",
             if delete { "-d" } else { "-t" }
         );
@@ -2143,7 +2144,7 @@ fn builtin_hash(argv: &[String], sh: &mut Shell) -> i32 {
 
     // A pathname without a name is a usage error.
     if pathname.is_some() && names.is_empty() {
-        eprintln!("{}", USAGE);
+        safe_eprintln!("{}", USAGE);
         return 2;
     }
 
@@ -2171,7 +2172,7 @@ fn builtin_hash(argv: &[String], sh: &mut Shell) -> i32 {
             match sh.hash_table.get(name) {
                 Some(path) => println!("{}", path),
                 None => {
-                    eprintln!("wash: hash: {}: not found", name);
+                    safe_eprintln!("wash: hash: {}: not found", name);
                     status = 1;
                 }
             }
@@ -2194,7 +2195,7 @@ fn builtin_hash(argv: &[String], sh: &mut Shell) -> i32 {
         }
         if delete {
             if sh.hash_table.remove(name).is_none() {
-                eprintln!("wash: hash: {}: not found", name);
+                safe_eprintln!("wash: hash: {}: not found", name);
                 status = 1;
             } else {
                 sh.hash_hits.remove(name);
@@ -2208,7 +2209,7 @@ fn builtin_hash(argv: &[String], sh: &mut Shell) -> i32 {
                 sh.hash_hits.entry(name.clone()).or_insert(0);
             }
             None => {
-                eprintln!("wash: hash: {}: not found", name);
+                safe_eprintln!("wash: hash: {}: not found", name);
                 status = 1;
             }
         }
@@ -2303,6 +2304,11 @@ fn read_fields(input: &[u8], ifs: &[char], nvars: usize) -> Vec<String> {
 /// `as_bytes()` 写出）会逐字节还原，绝不二次编码（这是 `read -n 4` 曾把
 /// `e6` 补全成 `c3 a6` 的根因）。字段切分因此也必须在字节层进行
 /// （见 [`read_fields`]）。
+///
+/// 注意：这处 unsafe 越过 Rust 的 String UTF-8 不变式，是当前 Shell env
+/// 全用 `String` 换取逐字节兼容的已知取舍（QA 已独立标记）。长期方案是把
+/// env 值改为字节容器（OsString/byte side-table）并在所有输出与 argv 边界
+/// 解码，以彻底消除该不变式风险；不要在此处叠加更多 char 层逻辑。
 fn decode_read_bytes(bytes: &[u8]) -> String {
     match std::str::from_utf8(bytes) {
         Ok(s) => s.to_string(),
@@ -2382,18 +2388,18 @@ fn builtin_read(argv: &[String], sh: &mut Shell) -> i32 {
                                     .unwrap_or(0);
                             }
                             'a' => {
-                                eprintln!("wash: read: -a: array assignment is not supported");
+                                safe_eprintln!("wash: read: -a: array assignment is not supported");
                                 return 1;
                             }
                             _ => {
-                                eprintln!("wash: read: -{}: not supported", c);
+                                safe_eprintln!("wash: read: -{}: not supported", c);
                                 return 1;
                             }
                         }
                     }
                     _ => {
-                        eprintln!("wash: read: -{}: invalid option", c);
-                        eprintln!("{}", USAGE);
+                        safe_eprintln!("wash: read: -{}: invalid option", c);
+                        safe_eprintln!("{}", USAGE);
                         return 2;
                     }
                 }
@@ -2475,7 +2481,7 @@ fn builtin_read(argv: &[String], sh: &mut Shell) -> i32 {
 
     for name in &names {
         if !is_valid_ident(name) {
-            eprintln!("wash: read: `{}': not a valid identifier", name);
+            safe_eprintln!("wash: read: `{}': not a valid identifier", name);
             return 1;
         }
     }
@@ -2596,8 +2602,8 @@ fn builtin_mapfile(argv: &[String], sh: &mut Shell) -> i32 {
                     // -c quantum / -C callback：本轮接受参数但不触发回调。
                     'c' | 'C' => {}
                     _ => {
-                        eprintln!("wash: mapfile: -{}: invalid option", c);
-                        eprintln!("{}", USAGE);
+                        safe_eprintln!("wash: mapfile: -{}: invalid option", c);
+                        safe_eprintln!("{}", USAGE);
                         return 2;
                     }
                 }
@@ -2612,7 +2618,7 @@ fn builtin_mapfile(argv: &[String], sh: &mut Shell) -> i32 {
     // 第一个非选项参数是要写入的数组名，默认 `MAPFILE`。
     let operands: Vec<String> = argv[i..].to_vec();
     if operands.len() > 1 {
-        eprintln!("wash: mapfile: too many arguments");
+        safe_eprintln!("wash: mapfile: too many arguments");
         return 2;
     }
     let name = operands
@@ -2620,7 +2626,7 @@ fn builtin_mapfile(argv: &[String], sh: &mut Shell) -> i32 {
         .cloned()
         .unwrap_or_else(|| "MAPFILE".to_string());
     if !is_valid_ident(&name) {
-        eprintln!("wash: mapfile: `{}': not a valid identifier", name);
+        safe_eprintln!("wash: mapfile: `{}': not a valid identifier", name);
         return 1;
     }
 
@@ -2760,7 +2766,7 @@ fn builtin_complete(argv: &[String], sh: &mut Shell) -> i32 {
         if print_mode && !commands.is_empty() {
             for cmd in &commands {
                 if !sh.completion_specs.iter().any(|(c, _)| c == cmd) {
-                    eprintln!("wash: complete: {}: no completion specification", cmd);
+                    safe_eprintln!("wash: complete: {}: no completion specification", cmd);
                     return 1;
                 }
             }
@@ -2770,7 +2776,7 @@ fn builtin_complete(argv: &[String], sh: &mut Shell) -> i32 {
 
     // 注册模式：必须有命令名。
     if commands.is_empty() {
-        eprintln!("wash: {}", USAGE);
+        safe_eprintln!("wash: {}", USAGE);
         return 2;
     }
     let spec = options.join(" ");
@@ -2811,8 +2817,8 @@ fn builtin_fc(argv: &[String], sh: &mut Shell) -> i32 {
                     // -r 反转、-e/-s 编辑类选项本轮仅接受、不报错。
                     'r' | 'e' | 's' => {}
                     _ => {
-                        eprintln!("wash: fc: -{}: invalid option", c);
-                        eprintln!("fc: usage: fc [-e ename] [-lnr] [first] [last] or fc -s [pat=rep] [command]");
+                        safe_eprintln!("wash: fc: -{}: invalid option", c);
+                        safe_eprintln!("fc: usage: fc [-e ename] [-lnr] [first] [last] or fc -s [pat=rep] [command]");
                         return 2;
                     }
                 }
@@ -2825,7 +2831,7 @@ fn builtin_fc(argv: &[String], sh: &mut Shell) -> i32 {
 
     if !list {
         // bash 会调用编辑器 / 重执行历史命令；本轮不实现，如实返回诊断。
-        eprintln!("wash: fc: editing/executing history is not supported");
+        safe_eprintln!("wash: fc: editing/executing history is not supported");
         return 1;
     }
 
@@ -2873,7 +2879,7 @@ fn builtin_history(argv: &[String], sh: &mut Shell) -> i32 {
                     i += 1;
                     delete = argv.get(i).and_then(|s| s.trim().parse::<usize>().ok());
                     if delete.is_none() {
-                        eprintln!("wash: history: -d: numeric argument required");
+                        safe_eprintln!("wash: history: -d: numeric argument required");
                         return 2;
                     }
                 }
@@ -2886,8 +2892,8 @@ fn builtin_history(argv: &[String], sh: &mut Shell) -> i32 {
                     break;
                 }
                 _ => {
-                    eprintln!("wash: history: {}: invalid option", a);
-                    eprintln!("history: usage: history [-c] [-d offset] [n] or history -anrw [filename] or history -ps arg [arg...]");
+                    safe_eprintln!("wash: history: {}: invalid option", a);
+                    safe_eprintln!("history: usage: history [-c] [-d offset] [n] or history -anrw [filename] or history -ps arg [arg...]");
                     return 2;
                 }
             }
@@ -2904,7 +2910,7 @@ fn builtin_history(argv: &[String], sh: &mut Shell) -> i32 {
     }
     if let Some(n) = delete {
         if n == 0 || n > sh.history.len() {
-            eprintln!("wash: history: {}: history position out of range", n);
+            safe_eprintln!("wash: history: {}: history position out of range", n);
             return 1;
         }
         sh.history.remove(n - 1);
@@ -3086,7 +3092,7 @@ fn builtin_bind(argv: &[String], _sh: &mut Shell) -> i32 {
     }
     // 非交互下 readline 行编辑未启用，bash 固定输出这条诊断；归一化后需
     // 精确等于 `bind: warning: line editing not enabled`。
-    eprintln!("wash: bind: warning: line editing not enabled");
+    safe_eprintln!("wash: bind: warning: line editing not enabled");
     0
 }
 
@@ -3134,8 +3140,8 @@ fn builtin_pwd(argv: &[String], sh: &mut Shell) -> i32 {
                     'L' => logical = true,
                     'P' | 'W' => logical = false,
                     _ => {
-                        eprintln!("wash: pwd: {}: invalid option", a);
-                        eprintln!("pwd: usage: pwd [-LPW]");
+                        safe_eprintln!("wash: pwd: {}: invalid option", a);
+                        safe_eprintln!("pwd: usage: pwd [-LPW]");
                         return 2;
                     }
                 }
@@ -3182,8 +3188,8 @@ fn builtin_alias(argv: &[String], sh: &mut Shell) -> i32 {
             match a.as_str() {
                 "-p" => print = true,
                 _ => {
-                    eprintln!("wash: alias: {}: invalid option", a);
-                    eprintln!("alias: usage: alias [-p] [name[=value] ... ]");
+                    safe_eprintln!("wash: alias: {}: invalid option", a);
+                    safe_eprintln!("alias: usage: alias [-p] [name[=value] ... ]");
                     return 2;
                 }
             }
@@ -3213,7 +3219,7 @@ fn builtin_alias(argv: &[String], sh: &mut Shell) -> i32 {
             None => match sh.aliases.get(arg) {
                 Some(value) => println!("alias {}={}", arg, quote_single(value)),
                 None => {
-                    eprintln!("wash: alias: {}: not found", arg);
+                    safe_eprintln!("wash: alias: {}: not found", arg);
                     status = 1;
                 }
             },
@@ -3237,8 +3243,8 @@ fn builtin_unalias(argv: &[String], sh: &mut Shell) -> i32 {
             match a.as_str() {
                 "-a" => all = true,
                 _ => {
-                    eprintln!("wash: unalias: {}: invalid option", a);
-                    eprintln!("unalias: usage: unalias [-a] name [name ...]");
+                    safe_eprintln!("wash: unalias: {}: invalid option", a);
+                    safe_eprintln!("unalias: usage: unalias [-a] name [name ...]");
                     return 2;
                 }
             }
@@ -3256,14 +3262,14 @@ fn builtin_unalias(argv: &[String], sh: &mut Shell) -> i32 {
     if i >= argv.len() {
         // bash prints the usage line (with the builtin name as prefix, no
         // shell prefix) and exits with 2.
-        eprintln!("wash: unalias: usage: unalias [-a] name [name ...]");
+        safe_eprintln!("wash: unalias: usage: unalias [-a] name [name ...]");
         return 2;
     }
 
     let mut status = 0;
     for name in &argv[i..] {
         if sh.aliases.remove(name).is_none() {
-            eprintln!("wash: unalias: {}: not found", name);
+            safe_eprintln!("wash: unalias: {}: not found", name);
             status = 1;
         }
     }
@@ -3278,15 +3284,15 @@ fn builtin_unalias(argv: &[String], sh: &mut Shell) -> i32 {
 /// shell.
 fn builtin_source(argv: &[String], sh: &mut Shell) -> i32 {
     if argv.len() < 2 {
-        eprintln!("wash: source: filename argument required");
-        eprintln!("source: usage: source [-p path] filename [arguments]");
+        safe_eprintln!("wash: source: filename argument required");
+        safe_eprintln!("source: usage: source [-p path] filename [arguments]");
         return 2;
     }
     let name = argv[1].clone();
     let path = match find_source_file(&name, sh) {
         Some(p) => p,
         None => {
-            eprintln!("wash: {}: {}", name, posix::errno_message(posix::errno()));
+            safe_eprintln!("wash: {}: {}", name, posix::errno_message(posix::errno()));
             return 1;
         }
     };
@@ -3295,14 +3301,14 @@ fn builtin_source(argv: &[String], sh: &mut Shell) -> i32 {
     // 原样拼写（相对路径保持相对）。修复前目录被当成空脚本静默成功 rc 0。
     if let Some(st) = posix::stat_path(&path, true) {
         if st.file_type == posix::FT_DIR {
-            eprintln!("wash: {}: {}: is a directory", argv[0], name);
+            safe_eprintln!("wash: {}: {}: is a directory", argv[0], name);
             return 1;
         }
     }
     let content = match posix::read_file(&path) {
         Some(c) => c,
         None => {
-            eprintln!("wash: {}: {}", path, posix::errno_message(posix::errno()));
+            safe_eprintln!("wash: {}: {}", path, posix::errno_message(posix::errno()));
             return 1;
         }
     };
@@ -3399,8 +3405,8 @@ fn builtin_exec(argv: &[String], sh: &mut Shell) -> i32 {
         }
         if a == "-a" {
             if i + 1 >= argv.len() {
-                eprintln!("wash: exec: -a: option requires an argument");
-                eprintln!("exec: usage: exec [-a name] [command [arguments ...]] [redirection ...]");
+                safe_eprintln!("wash: exec: -a: option requires an argument");
+                safe_eprintln!("exec: usage: exec [-a name] [command [arguments ...]] [redirection ...]");
                 return 2;
             }
             argv0 = Some(argv[i + 1].clone());
@@ -3408,8 +3414,8 @@ fn builtin_exec(argv: &[String], sh: &mut Shell) -> i32 {
             continue;
         }
         if a.len() > 1 && a.starts_with('-') {
-            eprintln!("wash: exec: {}: invalid option", a);
-            eprintln!("exec: usage: exec [-a name] [command [arguments ...]] [redirection ...]");
+            safe_eprintln!("wash: exec: {}: invalid option", a);
+            safe_eprintln!("exec: usage: exec [-a name] [command [arguments ...]] [redirection ...]");
             return 2;
         }
         break;
@@ -3435,7 +3441,7 @@ fn builtin_exec(argv: &[String], sh: &mut Shell) -> i32 {
             let argvec = crate::executor::ArgVec::from(&command);
             crate::executor::execve(&exe, &argvec.ptrs, &env_ptrs);
             let code = posix::errno();
-            eprintln!(
+            safe_eprintln!(
                 "wash: exec: {}: {}",
                 program,
                 posix::errno_message(code)
@@ -3448,7 +3454,7 @@ fn builtin_exec(argv: &[String], sh: &mut Shell) -> i32 {
             127
         }
         None => {
-            eprintln!("wash: exec: {}: not found", program);
+            safe_eprintln!("wash: exec: {}: not found", program);
             // 只有非交互 shell（-c / 脚本）在 exec 失败时终止；交互 shell
             // 只报错并返回 127，REPL 继续存活（对齐 bash 交互行为）。
             if !sh.interactive {
@@ -3479,7 +3485,15 @@ fn write_stdout_checked(bytes: &[u8], name: &str) -> i32 {
     let mut f = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(1) });
     if let Err(e) = f.write_all(bytes) {
         let code = e.raw_os_error().unwrap_or_else(posix::errno);
-        eprintln!("{}: write error: {}", name, posix::errno_message(code));
+        // stderr 本身也可能写失败（如 `echo hi > /dev/full 2>&1`）。bash
+        // 此时静默放弃诊断、仍按写错误退出 1；`eprintln!` 会 panic（rc=101）
+        // 造成逐字节偏离，必须使用不 panic 的 write! 并丢弃结果。
+        let _ = writeln!(
+            std::io::stderr(),
+            "{}: write error: {}",
+            name,
+            posix::errno_message(code)
+        );
         return 1;
     }
     0
@@ -3638,13 +3652,13 @@ fn builtin_printf(argv: &[String], sh: Option<&mut Shell>) -> i32 {
     match parse_printf_opt(argv) {
         PrintfOpt::Assign { var, format_idx } => {
             if !is_valid_ident(&var) {
-                eprintln!("wash: printf: `{}': not a valid identifier", var);
+                safe_eprintln!("wash: printf: `{}': not a valid identifier", var);
                 return 2;
             }
             let format = match argv.get(format_idx) {
                 Some(f) => f.clone(),
                 None => {
-                    eprintln!("wash: printf: usage: printf [-v var] format [arguments]");
+                    safe_eprintln!("wash: printf: usage: printf [-v var] format [arguments]");
                     return 2;
                 }
             };
@@ -3660,14 +3674,14 @@ fn builtin_printf(argv: &[String], sh: Option<&mut Shell>) -> i32 {
             }
         }
         PrintfOpt::Usage => {
-            eprintln!("wash: printf: usage: printf [-v var] format [arguments]");
+            safe_eprintln!("wash: printf: usage: printf [-v var] format [arguments]");
             2
         }
         PrintfOpt::Normal { format_idx } => {
             // 只有「完全没有格式串」才是 usage 错误；`printf ""` 输出为空
             // 但 rc 0（bash 实测），修复前空格式串被误报 usage rc 2。
             if format_idx >= argv.len() {
-                eprintln!("wash: printf: usage: printf [-v var] format [arguments]");
+                safe_eprintln!("wash: printf: usage: printf [-v var] format [arguments]");
                 return 2;
             }
             let format = &argv[format_idx];
@@ -3731,7 +3745,7 @@ fn printf_format(format: &str, args: &[String]) -> (Vec<u8>, bool) {
                     // A trailing '%' (no conversion): bash reports a missing
                     // format character and stops.
                     conv_error = true;
-                    eprintln!("wash: printf: `%': missing format character");
+                    safe_eprintln!("wash: printf: `%': missing format character");
                     return (out, conv_error);
                 }
                 let nxt = bytes[i + 1];
@@ -3847,7 +3861,7 @@ fn parse_printf_spec(
         // specification, reports it and stops.
         *conv_error = true;
         let spec = String::from_utf8_lossy(&bytes[start..]).into_owned();
-        eprintln!("wash: printf: `{}': missing format character", spec);
+        safe_eprintln!("wash: printf: `{}': missing format character", spec);
         return (bytes.len(), true);
     }
 
@@ -3985,7 +3999,7 @@ fn parse_printf_spec(
             // An unknown conversion character: bash quotes the character,
             // reports it and stops.
             *conv_error = true;
-            eprintln!(
+            safe_eprintln!(
                 "wash: printf: `{}': invalid format character",
                 conv as char
             );
@@ -3998,7 +4012,7 @@ fn parse_printf_spec(
 
 /// Report a numeric conversion that failed, the way bash does.
 fn report_invalid_number(arg: &str) {
-    eprintln!("wash: printf: {}: invalid number", arg);
+    safe_eprintln!("wash: printf: {}: invalid number", arg);
 }
 
 /// Read a `*` field-width / precision argument as a base-0 integer.
@@ -4312,8 +4326,8 @@ fn builtin_umask(argv: &[String], sh: &mut Shell) -> i32 {
                     'S' => symbolic = true,
                     'p' => portability = true,
                     _ => {
-                        eprintln!("wash: umask: {}: invalid option", a);
-                        eprintln!("umask: usage: umask [-p] [-S] [mode]");
+                        safe_eprintln!("wash: umask: {}: invalid option", a);
+                        safe_eprintln!("umask: usage: umask [-p] [-S] [mode]");
                         return 2;
                     }
                 }
@@ -4352,7 +4366,7 @@ fn builtin_umask(argv: &[String], sh: &mut Shell) -> i32 {
                 match i64::from_str_radix(mode.trim(), 8) {
                     Ok(v) => (v & 0o7777) as i32,
                     Err(_) => {
-                        eprintln!("wash: umask: `{}': invalid octal mode", mode.trim());
+                        safe_eprintln!("wash: umask: `{}': invalid octal mode", mode.trim());
                         return 1;
                     }
                 }
@@ -4494,7 +4508,7 @@ fn builtin_let(argv: &[String], sh: &mut Shell) -> i32 {
                 } else {
                     format!(" (error token is \"{}\")", e.token)
                 };
-                eprintln!("wash: let: {}: {}{}", expr, e.message, token);
+                safe_eprintln!("wash: let: {}: {}{}", expr, e.message, token);
                 status = 1;
             }
         }
@@ -4558,8 +4572,8 @@ fn builtin_enable(argv: &[String], sh: &mut Shell) -> i32 {
                         } else {
                             i += 1;
                             if i >= argv.len() {
-                                eprintln!("wash: enable: -f: option requires an argument");
-                                eprintln!("enable: usage: enable [-a] [-dnps] [-f filename] [name ...]");
+                                safe_eprintln!("wash: enable: -f: option requires an argument");
+                                safe_eprintln!("enable: usage: enable [-a] [-dnps] [-f filename] [name ...]");
                                 return 2;
                             }
                             load_file = Some(argv[i].clone());
@@ -4568,8 +4582,8 @@ fn builtin_enable(argv: &[String], sh: &mut Shell) -> i32 {
                         continue;
                     }
                     _ => {
-                        eprintln!("wash: enable: {}: invalid option", a);
-                        eprintln!("enable: usage: enable [-a] [-dnps] [-f filename] [name ...]");
+                        safe_eprintln!("wash: enable: {}: invalid option", a);
+                        safe_eprintln!("enable: usage: enable [-a] [-dnps] [-f filename] [name ...]");
                         return 2;
                     }
                 }
@@ -4589,7 +4603,7 @@ fn builtin_enable(argv: &[String], sh: &mut Shell) -> i32 {
             Ok(()) => 0,
             Err(e) => {
                 // wash 自有诊断，不冒充 bash 的 "dynamic loading not available"。
-                eprintln!("wash: enable: cannot load {}: {}", file, e);
+                safe_eprintln!("wash: enable: cannot load {}: {}", file, e);
                 1
             }
         };
@@ -4609,7 +4623,7 @@ fn builtin_enable(argv: &[String], sh: &mut Shell) -> i32 {
         let mut status = 0;
         for name in &names {
             if let Err(e) = crate::plugin::unload_plugin(name, sh) {
-                eprintln!("wash: enable: {}", e);
+                safe_eprintln!("wash: enable: {}", e);
                 status = 1;
             }
         }
@@ -4658,7 +4672,7 @@ fn builtin_enable(argv: &[String], sh: &mut Shell) -> i32 {
     let mut status = 0;
     for name in &names {
         if !is_builtin(sh, name) {
-            eprintln!("wash: enable: {}: not a shell builtin", name);
+            safe_eprintln!("wash: enable: {}: not a shell builtin", name);
             status = 1;
             continue;
         }
@@ -4681,7 +4695,7 @@ fn builtin_enable(argv: &[String], sh: &mut Shell) -> i32 {
 /// "can only `return' from a function or sourced script" and keeps going.
 fn builtin_return(argv: &[String], sh: &mut Shell) -> i32 {
     if sh.sourcing_depth == 0 && sh.function_depth == 0 {
-        eprintln!("wash: return: can only `return' from a function or sourced script");
+        safe_eprintln!("wash: return: can only `return' from a function or sourced script");
         return 1;
     }
     let code = if argv.len() >= 2 {
@@ -4697,7 +4711,7 @@ fn builtin_return(argv: &[String], sh: &mut Shell) -> i32 {
 /// "only meaningful in a `for', `while', or `until' loop" and keeps going.
 fn builtin_break(argv: &[String], sh: &mut Shell) -> i32 {
     if sh.loop_depth == 0 {
-        eprintln!("wash: break: only meaningful in a `for', `while', or `until' loop");
+        safe_eprintln!("wash: break: only meaningful in a `for', `while', or `until' loop");
         return 1;
     }
     let n = if argv.len() >= 2 {
@@ -4712,7 +4726,7 @@ fn builtin_break(argv: &[String], sh: &mut Shell) -> i32 {
 /// The `continue` builtin: resume a loop at the next iteration.
 fn builtin_continue(argv: &[String], sh: &mut Shell) -> i32 {
     if sh.loop_depth == 0 {
-        eprintln!("wash: continue: only meaningful in a `for', `while', or `until' loop");
+        safe_eprintln!("wash: continue: only meaningful in a `for', `while', or `until' loop");
         return 1;
     }
     let n = if argv.len() >= 2 {
@@ -4733,13 +4747,13 @@ fn builtin_continue(argv: &[String], sh: &mut Shell) -> i32 {
 /// matching shell attribute the way bash does.
 fn builtin_local(argv: &[String], sh: &mut Shell) -> i32 {
     if sh.function_depth == 0 {
-        eprintln!("wash: local: can only be used in a function");
+        safe_eprintln!("wash: local: can only be used in a function");
         return 1;
     }
     let frame = match sh.call_stack.last_mut() {
         Some(f) => f,
         None => {
-            eprintln!("wash: local: can only be used in a function");
+            safe_eprintln!("wash: local: can only be used in a function");
             return 1;
         }
     };
@@ -4775,7 +4789,7 @@ fn builtin_local(argv: &[String], sh: &mut Shell) -> i32 {
             None => (arg.as_str(), None),
         };
         if !is_valid_ident(name) {
-            eprintln!("wash: local: `{}': not a valid identifier", arg);
+            safe_eprintln!("wash: local: `{}': not a valid identifier", arg);
             status = 1;
             continue;
         }
@@ -4789,7 +4803,7 @@ fn builtin_local(argv: &[String], sh: &mut Shell) -> i32 {
                 // bash prints `local: Z: readonly variable` (builtin prefix).
                 // Guard applies with or without `-r`, so `local Z=9` can no
                 // longer silently overwrite a readonly variable.
-                eprintln!("wash: local: {}: readonly variable", name);
+                safe_eprintln!("wash: local: {}: readonly variable", name);
                 status = 1;
             } else {
                 sh.env.insert(name.to_string(), v);
@@ -4847,8 +4861,8 @@ fn builtin_declare(argv: &[String], sh: &mut Shell, _is_typeset: bool) -> i32 {
                     'p' => print = true,
                     'A' | 'g' | 'n' | 't' | 'l' | 'u' | 'c' | 'f' | 'F' => {} // 已接受但暂未实现
                     _ => {
-                        eprintln!("wash: declare: {}: invalid option", a);
-                        eprintln!("declare: usage: declare [-aAfFgilrtux] [-p] [name[=value] ...]");
+                        safe_eprintln!("wash: declare: {}: invalid option", a);
+                        safe_eprintln!("declare: usage: declare [-aAfFgilrtux] [-p] [name[=value] ...]");
                         return 2;
                     }
                 }
@@ -4885,7 +4899,7 @@ fn builtin_declare(argv: &[String], sh: &mut Shell, _is_typeset: bool) -> i32 {
                 let name = &arg[..eq];
                 let value = &arg[eq + 1..];
                 if !is_valid_ident(name) {
-                    eprintln!("wash: declare: `{}': not a valid identifier", arg);
+                    safe_eprintln!("wash: declare: `{}': not a valid identifier", arg);
                     status = 1;
                     continue;
                 }
@@ -4902,7 +4916,7 @@ fn builtin_declare(argv: &[String], sh: &mut Shell, _is_typeset: bool) -> i32 {
             }
             None => {
                 if !is_valid_ident(arg) {
-                    eprintln!("wash: declare: `{}': not a valid identifier", arg);
+                    safe_eprintln!("wash: declare: `{}': not a valid identifier", arg);
                     status = 1;
                     continue;
                 }
@@ -4946,8 +4960,8 @@ fn builtin_readonly(argv: &[String], sh: &mut Shell) -> i32 {
                         i += 1;
                         continue;
                     }
-                    eprintln!("wash: readonly: {}: invalid option", a);
-                    eprintln!("readonly: usage: readonly [-aAf] [name[=value] ...] or readonly -p");
+                    safe_eprintln!("wash: readonly: {}: invalid option", a);
+                    safe_eprintln!("readonly: usage: readonly [-aAf] [name[=value] ...] or readonly -p");
                     return 2;
                 }
             }
@@ -4984,12 +4998,12 @@ fn builtin_readonly(argv: &[String], sh: &mut Shell) -> i32 {
                 let name = &arg[..eq];
                 let value = &arg[eq + 1..];
                 if !is_valid_ident(name) {
-                    eprintln!("wash: readonly: `{}': not a valid identifier", arg);
+                    safe_eprintln!("wash: readonly: `{}': not a valid identifier", arg);
                     status = 1;
                     continue;
                 }
                 if sh.readonly.contains(name) {
-                    eprintln!("wash: {}: readonly variable", name);
+                    safe_eprintln!("wash: {}: readonly variable", name);
                     status = 1;
                     continue;
                 }
@@ -4998,12 +5012,12 @@ fn builtin_readonly(argv: &[String], sh: &mut Shell) -> i32 {
             }
             None => {
                 if !is_valid_ident(arg) {
-                    eprintln!("wash: readonly: `{}': not a valid identifier", arg);
+                    safe_eprintln!("wash: readonly: `{}': not a valid identifier", arg);
                     status = 1;
                     continue;
                 }
                 if sh.readonly.contains(arg) {
-                    eprintln!("wash: {}: readonly variable", arg);
+                    safe_eprintln!("wash: {}: readonly variable", arg);
                     status = 1;
                     continue;
                 }
@@ -5032,7 +5046,7 @@ fn apply_var_attrs(
     // Guard applies to every assignment path, not just `declare -r`: a plain
     // `declare X=2` must not silently overwrite a readonly variable either.
     if sh.readonly.contains(name) && (readonly_attr || value.is_some()) {
-        eprintln!("wash: declare: {}: readonly variable", name);
+        safe_eprintln!("wash: declare: {}: readonly variable", name);
         return false;
     }
     if let Some(v) = value {
@@ -5144,7 +5158,7 @@ fn builtin_kill(argv: &[String], sh: &mut Shell) -> i32 {
         "kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | jobspec ... or kill -l [sigspec]";
 
     if argv.len() < 2 {
-        eprintln!("wash: {}", USAGE);
+        safe_eprintln!("wash: {}", USAGE);
         return 2;
     }
 
@@ -5175,7 +5189,7 @@ fn builtin_kill(argv: &[String], sh: &mut Shell) -> i32 {
                     return 0;
                 }
                 None => {
-                    eprintln!("wash: kill: {}: invalid signal specification", spec);
+                    safe_eprintln!("wash: kill: {}: invalid signal specification", spec);
                     return 1;
                 }
             }
@@ -5193,7 +5207,7 @@ fn builtin_kill(argv: &[String], sh: &mut Shell) -> i32 {
                 return 0;
             }
         }
-        eprintln!("wash: kill: {}: invalid signal specification", spec);
+        safe_eprintln!("wash: kill: {}: invalid signal specification", spec);
         return 1;
     }
 
@@ -5204,13 +5218,13 @@ fn builtin_kill(argv: &[String], sh: &mut Shell) -> i32 {
         let opt = &argv[i][1..];
         if opt == "l" {
             // already handled above; guard against `-l` appearing mid-way
-            eprintln!("wash: {}", USAGE);
+            safe_eprintln!("wash: {}", USAGE);
             return 2;
         } else if opt == "s" {
             i += 1;
             if i >= argv.len() {
                 // bash: `kill: -s: option requires an argument`（rc 1）。
-                eprintln!("wash: kill: -{}: option requires an argument", opt);
+                safe_eprintln!("wash: kill: -{}: option requires an argument", opt);
                 return 1;
             }
             sigspec = Some(argv[i].clone());
@@ -5218,7 +5232,7 @@ fn builtin_kill(argv: &[String], sh: &mut Shell) -> i32 {
         } else if opt == "n" {
             i += 1;
             if i >= argv.len() {
-                eprintln!("wash: kill: -{}: option requires an argument", opt);
+                safe_eprintln!("wash: kill: -{}: option requires an argument", opt);
                 return 1;
             }
             sigspec = Some(argv[i].clone());
@@ -5241,7 +5255,7 @@ fn builtin_kill(argv: &[String], sh: &mut Shell) -> i32 {
                 match canonical_signal(s) {
                     Some(name) => signal_to_num(&name),
                     None => {
-                        eprintln!("wash: kill: {}: invalid signal specification", s);
+                        safe_eprintln!("wash: kill: {}: invalid signal specification", s);
                         return 1;
                     }
                 }
@@ -5251,7 +5265,7 @@ fn builtin_kill(argv: &[String], sh: &mut Shell) -> i32 {
     };
 
     if i >= argv.len() {
-        eprintln!("wash: {}", USAGE);
+        safe_eprintln!("wash: {}", USAGE);
         return 2;
     }
 
@@ -5270,7 +5284,7 @@ fn builtin_kill(argv: &[String], sh: &mut Shell) -> i32 {
         let pid: i32 = match numstr.trim().parse::<i64>() {
             Ok(p) if (i32::MIN as i64..=i32::MAX as i64).contains(&p) => p as i32,
             _ => {
-                eprintln!("wash: kill: `{pidstr}': not a pid or valid job spec");
+                safe_eprintln!("wash: kill: `{pidstr}': not a pid or valid job spec");
                 status = 1;
                 continue;
             }
@@ -5300,7 +5314,7 @@ fn builtin_kill(argv: &[String], sh: &mut Shell) -> i32 {
             let e = posix::errno();
             // bash prints `kill: (PID) - <strerror>` (note the ") - " form,
             // not a colon).
-            eprintln!(
+            safe_eprintln!(
                 "wash: kill: ({}) - {}",
                 target,
                 posix::errno_message(e)
@@ -5510,7 +5524,7 @@ fn builtin_trap(argv: &[String], sh: &mut Shell) -> i32 {
     let action = argv[1].clone();
     if argv.len() < 3 {
         // `trap CMD` with no signal is a usage error in bash.
-        eprintln!("wash: trap: usage: trap [-lp] [[arg] signal_spec ...]");
+        safe_eprintln!("wash: trap: usage: trap [-lp] [[arg] signal_spec ...]");
         return 2;
     }
 
@@ -5519,7 +5533,7 @@ fn builtin_trap(argv: &[String], sh: &mut Shell) -> i32 {
         let cn = match canonical_signal(sig) {
             Some(c) => c,
             None => {
-                eprintln!("wash: trap: {}: invalid signal specification", sig);
+                safe_eprintln!("wash: trap: {}: invalid signal specification", sig);
                 status = 1;
                 continue;
             }
@@ -5563,8 +5577,8 @@ fn builtin_dirs(argv: &[String], sh: &mut Shell) -> i32 {
                     'c' => clear = true,
                     'p' => {} // would print for command substitution
                     _ => {
-                        eprintln!("wash: dirs: {}: invalid option", a);
-                        eprintln!("dirs: usage: dirs [-clpv] [+N] [-N]");
+                        safe_eprintln!("wash: dirs: {}: invalid option", a);
+                        safe_eprintln!("dirs: usage: dirs [-clpv] [+N] [-N]");
                         return 2;
                     }
                 }
@@ -5596,7 +5610,7 @@ fn builtin_pushd(argv: &[String], sh: &mut Shell) -> i32 {
     if argv.len() == 1 {
         // Swap the top two stack entries (bash behaviour).
         if sh.dir_stack.len() < 2 {
-            eprintln!("wash: pushd: no other directory");
+            safe_eprintln!("wash: pushd: no other directory");
             return 1;
         }
         sh.dir_stack.swap(0, 1);
@@ -5608,13 +5622,13 @@ fn builtin_pushd(argv: &[String], sh: &mut Shell) -> i32 {
 
     // One operand only (more is an error in bash).
     if argv.len() > 2 {
-        eprintln!("wash: pushd: too many arguments");
+        safe_eprintln!("wash: pushd: too many arguments");
         return 1;
     }
     let dir = &argv[1];
     if dir.starts_with('+') || dir.starts_with('-') {
         // `pushd +N` rotates the stack — not yet implemented here.
-        eprintln!("wash: pushd: {}: invalid option", dir);
+        safe_eprintln!("wash: pushd: {}: invalid option", dir);
         return 1;
     }
 
@@ -5626,7 +5640,7 @@ fn builtin_pushd(argv: &[String], sh: &mut Shell) -> i32 {
     if !set_cwd(sh, dir) {
         // cd failed: bash leaves the stack unchanged and reports the error.
         let e = posix::errno();
-        eprintln!("wash: pushd: {}: {}", dir, posix::errno_message(e));
+        safe_eprintln!("wash: pushd: {}: {}", dir, posix::errno_message(e));
         return 1;
     }
     // The new directory is now at index 0; push the previous top down to index
@@ -5644,15 +5658,15 @@ fn builtin_popd(argv: &[String], sh: &mut Shell) -> i32 {
     while i < argv.len() {
         let a = &argv[i];
         if a.len() > 1 && a.starts_with('-') && a != "-" {
-            eprintln!("wash: popd: {}: invalid option", a);
-            eprintln!("popd: usage: popd [-n] [+N | -N]");
+            safe_eprintln!("wash: popd: {}: invalid option", a);
+            safe_eprintln!("popd: usage: popd [-n] [+N | -N]");
             return 2;
         }
         if let Some(n) = a.strip_prefix('+') {
             match n.trim().parse::<usize>() {
                 Ok(v) => index = v,
                 Err(_) => {
-                    eprintln!("wash: popd: {}: invalid option", a);
+                    safe_eprintln!("wash: popd: {}: invalid option", a);
                     return 2;
                 }
             }
@@ -5663,11 +5677,11 @@ fn builtin_popd(argv: &[String], sh: &mut Shell) -> i32 {
     }
 
     if sh.dir_stack.len() <= 1 {
-        eprintln!("wash: popd: directory stack empty");
+        safe_eprintln!("wash: popd: directory stack empty");
         return 1;
     }
     if index >= sh.dir_stack.len() {
-        eprintln!("wash: popd: +{}: directory stack index out of range", index);
+        safe_eprintln!("wash: popd: +{}: directory stack index out of range", index);
         return 1;
     }
 
@@ -5865,8 +5879,8 @@ fn builtin_ulimit(argv: &[String], _sh: &mut Shell) -> i32 {
                     'c' | 'd' | 'f' | 'n' | 'p' | 's' | 't' | 'u' | 'v' =>
                         resources.push(ch),
                     _ => {
-                        eprintln!("wash: ulimit: {}: invalid option", a);
-                        eprintln!(
+                        safe_eprintln!("wash: ulimit: {}: invalid option", a);
+                        safe_eprintln!(
                             "ulimit: usage: ulimit [-SHabcdefiklmnpqrstuvxPRT] [limit]"
                         );
                         return 2;
@@ -5937,11 +5951,11 @@ fn builtin_ulimit(argv: &[String], _sh: &mut Shell) -> i32 {
             //   * 否则原样尝试 setrlimit，失败走下方 `cannot modify limit`
             //     的 errno 路径（如 `-f 1024` → EINVAL、`-n 2^64-1` → EPERM）
             if v.starts_with("0x") || v.starts_with("0X") {
-                eprintln!("wash: ulimit: {}: invalid hex number", v);
+                safe_eprintln!("wash: ulimit: {}: invalid hex number", v);
                 return 1;
             }
             if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
-                eprintln!("wash: ulimit: {}: invalid number", v);
+                safe_eprintln!("wash: ulimit: {}: invalid number", v);
                 return 1;
             }
             let mut wrapped: u64 = 0;
@@ -5954,7 +5968,7 @@ fn builtin_ulimit(argv: &[String], _sh: &mut Shell) -> i32 {
                 .map(|(_, _, f)| *f)
                 .unwrap_or(1);
             if wrapped > INF / factor {
-                eprintln!("wash: ulimit: {}: limit out of range", v);
+                safe_eprintln!("wash: ulimit: {}: limit out of range", v);
                 return 1;
             }
             wrapped * factor
@@ -5970,7 +5984,7 @@ fn builtin_ulimit(argv: &[String], _sh: &mut Shell) -> i32 {
                 .find(|(_, c, _)| *c == letter)
                 .map(|(d, _, _)| *d)
                 .unwrap_or("");
-            eprintln!("wash: ulimit: {}: cannot modify limit: {}", desc, msg);
+            safe_eprintln!("wash: ulimit: {}: cannot modify limit: {}", desc, msg);
             return 1;
         }
         return 0;
@@ -5979,7 +5993,7 @@ fn builtin_ulimit(argv: &[String], _sh: &mut Shell) -> i32 {
     // ---- get (print soft limit value) ----
     match posix::rlimit(letter as u8, 0, 0, false) {
         None => {
-            eprintln!("wash: ulimit: {}: cannot get limit", letter);
+            safe_eprintln!("wash: ulimit: {}: cannot get limit", letter);
             1
         }
         Some(raw) => {
@@ -6054,7 +6068,7 @@ fn builtin_wait(argv: &[String], sh: &mut Shell) -> i32 {
             match jobno_str.parse::<usize>() {
                 Ok(n) if n >= 1 && n <= sh.jobs.len() => sh.jobs[n - 1],
                 _ => {
-                    eprintln!("wash: wait: `{}': no such job", arg);
+                    safe_eprintln!("wash: wait: `{}': no such job", arg);
                     return 1;
                 }
             }
@@ -6062,7 +6076,7 @@ fn builtin_wait(argv: &[String], sh: &mut Shell) -> i32 {
             match arg.parse::<i32>() {
                 Ok(p) => p,
                 Err(_) => {
-                    eprintln!("wash: wait: {}: not a pid or jobspec", arg);
+                    safe_eprintln!("wash: wait: {}: not a pid or jobspec", arg);
                     return 127;
                 }
             }
@@ -6076,7 +6090,7 @@ fn builtin_wait(argv: &[String], sh: &mut Shell) -> i32 {
                 sh.job_table.retain(|j| j.pid != pid);
             }
             None => {
-                eprintln!("wash: wait: pid {} is not a child of this shell", pid);
+                safe_eprintln!("wash: wait: pid {} is not a child of this shell", pid);
                 return 127;
             }
         }
@@ -6197,7 +6211,7 @@ fn builtin_jobs(argv: &[String], sh: &mut Shell) -> i32 {
             match find_job(sh, Some(s)) {
                 Ok(i) => v.push(i),
                 Err(text) => {
-                    eprintln!("wash: jobs: {}: no such job", text);
+                    safe_eprintln!("wash: jobs: {}: no such job", text);
                     return 1;
                 }
             }
@@ -6246,13 +6260,13 @@ fn builtin_jobs(argv: &[String], sh: &mut Shell) -> i32 {
 /// tcsetpgrp 交还终端；完整作业切换留待后续阶段，不假装完成。
 fn builtin_fg(argv: &[String], sh: &mut Shell) -> i32 {
     if !job_control_on(sh) {
-        eprintln!("wash: fg: no job control");
+        safe_eprintln!("wash: fg: no job control");
         return 1;
     }
     let idx = match find_job(sh, argv.get(1).map(|s| s.as_str())) {
         Ok(i) => i,
         Err(text) => {
-            eprintln!("wash: fg: {}: no such job", text);
+            safe_eprintln!("wash: fg: {}: no such job", text);
             return 1;
         }
     };
@@ -6279,7 +6293,7 @@ fn builtin_fg(argv: &[String], sh: &mut Shell) -> i32 {
 /// "job N already in background"（rc 仍为 0）。
 fn builtin_bg(argv: &[String], sh: &mut Shell) -> i32 {
     if !job_control_on(sh) {
-        eprintln!("wash: bg: no job control");
+        safe_eprintln!("wash: bg: no job control");
         return 1;
     }
     let specs: Vec<Option<&str>> = if argv.len() > 1 {
@@ -6297,13 +6311,13 @@ fn builtin_bg(argv: &[String], sh: &mut Shell) -> i32 {
         let idx = match find_job(sh, spec) {
             Ok(i) => i,
             Err(text) => {
-                eprintln!("wash: bg: {}: no such job", text);
+                safe_eprintln!("wash: bg: {}: no such job", text);
                 return 1;
             }
         };
         let jobno = idx + 1;
         if !sh.job_table[idx].done {
-            eprintln!("wash: bg: job {} already in background", jobno);
+            safe_eprintln!("wash: bg: job {} already in background", jobno);
             continue;
         }
         let pid = sh.job_table[idx].pid;
@@ -6365,7 +6379,7 @@ fn builtin_disown(argv: &[String], sh: &mut Shell) -> i32 {
                     }
                 }
                 Err(text) => {
-                    eprintln!("wash: disown: {}: no such job", text);
+                    safe_eprintln!("wash: disown: {}: no such job", text);
                     return 1;
                 }
             }
@@ -6496,11 +6510,11 @@ fn builtin_help(argv: &[String], sh: &mut Shell) -> i32 {
                     'm' => saw_m = true,
                     's' => saw_s = true,
                     _ => {
-                        eprintln!(
+                        safe_eprintln!(
                             "wash: help: {}",
                             crate::i18n::format_msg("-%s: invalid option", &[ch.to_string()])
                         );
-                        eprintln!("{}", tr!("help: usage: help [-dms] [pattern ...]"));
+                        safe_eprintln!("{}", tr!("help: usage: help [-dms] [pattern ...]"));
                         return 2;
                     }
                 }
@@ -6632,7 +6646,7 @@ fn builtin_help(argv: &[String], sh: &mut Shell) -> i32 {
             "no help topics match `%s'.  Try `help help' or `man -k %s' or `info %s'.",
             &[name.to_string(), name.to_string(), name.to_string()],
         );
-        eprintln!("wash: help: {}", msg);
+        safe_eprintln!("wash: help: {}", msg);
         return 1;
     }
     0

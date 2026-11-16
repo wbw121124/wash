@@ -24,6 +24,7 @@ use std::io::Write;
 
 use crate::arith;
 use crate::builtins;
+use crate::safe_eprintln;
 use crate::expand::{expand_argv, expand_scalar, expand_word, ExpandCtx};
 use crate::lexer::WordPart;
 use crate::parser::{AndOr, AndOrOp, CommandList, Compound, Pipeline, Redir, SimpleCommand};
@@ -219,7 +220,7 @@ fn exec_fail(msg_full: &str, code: i32, parent_shell: bool) -> i32 {
     if parent_shell && posix::INTERACTIVE_REPL.load(std::sync::atomic::Ordering::Relaxed) {
         return code;
     }
-    eprintln!("wash: {}", msg_full);
+    safe_eprintln!("wash: {}", msg_full);
     let _ = std::io::stdout().flush();
     posix::exit(code);
 }
@@ -278,7 +279,7 @@ fn run_script_in_shell(display: &str, argv_strs: &[String], shell_env: &HashMap<
     let content = match posix::read_file(display) {
         Some(c) => c,
         None => {
-            eprintln!("wash: {}: {}", display, posix::errno_message(posix::errno()));
+            safe_eprintln!("wash: {}: {}", display, posix::errno_message(posix::errno()));
             let _ = std::io::stdout().flush();
             posix::exit(126);
         }
@@ -330,7 +331,7 @@ fn fork_child() -> Option<i32> {
         // pid into `wait_pid` / the job table.  bash prints `fork: <strerror>`
         // and gives the command status 1 while the shell keeps running.
         let e = posix::errno();
-        eprintln!("wash: fork: {}", posix::errno_message(e));
+        safe_eprintln!("wash: fork: {}", posix::errno_message(e));
         return None;
     }
     if pid == 0 {
@@ -493,7 +494,7 @@ fn expand_redirs(redirs: &[Redir], ctx: &ExpandCtx) -> Vec<ExpRedir> {
 /// 错误的地方（旧行为：静默吞掉失败、rc=0、ls 的目录列表漏到 stdout）。
 fn redir_failed(file: &str) {
     let e = posix::errno();
-    eprintln!("wash: {}: {}", file, posix::errno_message(e));
+    safe_eprintln!("wash: {}: {}", file, posix::errno_message(e));
     let _ = std::io::stdout().flush();
     posix::exit(1);
 }
@@ -669,7 +670,7 @@ fn trace_command(argv: &[String]) {
         line.push(' ');
         line.push_str(&builtins::quote_for_trace(word));
     }
-    eprintln!("{}", line);
+    safe_eprintln!("{}", line);
 }
 
 // ---------------------------------------------------------------------------
@@ -839,7 +840,7 @@ pub fn exec_external(argv: &[String], sh: &Shell) -> i32 {
                 ));
             }
             None => {
-                eprintln!("wash: {}: command not found", argv[0]);
+                safe_eprintln!("wash: {}: command not found", argv[0]);
                 posix::exit(127);
             }
         }
@@ -1195,7 +1196,7 @@ fn execute_function(name: &str, args: Vec<String>, sh: &mut Shell) -> i32 {
     let body = match sh.functions.get(name) {
         Some(b) => b.clone(),
         None => {
-            eprintln!("wash: {}: command not found", name);
+            safe_eprintln!("wash: {}: command not found", name);
             return 127;
         }
     };
@@ -1203,7 +1204,7 @@ fn execute_function(name: &str, args: Vec<String>, sh: &mut Shell) -> i32 {
     sh.function_depth += 1;
     if sh.function_depth > MAX_FUNCTION_DEPTH {
         sh.function_depth -= 1;
-        eprintln!("wash: maximum function nesting level exceeded");
+        safe_eprintln!("wash: maximum function nesting level exceeded");
         return 1;
     }
     sh.call_stack.push(std::collections::HashMap::new());
@@ -1375,13 +1376,13 @@ fn child_run_exp(argv: &[String], path: Option<&str>, ctx: &ChildContext) -> ! {
         None if ctx.program_searched => {
             // 父进程已按（应用过 `PATH=` 前缀赋值的）PATH 搜索且未命中：
             // 直接报 command not found，不得用快照 PATH 重搜。
-            eprintln!("wash: {}: command not found", argv[0]);
+            safe_eprintln!("wash: {}: command not found", argv[0]);
             posix::exit(127);
         }
         None => match find_program(&argv[0], path) {
             Some((exe, display)) => (exe, display),
             None => {
-                eprintln!("wash: {}: command not found", argv[0]);
+                safe_eprintln!("wash: {}: command not found", argv[0]);
                 posix::exit(127);
             }
         },
@@ -1411,7 +1412,7 @@ fn child_run_exp(argv: &[String], path: Option<&str>, ctx: &ChildContext) -> ! {
 /// the caller turns that into a non-zero exit status the way bash does.
 fn assign_var(sh: &mut Shell, name: &str, value: String, append: bool) -> bool {
     if sh.readonly.contains(name) {
-        eprintln!("wash: {}: readonly variable", name);
+        safe_eprintln!("wash: {}: readonly variable", name);
         return false;
     }
     let final_value = if sh.integer_vars.contains(name) {
@@ -1620,7 +1621,7 @@ fn run_standalone_exp(
             let saved = match apply_redirs_in_parent(redirs, sh.options.noclobber) {
                 Ok(saved) => saved,
                 Err(message) => {
-                    eprintln!("{}", message);
+                    safe_eprintln!("{}", message);
                     return 1;
                 }
             };
@@ -1699,7 +1700,7 @@ fn run_standalone_exp(
         match apply_redirs_in_parent(redirs, sh.options.noclobber) {
             Ok(saved) => restore_fds(&saved),
             Err(message) => {
-                eprintln!("{}", message);
+                safe_eprintln!("{}", message);
                 return 1;
             }
         }
@@ -1716,7 +1717,7 @@ fn run_standalone_exp(
         let saved = match apply_redirs_in_parent(redirs, sh.options.noclobber) {
             Ok(saved) => saved,
             Err(message) => {
-                eprintln!("{}", message);
+                safe_eprintln!("{}", message);
                 return 1;
             }
         };
@@ -1734,7 +1735,7 @@ fn run_standalone_exp(
         let saved = match apply_redirs_in_parent(redirs, sh.options.noclobber) {
             Ok(saved) => saved,
             Err(message) => {
-                eprintln!("{}", message);
+                safe_eprintln!("{}", message);
                 return 1;
             }
         };
@@ -2393,7 +2394,7 @@ fn execute_background(p: &Pipeline, sh: &mut Shell, path: Option<&str>) -> i32 {
     // bash 只在交互式 shell（且打开了作业控制）里通报后台作业的启动；
     // 非交互的 `bash -c 'sleep 1 &'` 什么都不打印。通报信息走 stderr。
     if sh.interactive {
-        eprintln!("[{}] {}", jobno, pid);
+        safe_eprintln!("[{}] {}", jobno, pid);
     }
     0
 }

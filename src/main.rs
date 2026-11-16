@@ -15,6 +15,7 @@ mod expand;
 mod help_pages;
 mod i18n;
 mod lexer;
+mod macros;
 mod parser;
 mod plugin;
 mod posix;
