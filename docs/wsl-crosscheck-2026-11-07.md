@@ -51,7 +51,7 @@ alias-noninteractive、set-o、set-plus-o）
    fs 只读时套件症状极具迷惑性：`mktemp -d` 失败 → `$TMP` 为空 → 全部
    重定向 Permission denied → run_case 两侧全空「假 PASS」（331/338），
    仅 sem 用例现形。**看到 `$TMP` 为空的 Permission denied 先查 fs 只读**。
-3. 调用形式（用户约定）：`wsl -e bash -c 'cd /mnt/d/project/WorkBuddy/wash && ...'`；
+3. 调用形式（用户约定）：`wsl -e bash -c 'cd <WASH_REPO> && ...'`（`<WASH_REPO>` 为仓库在 WSL 中的挂载路径）；
    bash oracle 用 `/usr/local/bin/bash`（5.3.0；系统 `/usr/bin/bash` 是
    5.1.16 仅参考）。用完 `wsl --shutdown`。
 
