@@ -36,8 +36,6 @@ fn token_text(t: &Option<Tok>) -> String {
         Some(Tok::LParen) => "(".to_string(),
         Some(Tok::RParen) => ")".to_string(),
         Some(Tok::Comma) => ",".to_string(),
-        Some(Tok::Question) => "?".to_string(),
-        Some(Tok::Colon) => ":".to_string(),
         None => String::new(),
     }
 }
@@ -161,7 +159,7 @@ fn parse_unsigned(t: &str) -> Result<i64, ArithError> {
     Ok(v)
 }
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -172,8 +170,6 @@ enum Tok {
     LParen,
     RParen,
     Comma,
-    Question,
-    Colon,
 }
 
 /// A cursor over a shared, CACHED token stream.
@@ -217,6 +213,40 @@ const ARITH_TOK_CACHE_MAX: usize = 512;
 thread_local! {
     static TOK_CACHE: RefCell<HashMap<String, Arc<Vec<Tok>>>> =
         RefCell::new(HashMap::new());
+    // Guard against stack exhaustion from deeply nested arithmetic.  bash
+    // itself SIGSEGVs on MSYS2 long before it prints its own recursion-limit
+    // diagnostic; wash must instead fail deterministically without crashing.
+    static ARITH_NEST_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Nesting cap for the recursive arithmetic productions (parenthesised
+/// sub-expressions, `**` right-hand sides and conditional branches).  Well
+/// below any native-stack limit, so the parser returns an error instead of
+/// overflowing the stack on adversarial input.
+const MAX_ARITH_NEST: usize = 200;
+
+/// RAII token for one level of arithmetic recursion.  Dropped on every exit
+/// path (including `?` early returns), so normal nesting is never miscounted.
+struct NestGuard;
+
+impl NestGuard {
+    fn enter() -> Result<NestGuard, ArithError> {
+        ARITH_NEST_DEPTH.with(|depth| {
+            let n = depth.get();
+            if n >= MAX_ARITH_NEST {
+                Err(ArithError::new("expression recursion level exceeded"))
+            } else {
+                depth.set(n + 1);
+                Ok(NestGuard)
+            }
+        })
+    }
+}
+
+impl Drop for NestGuard {
+    fn drop(&mut self) {
+        ARITH_NEST_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
 }
 
 fn tokenize_cached(src: &str) -> Result<Arc<Vec<Tok>>, ArithError> {
@@ -296,12 +326,14 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, ArithError> {
             continue;
         }
         if c == '?' {
-            toks.push(Tok::Question);
+            // Emit an operator token so parse_conditional's eat_op("?")
+            // recognises it (same fix as Tok::Comma above).
+            toks.push(Tok::Op("?"));
             i += 1;
             continue;
         }
         if c == ':' {
-            toks.push(Tok::Colon);
+            toks.push(Tok::Op(":"));
             i += 1;
             continue;
         }
@@ -355,8 +387,6 @@ impl Lexer {
             Some(Tok::LParen) => "(".to_string(),
             Some(Tok::RParen) => ")".to_string(),
             Some(Tok::Comma) => ",".to_string(),
-            Some(Tok::Question) => "?".to_string(),
-            Some(Tok::Colon) => ":".to_string(),
             // Position exhausted: the old lexer reported the LAST SCANNED
             // token's text, which is exactly the final token of the stream.
             None => self
@@ -385,7 +415,7 @@ pub fn eval(src: &str, env: &mut dyn ArithEnv) -> Result<i64, ArithError> {
     let v = parse_comma(&mut lex, env)?;
     if lex.pos < lex.toks.len() {
         return Err(ArithError {
-            message: "syntax error in expression".to_string(),
+            message: "arithmetic syntax error in expression".to_string(),
             token: lex.error_token(),
         });
     }
@@ -459,14 +489,29 @@ fn parse_assign(lex: &mut Lexer, env: &mut dyn ArithEnv) -> Result<i64, ArithErr
     parse_conditional(lex, env)
 }
 
+/// A missing operand directly after `?` or `:` is reported by bash as
+/// "expression expected" rather than the generic "operand expected".
+fn expression_expected(mut e: ArithError) -> ArithError {
+    if e.message == "operand expected" {
+        e.message = "expression expected".to_string();
+    }
+    e
+}
+
 fn parse_conditional(lex: &mut Lexer, env: &mut dyn ArithEnv) -> Result<i64, ArithError> {
     let cond = parse_logical_or(lex, env)?;
     if lex.eat_op("?") {
-        let then = parse_assign(lex, env)?;
+        // Conditional branches recurse through parse_assign; cap the depth so
+        // a long `a?b:c?d:...` chain cannot exhaust the native stack.
+        let _guard = NestGuard::enter()?;
+        let then = parse_assign(lex, env).map_err(expression_expected)?;
         if !lex.eat_op(":") {
-            return Err(operand_expected(lex));
+            return Err(ArithError {
+                message: "`:' expected for conditional expression".to_string(),
+                token: lex.error_token(),
+            });
         }
-        let other = parse_assign(lex, env)?;
+        let other = parse_assign(lex, env).map_err(expression_expected)?;
         return Ok(if cond != 0 { then } else { other });
     }
     Ok(cond)
@@ -631,23 +676,38 @@ fn parse_multiplicative(lex: &mut Lexer, env: &mut dyn ArithEnv) -> Result<i64, 
 }
 
 fn parse_unary(lex: &mut Lexer, env: &mut dyn ArithEnv) -> Result<i64, ArithError> {
-    if lex.eat_op("!") {
-        let v = parse_unary(lex, env)?;
-        return Ok(if v == 0 { 1 } else { 0 });
+    // Fold the leading unary operators iteratively instead of recursing once
+    // per operator: tens of thousands of `!` used to overflow the native
+    // stack.  Prefix operators associate right-to-left, so the runs are kept
+    // in source order and applied in reverse.  Adjacent identical operators
+    // cancel in pairs (`~~x == x`, `--x == x`); a run of `!` is applied once
+    // when odd and twice when even (`!!x` boolises, matching bash), so `!`
+    // keeps its exact semantics while the work stays linear.
+    let mut runs: Vec<(char, usize)> = Vec::new();
+    loop {
+        let op = if lex.peek_op("!") {
+            '!'
+        } else if lex.peek_op("~") {
+            '~'
+        } else if lex.peek_op("-") {
+            '-'
+        } else if lex.peek_op("+") {
+            '+'
+        } else {
+            break;
+        };
+        lex.pos += 1;
+        if op == '+' {
+            continue; // unary plus is a no-op
+        }
+        match runs.last_mut() {
+            Some((last, n)) if *last == op => *n += 1,
+            _ => runs.push((op, 1)),
+        }
     }
-    if lex.eat_op("~") {
-        let v = parse_unary(lex, env)?;
-        return Ok(!v);
-    }
-    if lex.eat_op("-") {
-        let v = parse_unary(lex, env)?;
-        return Ok(v.wrapping_neg());
-    }
-    if lex.eat_op("+") {
-        return parse_unary(lex, env);
-    }
-    // prefix ++ / --
-    if lex.peek_op("++") || lex.peek_op("--") {
+
+    // The operand: prefix ++/-- mutates a variable once; otherwise descend.
+    let mut v = if lex.peek_op("++") || lex.peek_op("--") {
         let op = if lex.peek_op("++") { "++" } else { "--" };
         lex.pos += 1;
         let name = match lex.peek().cloned() {
@@ -662,16 +722,38 @@ fn parse_unary(lex: &mut Lexer, env: &mut dyn ArithEnv) -> Result<i64, ArithErro
             cur.wrapping_sub(1)
         };
         env.set(&name, newv);
-        return Ok(newv);
+        newv
+    } else {
+        parse_power(lex, env)?
+    };
+
+    for &(op, n) in runs.iter().rev() {
+        v = match op {
+            '!' => {
+                if n % 2 == 1 {
+                    if v == 0 { 1 } else { 0 } // logical not
+                } else {
+                    if v == 0 { 0 } else { 1 } // !! boolises
+                }
+            }
+            '~' => {
+                if n % 2 == 1 { !v } else { v }
+            }
+            '-' => {
+                if n % 2 == 1 { v.wrapping_neg() } else { v }
+            }
+            _ => v,
+        };
     }
-    parse_power(lex, env)
+    Ok(v)
 }
 
 fn parse_power(lex: &mut Lexer, env: &mut dyn ArithEnv) -> Result<i64, ArithError> {
     let base = parse_postfix(lex, env)?;
     if lex.peek_op("**") {
         lex.pos += 1;
-        // right associative
+        // right associative: each exponent recursion takes a depth slot
+        let _guard = NestGuard::enter()?;
         let exp = parse_unary(lex, env)?;
         if exp < 0 {
             // bash points at the exponent operand itself, e.g. `2**-1`
@@ -727,6 +809,9 @@ fn parse_primary(lex: &mut Lexer, env: &mut dyn ArithEnv) -> Result<i64, ArithEr
         }
         Some(Tok::LParen) => {
             lex.pos += 1;
+            // Each nested `(` recurses through parse_comma; cap the depth so
+            // thousands of parentheses cannot overflow the native stack.
+            let _guard = NestGuard::enter()?;
             let v = parse_comma(lex, env)?;
             if !matches!(lex.peek(), Some(Tok::RParen)) {
                 return Err(operand_expected(lex));

@@ -830,10 +830,15 @@ impl Editor {
     }
 
     fn cursor_pos(&self, lines: &[&str]) -> (usize, usize) {
+        // `cursor` is a char index, while `char_indices()` yields byte offsets.
+        // Convert once up front so every comparison/subtraction below stays in
+        // the byte domain; otherwise multi-byte characters (CJK) shift the
+        // caret to the wrong line/column.
+        let cbyte = char_to_byte(&self.buffer, self.cursor);
         let mut line_idx = 0;
         let mut line_start = 0;
         for (i, ch) in self.buffer.char_indices() {
-            if i >= self.cursor {
+            if i >= cbyte {
                 break;
             }
             if ch == '\n' {
@@ -842,7 +847,7 @@ impl Editor {
             }
         }
         let line = lines.get(line_idx).copied().unwrap_or("");
-        let offset = self.cursor - line_start;
+        let offset = cbyte - line_start;
         let mut col = 0;
         for (j, ch) in line.char_indices() {
             if j >= offset {
@@ -1608,6 +1613,22 @@ mod tests {
         assert_eq!(common_prefix(&ascii), "ab");
         assert_eq!(common_prefix(&[]), "");
         assert_eq!(common_prefix(&["x".to_string()]), "x");
+    }
+
+    #[test]
+    fn cursor_pos_multibyte_multiline() {
+        // buffer = "中文\nab", cursor right after 'a' (char index 4).
+        // 中/文 are 3 bytes each, so a byte-index bug would report line 0.
+        let mut ed = Editor::new(Vec::new());
+        ed.buffer = "中文\nab".to_string();
+        ed.cursor = 4;
+        let lines: Vec<&str> = ed.buffer.split('\n').collect();
+        assert_eq!(ed.cursor_pos(&lines), (1, 1));
+
+        // caret at end of the CJK first line (after 文, char index 2):
+        // display width = 2 + 2 = 4, still on line 0.
+        ed.cursor = 2;
+        assert_eq!(ed.cursor_pos(&lines), (0, 4));
     }
 
     #[test]
