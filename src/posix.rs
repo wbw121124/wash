@@ -414,6 +414,29 @@ pub fn read_file(path: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
+/// `read_file` 的字节级版本：不做 UTF-8 有损转换，供 execve 失败分类器
+/// 判定二进制文件（NUL / ELF 魔数）使用。
+pub fn read_file_bytes(path: &str) -> Option<Vec<u8>> {
+    let c = CString::new(path).unwrap_or_default();
+    let size = unsafe { wash_read_file(c.as_ptr(), std::ptr::null_mut(), 0) };
+    if size < 0 {
+        return None;
+    }
+    let mut buf: Vec<u8> = vec![0u8; size as usize + 1];
+    let n = unsafe {
+        wash_read_file(
+            c.as_ptr(),
+            buf.as_mut_ptr() as *mut c_char,
+            buf.len(),
+        )
+    };
+    if n < 0 {
+        return None;
+    }
+    buf.truncate(n as usize);
+    Some(buf)
+}
+
 pub fn execve(path: &CString, argv: &[*const c_char], envp: &[*const c_char]) -> i32 {
     unsafe { wash_execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr()) }
 }
@@ -645,9 +668,17 @@ pub fn read_byte_timeout(ms: i32) -> Option<u8> {
 
 // --- 交互 shell 信号 / 作业控制 / 本地时间 -------------------------------
 
+/// 只有交互 REPL 启动路径（`install_signal_handlers`，即 main.rs 里
+/// 「无 -c、无脚本且 stdin 为 tty」的那一次调用）才置位。`exec` 内建的
+/// execve 失败分类器据此决定是让 REPL 存活（交互，bash 不退出）还是
+/// 按 bash 语义终止整个非交互 shell（-c / 脚本）。
+pub static INTERACTIVE_REPL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// 交互 shell 启动时安装信号捕获 handler（幂等）。非交互（-c / 脚本）路径
 /// 不要调用，否则会改变默认的 SIGINT 语义。
 pub fn install_signal_handlers() {
+    INTERACTIVE_REPL.store(true, std::sync::atomic::Ordering::Relaxed);
     unsafe {
         wash_install_signal_handlers();
     }

@@ -26,7 +26,7 @@
 #       'cd <WASH_REPO> && bash tests/bash_diff_builtins.sh'
 #
 # Optional: ONLY_GROUP=A|K|B|C|D runs a single group.
-#   A = core semantics + finished builtins (503 cases: 340 + 33 brace-range
+#   A = core semantics + finished builtins (550 cases: 340 + 33 brace-range
 #       + 24 brace word-boundary + 15 brace nest/escape/quote-removal
 #       + 1 brace deep-nesting stack guard + 37 heredoc / herestring
 #       + 11 unclosed `$(` syntax-error fence
@@ -37,6 +37,11 @@
 #          case/{/(), innermost-opener line numbers, heredoc-body line
 #          counting, `>;` near-token, family priority, heredoc-EOF warning)
 #          -- mirrors qa9_oracle.tsv GROUP A)
+#       + 25 command-exec semantics fence (PATH unset/empty/empty-element,
+#          command-prefix assignment, ENOEXEC 4-class, exec builtin)
+#       + 22 builtins fence (kill signal-0 probe, ulimit out-of-range/hex,
+#          source directory, builtin write errors, read -n/-N byte counting,
+#          printf empty format)
 #       -> MUST stay green (regressions)
 #   K = KNOWN-DIFF: cannot be byte-equal by design (documented, not fixed)
 #   B = regression fence for already-fixed defects (GROUP B, 21 cases, green today)
@@ -84,6 +89,18 @@ SANDBOX="$TMP/sandbox"
 mkdir -p "$SANDBOX/sub" "$SANDBOX/bin" "$SANDBOX/cwd"
 printf 'echo FROM_PATH\n'         > "$SANDBOX/bin/probe.sh"
 printf 'echo FROM_CWD\n'          > "$SANDBOX/cwd/probe.sh"
+# --- 命令执行语义 fixtures（PATH 搜索 / ENOEXEC 分类 / exec 内建）-----------
+# oracle（MSYS2 bash 5.3.20, LC_ALL=C）实测：PATH 搜索只要求「存在的
+# regular file」（noacl 挂载上执行位不生效，这里也一律不 chmod +x）；
+# execve 失败再按 errno + 文件头分类：坏解释器 / ELF 或 NUL 二进制 /
+# 目录 / 纯文本回退为 shell 脚本执行。
+mkdir -p "$SANDBOX/execfix/pdir1"
+printf '#!/bin/sh\necho SHBANG-OK\n'            > "$SANDBOX/execfix/goodinterp"
+printf 'echo PLAIN-from-script\n'               > "$SANDBOX/execfix/plain"
+printf '#!/bin/definitely-not-exist\necho NO\n' > "$SANDBOX/execfix/badinterp"
+printf '\x7fELFfake'                            > "$SANDBOX/execfix/elf"
+printf 'AB\x00CD\n'                             > "$SANDBOX/execfix/nulf"
+printf 'echo FROM-EXECFIX\n'                    > "$SANDBOX/execfix/pdir1/nonexec"
 printf 'echo "hello from src"\n' > "$SANDBOX/script.sh"
 printf 'echo "1=$1 2=$2 n=$#"\n'  > "$SANDBOX/args.sh"
 printf 'exit 7\n'                 > "$SANDBOX/exit7.sh"
@@ -1188,6 +1205,74 @@ run_case A brace-closed-control    'echo ${foo}'
 run_case A arith-closed-control    'echo $((1+2))'
 run_case A dquote-cmdsub-closed-control 'echo "$(echo hi)"'
 run_case A brace-assign-closed-control  'x=${y}'
+
+# --- 命令执行语义（PATH 空串/未设置/空元素 + ENOEXEC 四类 + exec 内建）------
+# oracle = MSYS2 bash 5.3.20（LC_ALL=C）逐字节对拍，本节 22 条。
+# PATH 语义：未设置 → 对裸名直接 execve（ENOENT 报
+# `No such file or directory`，rc=127，不是 command not found）；已设置 →
+# 冒号切分逐目录找「存在的 regular file」（执行位不参与，空元素 = 当前
+# 目录）；命令前缀赋值（`PATH=... cmd`）在查找之前应用。
+run_case A path-unset-bare       'unset PATH; ls; echo "rc=$?"'
+run_case A path-empty-notfound   'PATH= ls; echo "rc=$?"'
+run_case A path-empty-cwd-miss   'PATH= no-such-cmd-zz; echo "rc=$?"'
+run_case A path-colon-cwd        'PATH=: no-such-cmd-zz; echo "rc=$?"'
+run_case A path-baddir-notfound  'PATH=/nonexistent-dir ls; echo "rc=$?"'
+run_case A path-assign-found     'PATH=@SANDBOX@/execfix/pdir1 nonexec; echo "rc=$?"'
+run_case A path-stage-pipe       'PATH= no-such-cmd-zz | wc -l; echo "rc=$?"'
+run_case A path-unset-direct-ok  'unset PATH; @SANDBOX@/execfix/plain; echo "rc=$?"'
+# ENOEXEC 四类：① shebang 解释器缺失 → `<脚本>: <解释器>: bad interpreter:
+# <strerror>`（无行号前缀，rc=126）；② ELF 魔数 / 头部 NUL →
+# `cannot execute binary file: Exec format error`（rc=126）；③ 目录 →
+# `Is a directory`（rc=126）；④ 无 shebang 纯文本 → 作为 shell 脚本执行。
+run_case A enoexec-badinterp     '@SANDBOX@/execfix/badinterp; echo "rc=$?"'
+run_case A enoexec-elf           '@SANDBOX@/execfix/elf; echo "rc=$?"'
+run_case A enoexec-nul           '@SANDBOX@/execfix/nulf; echo "rc=$?"'
+run_case A enoexec-text-script   '@SANDBOX@/execfix/plain; echo "rc=$?"'
+run_case A enoexec-shebang-ok    '@SANDBOX@/execfix/goodinterp; echo "rc=$?"'
+# 直接路径的 errno 分类：ENOENT → `No such file or directory`（127）。
+run_case A exec-enoent           '/nonexistent-zz-washfix; echo "rc=$?"'
+run_case A exec-isdir            '@SANDBOX@/execfix/pdir1; echo "rc=$?"'
+# exec 内建：非交互 shell 失败即终止（AFTER 不打印），rc=127/126；
+# 文本脚本回退在子 shell 里跑完并以其状态终止（rc=0 也不打印 AFTER）。
+run_case A exec-builtin-enoent   'exec /nonexistent-zz-washfix; echo AFTER'
+run_case A exec-builtin-pathmiss 'exec no-such-cmd-zz; echo AFTER'
+run_case A exec-builtin-isdir    'exec @SANDBOX@/execfix/pdir1; echo AFTER'
+run_case A exec-builtin-elf      'exec @SANDBOX@/execfix/elf; echo AFTER'
+run_case A exec-builtin-badinterp 'exec @SANDBOX@/execfix/badinterp; echo AFTER'
+run_case A exec-builtin-script   'exec @SANDBOX@/execfix/plain; echo AFTER'
+run_case A exec-builtin-ok       'exec @SANDBOX@/execfix/goodinterp; echo AFTER'
+run_case A exec-builtin-subshell '(exec /nonexistent-zz-washfix); echo "rc=$?"'
+# command 内建与普通命令走同一套搜索/分类器。
+run_case A command-enoent        'command /nonexistent-zz-washfix; echo "rc=$?"'
+run_case A command-pathmiss      'PATH=/nonexistent-dir command ls; echo "rc=$?"'
+
+# --- builtins 语义（kill 信号 0 / ulimit / source / 写错误 / read 字节计数）----
+# oracle = MSYS2 bash 5.3.20（LC_ALL=C）逐字节对拍，本节 22 条。
+# `read -n/-N` 按裸字节计数（不按 UTF-8 字符边界）；内建 stdout 写失败
+# （/dev/full）报 `<builtin>: write error: <strerror>` rc=1。
+printf '\344\270\255\346\226\207ab\n' > "$SANDBOX/execfix/utf8"
+run_case A kill-zero-self       'kill -0 $$; echo "rc=$?"'
+run_case A kill-zero-dead       'kill -0 999999; echo "rc=$?"'
+run_case A kill-zero-usage      'kill -0; echo "rc=$?"'
+run_case A kill-s-zero          'kill -s 0 $$; echo "rc=$?"'
+run_case A kill-n-zero          'kill -n 0 $$; echo "rc=$?"'
+run_case A kill-l-zero          'kill -l 0; echo "rc=$?"'
+run_case A kill-l-130           'kill -l 130; echo "rc=$?"'
+run_case A kill-badpid          'kill -0 abc; echo "rc=$?"'
+run_case A ulimit-range         'ulimit -f 99999999999999999999; echo "rc=$?"'
+run_case A ulimit-hex           'ulimit -f 0x10; echo "rc=$?"'
+run_case A ulimit-invalid       'ulimit -f abc; echo "rc=$?"'
+run_case A ulimit-boundary      'ulimit -f 18014398509481984; echo "rc=$?"'
+run_case A source-dir           'source @SANDBOX@/execfix/pdir1; echo "rc=$?"'
+run_case A echo-devfull         'echo hi > /dev/full; echo "rc=$?"'
+run_case A printf-devfull       'printf hi > /dev/full; echo "rc=$?"'
+run_case A pwd-devfull          'pwd > /dev/full; echo "rc=$?"'
+run_case A printf-empty-format  'printf ""; echo "rc=$?"'
+run_case A read-n-byte1         'read -n 1 v < @SANDBOX@/execfix/utf8; printf %s "$v"; echo ":rc=$?"'
+run_case A read-n-byte4         'read -n 4 v < @SANDBOX@/execfix/utf8; printf %s "$v" | od -An -tx1; echo "rc=$?"'
+run_case A read-n-zero          'read -n 0 v < @SANDBOX@/execfix/utf8; echo "[$v] rc=$?"; read w < @SANDBOX@/execfix/utf8; echo "[$w]"'
+run_case A read-N-byte4         'read -N 4 v < @SANDBOX@/execfix/utf8; printf %s "$v" | od -An -tx1; echo "rc=$?"'
+run_case A plain-script         '@SANDBOX@/execfix/plain; echo "rc=$?"'
 
 # GROUP B -- regression fence for already-fixed defects (21 cases, green today).
 # (每条用例都曾是真实缺陷，修复后留在这里作为回归栅栏：通过 run_case 同时跑

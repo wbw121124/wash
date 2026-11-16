@@ -90,8 +90,206 @@ pub(crate) fn build_shell_env_ptrs(sh: &Shell) -> (Vec<CString>, Vec<*const c_ch
 }
 
 /// Replace the current process with `path`. Only returns on failure.
+///
+/// 失败时按 bash 5.3（MSYS2 实测）分类报告 —— 这是 `exec` 内建（父 shell
+/// 进程）走的入口：
+///   * 文件不存在          → `wash: PATH: <strerror>`，rc 127
+///   * 目录                → `wash: PATH: Is a directory`，rc 126
+///   * 二进制（头部含 NUL）→ `wash: PATH: cannot execute binary file: Exec format error`，rc 126
+///   * shebang 的解释器坏  → `wash: PATH: INTERP: bad interpreter: <strerror>`，rc 126
+///   * ENOEXEC 文本        → 作为 shell 脚本执行（fork 子进程），shell 以
+///     脚本状态终止（交互 shell 同样终止 —— bash 实测一致）。
+///
+/// 交互 REPL（`posix::INTERACTIVE_REPL` 置位）下报告类失败**不打印也不
+/// 退出**：bash 交互 shell 在 exec 失败后继续存活，调用方（builtins.rs 的
+/// exec 内建）会打印自己的诊断并返回。非交互（-c / 脚本）则打印后直接
+/// 终止进程，rc 与 bash 一致（调用方的兜底消息永远不会再执行）。
 pub(crate) fn execve(path: &CString, argv: &[*const c_char], envp: &[*const c_char]) -> i32 {
-    posix::execve(path, argv, envp)
+    let display = path.to_string_lossy().into_owned();
+    // 指针数组在本调用期间有效，读回字符串以重建脚本回退的 argv。
+    let argv_strs: Vec<String> = argv
+        .iter()
+        .filter(|p| !p.is_null())
+        .map(|p| unsafe { std::ffi::CStr::from_ptr(*p) }.to_string_lossy().into_owned())
+        .collect();
+    let env_map = envp_map(envp);
+    exec_classified(path, &display, &argv_strs, argv, envp, &env_map, true)
+}
+
+/// Rebuild an environment map from an `envp` pointer array (the `exec`
+/// builtin's script fallback has no `Shell` at hand; bash 把整个变量表
+/// 交给子脚本，这里至少还原导出环境)。
+fn envp_map(envp: &[*const c_char]) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for p in envp.iter() {
+        if p.is_null() {
+            break;
+        }
+        let s = unsafe { std::ffi::CStr::from_ptr(*p) }.to_string_lossy().into_owned();
+        if let Some(eq) = s.find('=') {
+            out.insert(s[..eq].to_string(), s[eq + 1..].to_string());
+        }
+    }
+    out
+}
+
+/// execve 失败后的 bash 语义分类。成功路径永不返回；报告类失败在
+/// 非交互进程里直接 `posix::exit`（`exec` 内建语义：shell 被替换，
+/// 失败即终止），只有交互 REPL 例外（返回 rc，让 REPL 存活）。
+///
+/// `parent_shell`：true = `exec` 内建在 shell 本体进程里调用；false =
+/// 已经在 fork 出的命令子进程里（普通命令 / `command` 内建），失败
+/// 一律退出子进程。
+fn exec_classified(
+    exe: &CString,
+    display: &str,
+    argv_strs: &[String],
+    argv: &[*const c_char],
+    envp: &[*const c_char],
+    shell_env: &HashMap<String, String>,
+    parent_shell: bool,
+) -> i32 {
+    posix::execve(exe, argv, envp);
+    let e = posix::errno();
+    // --- 文件身份判定（优先于 errno：cygwin 对坏解释器脚本报的也是
+    // ENOENT，必须靠文件内容区分）---
+    let st = posix::stat_path(display, true);
+    if let Some(s) = &st {
+        if s.file_type == posix::FT_DIR {
+            let msg = format!("{}: Is a directory", display);
+            return exec_fail(&msg, 126, parent_shell);
+        }
+    }
+    let is_reg = matches!(&st, Some(s) if s.file_type == posix::FT_REG);
+    if is_reg {
+        if let Some(bytes) = posix::read_file_bytes(display) {
+            // bash check_binary_file：前 80 字节里出现 NUL，或以 `\x7fELF`
+            // 魔数开头 → 二进制（MSYS2 实测：\x01、\xff 等其他不可打印
+            // 字节仍走脚本回退）。
+            let head = &bytes[..bytes.len().min(80)];
+            if head.contains(&0u8) || head.starts_with(b"\x7fELF") {
+                let msg = format!(
+                    "{}: cannot execute binary file: Exec format error",
+                    display
+                );
+                return exec_fail(&msg, 126, parent_shell);
+            }
+            if let Some(interp) = shebang_interpreter(head) {
+                // bash 的 re-exec：execve(解释器, [解释器, 脚本, 参数...])。
+                // 解释器不存在/不可执行时按其实际 errno 报
+                // `bad interpreter: <strerror>`（rc 126，无行号前缀）。
+                let ic = CString::new(interp.clone()).unwrap_or_default();
+                let script_c = CString::new(display).unwrap_or_default();
+                let mut ptrs: Vec<*const c_char> =
+                    vec![ic.as_ptr(), script_c.as_ptr()];
+                for p in argv.iter().skip(1) {
+                    if p.is_null() {
+                        break;
+                    }
+                    ptrs.push(*p);
+                }
+                ptrs.push(std::ptr::null());
+                posix::execve(&ic, &ptrs, envp);
+                let e2 = posix::errno();
+                let msg = format!(
+                    "{}: {}: bad interpreter: {}",
+                    display,
+                    interp,
+                    posix::errno_message(e2)
+                );
+                return exec_fail(&msg, 126, parent_shell);
+            }
+            // ENOEXEC 纯文本：作为 shell 脚本执行。
+            return run_as_script(display, argv_strs, envp, shell_env, parent_shell);
+        }
+    }
+    // 文件消失 / 非 regular（设备等）：报 execve 的 errno。
+    let code = if e == 2 /* ENOENT */ || e == 20 /* ENOTDIR */ {
+        127
+    } else {
+        126
+    };
+    let msg = format!("{}: {}", display, posix::errno_message(e));
+    exec_fail(&msg, code, parent_shell)
+}
+
+/// Print `wash: MSG` and terminate.  交互 REPL 下不打印、不退出
+/// （返回 rc 交给 `exec` 内建兜底）。
+fn exec_fail(msg_full: &str, code: i32, parent_shell: bool) -> i32 {
+    if parent_shell && posix::INTERACTIVE_REPL.load(std::sync::atomic::Ordering::Relaxed) {
+        return code;
+    }
+    eprintln!("wash: {}", msg_full);
+    let _ = std::io::stdout().flush();
+    posix::exit(code);
+}
+
+/// Parse the interpreter out of a `#!` line: the first whitespace-delimited
+/// token after `#!` (leading blanks skipped).  `#!` 单独成行（无解释器）
+/// 返回 None —— bash 把它当普通脚本跑。
+fn shebang_interpreter(head: &[u8]) -> Option<String> {
+    if !head.starts_with(b"#!") {
+        return None;
+    }
+    let mut i = 2;
+    while i < head.len() && (head[i] == b' ' || head[i] == b'\t') {
+        i += 1;
+    }
+    let start = i;
+    while i < head.len() && head[i] != b' ' && head[i] != b'\t' && head[i] != b'\n' && head[i] != 0 {
+        i += 1;
+    }
+    if start == i {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&head[start..i]).into_owned())
+}
+
+/// ENOEXEC 纯文本回退：把文件当 shell 脚本执行并以其状态退出。
+///
+/// 普通命令路径已经在 fork 出的子进程里 → 直接执行后 exit；
+/// `exec` 内建在父 shell 里 → bash 实测会 fork 一个子 shell 跑脚本
+/// （BASHPID 可证），shell 以脚本状态终止（交互 shell 也不例外）。
+fn run_as_script(
+    display: &str,
+    argv_strs: &[String],
+    envp: &[*const c_char],
+    shell_env: &HashMap<String, String>,
+    parent_shell: bool,
+) -> i32 {
+    if !parent_shell {
+        run_script_in_shell(display, argv_strs, shell_env);
+    }
+    let pid = fork_child();
+    if let Some(pid) = pid {
+        if pid == 0 {
+            run_script_in_shell(display, argv_strs, shell_env);
+        }
+        let status = posix::wait_pid(pid);
+        let _ = std::io::stdout().flush();
+        posix::exit(status);
+    }
+    1
+}
+
+/// 在当前进程里执行脚本内容（`bash 脚本` 语义：全新 Shell、$0=脚本路径、
+/// 位置参数=脚本参数），然后退出进程。
+fn run_script_in_shell(display: &str, argv_strs: &[String], shell_env: &HashMap<String, String>) {
+    let content = match posix::read_file(display) {
+        Some(c) => c,
+        None => {
+            eprintln!("wash: {}: {}", display, posix::errno_message(posix::errno()));
+            let _ = std::io::stdout().flush();
+            posix::exit(126);
+        }
+    };
+    let mut sh = Shell::from_env(shell_env.clone());
+    sh.positional = argv_strs.iter().skip(1).cloned().collect();
+    sh.dollar_zero = display.to_string();
+    let code = sh.run_in_error_context(crate::shell::ErrorContext::sourced(display), &content);
+    let code = sh.finalize_exit(code);
+    let _ = std::io::stdout().flush();
+    posix::exit(code);
 }
 
 // 前台作业控制：只有主 shell 在「交互式 + tty」执行前台命令时才接管终端
@@ -141,33 +339,53 @@ fn fork_child() -> Option<i32> {
     Some(pid)
 }
 
+/// `path` 是 regular file（对齐 MSYS2 bash 的搜索语义：只看存在性，
+/// 不看执行位 —— Cygwin 对文本/二进制的 ENOEXEC 回退在 execve 之后才发生）。
+fn is_regular_file(path: &str) -> bool {
+    matches!(
+        posix::stat_path(path, true),
+        Some(st) if st.file_type == posix::FT_REG
+    )
+}
+
 /// Look `name` up in `path` (or directly, when it contains a slash).
+///
+/// bash 5.3（MSYS2 实测对齐）的查找规则：
+///   * 名字含斜杠：直接用该路径执行，不做 access 预检 —— execve 失败的
+///     errno（ENOENT → `No such file or directory`、目录 → `Is a
+///     directory`、ENOEXEC → 二进制/脚本分类）才是错误文案的来源。
+///   * `PATH` 未设置（`None`）：对裸名直接 execve（相对路径按 cwd 解析，
+///     失败报 `No such file or directory`，rc=127），而不是报
+///     `command not found`。
+///   * `PATH` 已设置：按冒号切分逐目录找 **regular file**；空元素表示
+///     当前目录（`PATH=:` / `PATH=` 都会搜 cwd）。执行位不参与筛选
+///     （Cygwin 的 noacl 挂载下权限位本来就不生效，bash 的搜索同样
+///     找到并交给 execve 分类）。
 ///
 /// Returns the path to execute and the path as the `$PATH` search reports
 /// it: Cygwin falls back to the `.exe` suffix when it executes a program,
 /// but it reports the name as it stands in the `$PATH`.
-pub(crate) fn find_program(name: &str, path: &str) -> Option<(CString, String)> {
+pub(crate) fn find_program(name: &str, path: Option<&str>) -> Option<(CString, String)> {
     if name.contains('/') || name.contains('\\') {
-        if posix::access(name, posix::X_OK) == 0 {
-            return Some((posix::to_cstr(name), name.to_string()));
-        }
-        let exe = format!("{}.exe", name);
-        if posix::access(&exe, posix::X_OK) == 0 {
-            return Some((posix::to_cstr(&exe), name.to_string()));
-        }
-        return None;
+        return Some((posix::to_cstr(name), name.to_string()));
     }
+    let path = match path {
+        // PATH 未设置：bash 直接对裸名 execve。
+        None => return Some((posix::to_cstr(name), name.to_string())),
+        Some(p) => p,
+    };
     for dir in path.split(':') {
-        if dir.is_empty() {
-            continue;
-        }
-        let cand = format!("{}/{}", dir, name);
-        if posix::access(&cand, posix::X_OK) == 0 {
+        let cand = if dir.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}/{}", dir, name)
+        };
+        if is_regular_file(&cand) {
             return Some((posix::to_cstr(&cand), cand.clone()));
         }
         let cand_exe = format!("{}.exe", cand);
-        if posix::access(&cand_exe, posix::X_OK) == 0 {
-            return Some((posix::to_cstr(&cand_exe), cand));
+        if is_regular_file(&cand_exe) {
+            return Some((posix::to_cstr(&cand), cand));
         }
     }
     None
@@ -175,34 +393,36 @@ pub(crate) fn find_program(name: &str, path: &str) -> Option<(CString, String)> 
 
 /// Look `name` up in `path` (or directly, when it contains a slash).
 pub(crate) fn find_executable(name: &str, path: &str) -> Option<CString> {
-    find_program(name, path).map(|(exe, _)| exe)
+    find_program(name, Some(path)).map(|(exe, _)| exe)
 }
 
 /// The executables named `name` in the colon-separated `$PATH`.
 ///
 /// Like Cygwin's `find_user_command`, the `.exe` suffix is tried as a
 /// fallback but it is not reported: bash prints the path exactly as it
-/// stands in the `$PATH`.
+/// stands in the `$PATH`.  搜索语义与 `find_program` 一致：regular file
+/// 即命中，执行位不参与（MSYS2 bash 实测）。
 pub fn path_matches(name: &str, path: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     if name.contains('/') || name.contains('\\') {
         // An explicit path is used as it is.
-        if posix::access(name, posix::X_OK) == 0 {
+        if is_regular_file(name) {
             out.push(name.to_string());
         }
         return out;
     }
     for dir in path.split(':') {
-        if dir.is_empty() {
-            continue;
-        }
-        let candidate = format!("{}/{}", dir, name);
-        if posix::access(&candidate, posix::X_OK) == 0 {
+        let candidate = if dir.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}/{}", dir, name)
+        };
+        if is_regular_file(&candidate) {
             out.push(candidate);
             continue;
         }
         let candidate_exe = format!("{}.exe", candidate);
-        if posix::access(&candidate_exe, posix::X_OK) == 0 {
+        if is_regular_file(&candidate_exe) {
             out.push(candidate);
         }
     }
@@ -598,7 +818,7 @@ pub fn exec_external(argv: &[String], sh: &Shell) -> i32 {
     if argv.is_empty() {
         return 0;
     }
-    let path = sh.env.get("PATH").cloned().unwrap_or_default();
+    let path = sh.env.get("PATH").cloned();
     let pid = match fork_child() {
         Some(p) => p,
         None => return 1,
@@ -606,12 +826,21 @@ pub fn exec_external(argv: &[String], sh: &Shell) -> i32 {
     if pid == 0 {
         let (_cstrings, env_ptrs) = build_shell_env_ptrs(sh);
         let argvec = ArgVec::from(argv);
-        match find_executable(&argv[0], &path) {
-            Some(exe) => {
-                execve(&exe, &argvec.ptrs, &env_ptrs);
+        match find_program(&argv[0], path.as_deref()) {
+            Some((exe, display)) => {
+                posix::exit(exec_classified(
+                    &exe,
+                    &display,
+                    argv,
+                    &argvec.ptrs,
+                    &env_ptrs,
+                    &sh.env,
+                    false,
+                ));
             }
             None => {
                 eprintln!("wash: {}: command not found", argv[0]);
+                posix::exit(127);
             }
         }
         posix::exit(127);
@@ -1045,8 +1274,15 @@ struct ChildContext<'a> {
     /// The compound command (`if ... fi`) the child has to run, if any.
     compound: Option<&'a Compound>,
     /// The program the child has to execute, already resolved by the
-    /// parent.
-    program: Option<&'a CString>,
+    /// parent: the execve path plus the name bash-style diagnostics
+    /// report (the `$PATH` entry without the implicit `.exe`).
+    program: Option<&'a (CString, String)>,
+    /// True when the parent ALREADY performed the `$PATH` search for this
+    /// command (with the command's own `PATH=` assignments applied).  When
+    /// `program` is `None` and this is true, the child must report
+    /// `command not found` instead of re-searching a stale snapshot PATH —
+    /// the snapshot would silently ignore `PATH=... cmd` prefixes.
+    program_searched: bool,
     /// True when the parent determined the command word may be a builtin
     /// (static or plugin), which is why `program` was left `None`.  When
     /// `program` is `Some` AND this is false, the child can exec straight
@@ -1062,7 +1298,7 @@ fn record_hash_entry(sh: &mut Shell, name: &str, path: &str) {
 
 /// Run a command inside the forked child: either a builtin (whose state
 /// changes are lost with the child) or an external program.
-fn child_run_exp(argv: &[String], path: &str, ctx: &ChildContext) -> ! {
+fn child_run_exp(argv: &[String], path: Option<&str>, ctx: &ChildContext) -> ! {
     if argv.is_empty() {
         // A compound command (`if ... fi`) has no words of its own: it runs
         // inside the child.
@@ -1091,11 +1327,19 @@ fn child_run_exp(argv: &[String], path: &str, ctx: &ChildContext) -> ! {
     // away by `execve`.  Go straight to exec.  `run_builtin` would have
     // returned `None` for this argv, so stdout/stderr/rc are unchanged.
     if !ctx.builtin_candidate {
-        if let Some(exe) = ctx.program {
+        if let Some((exe, display)) = ctx.program {
             let (_cstrings, env_ptrs) = build_env_ptrs(ctx.env);
             let argvec = ArgVec::from(argv);
-            posix::execve(exe, &argvec.ptrs, &env_ptrs);
-            posix::exit(127);
+            // 子进程里 exec_classified 永不返回（失败分类后 exit）。
+            posix::exit(exec_classified(
+                exe,
+                display,
+                argv,
+                &argvec.ptrs,
+                &env_ptrs,
+                ctx.shell_env,
+                false,
+            ));
         }
     }
     // The redirections have already been applied by the caller (pipes and the
@@ -1126,18 +1370,33 @@ fn child_run_exp(argv: &[String], path: &str, ctx: &ChildContext) -> ! {
     // Not a builtin: look it up in $PATH and replace the child process.
     let (_cstrings, env_ptrs) = build_env_ptrs(ctx.env);
     let argvec = ArgVec::from(argv);
-    let exe = match ctx.program {
-        Some(exe) => exe.clone(),
-        None => match find_executable(&argv[0], path) {
-            Some(exe) => exe,
+    let (exe, display) = match ctx.program {
+        Some((exe, display)) => (exe.clone(), display.clone()),
+        None if ctx.program_searched => {
+            // 父进程已按（应用过 `PATH=` 前缀赋值的）PATH 搜索且未命中：
+            // 直接报 command not found，不得用快照 PATH 重搜。
+            eprintln!("wash: {}: command not found", argv[0]);
+            posix::exit(127);
+        }
+        None => match find_program(&argv[0], path) {
+            Some((exe, display)) => (exe, display),
             None => {
                 eprintln!("wash: {}: command not found", argv[0]);
                 posix::exit(127);
             }
         },
     };
-    posix::execve(&exe, &argvec.ptrs, &env_ptrs);
-    posix::exit(127);
+    exec_classified(
+        &exe,
+        &display,
+        argv,
+        &argvec.ptrs,
+        &env_ptrs,
+        ctx.shell_env,
+        false,
+    );
+    // 子进程里 exec_classified 永不返回；保险起见按 127 退出。
+    posix::exit(127)
 }
 
 /// Apply a single assignment to the shell, honouring the `readonly` and
@@ -1319,6 +1578,30 @@ fn drop_underscore_export(sh: &mut Shell) {
     sh.exported.remove("_");
 }
 
+/// bash 在命令查找之前先应用命令前缀的赋值：`PATH= ls`、
+/// `PATH=/nonexistent ls`、`PATH+=/x ls` 的命令查找都用**应用后**的 PATH
+/// （MSYS2 实测：`PATH= ls` 报 command not found，`PATH= foo` 在 cwd 有
+/// `foo` 时能执行 —— 空元素即当前目录）。返回查找用的 PATH；
+/// `None` = PATH 未设置（裸名直接 execve，失败报 ENOENT 文案）。
+fn command_search_path(
+    env_values: Option<&[(String, String, bool)]>,
+    sh: &Shell,
+) -> Option<String> {
+    let mut cur: Option<String> = sh.env.get("PATH").cloned();
+    if let Some(values) = env_values {
+        for (n, v, ap) in values {
+            if n == "PATH" {
+                cur = Some(if *ap {
+                    format!("{}{}", cur.unwrap_or_default(), v)
+                } else {
+                    v.clone()
+                });
+            }
+        }
+    }
+    cur
+}
+
 /// Run a single (non-pipeline) command in the parent shell.
 fn run_standalone_exp(
     argv: &[String],
@@ -1328,7 +1611,7 @@ fn run_standalone_exp(
     compound: Option<&Compound>,
     env_values: Option<&[(String, String, bool)]>,
     sh: &mut Shell,
-    path: &str,
+    path: Option<&str>,
 ) -> i32 {
     if argv.is_empty() {
         // A compound command (`if ... fi`): its redirections apply to the
@@ -1477,7 +1760,8 @@ fn run_standalone_exp(
     // A command-prefixed array assignment (`a=(1) prog`) is visible only to this
     // command; we apply it temporarily and restore it afterwards.
     let array_saves = apply_array_assignments(array_assigns, sh);
-    let program = find_program(&argv[0], path);
+    let search_path = command_search_path(env_values, sh);
+    let program = find_program(&argv[0], search_path.as_deref());
     // 前台作业控制：仅交互式 + tty 的主 shell 接管终端。job_ctl / shell_pgrp
     // 都在 fork 前算好，子进程继承同一份值；-c / piped（isatty 判假）整段跳过。
     let job_ctl = job_control_active(sh);
@@ -1514,7 +1798,9 @@ fn run_standalone_exp(
             bg_pid: sh.bg_pid,
             functions: &sh.functions,
             compound: None,
-            program: program.as_ref().map(|(exe, _)| exe),
+            program: program.as_ref(),
+            // 外部命令的 PATH 搜索已在父进程完成（含命令前缀赋值）。
+            program_searched: true,
             // Builtins and functions were already handled above in this
             // function, so reaching this fork means the word is external.
             builtin_candidate: false,
@@ -1856,7 +2142,7 @@ fn prepare_stage(c: &SimpleCommand, sh: &mut Shell) -> Prepared {
 /// a `set -u` unbound variable or a failed arithmetic expansion only kills
 /// this stage (the child exits 127 / 1 after printing the diagnostic) while
 /// the other stages and the rest of the command line keep running.
-fn child_prepare_and_run(c: &SimpleCommand, sh: &mut Shell, path: &str, noclobber: bool) -> ! {
+fn child_prepare_and_run(c: &SimpleCommand, sh: &mut Shell, path: Option<&str>, noclobber: bool) -> ! {
     let pr = prepare_stage(c, sh);
     // A fatal parameter-expansion error (`set -u`, `${var?word}`) aborts only
     // this stage, with status 127.  A failed arithmetic expansion aborts only
@@ -1877,10 +2163,11 @@ fn child_prepare_and_run(c: &SimpleCommand, sh: &mut Shell, path: &str, noclobbe
     let builtin_candidate = pr.argv.is_empty()
         || builtins::is_builtin(sh, &pr.argv[0])
         || sh.functions.contains_key(&pr.argv[0]);
+    let search_path = command_search_path(pr.env_values.as_deref(), sh);
     let program = if builtin_candidate {
         None
     } else {
-        find_program(&pr.argv[0], path)
+        find_program(&pr.argv[0], search_path.as_deref())
     };
     // This stage runs in an already-forked child: it always needs both
     // private environments, so they are built here on demand.
@@ -1897,13 +2184,16 @@ fn child_prepare_and_run(c: &SimpleCommand, sh: &mut Shell, path: &str, noclobbe
         bg_pid: sh.bg_pid,
         functions: &sh.functions,
         compound: pr.compound.as_ref(),
-        program: program.as_ref().map(|(exe, _)| exe),
+        program: program.as_ref(),
+        // 仅非 builtin 候选阶段由父进程完成搜索；builtin 候选（函数/
+        // 内建）走 None + 未搜索，子进程兜底重搜才被允许。
+        program_searched: !builtin_candidate,
         builtin_candidate,
     };
     child_run_exp(&pr.argv, path, &ctx);
 }
 
-fn execute_pipeline(p: &Pipeline, sh: &mut Shell, path: &str) -> i32 {
+fn execute_pipeline(p: &Pipeline, sh: &mut Shell, path: Option<&str>) -> i32 {
     if p.background {
         return execute_background(p, sh, path);
     }
@@ -2068,7 +2358,7 @@ fn execute_pipeline(p: &Pipeline, sh: &mut Shell, path: &str) -> i32 {
 /// `$!`, prints the bash-style `[job] pid` line and returns immediately, so the
 /// REPL stays responsive.  This is the scaffolding the `jobs`/`fg`/`bg`/`wait`
 /// builtins build on.
-fn execute_background(p: &Pipeline, sh: &mut Shell, path: &str) -> i32 {
+fn execute_background(p: &Pipeline, sh: &mut Shell, path: Option<&str>) -> i32 {
     let pid = match fork_child() {
         Some(p) => p,
         None => {
@@ -2116,7 +2406,7 @@ fn execute_background(p: &Pipeline, sh: &mut Shell, path: &str) -> i32 {
 ///
 /// Returns `true` when `set -e` aborted the list; the caller then stops
 /// executing the remaining lists as well.
-fn execute_andor(andor: &AndOr, sh: &mut Shell, path: &str, last: &mut i32) -> bool {
+fn execute_andor(andor: &AndOr, sh: &mut Shell, path: Option<&str>, last: &mut i32) -> bool {
     let count = andor.pipelines.len();
     for (i, pipeline) in andor.pipelines.iter().enumerate() {
         if i > 0 {
@@ -2163,7 +2453,11 @@ pub fn execute(list: &CommandList, sh: &mut Shell) -> i32 {
     // ones) callable before any command runs.
     register_functions(list, sh);
 
-    let path = sh.env.get("PATH").cloned().unwrap_or_default();
+    // `PATH` 未设置（键不存在）与设置为空串要区分开：未设置 → 裸名直接
+    // execve（bash 报 `No such file or directory`），设置为空 → 只搜
+    // 空元素代表的当前目录（搜不到报 `command not found`）。
+    let path_owned: Option<String> = sh.env.get("PATH").cloned();
+    let path: Option<&str> = path_owned.as_deref();
 
     let mut last = 0;
     // Aliases are expanded before the commands run.  When aliases cannot
@@ -2179,7 +2473,7 @@ pub fn execute(list: &CommandList, sh: &mut Shell) -> i32 {
         list
     };
     for andor in &expanded.andors {
-        let aborted = execute_andor(andor, sh, &path, &mut last);
+        let aborted = execute_andor(andor, sh, path, &mut last);
         // A fatal expansion error aborts every enclosing command list,
         // including `if` / loop / function bodies that called us.
         if crate::expand::arith_failed() || crate::expand::expansion_abort_code().is_some() {

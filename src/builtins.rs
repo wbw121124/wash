@@ -2221,49 +2221,74 @@ fn builtin_hash(argv: &[String], sh: &mut Shell) -> i32 {
 // read
 // ---------------------------------------------------------------------------
 
-/// The IFS characters that are white space (space, tab and newline).
-///
-/// A white space IFS character is skipped in front of a field and at the
-/// end of the line, while any other IFS character ends a field.
-fn is_ifs_whitespace(c: char, ifs: &[char]) -> bool {
-    ifs.contains(&c) && matches!(c, ' ' | '\t' | '\n')
-}
-
 /// Split the input of `read` into the fields of its variables.
+///
+/// 切分直接在**字节层**进行：bash 的 read 字段切分本质是字节操作，而
+/// `read -n` 截断出的变量可能包含非法 UTF-8（如 `e4 b8 ad e6`），若按
+/// char 迭代会在非字符边界切片 panic。IFS 字符按其 UTF-8 字节序列匹配，
+/// 对合法 UTF-8 输入与旧的逐 char 实现逐字节等价。
 ///
 /// The variables before the last one get a single field each; the last one
 /// gets the rest of the line (without the trailing IFS white space).
-fn read_fields(input: &str, ifs: &[char], nvars: usize) -> Vec<String> {
-    let chars: Vec<char> = input.chars().collect();
+fn read_fields(input: &[u8], ifs: &[char], nvars: usize) -> Vec<String> {
+    // 每个 IFS 字符的 UTF-8 字节序列；IFS 空白恒为单字节（空格/制表/换行）。
+    let mut ifs_seqs: Vec<Vec<u8>> = Vec::with_capacity(ifs.len());
+    for c in ifs {
+        let mut buf = [0u8; 4];
+        ifs_seqs.push(c.encode_utf8(&mut buf).as_bytes().to_vec());
+    }
+    let is_ws_seq = |seq: &[u8]| -> bool {
+        seq.len() == 1 && matches!(seq[0], b' ' | b'\t' | b'\n')
+    };
+    let bytes_to_string = |b: &[u8]| -> String {
+        match std::str::from_utf8(b) {
+            Ok(s) => s.to_string(),
+            Err(_) => unsafe { String::from_utf8_unchecked(b.to_vec()) },
+        }
+    };
+
     let mut pos = 0usize;
     let mut fields: Vec<String> = Vec::new();
 
     for index in 0..nvars {
         // Remove the IFS white space at the beginning of the field.
-        while pos < chars.len() && is_ifs_whitespace(chars[pos], ifs) {
+        while pos < input.len()
+            && ifs_seqs
+                .iter()
+                .any(|s| is_ws_seq(s) && input[pos..].starts_with(s))
+        {
             pos += 1;
         }
         if index + 1 == nvars {
             // The last variable gets the rest of the line.
-            let mut end = chars.len();
-            while end > pos && is_ifs_whitespace(chars[end - 1], ifs) {
+            let mut end = input.len();
+            while end > pos
+                && ifs_seqs
+                    .iter()
+                    .any(|s| is_ws_seq(s) && input[end - 1] == s[0])
+            {
                 end -= 1;
             }
-            fields.push(chars[pos..end].iter().collect());
+            fields.push(bytes_to_string(&input[pos..end]));
             pos = end;
             break;
         }
         // One field: everything up to the next IFS character.
-        let mut field = String::new();
-        while pos < chars.len() && !ifs.contains(&chars[pos]) {
-            field.push(chars[pos]);
-            pos += 1;
+        let mut q = pos;
+        while q < input.len() && !ifs_seqs.iter().any(|s| input[q..].starts_with(s)) {
+            q += 1;
         }
+        let field = bytes_to_string(&input[pos..q]);
         // A non-white-space IFS character ends the field and is consumed.
-        if pos < chars.len() && ifs.contains(&chars[pos]) && !is_ifs_whitespace(chars[pos], ifs) {
-            pos += 1;
+        if q < input.len() {
+            if let Some(s) = ifs_seqs.iter().find(|s| input[q..].starts_with(s.as_slice())) {
+                if !is_ws_seq(s) {
+                    q += s.len();
+                }
+            }
         }
         fields.push(field);
+        pos = q;
     }
 
     fields
@@ -2271,55 +2296,18 @@ fn read_fields(input: &str, ifs: &[char], nvars: usize) -> Vec<String> {
 
 /// 把 `read` 收集到的**原始字节流**还原成 String。
 ///
-/// bash 的 `read` 按字节保真：变量里存的就是 stdin 的原始字节，`LC_ALL=C`
-/// 下尤其明显——多字节 UTF-8 序列并不被当作 Unicode 字符重新解释。因此
-/// 这里优先把整段按合法 UTF-8 还原：合法时 String 的内部字节与原始字节
-/// 逐字节相同，后续 `printf '%s'` 输出自然与 bash 一致，中文不会被二次
-/// 编码成 `c3 xx`。实测 C 与 C.utf8 两种 locale 下 bash 的中文 read 输出
-/// 完全相同，正是这种字节保真语义。
-///
-/// 不能写成逐字节 `out.push(b as char)`：那会把 UTF-8 多字节序列拆成
-/// Latin-1 字符，输出时再编码，正是本项要修的乱码。只有遇到非法/不完整
-/// UTF-8（例如 C locale 下 `read -n` 截断在多字节字符中间）才逐段做
-/// Latin-1 有损回退，且不引入 U+FFFD 替换符。
+/// bash 的 `read` 是字节保真的：变量里存的就是 stdin 的原始字节。合法
+/// UTF-8 时 String 的内部字节与原始字节逐字节相同；非法/不完整 UTF-8（
+/// 例如 `read -n` 截断在多字节字符中间）时 String 没有合法的逐字节表示，
+/// 用 `from_utf8_unchecked` 原样装箱——输出路径（echo/printf 按
+/// `as_bytes()` 写出）会逐字节还原，绝不二次编码（这是 `read -n 4` 曾把
+/// `e6` 补全成 `c3 a6` 的根因）。字段切分因此也必须在字节层进行
+/// （见 [`read_fields`]）。
 fn decode_read_bytes(bytes: &[u8]) -> String {
-    if let Ok(s) = std::str::from_utf8(bytes) {
-        return s.to_string();
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => unsafe { String::from_utf8_unchecked(bytes.to_vec()) },
     }
-    let mut out = String::with_capacity(bytes.len());
-    let mut i = 0usize;
-    while i < bytes.len() {
-        let b = bytes[i];
-        // 内联 UTF-8 首字节长度判定，避免依赖 repl.rs 的私有工具函数。
-        let len = if b < 0x80 {
-            1
-        } else if b >> 5 == 0b110 {
-            2
-        } else if b >> 4 == 0b1110 {
-            3
-        } else if b >> 3 == 0b11110 {
-            4
-        } else {
-            1
-        };
-        if len == 1 {
-            out.push(b as char);
-            i += 1;
-            continue;
-        }
-        let end = (i + len).min(bytes.len());
-        match std::str::from_utf8(&bytes[i..end]) {
-            Ok(s) => {
-                out.push_str(s);
-                i = end;
-            }
-            Err(_) => {
-                out.push(b as char);
-                i += 1;
-            }
-        }
-    }
-    out
 }
 
 /// The `read` builtin: read a line from the standard input and split it
@@ -2338,6 +2326,7 @@ fn builtin_read(argv: &[String], sh: &mut Shell) -> i32 {
     let mut prompt: Option<String> = None;
     let mut delim: u8 = b'\n';
     let mut nchars: usize = 0;
+    let mut nchars_given = false;
     let mut exact = false; // -N: read exactly NCHARS characters
     let mut fd = 0i32;
     let mut i = 1usize;
@@ -2380,6 +2369,7 @@ fn builtin_read(argv: &[String], sh: &mut Shell) -> i32 {
                             }
                             'n' | 'N' => {
                                 exact = c == 'N';
+                                nchars_given = true;
                                 nchars = value
                                     .as_ref()
                                     .and_then(|s| s.trim().parse::<usize>().ok())
@@ -2433,36 +2423,40 @@ fn builtin_read(argv: &[String], sh: &mut Shell) -> i32 {
     let mut eof = false;
     let mut count = 0usize;
     let mut pass_next = false;
-    loop {
-        if nchars > 0 && count >= nchars {
-            break;
-        }
-        let c = match posix::read_byte_from(fd) {
-            Some(c) => c,
-            None => {
-                eof = true;
+    // `read -n 0` / `-N 0`：bash 一个字节都不读（stdin 保持原位）、变量为
+    // 空、rc 0（实测：后续 read 拿到完整第一行）。
+    if !(nchars_given && nchars == 0) {
+        loop {
+            if nchars > 0 && count >= nchars {
                 break;
             }
-        };
-        if pass_next {
-            pass_next = false;
-            if c == b'\n' {
-                // A backslash-newline pair disappears from the input.
+            let c = match posix::read_byte_from(fd) {
+                Some(c) => c,
+                None => {
+                    eof = true;
+                    break;
+                }
+            };
+            if pass_next {
+                pass_next = false;
+                if c == b'\n' {
+                    // A backslash-newline pair disappears from the input.
+                    continue;
+                }
+                input_bytes.push(c);
+                count += 1;
                 continue;
+            }
+            if c == b'\\' && !raw {
+                pass_next = true;
+                continue;
+            }
+            if c == delim && !exact {
+                break;
             }
             input_bytes.push(c);
             count += 1;
-            continue;
         }
-        if c == b'\\' && !raw {
-            pass_next = true;
-            continue;
-        }
-        if c == delim && !exact {
-            break;
-        }
-        input_bytes.push(c);
-        count += 1;
     }
     if pass_next {
         // The input ended with a lone backslash: it is dropped.
@@ -2493,7 +2487,7 @@ fn builtin_read(argv: &[String], sh: &mut Shell) -> i32 {
         Some(value) => value.chars().collect(),
         None => vec![' ', '\t', '\n'],
     };
-    let fields = read_fields(&input, &ifs_chars, names.len());
+    let fields = read_fields(input.as_bytes(), &ifs_chars, names.len());
     for (name, value) in names.iter().zip(fields.iter()) {
         sh.env.insert(name.clone(), value.clone());
     }
@@ -3162,8 +3156,11 @@ fn builtin_pwd(argv: &[String], sh: &mut Shell) -> i32 {
             p
         }
     };
-    println!("{}", path);
-    0
+    // bash 检测 pwd 的写错误（`pwd > /dev/full` → `pwd: write error: ...`
+    // rc 1）；修复前 println! 在写失败时直接 panic（rc 101）。
+    let mut out = path.into_bytes();
+    out.push(b'\n');
+    write_stdout_checked(&out, "pwd")
 }
 
 // ---------------------------------------------------------------------------
@@ -3293,6 +3290,15 @@ fn builtin_source(argv: &[String], sh: &mut Shell) -> i32 {
             return 1;
         }
     };
+    // bash refuses to source a directory: `<cmd>: <name>: is a directory`
+    // (rc 1)，其中 <cmd> 是 `source` 或 `.`（argv[0]），<name> 是调用时的
+    // 原样拼写（相对路径保持相对）。修复前目录被当成空脚本静默成功 rc 0。
+    if let Some(st) = posix::stat_path(&path, true) {
+        if st.file_type == posix::FT_DIR {
+            eprintln!("wash: {}: {}: is a directory", argv[0], name);
+            return 1;
+        }
+    }
     let content = match posix::read_file(&path) {
         Some(c) => c,
         None => {
@@ -3454,6 +3460,32 @@ fn builtin_exec(argv: &[String], sh: &mut Shell) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
+// checked stdout writes
+// ---------------------------------------------------------------------------
+
+/// Write `bytes` to stdout (fd 1) and report failures bash-style.
+///
+/// bash 会对内建的 stdout 写入做错误检测：`echo hi > /dev/full` 报
+/// `<builtin>: write error: <strerror>` 并置 rc=1。这里必须绕过 Rust 的
+/// LineWriter 缓冲、直接对 fd 1 做 write(2)：
+///   1. 缓冲 write 失败会把数据留在缓冲区，executor 恢复重定向后进程退出
+///      的兜底 flush 会把残留字节泄漏到已恢复的真实 stdout（曾实测 `printf
+///      hi > /dev/full` 把 `hi` 漏到了终端）；
+///   2. errno 文案必须走单一真源 `posix::errno_message`（wash_strerror）。
+///
+/// fd 1 由 executor 的重定向机制管理，这里只写不关（ManuallyDrop）。
+fn write_stdout_checked(bytes: &[u8], name: &str) -> i32 {
+    use std::os::unix::io::FromRawFd;
+    let mut f = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(1) });
+    if let Err(e) = f.write_all(bytes) {
+        let code = e.raw_os_error().unwrap_or_else(posix::errno);
+        eprintln!("{}: write error: {}", name, posix::errno_message(code));
+        return 1;
+    }
+    0
+}
+
+// ---------------------------------------------------------------------------
 // echo
 // ---------------------------------------------------------------------------
 
@@ -3510,9 +3542,9 @@ fn builtin_echo(argv: &[String]) -> i32 {
         }
     }
 
-    let _ = std::io::stdout().write_all(&out);
-    let _ = std::io::stdout().flush();
-    0
+    // 写失败（如 `> /dev/full`）报 `echo: write error: <strerror>` rc=1，
+    // 与 bash 一致；成功 rc=0。
+    write_stdout_checked(&out, "echo")
 }
 
 // ---------------------------------------------------------------------------
@@ -3632,16 +3664,19 @@ fn builtin_printf(argv: &[String], sh: Option<&mut Shell>) -> i32 {
             2
         }
         PrintfOpt::Normal { format_idx } => {
-            let format = argv.get(format_idx).cloned().unwrap_or_default();
-            let args = argv.get(format_idx + 1..).unwrap_or(&[]);
-            if format.is_empty() {
+            // 只有「完全没有格式串」才是 usage 错误；`printf ""` 输出为空
+            // 但 rc 0（bash 实测），修复前空格式串被误报 usage rc 2。
+            if format_idx >= argv.len() {
                 eprintln!("wash: printf: usage: printf [-v var] format [arguments]");
                 return 2;
             }
-            let (bytes, conv_error) = printf_format(&format, args);
-            let _ = std::io::stdout().write_all(&bytes);
-            let _ = std::io::stdout().flush();
-            if conv_error {
+            let format = &argv[format_idx];
+            let args = argv.get(format_idx + 1..).unwrap_or(&[]);
+            let (bytes, conv_error) = printf_format(format, args);
+            // bash 也会检测 printf 的写错误（`printf hi > /dev/full` →
+            // `printf: write error: ...` rc 1）；转换错误与写错误都是 rc 1。
+            let werr = write_stdout_checked(&bytes, "printf");
+            if conv_error || werr != 0 {
                 1
             } else {
                 0
@@ -5119,9 +5154,20 @@ fn builtin_kill(argv: &[String], sh: &mut Shell) -> i32 {
             print_signal_table();
             return 0;
         }
-        // `kill -l SIGSPEC` → name for a number, number for a name.
+        // `kill -l` with a numeric spec: `0` is EXIT, and `128+N` maps back
+        // to signal N (bash: `kill -l 130` -> INT, `kill -l 192` -> RTMAX).
         let spec = &argv[2];
         if let Ok(n) = spec.trim().parse::<i32>() {
+            if n == 0 {
+                println!("EXIT");
+                return 0;
+            }
+            if (129..=192).contains(&n) {
+                if let Some(name) = signal_name(n - 128) {
+                    println!("{}", name);
+                    return 0;
+                }
+            }
             // 数字信号号 → 裸名（不含 SIG 前缀，与 bash 一致）。
             match signal_name(n) {
                 Some(name) => {
@@ -5163,16 +5209,17 @@ fn builtin_kill(argv: &[String], sh: &mut Shell) -> i32 {
         } else if opt == "s" {
             i += 1;
             if i >= argv.len() {
-                eprintln!("wash: {}", USAGE);
-                return 2;
+                // bash: `kill: -s: option requires an argument`（rc 1）。
+                eprintln!("wash: kill: -{}: option requires an argument", opt);
+                return 1;
             }
             sigspec = Some(argv[i].clone());
             i += 1;
         } else if opt == "n" {
             i += 1;
             if i >= argv.len() {
-                eprintln!("wash: {}", USAGE);
-                return 2;
+                eprintln!("wash: kill: -{}: option requires an argument", opt);
+                return 1;
             }
             sigspec = Some(argv[i].clone());
             i += 1;
@@ -5183,13 +5230,23 @@ fn builtin_kill(argv: &[String], sh: &mut Shell) -> i32 {
     }
 
     let sig = match &sigspec {
-        Some(s) => match canonical_signal(s) {
-            Some(name) => signal_to_num(&name),
-            None => {
-                eprintln!("wash: kill: {}: invalid signal specification", s);
-                return 1;
+        Some(s) => {
+            // 信号 0 是合法的 sigspec：不投递任何信号，仅做进程存在性探活
+            // （bash 实测：`kill -0 $$` / `kill -s 0 $$` / `kill -n 0 $$`
+            // rc 0；`kill -0` 无 pid 才报 usage rc 2）。修复前信号 0 被当成
+            // 非法信号报 `invalid signal specification`。
+            if s.trim().parse::<i32>().map(|n| n == 0).unwrap_or(false) {
+                0
+            } else {
+                match canonical_signal(s) {
+                    Some(name) => signal_to_num(&name),
+                    None => {
+                        eprintln!("wash: kill: {}: invalid signal specification", s);
+                        return 1;
+                    }
+                }
             }
-        },
+        }
         None => 15, // SIGTERM
     };
 
@@ -5207,10 +5264,13 @@ fn builtin_kill(argv: &[String], sh: &mut Shell) -> i32 {
         } else {
             (false, pidstr.as_str())
         };
-        let pid: i32 = match numstr.trim().parse() {
-            Ok(p) => p,
-            Err(_) => {
-                eprintln!("wash: kill: {}: arguments must be process or job IDs", pidstr);
+        // bash 接受任意 `int` 范围内的 pid；非数字或超出范围都报
+        // ``kill: `ARG': not a pid or valid job spec``（注意反引号包裹，
+        // 实测 `kill -0 10000000000` 与 `kill abc` 同文案，rc 1）。
+        let pid: i32 = match numstr.trim().parse::<i64>() {
+            Ok(p) if (i32::MIN as i64..=i32::MAX as i64).contains(&p) => p as i32,
+            _ => {
+                eprintln!("wash: kill: `{pidstr}': not a pid or valid job spec");
                 status = 1;
                 continue;
             }
@@ -5865,30 +5925,39 @@ fn builtin_ulimit(argv: &[String], _sh: &mut Shell) -> i32 {
         } else if v == "soft" {
             posix::rlimit(letter as u8, 0, 0, false).unwrap_or(0)
         } else {
-            match v.parse::<u64>() {
-                Ok(n) => {
-                    let factor = RES
-                        .iter()
-                        .find(|(_, c, _)| *c == letter)
-                        .map(|(_, _, f)| *f)
-                        .unwrap_or(1);
-                    // bash rejects a value whose scaled rlimit does not fit in
-                    // rlim_t with `ulimit: <value>: limit out of range` (rc 1).
-                    // checked_mul (never wrapping_mul) avoids both a debug-build
-                    // panic and a silently truncated / wrapped limit.
-                    match n.checked_mul(factor) {
-                        Some(raw) => raw,
-                        None => {
-                            eprintln!("wash: ulimit: {}: limit out of range", v);
-                            return 1;
-                        }
-                    }
-                }
-                Err(_) => {
-                    eprintln!("wash: ulimit: {}: invalid number", v);
-                    return 1;
-                }
+            // bash 的 ulimit 数值语义（MSYS2 bash 5.3 逐例实测标定）：
+            //   * `0x`/`0X` 前缀              → `invalid hex number` (rc 1)
+            //   * 其它非纯十进制数字           → `invalid number` (rc 1)
+            //     （`+5`、`12abc`、`1k`、空串、带空格都算）
+            //   * 纯数字按 **u64 回绕**（mod 2^64）：超长十进制串不会 clamp
+            //     （`2^128+1` 对 -t 回绕成 1 后照常尝试 setrlimit）
+            //   * 回绕值 > RLIM_INFINITY/factor → `limit out of range` (rc 1)
+            //     （-f 边界恰为 18014398509481983 = 2^64/1024：等于则照常
+            //      尝试 setrlimit，加 1 才 out of range）
+            //   * 否则原样尝试 setrlimit，失败走下方 `cannot modify limit`
+            //     的 errno 路径（如 `-f 1024` → EINVAL、`-n 2^64-1` → EPERM）
+            if v.starts_with("0x") || v.starts_with("0X") {
+                eprintln!("wash: ulimit: {}: invalid hex number", v);
+                return 1;
             }
+            if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
+                eprintln!("wash: ulimit: {}: invalid number", v);
+                return 1;
+            }
+            let mut wrapped: u64 = 0;
+            for b in v.bytes() {
+                wrapped = wrapped.wrapping_mul(10).wrapping_add((b - b'0') as u64);
+            }
+            let factor = RES
+                .iter()
+                .find(|(_, c, _)| *c == letter)
+                .map(|(_, _, f)| *f)
+                .unwrap_or(1);
+            if wrapped > INF / factor {
+                eprintln!("wash: ulimit: {}: limit out of range", v);
+                return 1;
+            }
+            wrapped * factor
         };
         if posix::rlimit(letter as u8, raw, raw, true).is_none() {
             // bash reports `ulimit: <resource name>: cannot modify limit:
