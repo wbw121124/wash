@@ -12,8 +12,8 @@
 | ---- | ---- | ---- |
 | `:` | full | 无参与带参数（`: foo`）均与 bash 一致 |
 | `true` / `false` | full | 退出码与 stdout 均一致 |
-| `echo` | full | `-n` / `-e` / `-E` / `--` 字面量 / 全部转义序列逐字节一致（`tests/bash_diff_echo_printf.sh` 100/100） |
-| `printf` | full | 全部转换说明符逐字节一致（`%s %d %i %o %u %x %X %e %E %f %g %G %a %A %c %b %q %%`、字段宽度/精度/`*`、`-v`），25 条定向探针全通过。两个历史缺陷（`%%` 死循环、非法数字静默）已修复并复测 |
+| `echo` | full | `-n` / `-e` / `-E` / `--` 字面量 / 全部转义序列逐字节一致（`tests/bash_diff_echo_printf.sh` 100/100）；stdout 写失败（如 `> /dev/full`）报 `echo: write error: <strerror>` rc=1，亦已对齐 |
+| `printf` | full | 全部转换说明符逐字节一致（`%s %d %i %o %u %x %X %e %E %f %g %G %a %A %c %b %q %%`、字段宽度/精度/`*`、`-v`），25 条定向探针全通过。历史缺陷（`%%` 死循环、非法数字静默、空格式串误报 usage、写错误静默）均已修复并复测 |
 | `cd` | full | 绝对/相对/逻辑(`/L`)/物理(`/P`)/`CDPATH`/`-`/`--`/空串/不存在/失败后 `PWD` 不变，全部一致（含 bash 的 `cd: too many arguments`，rc=2） |
 | `exit` | full | 无参/`42`/`300`/`-1`/被 source 的脚本内 `exit` 一致；`exit abc` 时 bash 报 `exit: abc: numeric argument required`、置 `$?=2`、**继续执行后续命令**，wash 已对齐 |
 | `export` | partial | `-p` / 无参 / `NAME=val` / `-n` / 非法标识符报错，格式逐字节一致。**差异**：①`export -f`（导出函数）wash 报 `export: -f: not supported`（rc=2），bash 是 `export: f: not a function`（rc=1）；②wash 不维护 bash 的 `BASH_*` / `BASHOPTS` / `BASH_VERSINFO` 等内部变量（shell 内部变量集合差异）；③`$_` 的导出属性处理与 bash 不同 |
@@ -21,15 +21,15 @@
 | `set` | partial | 选项处理（`-o` / `+o` / `-e` / `-f` / `-n`（noexec）/ `--` / 位置参数 / 非法选项报错）与 bash **逐字节一致**（`set -o`、`set +o` 全表比对通过）。**差异**：`set` 无参时 bash 打印整个变量表（含 `BASH_*` / `PIPESTATUS` / `RANDOM` / `SECONDS` 等内部变量），wash 只有自己的变量表，集合必然不同 |
 | `alias` | full | 无参列出 / `-p` / 定义 / 未定义别名报错 / 非法名报错 / 别名展开，一致 |
 | `unalias` | full | `-a` / 删单个 / 不存在 / **无参打印用法行**（rc=2），一致。注意 `unalias` 无参**不是**列出全部别名 |
-| `source` / `.` | full | 基本 / `.` 形式 / 带参数 / 不存在 / 无参 / 退出码透传 / `$0` 语义 / 查找顺序（无斜杠时**先查 `PATH`** 再回落当前目录），一致。差异仅在 `$0` 的**字面值**（两个二进制路径不同，GROUP K 改断言语义不变量） |
+| `source` / `.` | full | 基本 / `.` 形式 / 带参数 / 不存在 / 无参 / 退出码透传 / `$0` 语义 / 查找顺序（无斜杠时**先查 `PATH`** 再回落当前目录）/ 目录（`<cmd>: <path>: is a directory` rc=1），一致。差异仅在 `$0` 的**字面值**（两个二进制路径不同，GROUP K 改断言语义不变量） |
 | `eval` | full | 副作用 / 执行命令 / 空串 / 无参 / `eval 'exit 3'` 退出整 shell / 多词，一致 |
-| `exec` | full | `-a name` / 替换当前进程 / 命令不存在 / 无参，一致 |
+| `exec` | full | `-a name` / 替换当前进程 / 命令不存在（`<path>: No such file or directory` rc=127，shell 终止）/ 无参，一致；ENOEXEC 四类（坏解释器 / 二进制 / 目录 / 纯文本脚本回退）均逐字节对齐 |
 | `test` / `[` | full | 数值比较、字符串比较、`-z -n -f -d -e -r -w -x -s -L -h -b -c -p -S`、`!`、`-a`、`-o`、`-nt -ot -ef`、`[` `]` 形式、参数个数错误、缺右括号、八进制数值，全部逐字节一致 |
 | `type` | full | 无参 / `-t` / `-a` / `-f` / `-P`，全部逐字节一致 |
 | `command` | full | `-v` / `-V` / `-p` / `-a`（非法选项 rc=2）/ 无参直接执行，全部逐字节一致 |
 | `builtin` | full | 执行内建 / 非内建报错（rc=1）/ 无参列出内建清单，逐字节一致 |
 | `hash` | full | 无参 / `-t <name>` / `-l` / `-r` / `-p <path> <name>` 五种用法逐字节一致 |
-| `read` | full | `-r`/`-n`/`-d`/`-p`/`REPLY`/EOF rc=1/多变量/`IFS` 分隔均逐字节一致（含前缀赋值 `IFS=: read` 与空 `IFS=`） |
+| `read` | full | `-r`/`-n`/`-N`/`-d`/`-p`/`REPLY`/EOF rc=1/多变量/`IFS` 分隔均逐字节一致（含前缀赋值 `IFS=: read` 与空 `IFS=`）；`-n`/`-N` 按**裸字节**计数，不做 UTF-8 字符边界重编码 |
 | `pwd` | full | `pwd` / `-L` / `-P` 三种形式逐字节一致 |
 | `shift` | full | 基本位移 / 连续位移 / 计数按**十进制**解析 / 越界 rc=1，一致 |
 | `return` | partial | 已实现；sourced 脚本/函数内 `return n` 正常（rc=n）。**差异**：函数/source 外调用 bash 报中文（rc=2），wash 报英文（rc=1） |
@@ -37,9 +37,9 @@
 | `local` | partial | 已实现；函数内声明局部变量。差异：函数外调用 bash 报中文（rc=1），wash 报英文（rc=1） |
 | `declare` / `typeset` / `readonly` | partial | 已实现：赋值/`declare -i`/`declare -p`/`readonly` 可用。差异：数组下标展开 `${arr[@]}` 待补；`declare -p` 变量集合与 bash 不同（身份差异） |
 | `let` | partial | 已实现；`let expr` 算术赋值与 bash 一致。基础算术已对齐；`-p` 等选项待补 |
-| `ulimit` | deferred | 未实现（rc=127）。Phase 4 落地 |
+| `ulimit` | full | 选项解析（非法选项 usage rc=2）、十进制回绕、超范围 `limit out of range`、`invalid number` / `invalid hex number`、软硬限制查询均逐字节一致；setrlimit 成败取决于平台资源上限，诊断文案已对齐 |
 | `umask` / `times` | full | `umask`(`-S`/`-p`)/`times` 与 bash 逐字节一致（数值属运行时） |
-| `kill` | partial | **发信号路径已覆盖**：`kill -0 $$` rc=0、`kill -TERM $$` rc=143、`kill -TERM <子进程>` 后 `wait` 报 143；`kill -l 9` / `kill -l KILL` 一致。**三处差异**：①`kill -l` 全量清单格式不同；②`kill` 无参 bash 打自己的用法行（rc=2），wash 转发给外部 `/usr/bin/kill`（rc=1）；③非法信号名 / 不存在进程的错误文案不同 |
+| `kill` | partial | **发信号路径已覆盖**：`kill -0 $$` rc=0、`kill -TERM $$` rc=143、`kill -TERM <子进程>` 后 `wait` 报 143；`kill -l 9` / `kill -l KILL` 一致；信号 0 探活、不存在进程 `kill: (PID) - No such process`、无参 usage rc=2、非法 pid 文案、`kill -l 0/130` 均已对齐。**剩余差异**：`kill -l` 全量清单格式不同 |
 | `trap` | partial | 已实现；无参列出已设陷阱与 bash 一致。差异：信号说明符解析/`-p`/`-l`/`-P` 覆盖不完整 |
 | `dirs` / `pushd` / `popd` | partial | 已实现；`dirs`/`pushd dir` 与 bash 逐字节一致。差异：`popd` 空栈 wash 报英文（rc=1，bash 中文 rc=1，rc 已对齐） |
 | `help` | partial | 77 主题完整页 + 双 locale 清单逐字节对齐；正文/集合仍待对齐 bash（见有意偏离清单） |
