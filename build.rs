@@ -99,7 +99,23 @@ fn main() {
     }
     let sysroot = String::from_utf8_lossy(&out.stdout);
     let sysroot = sysroot.trim();
-    let candidate: PathBuf = PathBuf::from(sysroot).join("bin/gcc.exe");
+    // Windows/MSYS builds: the rustup/MSYS toolchain dir must contain the
+    // gcc.exe that build.rs binds to (see ci.yml -- the msys/rust package's
+    // sysroot IS /usr, so this is /usr/bin/gcc.exe).  Native Linux builds
+    // (WSL second oracle, CI linux runners, real deployments) use the
+    // distro's POSIX gcc: no `.exe` suffix, found either next to rustc in
+    // the sysroot or at the canonical /usr/bin/gcc.
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let candidate: PathBuf = if target_os == "linux" {
+        let in_sysroot = PathBuf::from(sysroot).join("bin/gcc");
+        if in_sysroot.exists() {
+            in_sysroot
+        } else {
+            PathBuf::from("/usr/bin/gcc")
+        }
+    } else {
+        PathBuf::from(sysroot).join("bin/gcc.exe")
+    };
     if !candidate.exists() {
         panic!(
             "{} not found; refusing to fall back to whatever gcc is first on PATH (see build.rs header)",
