@@ -26,7 +26,7 @@
 #       'cd <WASH_REPO> && bash tests/bash_diff_builtins.sh'
 #
 # Optional: ONLY_GROUP=A|K|B|C|D runs a single group.
-#   A = core semantics + finished builtins (634 cases: 340 + 33 brace-range
+#   A = core semantics + finished builtins (639 cases: 340 + 33 brace-range
 #       + 24 brace word-boundary + 15 brace nest/escape/quote-removal
 #       + 1 brace deep-nesting stack guard + 37 heredoc / herestring
 #       + 11 unclosed `$(` syntax-error fence
@@ -57,6 +57,8 @@
 #          raw 0xff must survive, never become U+FFFD or U+00FF)
 #       + 44 [[ ]] conditional-command fence (operators, ERE/BASH_REMATCH,
 #          no word splitting, bash's two-line malformed-expression diagnostics)
+#       + 5 quoted-token diagnostic fence (raw yytext quotes/escapes/$ prefix
+#          in the cond message, whitespace-truncated yacc near, escaped `=`)
 #       -> MUST stay green (regressions)
 #   K = KNOWN-DIFF: cannot be byte-equal by design (documented, not fixed)
 #   B = regression fence for already-fixed defects (GROUP B, 21 cases, green today)
@@ -1433,6 +1435,17 @@ run_case A cond-regex-two-grp   '[[ abc =~ ^(a)(b)c$ ]]; declare -p BASH_REMATCH
 run_case A cond-regex-fail      '[[ x =~ ^(a) ]]; echo R=$?; declare -p BASH_REMATCH'
 run_case A cond-regex-persist   '[[ abc =~ (b) ]]; echo one=${BASH_REMATCH[1]}; [[ -n x ]]; declare -p BASH_REMATCH'
 run_case A cond-regex-invalid   '[[ abc =~ a(b ]]; echo R=$?'
+
+# --- quoted-token diagnostic fence (5 cases) --------------------------------
+# bash renders a malformed cond token from its raw source text: the quotes,
+# escapes and the `$` of `$'...'` are kept in the conditional message, while
+# the yacc `near` line keeps only the tail after the last space.  An escaped
+# `=` is a literal word, not an operator (rc=2, not rc=0).
+run_case A cond-quoted-op-dq    '[[ a "=" a ]]; echo R=$?'
+run_case A cond-quoted-op-sq    "[[ a '=' a ]]; echo R=\$?"
+run_case A cond-quoted-op-esc   '[[ a \= a ]]; echo R=$?'
+run_case A cond-quoted-op-ansi  '[[ a $'"'"'='"'"' a ]]; echo R=$?'
+run_case A cond-quoted-space    '[[ a "b c" d ]]; echo R=$?'
 
 # GROUP B -- regression fence for already-fixed defects (21 cases, green today).
 # (每条用例都曾是真实缺陷，修复后留在这里作为回归栅栏：通过 run_case 同时跑

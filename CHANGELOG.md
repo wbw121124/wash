@@ -55,6 +55,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **`[[ ]]` 畸形诊断的 quoted token 渲染**：此前 `WordPart` 只记录「是否 quoted」，
+  丢失引号类型与原始源码文本，导致 `[[ a "=" a ]]` 输出 `unexpected token \`='`
+  而不是 bash 的 `` `"="'``。词法层为 cond 词新增 `Token::CondWord(parts, raw)`，
+  随词携带 `chars[word_start..i]` 原始文本；conditional 消息用 raw `yytext`（`$'...'`
+  去掉 `$` 前缀），yacc `syntax error near` 行取最后一个空白之后的尾部；被转义的
+  运算符（`\=`）不再被当成运算符（rc=2 对齐）。新增 5 条 GROUP A 栅栏，A 组
+  634 → 639，全量 880 → 885。
 - **Cargo 版本号补齐并与 git tag 对齐**：`Cargo.toml` / `Cargo.lock` 升到 **0.2.1**
   （此前 `v0.2.1` tag 已打，清单却仍写 0.2.0，所有版本行因此输出旧版本）；
   `po/en.po` / `po/zh_CN.po` 的 `Project-Id-Version` 由生成脚本同步。

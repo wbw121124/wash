@@ -11,7 +11,7 @@ wash 分阶段推进。命令/语法层面以 GNU bash 5.3 逐字节兼容为硬
 | 1 | 展开系统：变量、花括号（含 range）、命令替换、算术、波浪号、glob、分词、参数运算 | 已完成（oracle 20/20） |
 | 2 | 作业控制：`&` / `jobs` / `fg` / `bg` / `wait` / 信号 | 待开始 |
 | 3 | 控制流与函数：`if` / `for` / `while` / `until` / `case`、函数 | 基本完成（`select` 未实现） |
-| 4 | 高级内建与特性：数组、`[[ ]]`（已完成，44 条逐字节栅栏）、`(( ))` 算术命令、`declare`、`mapfile`、`trap` 等 | 进行中/部分，见 [兼容性矩阵](compatibility.md) |
+| 4 | 高级内建与特性：数组、`[[ ]]`（已完成，49 条逐字节栅栏）、`(( ))` 算术命令、`declare`、`mapfile`、`trap` 等 | 进行中/部分，见 [兼容性矩阵](compatibility.md) |
 | 5 | 长尾 100% 兼容：边缘语义、locale、shopt 等 | 进行中/部分 |
 | 6 | 交互式 REPL（fish 风格） | 已完成，见 [架构](architecture.md) |
 | 7 | 二进制插件系统（wash C ABI）与 0.2.0 发布 | 已完成，见 [插件](plugins.md) |

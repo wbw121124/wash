@@ -105,6 +105,14 @@ pub enum RedirKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Token {
     Word(Vec<WordPart>),
+    /// A word inside `[[ ... ]]`.  bash's conditional parser and yacc layer
+    /// render the offending token from its raw source text (`yytext`), which
+    /// keeps the original quotes and escapes (`[[ a "=" a ]]` prints
+    /// ``unexpected token `"="'``, not ``unexpected token `='``).  `WordPart`
+    /// only records *whether* a part was quoted, so the exact source text is
+    /// carried alongside the parts.  Semantically this is identical to
+    /// `Word`; the raw text is used only by cond diagnostics.
+    CondWord(Vec<WordPart>, String),
     /// A reserved word in command position (`if`, `then`, `elif`, `else`,
     /// `fi`).  Bash only recognises a reserved word where a command may
     /// start, so `echo fi` still passes "fi" as an ordinary argument.
@@ -239,6 +247,10 @@ fn push_word(
     redirect_target: &mut bool,
     cond_depth: &mut usize,
     cond_regex_rhs: &mut bool,
+    // The raw source characters of this word, from its first character up
+    // to (but excluding) the delimiter that ended it.  Only cond words keep
+    // it: bash renders malformed `[[ ]]` tokens from their raw `yytext`.
+    word_chars: &[char],
 ) {
     if *redirect_target {
         // The word is the target of a redirection: it is not a command word
@@ -272,8 +284,11 @@ fn push_word(
             *cond_regex_rhs = true;
         }
         // Inside a conditional expression no word is a reserved word:
-        // `[[ if == if ]]` compares the two words.
-        tokens.push(Token::Word(parts));
+        // `[[ if == if ]]` compares the two words.  Keep the raw source
+        // text so a malformed expression can render the token exactly as
+        // bash does (quotes and escapes included).
+        let raw: String = word_chars.iter().collect();
+        tokens.push(Token::CondWord(parts, raw));
         *at_command_start = false;
         return;
     }
@@ -1024,6 +1039,10 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
     let mut parts: Vec<WordPart> = Vec::new();
     let mut pending = String::new();
     let mut pending_quoted = false;
+    // Character index where the current word began.  bash renders malformed
+    // `[[ ]]` tokens from their raw source text, so cond words keep the
+    // `chars[word_start..i]` slice.  Reset whenever a new word starts.
+    let mut word_start: usize = 0;
     let mut in_single = false;
     let mut in_double = false;
     // 1-based source line number (bash counts every physical line, including
@@ -1075,6 +1094,14 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
 
     while i < n {
         let c = chars[i];
+        // A word starts at the first character after the previous word or
+        // operator was flushed.  Once characters are being accumulated the
+        // start stays put until the word is pushed.  A quote opened at the
+        // very start of a word is part of that word, so do not reset inside
+        // a quoting context (that would drop the opening `"` / `'`).
+        if !in_single && !in_double && parts.is_empty() && pending.is_empty() {
+            word_start = i;
+        }
 
         if in_single {
             if c == '\'' {
@@ -1254,6 +1281,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                         &mut redirect_target,
                         &mut cond_depth,
                         &mut cond_regex_rhs,
+                        &chars[word_start..i],
                     );
                 }
                 i += 1;
@@ -1270,6 +1298,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                         &mut redirect_target,
                         &mut cond_depth,
                         &mut cond_regex_rhs,
+                        &chars[word_start..i],
                     );
                 }
                 // A here-document operator seen on this line starts reading
@@ -1310,6 +1339,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                         &mut redirect_target,
                         &mut cond_depth,
                         &mut cond_regex_rhs,
+                        &chars[word_start..i],
                     );
                 }
                 // `||` is the OR operator; a single `|` still starts a
@@ -1334,6 +1364,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                         &mut redirect_target,
                         &mut cond_depth,
                         &mut cond_regex_rhs,
+                        &chars[word_start..i],
                     );
                 }
                 // A redirection left without a target word immediately before
@@ -1376,6 +1407,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                         &mut redirect_target,
                         &mut cond_depth,
                         &mut cond_regex_rhs,
+                        &chars[word_start..i],
                     );
                 }
                 if i + 1 < n && chars[i + 1] == '&' {
@@ -1455,6 +1487,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                         &mut redirect_target,
                         &mut cond_depth,
                         &mut cond_regex_rhs,
+                        &chars[word_start..i],
                     );
                 }
                 if i + 1 < n && chars[i + 1] == '&' {
@@ -1494,6 +1527,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                         &mut redirect_target,
                         &mut cond_depth,
                         &mut cond_regex_rhs,
+                        &chars[word_start..i],
                     );
                 }
                 if i + 1 < n && chars[i + 1] == '&' {
@@ -1698,6 +1732,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                         &mut redirect_target,
                         &mut cond_depth,
                         &mut cond_regex_rhs,
+                        &chars[word_start..i],
                     );
                 }
                 tokens.push(Token::Word(vec![WordPart::Text(c.to_string(), false)]));
@@ -1750,6 +1785,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
             &mut redirect_target,
             &mut cond_depth,
             &mut cond_regex_rhs,
+            &chars[word_start..i],
         );
     }
 

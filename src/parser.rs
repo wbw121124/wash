@@ -1258,7 +1258,10 @@ fn parse_simple(tokens: &[Token]) -> Result<SimpleCommand> {    let mut argv: Ve
 
     while i < tokens.len() {
         match &tokens[i] {
-            Token::Word(parts) => {
+            // `CondWord` only occurs inside `[[ ... ]]` and is consumed by
+            // `parse_cond_compound`; treat it as an ordinary word here so an
+            // unexpected one degrades gracefully instead of panicking.
+            Token::Word(parts) | Token::CondWord(parts, _) => {
                 if !seen_command {
                     if is_array_assignment_head(parts, tokens, i) {
                         match parse_array_assignment(tokens, &mut i) {

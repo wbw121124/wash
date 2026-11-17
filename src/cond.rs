@@ -113,7 +113,10 @@ pub fn parse_cond(tokens: &[Token], start: usize, line: usize) -> Result<(CondEx
     // bash's grammar rejects a bare `[[ ]]` at the yacc level: it prints only
     // "syntax error near <token-after-]]>", with no conditional message line.
     if matches!(tokens.get(start), Some(Token::CondEnd)) {
-        let after = tokens.get(start + 1).map(render_token).unwrap_or_default();
+        let after = tokens
+            .get(start + 1)
+            .map(render_token_near)
+            .unwrap_or_default();
         let mut err = WashError::syntax("");
         err.family = DiagnosticFamily::CondExpr;
         err.open_line = line;
@@ -136,7 +139,7 @@ pub fn parse_cond(tokens: &[Token], start: usize, line: usize) -> Result<(CondEx
                 ce.near = p
                     .tokens
                     .get(p.pos + 1)
-                    .map(render_token)
+                    .map(render_token_near)
                     .unwrap_or_default();
             }
             return Err(ce.into_wash_error());
@@ -146,11 +149,12 @@ pub fn parse_cond(tokens: &[Token], start: usize, line: usize) -> Result<(CondEx
     match p.tokens.get(p.pos) {
         Some(Token::CondEnd) => Ok((expr, p.pos + 1)),
         Some(other) => {
-            let near = render_token(other);
+            let full = render_token(other);
+            let near = render_token_near(other);
             Err(CondError::new(
                 format!(
                     "syntax error in conditional expression: unexpected token `{}'",
-                    near
+                    full
                 ),
                 line,
                 near,
@@ -228,46 +232,48 @@ impl<'a> CondParser<'a> {
                 self.line,
                 "]]",
             )),
-            Token::Word(parts) if is_paren_open(parts) => {
+            Token::Word(parts) | Token::CondWord(parts, _) if is_paren_open(parts) => {
                 self.pos += 1;
                 let inner = self.parse_expr()?;
                 self.skip_newlines();
                 match self.peek() {
-                    Some(Token::Word(p)) if is_paren_close(p) => {
+                    Some(Token::Word(p)) | Some(Token::CondWord(p, _)) if is_paren_close(p) => {
                         self.pos += 1;
                         Ok(CondExpr::Group(Box::new(inner)))
                     }
                     other => {
-                        let near = other.map(render_token).unwrap_or_default();
+                        let full = other.map(render_token).unwrap_or_default();
+                        let near = other.map(render_token_near).unwrap_or_default();
                         Err(CondError::new(
-                            format!("unexpected token `{}', expected `)'", near),
+                            format!("unexpected token `{}', expected `)'", full),
                             self.line,
                             near,
                         ))
                     }
                 }
             }
-            Token::Word(parts) if is_bang(parts) => {
+            Token::Word(parts) | Token::CondWord(parts, _) if is_bang(parts) => {
                 self.pos += 1;
                 let inner = self.parse_term()?;
                 Ok(CondExpr::Not(Box::new(inner)))
             }
-            Token::Word(parts) if is_unary_op(parts) => {
+            Token::Word(parts) | Token::CondWord(parts, _) if is_unary_op(parts) => {
                 let op = render_word(parts);
                 self.pos += 1;
                 match self.peek() {
-                    Some(Token::Word(operand)) => {
+                    Some(Token::Word(operand)) | Some(Token::CondWord(operand, _)) => {
                         let operand = operand.clone();
                         self.pos += 1;
                         self.skip_newlines();
                         Ok(CondExpr::Unary { op, operand })
                     }
                     other => {
-                        let near = other.map(render_token).unwrap_or_default();
+                        let full = other.map(render_token).unwrap_or_default();
+                        let near = other.map(render_token_near).unwrap_or_default();
                         Err(CondError::new(
                             format!(
                                 "unexpected argument `{}' to conditional unary operator",
-                                near
+                                full
                             ),
                             self.line,
                             near,
@@ -275,7 +281,7 @@ impl<'a> CondParser<'a> {
                     }
                 }
             }
-            Token::Word(parts) => {
+            Token::Word(parts) | Token::CondWord(parts, _) => {
                 let lhs = parts.clone();
                 self.pos += 1;
                 // The binary operator.  bash reads the next token *without*
@@ -284,6 +290,14 @@ impl<'a> CondParser<'a> {
                 let op_tok = self.peek().cloned();
                 match op_tok {
                     Some(Token::Word(w)) if is_binop(&w) => {
+                        let op = render_word(&w);
+                        self.pos += 1;
+                        self.binary_rhs(op, lhs)
+                    }
+                    // An escaped operator (`\=`) is a literal word, not an
+                    // operator.  `WordPart` drops the backslash, but the raw
+                    // source text still has it.
+                    Some(Token::CondWord(w, raw)) if is_binop(&w) && !raw.contains('\\') => {
                         let op = render_word(&w);
                         self.pos += 1;
                         self.binary_rhs(op, lhs)
@@ -300,16 +314,19 @@ impl<'a> CondParser<'a> {
                             operand: lhs,
                         })
                     }
-                    Some(Token::Word(w)) if is_paren_close(&w) => Ok(CondExpr::Unary {
-                        op: "-n".to_string(),
-                        operand: lhs,
-                    }),
+                    Some(Token::Word(w)) | Some(Token::CondWord(w, _)) if is_paren_close(&w) => {
+                        Ok(CondExpr::Unary {
+                            op: "-n".to_string(),
+                            operand: lhs,
+                        })
+                    }
                     other => {
-                        let near = other.as_ref().map(render_token).unwrap_or_default();
+                        let full = other.as_ref().map(render_token).unwrap_or_default();
+                        let near = other.as_ref().map(render_token_near).unwrap_or_default();
                         Err(CondError::new(
                             format!(
                                 "unexpected token `{}', conditional binary operator expected",
-                                near
+                                full
                             ),
                             self.line,
                             near,
@@ -318,9 +335,10 @@ impl<'a> CondParser<'a> {
                 }
             }
             other => {
-                let near = render_token(other);
+                let full = render_token(other);
+                let near = render_token_near(other);
                 Err(CondError::new(
-                    format!("unexpected token `{}' in conditional command", near),
+                    format!("unexpected token `{}' in conditional command", full),
                     self.line,
                     near,
                 ))
@@ -335,18 +353,19 @@ impl<'a> CondParser<'a> {
         lhs: Vec<WordPart>,
     ) -> std::result::Result<CondExpr, CondError> {
         match self.peek() {
-            Some(Token::Word(rhs)) => {
+            Some(Token::Word(rhs)) | Some(Token::CondWord(rhs, _)) => {
                 let rhs = rhs.clone();
                 self.pos += 1;
                 self.skip_newlines();
                 Ok(CondExpr::Binary { op, lhs, rhs })
             }
             other => {
-                let near = other.map(render_token).unwrap_or_default();
+                let full = other.map(render_token).unwrap_or_default();
+                let near = other.map(render_token_near).unwrap_or_default();
                 Err(CondError::new(
                     format!(
                         "unexpected argument `{}' to conditional binary operator",
-                        near
+                        full
                     ),
                     self.line,
                     near,
@@ -418,10 +437,13 @@ pub fn render_cond(expr: &CondExpr) -> String {
     }
 }
 
-/// The token text bash prints in its diagnostics (`error_token_from_token`).
-fn render_token(tok: &Token) -> String {
+/// The raw source text of a token.  This is what bash's yacc layer uses for
+/// `syntax error near ...`: quotes, escapes and the `$` of `$'...'` are all
+/// preserved verbatim.
+fn raw_token(tok: &Token) -> String {
     match tok {
         Token::Word(parts) => render_word(parts),
+        Token::CondWord(_, raw) => raw.clone(),
         Token::CondEnd => "]]".to_string(),
         Token::CondOp(op) => op.clone(),
         Token::CondNumber(n) => n.clone(),
@@ -436,6 +458,30 @@ fn render_token(tok: &Token) -> String {
         Token::Compound(_) => "compound".to_string(),
         Token::FunctionDef(name) => name.clone(),
         Token::Redirect { .. } => "redirection".to_string(),
+    }
+}
+
+/// The token text in the conditional parser's own diagnostic.  It is the raw
+/// source text except that bash drops the `$` prefix of an ANSI-C / locale
+/// quoted word (`[[ a $'=' a ]]` reports ```'=''`` while its yacc line keeps
+/// ``$'='``).
+fn render_token(tok: &Token) -> String {
+    let raw = raw_token(tok);
+    if matches!(tok, Token::CondWord(_, _)) && (raw.starts_with("$'") || raw.starts_with("$\"")) {
+        return raw[1..].to_string();
+    }
+    raw
+}
+
+/// The token text in bash's yacc-layer `syntax error near ...` line.  bash's
+/// `error_token_from_token` returns only the tail after the last space or tab
+/// when the token contains one (`[[ a "b c" d ]]` shows `"b c"` in the
+/// conditional message but `c"` in the yacc line).
+fn render_token_near(tok: &Token) -> String {
+    let full = raw_token(tok);
+    match full.rfind(|c| c == ' ' || c == '\t') {
+        Some(idx) => full[idx + 1..].to_string(),
+        None => full,
     }
 }
 
