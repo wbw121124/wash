@@ -44,6 +44,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   **0.42x / 0.38x**、VmRSS **0.65x / 0.65x**，7 项负载全部 < 1.00x。
   UX 维度（语法高亮 / ghost 建议 / Tab 补全 / 多行编辑）由 `tests/e2e/` 覆盖；
   非交互 `-c` 的逐字节兼容闸门不放宽。
+- **`[[ ... ]]` 条件命令已实现并与 bash 5.3 逐字节对齐**：新增 `src/cond.rs`
+  （递归下降解析 + 求值），词法层新增 `COND_START`/`COND_END`/`COND_OP`/
+  `COND_NUMBER`/`COND_NEWLINE` 与 `PST_REGEXP` 状态（`=~` 右侧的 `|`/`(` 按
+  bash `parse_matched_pair` 规则处理），执行器把 `=~` 捕获组写入 `BASH_REMATCH`。
+  覆盖单目/双目/文件/数值/字符串/模式/ERE 运算、`!`/`&&`/`||`/分组、`[[ ]]`
+  内不做词分割，以及畸形表达式**两行诊断**（含 yacc `syntax error near` 行与
+  未闭合 `(` 的词法 EOF 行）。`tests/bash_diff_builtins.sh` GROUP A 新增 44 条
+  逐字节栅栏（rc + stdout + 仅剥 shell 名前缀的 stderr），A 组 590 → 634。
 
 ### Fixed
 

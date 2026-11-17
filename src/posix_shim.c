@@ -798,3 +798,82 @@ const char *wash_dlerror(void) {
 const char *wash_strerror(int code) {
     return strerror(code);
 }
+
+// --- POSIX 正则 ([[ ... =~ ... ]]) ----------------------------------------
+//
+// bash 的 `[[ str =~ re ]]` 直接调用 libc 的 regcomp/regexec（POSIX
+// ERE）。本平台（MSYS2/Cygwin）上的 bash 用的就是同一份实现，所以把
+// 正则交给 libc 可以逐字节复刻 bash 的匹配语义 *和* 错误文案
+// （例如 "brackets ([ ]) not balanced"），无需自研正则引擎。
+//
+// regex_t 对 Rust 是不透明结构，这里在 C 侧持有它，只向 Rust 暴露
+// 指针级别的句柄与编译/匹配/取错四个动作。
+#include <regex.h>
+
+struct wash_regex {
+    regex_t re;
+};
+
+void *wash_regex_new(void) {
+    struct wash_regex *r = (struct wash_regex *)malloc(sizeof(struct wash_regex));
+    if (r != NULL) {
+        memset(r, 0, sizeof(*r));
+    }
+    return r;
+}
+
+void wash_regex_free(void *p) {
+    struct wash_regex *r = (struct wash_regex *)p;
+    if (r == NULL) {
+        return;
+    }
+    regfree(&r->re);
+    free(r);
+}
+
+// 编译；返回 regcomp 的错误码（0 表示成功）。
+int wash_regex_compile(void *p, const char *pattern, int cflags) {
+    struct wash_regex *r = (struct wash_regex *)p;
+    return regcomp(&r->re, pattern, cflags);
+}
+
+// regerror：把错误码翻译成 libc 的文案，写入 buf 并返回写入长度。
+int wash_regex_error(int code, void *p, char *buf, size_t buflen) {
+    struct wash_regex *r = (struct wash_regex *)p;
+    return regerror(code, &r->re, buf, buflen);
+}
+
+// 子表达式数量（re_nsub）。
+size_t wash_regex_nsub(void *p) {
+    struct wash_regex *r = (struct wash_regex *)p;
+    return (size_t)r->re.re_nsub;
+}
+
+// 匹配；starts/ends 长度需 >= nsub+1。返回 0 表示匹配，1 表示不匹配，
+// 其它值是 regexec 的错误码。
+int wash_regex_exec(void *p, const char *s, long *starts, long *ends, size_t cap) {
+    struct wash_regex *r = (struct wash_regex *)p;
+    regmatch_t *m = NULL;
+    size_t n = 0;
+    size_t i;
+
+    if (cap > 0) {
+        n = (size_t)r->re.re_nsub + 1;
+        if (n > cap) {
+            n = cap;
+        }
+        m = (regmatch_t *)calloc(n, sizeof(regmatch_t));
+        if (m == NULL) {
+            return 2;
+        }
+    }
+    int rc = regexec(&r->re, s, n, m, 0);
+    if (rc == 0 && m != NULL) {
+        for (i = 0; i < n; i++) {
+            starts[i] = (long)m[i].rm_so;
+            ends[i] = (long)m[i].rm_eo;
+        }
+    }
+    free(m);
+    return rc;
+}

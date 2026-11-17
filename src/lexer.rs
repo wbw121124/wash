@@ -115,6 +115,27 @@ pub enum Token {
     Reserved(String, usize),
     /// A compound command (`if ... fi`) that has already been parsed.
     Compound(crate::parser::Compound),
+    /// `[[` — opens a conditional expression.  bash's COND_START: it is
+    /// recognised only where a command may start, exactly like a reserved
+    /// word, so `echo [[` prints `[[`.
+    CondStart(usize),
+    /// `]]` — closes a conditional expression (bash's COND_END).  It must
+    /// be a word of its own: bash lexes the *word* `]]` as the reserved
+    /// word COND_END, so `abc]]` stays an ordinary word and the expression
+    /// is left unterminated.
+    CondEnd,
+    /// `<` or `>` inside `[[ ... ]]` — the string comparison operators.
+    /// bash returns them as the character tokens `<` / `>`; inside a
+    /// conditional expression they are never redirections.
+    CondOp(String),
+    /// A word of only digits immediately followed by `<`/`>` inside
+    /// `[[ ... ]]`.  bash lexes such a word as a NUMBER token, which the
+    /// conditional parser rejects ("unexpected token `2' in conditional
+    /// command").
+    CondNumber(String),
+    /// A newline inside `[[ ... ]]`.  bash's lexer returns the character
+    /// '\n'; the conditional parser skips it only at the start of a term.
+    CondNewline,
     /// A shell function definition (`NAME() { ... }` or `function NAME { ... }`).
     /// Carries the function name; the body lives in `CommandList::func_defs`.
     FunctionDef(String),
@@ -216,12 +237,51 @@ fn push_word(
     line: usize,
     at_command_start: &mut bool,
     redirect_target: &mut bool,
+    cond_depth: &mut usize,
+    cond_regex_rhs: &mut bool,
 ) {
     if *redirect_target {
         // The word is the target of a redirection: it is not a command word
         // and it does not change the command position.
         *redirect_target = false;
         tokens.push(Token::Word(parts));
+        return;
+    }
+    // `[[` and `]]` delimit a conditional expression.  `[[` opens it and is
+    // only recognised where a command may start; `]]` closes it and must be
+    // a word of its own (bash lexes the *word* `]]` as the reserved word
+    // COND_END, so `abc]]` remains an ordinary word).
+    let plain = match parts.as_slice() {
+        [WordPart::Text(text, false)] => Some(text.as_str()),
+        _ => None,
+    };
+    if *cond_depth > 0 {
+        if plain == Some("]]") {
+            *cond_regex_rhs = false;
+            tokens.push(Token::CondEnd);
+            *cond_depth = 0;
+            *at_command_start = true;
+            return;
+        }
+        // bash's COND_REGEXP state: on the word following an unquoted `=~`,
+        // `|`, `(` and `)` are ordinary pattern characters rather than
+        // operators, so `[[ x =~ ^(a|b)$ ]]` keeps them in one word.
+        if *cond_regex_rhs {
+            *cond_regex_rhs = false;
+        } else if plain == Some("=~") {
+            *cond_regex_rhs = true;
+        }
+        // Inside a conditional expression no word is a reserved word:
+        // `[[ if == if ]]` compares the two words.
+        tokens.push(Token::Word(parts));
+        *at_command_start = false;
+        return;
+    }
+    if plain == Some("[[") && *at_command_start {
+        tokens.push(Token::CondStart(line));
+        *cond_depth = 1;
+        // The word after `[[` is an operand, not a command word.
+        *at_command_start = false;
         return;
     }
     let reserved = match parts.as_slice() {
@@ -242,6 +302,37 @@ fn push_word(
     }
     tokens.push(Token::Word(parts));
     *at_command_start = false;
+}
+
+/// Lex a `<` or `>` inside a conditional expression: the bracket is the
+/// string comparison operator, not a redirection.
+///
+/// bash lexes a word of only digits that is *immediately* followed by the
+/// bracket as a NUMBER token (`2>1` is `NUMBER 2`, `>` , `1`); the
+/// conditional parser rejects a NUMBER with "unexpected token `2' in
+/// conditional command".  A quoted or non-numeric word stays an ordinary
+/// word.
+fn cond_angle(
+    tokens: &mut Vec<Token>,
+    parts: &mut Vec<WordPart>,
+    pending: &mut String,
+    pending_quoted: bool,
+    ch: char,
+) {
+    let all_digits = parts.is_empty()
+        && !pending.is_empty()
+        && pending.bytes().all(|b| b.is_ascii_digit());
+    if all_digits {
+        tokens.push(Token::CondNumber(std::mem::take(pending)));
+    } else {
+        if !pending.is_empty() {
+            parts.push(WordPart::Text(std::mem::take(pending), pending_quoted));
+        }
+        if !parts.is_empty() {
+            tokens.push(Token::Word(std::mem::take(parts)));
+        }
+    }
+    tokens.push(Token::CondOp(ch.to_string()));
 }
 
 /// Whether the word being built is an assignment word (`NAME=...` /
@@ -963,6 +1054,14 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
     // Set right after a redirection: the next word is the redirection's
     // target, not a command word.
     let mut redirect_target = false;
+    // Depth of nested `[[ ... ]]` conditional expressions.  While it is
+    // non-zero the lexer produces the conditional grammar's tokens (`]]`,
+    // the `<`/`>` comparison operators, newlines) instead of redirections
+    // and reserved words.
+    let mut cond_depth: usize = 0;
+    // True while lexing the word after an unquoted `=~` inside `[[ ]]`: bash's
+    // COND_REGEXP state keeps `|`, `(` and `)` inside that word.
+    let mut cond_regex_rhs = false;
 
     // Flush the current `pending` literal buffer into a `Text` part. `quoted`
     // must reflect whether the buffered characters came from a quoted context
@@ -1153,6 +1252,8 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                         line_no,
                         &mut at_command_start,
                         &mut redirect_target,
+                        &mut cond_depth,
+                        &mut cond_regex_rhs,
                     );
                 }
                 i += 1;
@@ -1167,6 +1268,8 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                         line_no,
                         &mut at_command_start,
                         &mut redirect_target,
+                        &mut cond_depth,
+                        &mut cond_regex_rhs,
                     );
                 }
                 // A here-document operator seen on this line starts reading
@@ -1175,9 +1278,26 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                 let (next_i, body_lines) =
                     collect_heredocs(&mut tokens, &mut pending_heredocs, &chars, i + 1);
                 line_no += 1 + body_lines;
-                tokens.push(Token::Semicolon);
-                at_command_start = true;
+                if cond_depth > 0 {
+                    // Inside `[[ ]]` a newline is a token of its own: the
+                    // conditional parser skips it only at the start of a term.
+                    tokens.push(Token::CondNewline);
+                } else {
+                    tokens.push(Token::Semicolon);
+                    at_command_start = true;
+                }
                 i = next_i;
+            }
+            '|' if cond_depth > 0 && cond_regex_rhs => {
+                // In bash's COND_REGEXP state a `|` (even a doubled one) is a
+                // regex alternation character, not the `||` cond operator.
+                pending.push('|');
+                if i + 1 < n && chars[i + 1] == '|' {
+                    pending.push('|');
+                    i += 2;
+                } else {
+                    i += 1;
+                }
             }
             '|' => {
                 flush_text(&mut pending, &mut parts, pending_quoted);
@@ -1188,6 +1308,8 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                         line_no,
                         &mut at_command_start,
                         &mut redirect_target,
+                        &mut cond_depth,
+                        &mut cond_regex_rhs,
                     );
                 }
                 // `||` is the OR operator; a single `|` still starts a
@@ -1210,6 +1332,8 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                         line_no,
                         &mut at_command_start,
                         &mut redirect_target,
+                        &mut cond_depth,
+                        &mut cond_regex_rhs,
                     );
                 }
                 // A redirection left without a target word immediately before
@@ -1230,6 +1354,13 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                 i += 1;
             }
             '<' => {
+                if cond_depth > 0 {
+                    // Inside `[[ ]]` the bracket is the string comparison
+                    // operator, not a redirection.
+                    cond_angle(&mut tokens, &mut parts, &mut pending, pending_quoted, '<');
+                    i += 1;
+                    continue;
+                }
                 // A digit run immediately before the operator is the redirected
                 // descriptor (`0<file`, `2>err`).  It MUST be consumed before
                 // flushing `pending` into a word, otherwise it becomes an extra
@@ -1243,6 +1374,8 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                         line_no,
                         &mut at_command_start,
                         &mut redirect_target,
+                        &mut cond_depth,
+                        &mut cond_regex_rhs,
                     );
                 }
                 if i + 1 < n && chars[i + 1] == '&' {
@@ -1304,6 +1437,13 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                 }
             }
             '>' => {
+                if cond_depth > 0 {
+                    // Inside `[[ ]]` the bracket is the string comparison
+                    // operator, not a redirection.
+                    cond_angle(&mut tokens, &mut parts, &mut pending, pending_quoted, '>');
+                    i += 1;
+                    continue;
+                }
                 let fd = take_digit_prefix(&mut pending);
                 flush_text(&mut pending, &mut parts, pending_quoted);
                 if !parts.is_empty() {
@@ -1313,6 +1453,8 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                         line_no,
                         &mut at_command_start,
                         &mut redirect_target,
+                        &mut cond_depth,
+                        &mut cond_regex_rhs,
                     );
                 }
                 if i + 1 < n && chars[i + 1] == '&' {
@@ -1350,6 +1492,8 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                         line_no,
                         &mut at_command_start,
                         &mut redirect_target,
+                        &mut cond_depth,
+                        &mut cond_regex_rhs,
                     );
                 }
                 if i + 1 < n && chars[i + 1] == '&' {
@@ -1506,6 +1650,40 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                     i += 1;
                 }
             }
+            '(' if cond_depth > 0 && cond_regex_rhs => {
+                // bash's `PST_REGEXP` state consumes a whole matched pair via
+                // `parse_matched_pair`: `a(b)c` stays ONE regex word, while an
+                // unmatched `(` is a lexer EOF error (not a regex error).
+                let mut depth = 1usize;
+                pending.push('(');
+                i += 1;
+                while i < n && depth > 0 {
+                    let ch = chars[i];
+                    if ch == '\\' && i + 1 < n {
+                        pending.push(ch);
+                        pending.push(chars[i + 1]);
+                        i += 2;
+                        continue;
+                    }
+                    if ch == '(' {
+                        depth += 1;
+                    } else if ch == ')' {
+                        depth -= 1;
+                    }
+                    pending.push(ch);
+                    i += 1;
+                }
+                if depth > 0 {
+                    return Err(WashError::syntax_unclosed(
+                        DiagnosticFamily::CondRegexEof,
+                        line_no,
+                        "unexpected EOF while looking for matching `)'",
+                    ));
+                }
+            }
+            // bash only special-cases `(` and `|` in PST_REGEXP: a lone `)`
+            // stays a delimiter, so it falls through to the normal branch and
+            // the conditional parser rejects it.
             '(' | ')' => {
                 // `(` and `)` are word delimiters in bash: `f() { ... }` must
                 // tokenize as the separate words `f`, `(`, `)`, `{`.  Flush any
@@ -1518,10 +1696,14 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                         line_no,
                         &mut at_command_start,
                         &mut redirect_target,
+                        &mut cond_depth,
+                        &mut cond_regex_rhs,
                     );
                 }
                 tokens.push(Token::Word(vec![WordPart::Text(c.to_string(), false)]));
-                at_command_start = true;
+                // Inside a conditional expression `(` / `)` group operands;
+                // they never introduce a subshell.
+                at_command_start = cond_depth == 0;
                 i += 1;
             }
             '}' => {
@@ -1566,6 +1748,8 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
             line_no,
             &mut at_command_start,
             &mut redirect_target,
+            &mut cond_depth,
+            &mut cond_regex_rhs,
         );
     }
 

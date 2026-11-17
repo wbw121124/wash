@@ -1897,6 +1897,9 @@ fn render_compound(c: &crate::parser::Compound) -> String {
             s.push_str("esac");
             s
         }
+        crate::parser::Compound::Cond { expr, .. } => {
+            format!("[[ {} ]]", crate::cond::render_cond(expr))
+        }
     }
 }
 

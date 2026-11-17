@@ -26,7 +26,7 @@
 #       'cd <WASH_REPO> && bash tests/bash_diff_builtins.sh'
 #
 # Optional: ONLY_GROUP=A|K|B|C|D runs a single group.
-#   A = core semantics + finished builtins (590 cases: 340 + 33 brace-range
+#   A = core semantics + finished builtins (634 cases: 340 + 33 brace-range
 #       + 24 brace word-boundary + 15 brace nest/escape/quote-removal
 #       + 1 brace deep-nesting stack guard + 37 heredoc / herestring
 #       + 11 unclosed `$(` syntax-error fence
@@ -55,6 +55,8 @@
 #       + 5 from_utf8_lossy fence (script/source ingress, printf invalid
 #          format char, shebang bad interpreter, command-name errno diagnostic;
 #          raw 0xff must survive, never become U+FFFD or U+00FF)
+#       + 44 [[ ]] conditional-command fence (operators, ERE/BASH_REMATCH,
+#          no word splitting, bash's two-line malformed-expression diagnostics)
 #       -> MUST stay green (regressions)
 #   K = KNOWN-DIFF: cannot be byte-equal by design (documented, not fixed)
 #   B = regression fence for already-fixed defects (GROUP B, 21 cases, green today)
@@ -1375,6 +1377,62 @@ run_case A stderr-full-source    'source @SANDBOX@/execfix/pdir1 > /dev/full 2>&
 run_case A stderr-full-kill      'kill -0 999999 > /dev/full 2>&1; echo "rc=$?"'
 run_case A stderr-full-ulimit    'ulimit -f 99999999999999999999 > /dev/full 2>&1; echo "rc=$?"'
 run_case A stderr-full-notfound  'no-such-cmd-xyz-washfix > /dev/full 2>&1; echo "rc=$?"'
+
+# ---------------------------------------------------------------------------
+# GROUP A: `[[ ... ]]` conditional-command fence (44 cases).
+# Every case was first run against the MSYS2 bash 5.3.20 oracle and then
+# compared byte-for-byte with wash (rc + stdout + normalized stderr).  Covers
+# the lone-word `-n` special case, unary/binary/file/numeric/string/pattern
+# operators, POSIX ERE via libc regcomp/regexec, BASH_REMATCH capture groups,
+# `!`/`&&`/`||`/grouping, no word splitting inside `[[ ]]`, and bash's exact
+# two-line diagnostics for malformed expressions (including the yacc
+# "syntax error near" line and the unmatched `(` lexer EOF).
+# ---------------------------------------------------------------------------
+run_case A cond-lone-word       '[[ abc ]]; echo R=$?'
+run_case A cond-lone-quoted     '[[ "abc" ]]; echo R=$?'
+run_case A cond-unary-n         '[[ -n abc ]]; echo R=$?'
+run_case A cond-unary-n-empty   '[[ -n "" ]]; echo R=$?'
+run_case A cond-unary-z-empty   '[[ -z "" ]]; echo R=$?'
+run_case A cond-unary-z-non     '[[ -z abc ]]; echo R=$?'
+run_case A cond-eq-plain        '[[ abc = abc ]]; echo R=$?'
+run_case A cond-eq-diff         '[[ abc = abd ]]; echo R=$?'
+run_case A cond-eq-glob         '[[ abc = a* ]]; echo R=$?'
+run_case A cond-eq-ne           '[[ abc != a* ]]; echo R=$?'
+run_case A cond-eqeq-glob       '[[ abc == a?c ]]; echo R=$?'
+run_case A cond-eq-quoted-glob  '[[ "a*" = a* ]]; echo R=$?'
+run_case A cond-regex           '[[ abc =~ ^a.c$ ]]; echo R=$?'
+run_case A cond-regex-group     '[[ abc =~ a(b)c ]]; echo R=${BASH_REMATCH[1]}'
+run_case A cond-regex-noquote   '[[ "a.c" =~ ^a.c$ ]]; echo R=$?'
+run_case A cond-regex-literal   '[[ "a.c" =~ ^a\.c$ ]]; echo R=$?'
+run_case A cond-num-lt          '[[ 1 -lt 2 ]]; echo R=$?'
+run_case A cond-num-lt-false    '[[ 2 -lt 1 ]]; echo R=$?'
+run_case A cond-num-eq-abc      '[[ abc -eq 0 ]]; echo R=$?'
+run_case A cond-num-ge          '[[ 3 -ge 3 ]]; echo R=$?'
+run_case A cond-bang            '[[ ! -f /nonexistent_zz ]]; echo R=$?'
+run_case A cond-andand          '[[ -n a && -n b ]]; echo R=$?'
+run_case A cond-andand-false    '[[ -z a && -n b ]]; echo R=$?'
+run_case A cond-oror            '[[ -z a || -n b ]]; echo R=$?'
+run_case A cond-group           '[[ ( -n a ) ]]; echo R=$?'
+run_case A cond-nested          '[[ ( -n a || -z b ) && -n c ]]; echo R=$?'
+run_case A cond-var-nosplit     'x="a b"; [[ -n $x ]]; echo R=$?'
+run_case A cond-var-unquoted    'x="a b"; [[ $x = "a b" ]]; echo R=$?'
+run_case A cond-file-test       '[[ -e /tmp ]]; echo R=$?'
+run_case A cond-empty           '[[ ]]; echo R=$?'
+run_case A cond-two-words       '[[ a b ]]; echo R=$?'
+run_case A cond-bin-missing     '[[ a = ]]; echo R=$?'
+run_case A cond-bin-badop       '[[ a -zz b ]]; echo R=$?'
+run_case A cond-unary-missing   '[[ -n ]]; echo R=$?'
+run_case A cond-no-close        '[[ -n a; echo R=$?'
+run_case A cond-unmatched-paren '[[ ( -n a ]]; echo R=$?'
+run_case A cond-lt-op           '[[ a < b ]]; echo R=$?'
+run_case A cond-gt-op           '[[ b > a ]]; echo R=$?'
+run_case A cond-multiline       '[[ -n a &&
+ -n b ]]; echo R=$?'
+run_case A cond-regex-alt       '[[ abc =~ ^(a|b)c$ ]]; echo R=$? M=${BASH_REMATCH[1]}'
+run_case A cond-regex-two-grp   '[[ abc =~ ^(a)(b)c$ ]]; declare -p BASH_REMATCH'
+run_case A cond-regex-fail      '[[ x =~ ^(a) ]]; echo R=$?; declare -p BASH_REMATCH'
+run_case A cond-regex-persist   '[[ abc =~ (b) ]]; echo one=${BASH_REMATCH[1]}; [[ -n x ]]; declare -p BASH_REMATCH'
+run_case A cond-regex-invalid   '[[ abc =~ a(b ]]; echo R=$?'
 
 # GROUP B -- regression fence for already-fixed defects (21 cases, green today).
 # (每条用例都曾是真实缺陷，修复后留在这里作为回归栅栏：通过 run_case 同时跑

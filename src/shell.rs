@@ -801,35 +801,75 @@ impl Shell {
         // strings are byte-identical (e.g. an unclosed `$(` vs `$((`) yet need
         // different line numbers.  `Unspecified` keeps the legacy message-prefix
         // heuristic for every existing parser/executor error.
-        let (line_no, echo): (usize, Option<&str>) = match e.family {
-            DiagnosticFamily::CmdsubEof => (s.lines().count() + 1, None),
-            DiagnosticFamily::OtherDelimiterEof => (e.open_line, None),
+        // The third tuple item is an optional extra diagnostic: (line, text).
+        // `CondExpr` adds bash's yacc-layer "syntax error near ..." line;
+        // `CondRegexEof` adds the second line after an unclosed regex `(`.
+        let (line_no, echo, extra): (usize, Option<&str>, Option<(usize, String)>) = match e.family {
+            DiagnosticFamily::CmdsubEof => (s.lines().count() + 1, None, None),
+            DiagnosticFamily::OtherDelimiterEof => (e.open_line, None, None),
             // Unterminated compound command: bash reports the virtual line
             // just past the input (n_lines + 1), no echo; the message itself
             // already carries "on line N" for the innermost opener (qa9).
-            DiagnosticFamily::CompoundEof => (s.lines().count() + 1, None),
+            DiagnosticFamily::CompoundEof => (s.lines().count() + 1, None, None),
+            // A malformed `[[ ... ]]`: bash prints the conditional parser's
+            // own message, then "syntax error near <token>", then echoes the
+            // source line holding the `[[`.  `open_line` is that line.
+            DiagnosticFamily::CondExpr => {
+                let ln = e.open_line;
+                let src = lines.get(ln.saturating_sub(1)).copied();
+                (
+                    ln,
+                    src,
+                    Some((ln, format!("syntax error near `{}'", e.near))),
+                )
+            }
+            // Unmatched `( ` in the `=~` RHS: the lexer error names the
+            // opener's line, then bash adds a second line on the virtual line
+            // past end of input.
+            DiagnosticFamily::CondRegexEof => (
+                e.open_line,
+                None,
+                Some((
+                    s.lines().count() + 1,
+                    "unexpected argument to conditional binary operator".to_string(),
+                )),
+            ),
             DiagnosticFamily::NearToken => {
                 let consumed = tokens.map(Self::heredoc_consumed_lines).unwrap_or(0);
-                (k + 1 + consumed, Some(lines.get(k).copied().unwrap_or("")))
+                (
+                    k + 1 + consumed,
+                    Some(lines.get(k).copied().unwrap_or("")),
+                    None,
+                )
             }
             DiagnosticFamily::Unspecified => {
                 let at_eof = e.message.starts_with("syntax error: unexpected end of file")
                     || e.message.starts_with("unexpected EOF");
                 let near_token = e.message.starts_with("syntax error near unexpected token");
                 if at_eof {
-                    (s.lines().count() + 1, None)
+                    (s.lines().count() + 1, None, None)
                 } else if near_token {
                     let consumed = tokens.map(Self::heredoc_consumed_lines).unwrap_or(0);
-                    (k + 1 + consumed, Some(lines.get(k).copied().unwrap_or("")))
+                    (
+                        k + 1 + consumed,
+                        Some(lines.get(k).copied().unwrap_or("")),
+                        None,
+                    )
                 } else {
-                    (1, None)
+                    (1, None, None)
                 }
             }
         };
-        self.report_parse_error(&e.message, line_no, echo);
+        self.report_parse_error(&e.message, line_no, echo, extra);
     }
 
-    fn report_parse_error(&self, message: &str, line_no: usize, echo: Option<&str>) {
+    fn report_parse_error(
+        &self,
+        message: &str,
+        line_no: usize,
+        echo: Option<&str>,
+        extra: Option<(usize, String)>,
+    ) {
         if self.quiet_errors {
             return;
         }
@@ -856,7 +896,19 @@ impl Shell {
         } else {
             message.to_string()
         };
-        eprintln!("{}{}", prefix, body);
+        // An empty message means bash produced no conditional-parser line
+        // (a bare `[[ ]]`), so only the yacc "near" line and echo are printed.
+        if !message.is_empty() {
+            eprintln!("{}{}", prefix, body);
+        }
+        if let Some((extra_line, extra_msg)) = extra {
+            let extra_prefix = if ctx.with_shell_name {
+                format!("wash: {}: line {}: ", ctx.label, extra_line)
+            } else {
+                format!("{}: line {}: ", ctx.label, extra_line)
+            };
+            eprintln!("{}{}", extra_prefix, extra_msg);
+        }
         if let Some(line) = echo {
             eprintln!("{}`{}'", prefix, line);
         }

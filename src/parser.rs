@@ -89,6 +89,14 @@ pub enum Compound {
     /// variable assignments, `cd` and file-descriptor changes inside it do not
     /// leak back to the parent process.
     Subshell { body: CommandList },
+    /// `[[ EXPR ]]` — a conditional command.  Its exit status is 0 when the
+    /// expression is true and 1 when it is false; the expression itself is
+    /// evaluated by `crate::cond`.
+    Cond {
+        expr: crate::cond::CondExpr,
+        /// The 1-based line of the `[[`, used for bash's diagnostics.
+        line: usize,
+    },
 }
 
 /// One arm of a `case` command: a set of patterns and the body to run.
@@ -220,6 +228,14 @@ fn parse_compounds(tokens: &[Token]) -> Result<(Vec<Token>, Vec<FuncDef>)> {
                     )))
                 }
             },
+            Token::CondStart(line) => {
+                // `[[ EXPR ]]` — a conditional command.  The lexer only emits
+                // the opener where a command may start, so no command-position
+                // test is needed here.
+                let (compound, end) = parse_cond_compound(tokens, i, *line)?;
+                out.push(Token::Compound(compound));
+                i = end;
+            }
             Token::Word(_) => {
                 // A `NAME() { ... }` / `NAME () { ... }` function definition
                 // starts with an ordinary word; detect and extract it.
@@ -520,6 +536,14 @@ fn find_matching_closer(tokens: &[Token], start: usize) -> Result<usize> {
         0,
         compound_eof_message(&kw, open_line),
     ))
+}
+
+/// Parse the `[[ ... ]]` conditional command that starts at `start` (the
+/// `[[` token itself).  Returns the parsed compound and the index just after
+/// the closing `]]`.
+fn parse_cond_compound(tokens: &[Token], start: usize, line: usize) -> Result<(Compound, usize)> {
+    let (expr, end) = crate::cond::parse_cond(tokens, start + 1, line)?;
+    Ok((Compound::Cond { expr, line }, end))
 }
 
 /// Parse the `if` construct that starts at `start` (the `if` token itself).
@@ -1345,6 +1369,13 @@ fn parse_simple(tokens: &[Token]) -> Result<SimpleCommand> {    let mut argv: Ve
             Token::FunctionDef(_) => {
                 // A function definition inside a simple command is unreachable
                 // (it is skipped earlier), but guard against it anyway.
+                return Err(WashError::syntax("syntax error near unexpected token"));
+            }
+            // Conditional-expression tokens are consumed by `parse_cond_compound`
+            // before `parse_simple` is reached.  Seeing one here means the
+            // input is malformed; report it like any other stray token.
+            Token::CondStart(_) | Token::CondEnd | Token::CondOp(_) | Token::CondNumber(_)
+            | Token::CondNewline => {
                 return Err(WashError::syntax("syntax error near unexpected token"));
             }
         }

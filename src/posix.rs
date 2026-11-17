@@ -6,7 +6,7 @@
 // are added ahead of the phases that consume them.
 #![allow(dead_code)]
 
-use std::ffi::{c_char, c_int, CStr, CString};
+use std::ffi::{c_char, c_int, c_long, c_void, CStr, CString};
 use std::os::raw::c_int as RawCInt;
 
 extern "C" {
@@ -49,6 +49,20 @@ extern "C" {
     fn wash_getuid() -> u32;
     fn wash_getppid() -> i32;
     fn wash_getgroups(cap: c_int, list: *mut c_int, ng: *mut c_int) -> c_int;
+
+    // POSIX ERE ([[ ... =~ ... ]]) -- 与 bash 同源 libc 实现
+    fn wash_regex_new() -> *mut c_void;
+    fn wash_regex_free(p: *mut c_void);
+    fn wash_regex_compile(p: *mut c_void, pattern: *const c_char, cflags: c_int) -> c_int;
+    fn wash_regex_error(code: c_int, p: *mut c_void, buf: *mut c_char, buflen: usize) -> c_int;
+    fn wash_regex_nsub(p: *mut c_void) -> usize;
+    fn wash_regex_exec(
+        p: *mut c_void,
+        s: *const c_char,
+        starts: *mut c_long,
+        ends: *mut c_long,
+        cap: usize,
+    ) -> c_int;
 
     // bash-compatible numeric parsing / formatting (msys C library)
     fn wash_parse_ll(s: *const c_char, fully: *mut c_int, overflow: *mut c_int) -> i64;
@@ -786,3 +800,85 @@ pub fn dl_error() -> String {
     }
 }
 
+
+// --- POSIX ERE ([[ ... =~ ... ]]) ----------------------------------------
+//
+// bash 的 `[[ str =~ re ]]` 走的是 libc 的 regcomp/regexec（POSIX ERE）。
+// MSYS2 上的 bash 用的就是同一份实现，所以把正则交给 libc 可以逐字节
+// 复刻 bash 的匹配语义 *和* 错误文案（例如 "brackets ([ ]) not
+// balanced"），不必自研正则引擎。
+
+/// `regcomp` 的编译标志（POSIX 取值，与 libc 一致）。
+pub const REG_EXTENDED: c_int = 1;
+pub const REG_ICASE: c_int = 2;
+
+/// `[[ str =~ re ]]` 的匹配结果。
+pub enum RegexMatch {
+    /// 匹配成功。`groups[0]` 是整体匹配，`groups[i]` 是第 i 个子表达式；
+    /// 未参与匹配的子表达式是 `None`。
+    Match(Vec<Option<(usize, usize)>>),
+    /// 未匹配。
+    NoMatch,
+    /// 正则非法；`msg` 是 libc `regerror` 的文案（与 bash 逐字节相同）。
+    Invalid(String),
+    /// `regexec` 以其它原因失败。
+    Error,
+}
+
+/// 用 POSIX ERE 匹配 `text`。
+pub fn regex_match(text: &str, pattern: &str, icase: bool) -> RegexMatch {
+    let handle = unsafe { wash_regex_new() };
+    if handle.is_null() {
+        return RegexMatch::Error;
+    }
+    let cpat = CString::new(pattern).unwrap_or_default();
+    let mut cflags = REG_EXTENDED;
+    if icase {
+        cflags |= REG_ICASE;
+    }
+    let rc = unsafe { wash_regex_compile(handle, cpat.as_ptr(), cflags) };
+    if rc != 0 {
+        let mut buf = [0 as c_char; 256];
+        unsafe {
+            wash_regex_error(rc, handle, buf.as_mut_ptr(), buf.len());
+        }
+        let msg = unsafe { CStr::from_ptr(buf.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { wash_regex_free(handle) };
+        return RegexMatch::Invalid(msg);
+    }
+    let cap = unsafe { wash_regex_nsub(handle) } + 1;
+    let mut starts = vec![0 as c_long; cap];
+    let mut ends = vec![0 as c_long; cap];
+    let ctext = CString::new(text).unwrap_or_default();
+    let rc = unsafe {
+        wash_regex_exec(
+            handle,
+            ctext.as_ptr(),
+            starts.as_mut_ptr(),
+            ends.as_mut_ptr(),
+            cap,
+        )
+    };
+    let out = if rc == 0 {
+        let groups = (0..cap)
+            .map(|i| {
+                let s = starts[i];
+                let e = ends[i];
+                if s < 0 || e < 0 {
+                    None
+                } else {
+                    Some((s as usize, e as usize))
+                }
+            })
+            .collect();
+        RegexMatch::Match(groups)
+    } else if rc == 1 {
+        RegexMatch::NoMatch
+    } else {
+        RegexMatch::Error
+    };
+    unsafe { wash_regex_free(handle) };
+    out
+}

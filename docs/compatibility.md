@@ -125,8 +125,12 @@ glob / 多 pattern / 空 pattern / 其余清单显示值 / 别名路径全部仍
 
 ## 已知未实现特性（功能缺失，非覆盖空洞）
 
-oracle 实测：`[[ ]]` → `command not found`；`(( ))` 算术命令 → `command not found`
-（但 `$(( ))` **展开**已实现对齐）；heredoc `<<`/`<<-`/herestring `<<<` 曾为 rc=2
+oracle 实测：`(( ))` 算术命令 → `command not found`（但 `$(( ))` **展开**已实现对齐）；
+`[[ ]]` 已实现并与 bash 5.3 逐字节对齐（44 条栅栏见 `tests/bash_diff_builtins.sh`
+GROUP A）：单目/双目/文件/数值/字符串/模式/ERE 运算、`BASH_REMATCH` 捕获组、
+`!`/`&&`/`||`/分组、`[[ ]]` 内不做词分割，以及畸形表达式的两行诊断（含 yacc
+`syntax error near` 行与未闭合 `(` 的词法 EOF）。
+heredoc `<<`/`<<-`/herestring `<<<` 曾为 rc=2
 （后续已实现）；`select` → 语法错误；`shopt -s nullglob` → `invalid shell option name`；
 `declare -A`、`getopts`、`trap -l` → **静默 rc=0 但功能未生效**（最危险，勿把它当成功）。
 已对齐：if/for/while/until/case、函数、eval、mapfile、local、`>|`、`exec 3>&-`、

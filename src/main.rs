@@ -10,6 +10,7 @@
 mod arith;
 mod builtins;
 mod byteval;
+mod cond;
 mod error;
 mod executor;
 mod expand;

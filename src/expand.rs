@@ -136,6 +136,9 @@ pub struct ExpandCtx<'a> {
     /// an owned String (not injected into `env`) so it stays in sync with
     /// `set` across separate commands.
     pub shell_flags: String,
+    /// The shell's `set -o` options, borrowed: `[[ -o name ]]` has to know
+    /// whether a named option is on.
+    pub set_options: &'a crate::shell::SetOptions,
 }
 
 /// The result of evaluating a parameter expansion.

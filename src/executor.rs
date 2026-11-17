@@ -936,6 +936,37 @@ fn execute_compound(compound: &Compound, sh: &mut Shell) -> i32 {
             is_until,
         } => execute_while(condition, body, *is_until, sh),
         Compound::Case { word, arms } => execute_case(word, arms, sh),
+        // `[[ EXPR ]]` — a conditional command.  It succeeds when the
+        // expression is true and fails when it is false; nothing else in
+        // the shell changes.
+        Compound::Cond { expr, .. } => {
+            let attrs = sh.attr_refs();
+            let ctx = ExpandCtx {
+                env: &sh.env,
+                positional: &sh.positional,
+                last_status: sh.last_status,
+                self_pid: sh.self_pid,
+                noglob: sh.options.noglob,
+                nounset: sh.options.nounset,
+                shell_flags: sh.dash_flags(),
+                set_options: &sh.options,
+                bg_pid: sh.bg_pid,
+                dollar_zero: &sh.dollar_zero,
+                attrs: &attrs,
+                functions: &sh.functions,
+                arrays: &sh.arrays,
+                pending_assign: None,
+            };
+            let status = if crate::cond::eval_cond(expr, &ctx) { 0 } else { 1 };
+            // A successful (or failed) `=~` publishes its captures through
+            // BASH_REMATCH; other conditional commands leave it untouched.
+            if let Some(rematch) = crate::cond::take_rematch() {
+                sh.arrays.insert("BASH_REMATCH".to_string(), rematch);
+                sh.array_assigned.insert("BASH_REMATCH".to_string());
+            }
+            sh.last_status = status;
+            status
+        }
         // A brace group runs in the *current* shell (no subshell): assignments
         // and `cd` inside it persist.  When the group is part of a pipeline
         // the executor already forked, which matches bash too.
@@ -988,6 +1019,7 @@ fn execute_for(var: &str, words: &[Vec<WordPart>], body: &CommandList, sh: &mut 
         noglob: sh.options.noglob,
         nounset: sh.options.nounset,
         shell_flags: sh.dash_flags(),
+        set_options: &sh.options,
         bg_pid: sh.bg_pid,
         dollar_zero: &sh.dollar_zero,
         attrs: &attrs,
@@ -1105,6 +1137,7 @@ fn execute_case(word: &[WordPart], arms: &[crate::parser::CaseArm], sh: &mut She
         noglob: sh.options.noglob,
         nounset: sh.options.nounset,
         shell_flags: sh.dash_flags(),
+        set_options: &sh.options,
         bg_pid: sh.bg_pid,
         dollar_zero: &sh.dollar_zero,
         attrs: &attrs,
@@ -1511,6 +1544,7 @@ fn apply_command_assignments(
             noglob: sh.options.noglob,
             nounset: sh.options.nounset,
         shell_flags: sh.dash_flags(),
+        set_options: &sh.options,
         bg_pid: sh.bg_pid,
             dollar_zero: &sh.dollar_zero,
             attrs: &attrs,
@@ -1569,6 +1603,7 @@ fn apply_array_assignments(
             noglob: sh.options.noglob,
             nounset: sh.options.nounset,
         shell_flags: sh.dash_flags(),
+        set_options: &sh.options,
             bg_pid: sh.bg_pid,
             dollar_zero: &sh.dollar_zero,
             attrs: &attrs,
@@ -1714,6 +1749,7 @@ fn run_standalone_exp(
                     noglob: sh.options.noglob,
                     nounset: sh.options.nounset,
         shell_flags: sh.dash_flags(),
+        set_options: &sh.options,
         bg_pid: sh.bg_pid,
                     dollar_zero: &sh.dollar_zero,
                     attrs: &attrs,
@@ -2130,6 +2166,7 @@ fn prepare_stage(c: &SimpleCommand, sh: &mut Shell) -> Prepared {
             noglob: sh.options.noglob,
             nounset: sh.options.nounset,
             shell_flags: shell_flags.clone(),
+            set_options: &sh.options,
             bg_pid: sh.bg_pid,
             dollar_zero: &sh.dollar_zero,
             attrs: &attrs,
@@ -2166,6 +2203,7 @@ fn prepare_stage(c: &SimpleCommand, sh: &mut Shell) -> Prepared {
             noglob: sh.options.noglob,
             nounset: sh.options.nounset,
             shell_flags,
+            set_options: &sh.options,
             bg_pid: sh.bg_pid,
             dollar_zero: &sh.dollar_zero,
             attrs: &attrs,

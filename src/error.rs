@@ -42,6 +42,21 @@ pub enum DiagnosticFamily {
     /// diagnostics). Allowed dead code so the scaffold stays warning-free.
     #[allow(dead_code)]
     NearToken,
+    /// A diagnostic from a `[[ ... ]]` conditional expression.
+    ///
+    /// bash prints *two* lines for a malformed conditional expression: the
+    /// conditional parser's own message ("unexpected token `X', conditional
+    /// binary operator expected") followed by the yacc layer's "syntax error
+    /// near `X'", and then echoes the offending source line.  `near` holds
+    /// the token text for the second line; `open_line` is the line of the
+    /// `[[` that opened the expression.
+    CondExpr,
+    /// An unmatched `(` in the RHS of `=~`: bash's lexer calls
+    /// `parse_matched_pair`, which reports "unexpected EOF while looking for
+    /// matching `)'" on the opener's line and then a second "unexpected
+    /// argument to conditional binary operator" line on the virtual line
+    /// past end of input.
+    CondRegexEof,
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +69,9 @@ pub struct WashError {
     /// For `OtherDelimiterEof`: the 1-based line where the unclosed delimiter
     /// started.  Ignored by other families.
     pub open_line: usize,
+    /// For `CondExpr`: the offending token, rendered the way bash renders it
+    /// in its "syntax error near ..." line.  Empty for other families.
+    pub near: String,
 }
 
 pub type Result<T> = std::result::Result<T, WashError>;
@@ -65,6 +83,7 @@ impl WashError {
             exit_code,
             family: DiagnosticFamily::Unspecified,
             open_line: 0,
+            near: String::new(),
         }
     }
 
@@ -85,6 +104,7 @@ impl WashError {
             exit_code: 2,
             family,
             open_line,
+            near: String::new(),
         }
     }
 }
