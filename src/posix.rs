@@ -618,6 +618,11 @@ pub fn read_byte_from(fd: i32) -> Option<u8> {
 }
 
 /// Read all of `fd` into a string.
+///
+/// 返回的是 byteval 规范形式：子进程的原始输出字节按字节编码，绝不走
+/// `from_utf8_lossy`（会永久丢失非法 UTF-8 字节）。命令替换的值随后经
+/// `decode_raw` 原样吐回，因此外部命令输出里恰好含 `U+E100` + PUA 的
+/// 字节序列也不会被误当成编码字节。
 pub fn read_all(fd: i32) -> String {
     let mut buf = [0u8; 4096];
     let mut out = Vec::new();
@@ -628,7 +633,7 @@ pub fn read_all(fd: i32) -> String {
         }
         out.extend_from_slice(&buf[..n as usize]);
     }
-    String::from_utf8_lossy(&out).into_owned()
+    crate::byteval::encode_raw(&out)
 }
 
 // --- raw terminal handling for the interactive REPL -------------------------

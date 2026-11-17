@@ -284,7 +284,7 @@ fn run_as_script(
 /// 位置参数=脚本参数），然后退出进程。
 fn run_script_in_shell(display: &str, argv_strs: &[String], shell_env: &HashMap<String, String>) {
     let content = match posix::read_file(display) {
-        Some(c) => c,
+        Some(c) => crate::byteval::escape_literal(&c),
         None => {
             safe_eprintln!("wash: {}: {}", display, posix::errno_message(posix::errno()));
             let _ = std::io::stdout().flush();
@@ -847,7 +847,10 @@ pub fn exec_external(argv: &[String], sh: &Shell) -> i32 {
                 ));
             }
             None => {
-                safe_eprintln!("wash: {}: command not found", argv[0]);
+                safe_eprintln!(
+                    "wash: {}: command not found",
+                    crate::builtins::diag_text(&argv[0])
+                );
                 posix::exit(127);
             }
         }
@@ -1203,7 +1206,10 @@ fn execute_function(name: &str, args: Vec<String>, sh: &mut Shell) -> i32 {
     let body = match sh.functions.get(name) {
         Some(b) => b.clone(),
         None => {
-            safe_eprintln!("wash: {}: command not found", name);
+            safe_eprintln!(
+                "wash: {}: command not found",
+                crate::builtins::diag_text(name)
+            );
             return 127;
         }
     };
@@ -1383,13 +1389,19 @@ fn child_run_exp(argv: &[String], path: Option<&str>, ctx: &ChildContext) -> ! {
         None if ctx.program_searched => {
             // 父进程已按（应用过 `PATH=` 前缀赋值的）PATH 搜索且未命中：
             // 直接报 command not found，不得用快照 PATH 重搜。
-            safe_eprintln!("wash: {}: command not found", argv[0]);
+            safe_eprintln!(
+                "wash: {}: command not found",
+                crate::builtins::diag_text(&argv[0])
+            );
             posix::exit(127);
         }
         None => match find_program(&argv[0], path) {
             Some((exe, display)) => (exe, display),
             None => {
-                safe_eprintln!("wash: {}: command not found", argv[0]);
+                safe_eprintln!(
+                    "wash: {}: command not found",
+                    crate::builtins::diag_text(&argv[0])
+                );
                 posix::exit(127);
             }
         },

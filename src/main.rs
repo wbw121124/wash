@@ -105,7 +105,9 @@ fn main() {
             eprintln!("wash: -c requires an argument");
             exit(2);
         }
-        command = Some(args[i].clone());
+        // 源码文本入口：双写字面哨兵后，decode_raw 才能只把 encode_raw
+        // 产生的 ESC+PUA 当字节，避免源码里合法的 PUA 字符被误解码。
+        command = Some(crate::byteval::escape_literal(&args[i]));
         if i + 1 < args.len() {
             command_name = Some(args[i + 1].clone());
             positional = args[i + 2..].to_vec();
@@ -183,7 +185,7 @@ fn main() {
         // bash labels parse errors from it with the script path (no shell
         // name), so the sourced-script error context is the right one.
         let content = match posix::read_file(&path) {
-            Some(c) => c,
+            Some(c) => crate::byteval::escape_literal(&c),
             None => {
                 eprintln!("wash: {}: {}", path, posix::errno_message(posix::errno()));
                 exit(127);

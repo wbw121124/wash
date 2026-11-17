@@ -20,6 +20,7 @@
 use std::io::Write;
 
 use crate::arith;
+use crate::safe_eprint_bytes;
 use crate::safe_eprintln;
 use crate::posix;
 use crate::shell::{Shell, JobInfo, SET_O_ORDER, SHOPT_ORDER};
@@ -294,7 +295,7 @@ fn builtin_cd(argv: &[String], sh: &mut Shell) -> i32 {
         None => {
             safe_eprintln!(
                 "wash: cd: {}: {}",
-                dir,
+                diag_text(&dir),
                 posix::errno_message(last_errno)
             );
             return 1;
@@ -1952,7 +1953,11 @@ fn builtin_type(argv: &[String], sh: &mut Shell) -> i32 {
             // bash only reports the failure when it did not print a type
             // or a path.
             if !matches!(flags.mode, DescMode::Type | DescMode::PathOnly) {
-                safe_eprintln!("wash: type: {}: not found", name);
+                safe_eprint_bytes!(
+                    b"wash: type: ",
+                    crate::byteval::decode_raw(&name),
+                    b": not found\n"
+                );
             }
             any_failed = true;
         }
@@ -2012,7 +2017,7 @@ fn builtin_command(argv: &[String], sh: &mut Shell) -> i32 {
                 let found = describe_command(name, flags, sh);
                 // `-v` stays silent when the command is unknown.
                 if !found && mode != DescMode::Reusable {
-                    safe_eprintln!("wash: command: {}: not found", name);
+                    safe_eprintln!("wash: command: {}: not found", diag_text(name));
                 }
                 any_found |= found;
             }
@@ -2047,7 +2052,7 @@ fn builtin_builtin(argv: &[String], sh: &mut Shell) -> i32 {
 
     let name = argv[i].clone();
     if !is_builtin(sh, &name) || sh.disabled_builtins.contains(&name) {
-        safe_eprintln!("wash: builtin: {}: not a shell builtin", name);
+        safe_eprintln!("wash: builtin: {}: not a shell builtin", diag_text(&name));
         return 1;
     }
 
@@ -2172,7 +2177,7 @@ fn builtin_hash(argv: &[String], sh: &mut Shell) -> i32 {
             match sh.hash_table.get(name) {
                 Some(path) => println!("{}", path),
                 None => {
-                    safe_eprintln!("wash: hash: {}: not found", name);
+                    safe_eprintln!("wash: hash: {}: not found", diag_text(name));
                     status = 1;
                 }
             }
@@ -2195,7 +2200,7 @@ fn builtin_hash(argv: &[String], sh: &mut Shell) -> i32 {
         }
         if delete {
             if sh.hash_table.remove(name).is_none() {
-                safe_eprintln!("wash: hash: {}: not found", name);
+                safe_eprintln!("wash: hash: {}: not found", diag_text(name));
                 status = 1;
             } else {
                 sh.hash_hits.remove(name);
@@ -2209,7 +2214,7 @@ fn builtin_hash(argv: &[String], sh: &mut Shell) -> i32 {
                 sh.hash_hits.entry(name.clone()).or_insert(0);
             }
             None => {
-                safe_eprintln!("wash: hash: {}: not found", name);
+                safe_eprintln!("wash: hash: {}: not found", diag_text(name));
                 status = 1;
             }
         }
@@ -2627,7 +2632,7 @@ fn builtin_mapfile(argv: &[String], sh: &mut Shell) -> i32 {
             if !strip_delim {
                 cur.push(byte);
             }
-            lines.push(String::from_utf8_lossy(&cur).into_owned());
+            lines.push(crate::byteval::encode_raw(&cur));
             cur.clear();
         } else {
             cur.push(byte);
@@ -2635,7 +2640,7 @@ fn builtin_mapfile(argv: &[String], sh: &mut Shell) -> i32 {
     }
     // 末尾没有分隔符时，最后一段仍算一行（不含分隔符）。
     if !cur.is_empty() {
-        lines.push(String::from_utf8_lossy(&cur).into_owned());
+        lines.push(crate::byteval::encode_raw(&cur));
     }
 
     // -s 跳过前 skip 行，再按 -n 截断。
@@ -3280,7 +3285,15 @@ fn builtin_source(argv: &[String], sh: &mut Shell) -> i32 {
     let path = match find_source_file(&name, sh) {
         Some(p) => p,
         None => {
-            safe_eprintln!("wash: {}: {}", name, posix::errno_message(posix::errno()));
+            // source 把文件名按 `%s` 原样写诊断（不 ANSI-C 引用），可能含
+            // 任意字节；必须 decode_raw 后按裸字节写出。
+            safe_eprint_bytes!(
+                b"wash: ",
+                crate::byteval::decode_raw(&name),
+                b": ",
+                posix::errno_message(posix::errno()).as_bytes(),
+                b"\n"
+            );
             return 1;
         }
     };
@@ -3289,14 +3302,28 @@ fn builtin_source(argv: &[String], sh: &mut Shell) -> i32 {
     // 原样拼写（相对路径保持相对）。修复前目录被当成空脚本静默成功 rc 0。
     if let Some(st) = posix::stat_path(&path, true) {
         if st.file_type == posix::FT_DIR {
-            safe_eprintln!("wash: {}: {}: is a directory", argv[0], name);
+            safe_eprint_bytes!(
+                b"wash: ",
+                crate::byteval::decode_raw(&argv[0]),
+                b": ",
+                crate::byteval::decode_raw(&name),
+                b": is a directory\n"
+            );
             return 1;
         }
     }
     let content = match posix::read_file(&path) {
-        Some(c) => c,
+        // 源码文本入口：与 `main.rs` 的 -c / 脚本入口一致，双写字面哨兵，
+        // 使 decode_raw 只把 encode_raw 产生的 ESC+PUA 当字节。
+        Some(c) => crate::byteval::escape_literal(&c),
         None => {
-            safe_eprintln!("wash: {}: {}", path, posix::errno_message(posix::errno()));
+            safe_eprint_bytes!(
+                b"wash: ",
+                crate::byteval::decode_raw(&path),
+                b": ",
+                posix::errno_message(posix::errno()).as_bytes(),
+                b"\n"
+            );
             return 1;
         }
     };
@@ -5746,6 +5773,20 @@ fn quote_double(value: &str) -> String {
 /// 把 byteval 编码的变量值先还原成裸字节，再按 bash 的审计输出规则引用。
 /// 直接把编码串交给 [`quote_double`] 会把 PUA 转义序列当成普通字符输出
 /// （例如裸字节 0xff 会打印成 `$'\356\201\277'` 而不是 `$'\377'`）。
+/// 把 byteval 编码值还原成 bash 诊断里显示的文本。
+///
+/// 可打印 ASCII 原样输出（bash 的 `cd: foo: ...` 不加引号）；只要含不可打印
+/// 或高位字节，就按 `$'...'` ANSI-C 引用（bash 的 `cd: $'\377': ...`）。
+/// 所有把变量值嵌入 stderr 诊断的站点都必须先过这里，禁止直接打印编码串。
+pub(crate) fn diag_text(value: &str) -> String {
+    let raw = crate::byteval::decode_raw(value);
+    if raw.iter().all(|&b| (0x20..=0x7e).contains(&b)) {
+        // 全部是 ASCII，from_utf8 必然成功。
+        return String::from_utf8(raw).unwrap();
+    }
+    ansi_quote_bytes(&raw)
+}
+
 fn quote_value_for_audit(value: &str) -> String {
     let raw = crate::byteval::decode_raw(value);
     if raw.iter().any(|&b| b < 0x20 || b == 0x7f || b >= 0x80) {

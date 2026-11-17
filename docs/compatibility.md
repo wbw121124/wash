@@ -46,6 +46,30 @@
 | `enable` | partial | `-a` / `-n` / `-p` / `-s` 静态语义、`-z` 用法错误、未知名报错按 oracle 实测对齐。差异：全量清单内建集合与 bash 不同；`-f`/`-d` 是 `wash-extension` |
 | 二进制插件（wash C ABI） | wash-extension | `enable -f/-d`、`BASH_LOADABLES_PATH` 白名单、ABI 协商、多内建注册与热卸载、变量读写；由 golden 契约验证，见 [插件](plugins.md) |
 
+## 裸字节保真（byteval 契约）
+
+`LC_ALL=C` 下 bash 的变量是裸字节序列，`read -n` 可在多字节字符中间截断。Rust 的
+`String` 必须是合法 UTF-8，因此 wash 用 `src/byteval.rs` 做**可逆**编码：ASCII
+原样，高位字节 `0x80..=0xFF` 映射为哨兵 `U+E100` + PUA `U+E000..=U+E07F`；
+源码里的字面 `U+E100` 双写为 `U+E100 U+E100`。`decode_raw` 见 `ESC ESC` 还原
+一个字面哨兵，见 `ESC PUA` 还原一个高位字节，落单 PUA 原样输出。
+
+**纪律**（改动相关路径前必读）：
+
+| 类别 | 规则 | 站点 |
+| ---- | ---- | ---- |
+| 源码文本 ingress | `escape_literal`（双写字面哨兵） | `-c` 参数、脚本文件、`source`、`run_script_in_shell`、继承环境变量 |
+| 原始字节 ingress | `encode_raw`（逐字节编码） | `read -n`/`-N`、`printf -v`、命令替换 `read_all`、`mapfile` |
+| 按字节解释 | 先 `decode_raw` | `${#v}` / substring / pattern substitution / 审计输出 |
+| 普通 egress | `decode_raw` | `echo` / `printf` / argv / env / path / heredoc |
+| 诊断 egress | 按内建分流 | `cd` 与 command-not-found 用 `$'...'`（`diag_text`）；`source`/`type` 按 `%s` 原样裸字节写（`safe_eprint_bytes!`） |
+
+禁止 `String::from_utf8_unchecked`（UB）与 `from_utf8_lossy` 处理变量字节
+（永久失真）。`read_fields` 必须吃**原始** `input_bytes`，传已编码串的
+`.as_bytes()` 会二次编码。逐字节栅栏见 `tests/bash_diff_builtins.sh` GROUP A
+的 15 条 byteval 用例（含字面哨兵经 `-c` / 命令替换 / `source` / `mapfile` /
+继承环境五条 ingress，以及 stderr 诊断不泄漏编码串）。
+
 ## 有意偏离（唯一真源）
 
 非交互 `-c` 输出默认**逐字节一致**，全部有意例外的单一清单是

@@ -26,7 +26,7 @@
 #       'cd <WASH_REPO> && bash tests/bash_diff_builtins.sh'
 #
 # Optional: ONLY_GROUP=A|K|B|C|D runs a single group.
-#   A = core semantics + finished builtins (564 cases: 340 + 33 brace-range
+#   A = core semantics + finished builtins (573 cases: 340 + 33 brace-range
 #       + 24 brace word-boundary + 15 brace nest/escape/quote-removal
 #       + 1 brace deep-nesting stack guard + 37 heredoc / herestring
 #       + 11 unclosed `$(` syntax-error fence
@@ -44,8 +44,11 @@
 #          printf empty format)
 #       + 8 stderr-write-failure fence (`fd2` also /dev/full: diagnostics must
 #          be dropped silently, never panic with rc=101)
-#       + 6 byteval raw-byte fence (truncated UTF-8 via REPLY/printf -v,
-#          ${#v} byte length, substring, declare -p audit; no PUA leakage)
+#       + 15 byteval raw-byte fence (truncated UTF-8 via REPLY/printf -v,
+#          ${#v} byte length, substring, declare -p audit; no PUA leakage;
+#          literal U+E100+U+E000 sentinel forgery via -c source, command
+#          substitution, source file, mapfile and inherited-env ingress;
+#          stderr diagnostics must not leak encoded values)
 #       -> MUST stay green (regressions)
 #   K = KNOWN-DIFF: cannot be byte-equal by design (documented, not fixed)
 #   B = regression fence for already-fixed defects (GROUP B, 21 cases, green today)
@@ -105,6 +108,12 @@ printf '#!/bin/definitely-not-exist\necho NO\n' > "$SANDBOX/execfix/badinterp"
 printf '\x7fELFfake'                            > "$SANDBOX/execfix/elf"
 printf 'AB\x00CD\n'                             > "$SANDBOX/execfix/nulf"
 printf 'echo FROM-EXECFIX\n'                    > "$SANDBOX/execfix/pdir1/nonexec"
+# byteval 哨兵伪造夹具：原始字节 ee 84 80 ee 80 80（字面 U+E100 + U+E000）。
+# 必须进行「命令替换 / source / mapfile」三个独立 ingress；用 printf 八进制
+# 转义写文件，禁止在 Python/脚本字符串里写 \356（会被当 Unicode 转义而失真）。
+printf '\356\204\200\356\200\200' > "$SANDBOX/execfix/forge.bin"
+printf 'printf %%s "\356\204\200\356\200\200" | od -An -tx1\n' > "$SANDBOX/execfix/forge_src.sh"
+printf '\377' > "$SANDBOX/execfix/ff.bin"
 printf 'echo "hello from src"\n' > "$SANDBOX/script.sh"
 printf 'echo "1=$1 2=$2 n=$#"\n'  > "$SANDBOX/args.sh"
 printf 'exit 7\n'                 > "$SANDBOX/exit7.sh"
@@ -274,10 +283,10 @@ run_case_sem() {
     case_text="${case_text//@SANDBOX@/$SANDBOX}"
     g_total[$group]=$(( ${g_total[$group]:-0} + 1 ))
 
-    "${RUNNER[@]}" "$BASH_BIN" -c "$case_text" \
+    "${RUNNER[@]}" "${CASE_ENV[@]}" "$BASH_BIN" -c "$case_text" \
         >"$TMP/bash.out" 2>"$TMP/bash.err" </dev/null
     rb=$?
-    "${RUNNER[@]}" "$WASH_BIN" -c "$case_text" \
+    "${RUNNER[@]}" "${CASE_ENV[@]}" "$WASH_BIN" -c "$case_text" \
         >"$TMP/wash.out" 2>"$TMP/wash.err" </dev/null
     rw=$?
 
@@ -309,6 +318,11 @@ report_failure_sem() {
 #        it is substituted before running, so case texts can stay
 #        single-quoted (which keeps $VAR expansion for the inner shell).
 # ---------------------------------------------------------------------------
+# 每个用例可临时注入一行环境变量（CASE_ENV），仅作用于两侧被测进程；
+# 用于 byteval 环境变量 ingress 栅栏，且不污染 export-p / export-count 等
+# 全量环境用例。调用方用完必须重置 CASE_ENV=()。
+CASE_ENV=()
+
 run_case() {
     local group="$1" label="$2" case_text="$3"
     local rb rw
@@ -1286,6 +1300,25 @@ run_case A byteval-len-trunc    'read -n 4 v < @SANDBOX@/execfix/utf8; echo "len
 run_case A byteval-len-utf8     'v=中文; echo "len=${#v}"'
 run_case A byteval-substring    'read -n 4 v < @SANDBOX@/execfix/utf8; printf %s "${v:0:2}" | od -An -tx1; echo "rc=$?"'
 run_case A byteval-declare-raw  'printf -v v "\xff"; declare -p v; echo "rc=$?"'
+# QA 最终复验残留：字面 U+E100 紧邻 U+E000 的字节序列来自源码文本或外部
+# 命令输出时，曾被 decode_raw 误当成编码字节。下列 4 条覆盖所有 ingress：
+# -c 源码、命令替换原始字节、source 源码文件、mapfile 原始字节。
+run_case A byteval-sentinel-inline  'printf %s "" | od -An -tx1; echo "rc=$?"'
+run_case A byteval-sentinel-cmdsub  'v=$(cat @SANDBOX@/execfix/forge.bin); printf %s "$v" | od -An -tx1; echo "len=${#v}"'
+run_case A byteval-sentinel-source  'source @SANDBOX@/execfix/forge_src.sh; echo "rc=$?"'
+run_case A byteval-sentinel-mapfile 'mapfile -t A < @SANDBOX@/execfix/forge.bin; printf %s "${A[0]}" | od -An -tx1; echo "len=${#A[0]}"'
+# 环境变量 ingress：字面哨兵经继承环境进入 shell。只在两侧被测进程注入，
+# 不污染 export-p / export-count 等全量环境用例。
+LITPUA_RAW="$(printf '\356\204\200\356\200\200')"
+CASE_ENV=(env LITPUA="$LITPUA_RAW")
+run_case A byteval-env-ingress 'printf %s "$LITPUA" | od -An -tx1; echo "len=${#LITPUA}"'
+CASE_ENV=()
+# 诊断 egress：变量值中的裸字节按 bash 规则显示（cd/command-not-found 用
+# $'...'；source/type 按 %s 原样写出），禁止泄漏 byteval 编码串。
+run_case A byteval-diag-cd 'v=$(cat @SANDBOX@/execfix/ff.bin); cd "$v"; echo "rc=$?"'
+run_case A byteval-diag-cmdnotfound 'v=$(cat @SANDBOX@/execfix/ff.bin); "$v"; echo "rc=$?"'
+run_case A byteval-diag-source 'v=$(cat @SANDBOX@/execfix/ff.bin); source "$v"; echo "rc=$?"'
+run_case A byteval-diag-type 'v=$(cat @SANDBOX@/execfix/ff.bin); type "$v"; echo "rc=$?"'
 run_case A plain-script         '@SANDBOX@/execfix/plain; echo "rc=$?"'
 # stderr 本身写失败（2>&1 指向 /dev/full）：bash 静默放弃诊断并保留命令自身
 # 的 rc；Rust 的 eprintln!/println! 在写失败时 panic(rc=101)，属逐字节/rc

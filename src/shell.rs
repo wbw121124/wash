@@ -470,7 +470,17 @@ pub struct Shell {
 
 impl Shell {
     pub fn new() -> Self {
-        let mut env: HashMap<String, String> = std::env::vars().collect();
+        // 继承的环境是「外部文本 ingress」：字面 U+E100 必须双写，否则
+        // decode_raw 会把紧邻的 U+E000 误当编码字节。与 -c / 脚本 / source
+        // 三个源码入口同一纪律。
+        let mut env: HashMap<String, String> = std::env::vars()
+            .map(|(k, v)| {
+                (
+                    crate::byteval::escape_literal(&k),
+                    crate::byteval::escape_literal(&v),
+                )
+            })
+            .collect();
 
         // bash increments SHLVL on every shell startup.  This happens
         // EXACTLY ONCE per process, here -- and NOT in `from_env`, which also

@@ -21,6 +21,23 @@ fn is_encoded_pua(cp: u32) -> bool {
     (PUA_BASE..PUA_BASE + 0x80).contains(&cp)
 }
 
+/// 把源码文本里的字面哨兵 `U+E100` 双写成 `U+E100 U+E100`。
+///
+/// 源码（`-c` 参数、脚本文件）可以包含任意合法 UTF-8，包括 PUA 字符。
+/// 若不转义，字面 `U+E100 U+E000` 会在 egress 被 [`decode_raw`] 误当成
+/// 编码字节 0x80。所有「外部文本进入 shell」的入口必须先调用本函数；
+/// [`encode_raw`] 产生的编码串不经过此路径（它由原始字节生成）。
+pub fn escape_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        out.push(ch);
+        if ch as u32 == ESC {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// 把裸字节编码成可安全存入 `String` 的合法 UTF-8 文本。
 pub fn encode_raw(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len());
@@ -42,9 +59,17 @@ pub fn decode_raw(s: &str) -> Vec<u8> {
     while let Some(ch) = it.next() {
         if ch as u32 == ESC {
             if let Some(&next) = it.peek() {
-                if is_encoded_pua(next as u32) {
+                let nc = next as u32;
+                if nc == ESC {
+                    // 双写哨兵 = 源码字面 U+E100，原样输出一个 ESC 的 UTF-8。
                     it.next();
-                    out.push((next as u32 - PUA_BASE) as u8 + 0x80);
+                    let mut buf = [0u8; 4];
+                    out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                    continue;
+                }
+                if is_encoded_pua(nc) {
+                    it.next();
+                    out.push((nc - PUA_BASE) as u8 + 0x80);
                     continue;
                 }
             }
@@ -62,7 +87,13 @@ pub fn decoded_len(s: &str) -> usize {
     while let Some(ch) = it.next() {
         if ch as u32 == ESC {
             if let Some(&next) = it.peek() {
-                if is_encoded_pua(next as u32) {
+                let nc = next as u32;
+                if nc == ESC {
+                    it.next();
+                    n += ch.len_utf8();
+                    continue;
+                }
+                if is_encoded_pua(nc) {
                     it.next();
                     n += 1;
                     continue;
@@ -108,5 +139,20 @@ mod tests {
         let b = encode_raw(b"x\x80");
         let joined = format!("{}{}", a, b);
         assert_eq!(decode_raw(&joined), vec![0xff, b'x', 0x80]);
+    }
+
+    #[test]
+    fn literal_sentinel_roundtrip() {
+        // 源码字面 U+E100 紧跟 PUA 不再被误解码。
+        let source = "\u{e100}\u{e000}";
+        let escaped = escape_literal(source);
+        assert_eq!(escaped, "\u{e100}\u{e100}\u{e000}");
+        assert_eq!(decode_raw(&escaped), source.as_bytes());
+        assert_eq!(decoded_len(&escaped), source.len());
+        // 转义序列与编码序列拼接仍各自正确。
+        let mixed = format!("{}{}", escape_literal(source), encode_raw(&[0x80]));
+        let mut expected = source.as_bytes().to_vec();
+        expected.push(0x80);
+        assert_eq!(decode_raw(&mixed), expected);
     }
 }
