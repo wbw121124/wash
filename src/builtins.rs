@@ -3313,9 +3313,9 @@ fn builtin_source(argv: &[String], sh: &mut Shell) -> i32 {
         }
     }
     let content = match posix::read_file(&path) {
-        // 源码文本入口：与 `main.rs` 的 -c / 脚本入口一致，双写字面哨兵，
-        // 使 decode_raw 只把 encode_raw 产生的 ESC+PUA 当字节。
-        Some(c) => crate::byteval::escape_literal(&c),
+        // read_file 已做 byteval 原始字节编码（含字面哨兵），不能再
+        // escape_literal，否则会把 encode_raw 产生的 ESC 标记双写。
+        Some(c) => c,
         None => {
             safe_eprint_bytes!(
                 b"wash: ",
@@ -3879,8 +3879,13 @@ fn parse_printf_spec(
         // Incomplete conversion (e.g. a trailing "%5"): bash quotes the whole
         // specification, reports it and stops.
         *conv_error = true;
-        let spec = String::from_utf8_lossy(&bytes[start..]).into_owned();
-        safe_eprintln!("wash: printf: `{}': missing format character", spec);
+        // spec 来自格式串原始字节（可能含裸 0xff），必须按裸字节写诊断，
+        // 不能 from_utf8_lossy 成 U+FFFD 或 U+00FF。
+        safe_eprint_bytes!(
+            b"wash: printf: `",
+            &bytes[start..],
+            b"': missing format character\n"
+        );
         return (bytes.len(), true);
     }
 
@@ -4017,11 +4022,13 @@ fn parse_printf_spec(
         }
         _ => {
             // An unknown conversion character: bash quotes the character,
-            // reports it and stops.
+            // reports it and stops.  conv 是格式串里的原始字节（可能是
+            // 0xff），`conv as char` 会变成 U+00FF 写出 c3 bf；按裸字节写。
             *conv_error = true;
-            safe_eprintln!(
-                "wash: printf: `{}': invalid format character",
-                conv as char
+            safe_eprint_bytes!(
+                b"wash: printf: `",
+                &[conv],
+                b"': invalid format character\n"
             );
             return (i, true);
         }

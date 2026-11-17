@@ -185,7 +185,9 @@ fn main() {
         // bash labels parse errors from it with the script path (no shell
         // name), so the sourced-script error context is the right one.
         let content = match posix::read_file(&path) {
-            Some(c) => crate::byteval::escape_literal(&c),
+            // read_file 已做 byteval 原始字节编码，不能再 escape_literal，
+            // 否则会把 encode_raw 产生的 ESC 标记双写。
+            Some(c) => c,
             None => {
                 eprintln!("wash: {}: {}", path, posix::errno_message(posix::errno()));
                 exit(127);

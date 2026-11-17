@@ -58,17 +58,45 @@
 
 | 类别 | 规则 | 站点 |
 | ---- | ---- | ---- |
-| 源码文本 ingress | `escape_literal`（双写字面哨兵） | `-c` 参数、脚本文件、`source`、`run_script_in_shell`、继承环境变量 |
-| 原始字节 ingress | `encode_raw`（逐字节编码） | `read -n`/`-N`、`printf -v`、命令替换 `read_all`、`mapfile` |
+| 源码文本 ingress | `escape_literal`（双写字面哨兵） | `-c` 参数、继承环境变量 |
+| 文件文本 ingress | `encode_raw`（`read_file` 已编码，调用方**不得**再 `escape_literal`） | 脚本文件、`source`、`run_script_in_shell` |
+| 原始字节 ingress | `encode_raw`（逐字节编码） | `read -n`/`-N`、`printf -v`、命令替换 `read_all`、`mapfile`、shebang 解释器路径 |
 | 按字节解释 | 先 `decode_raw` | `${#v}` / substring / pattern substitution / 审计输出 |
 | 普通 egress | `decode_raw` | `echo` / `printf` / argv / env / path / heredoc |
-| 诊断 egress | 按内建分流 | `cd` 与 command-not-found 用 `$'...'`（`diag_text`）；`source`/`type` 按 `%s` 原样裸字节写（`safe_eprint_bytes!`） |
+| 诊断 egress | 按内建分流 | `cd` 与 command-not-found 用 `$'...'`（`diag_text`）；`source`/`type` 按 `%s` 裸字节写（`safe_eprint_bytes!`）；exec 类诊断（`bad interpreter` / `Is a directory` / `cannot execute binary` / errno）用 `exec_fail_bytes!` 写 `decode_raw(display)` |
 
-禁止 `String::from_utf8_unchecked`（UB）与 `from_utf8_lossy` 处理变量字节
-（永久失真）。`read_fields` 必须吃**原始** `input_bytes`，传已编码串的
-`.as_bytes()` 会二次编码。逐字节栅栏见 `tests/bash_diff_builtins.sh` GROUP A
-的 15 条 byteval 用例（含字面哨兵经 `-c` / 命令替换 / `source` / `mapfile` /
-继承环境五条 ingress，以及 stderr 诊断不泄漏编码串）。
+禁止 `String::from_utf8_unchecked`（UB）与 `from_utf8_lossy` / `to_string_lossy`
+处理可能含非法 UTF-8 的字节（永久失真）。`read_fields` 必须吃**原始** `input_bytes`，
+传已编码串的 `.as_bytes()` 会二次编码。逐字节栅栏见 `tests/bash_diff_builtins.sh`
+GROUP A 的 byteval / ANSI-C / from_utf8_lossy 用例（含字面哨兵五条 ingress、
+stderr 诊断不泄漏编码串、`$'\u...'` 的 locale 回退、裸 0xff 在脚本/printf/shebang/命令名的保真）。
+
+### `from_utf8_lossy` 站点清零（非交互 `-c` 可达路径）
+
+oracle（MSYS2 bash 5.3, `LC_ALL=C`）实测原始字节 `0xff` 在下列站点必须原样保真，
+修复前一律失真为 `U+FFFD`（`ef bf bd`）或 `U+00FF`（`c3 bf`）：
+
+| 站点 | 修复前 | 修复后 |
+| ---- | ---- | ---- |
+| `posix::read_file`（脚本/`source` 源码） | `from_utf8_lossy` | `encode_raw`，调用方不再 `escape_literal` |
+| `executor::shebang_interpreter` | `from_utf8_lossy` | `encode_raw`；execve 前 `decode_raw`，诊断裸字节写 |
+| `builtins::printf` 非法/缺失格式字符 | `from_utf8_lossy` / `as char` | `safe_eprint_bytes!` 写 `bytes` 原始切片 |
+| `executor::exec_classified` errno/目录/二进制诊断 | `format!` + `to_string_lossy` 的 `display` | `exec_fail_bytes!` 写 `decode_raw(display)` |
+
+**残留边界（不在 `-c` 对拍门内，如实登记）**：`posix::strftime_local` 仍用
+`from_utf8_lossy`。它只喂交互 REPL 的 PS1 `\d/\t/\T/\A/\@`，格式串是硬编码 ASCII，
+本平台 locale 输出只有 ASCII 或合法 UTF-8，用户非法字节无法经此进入；改动显示路径
+（同时被 `visible_width` 消费）风险大于收益，故保留并在此登记。
+
+### ANSI-C quoting `$'...'` 与字符分类 locale
+
+bash 对 `$'\uHHHH'`/`$'\UHHHHHHHH'` 的解释取决于 `MB_CUR_MAX`（字符分类 locale），
+不是消息 locale。实测（MSYS2 bash 5.3）：单字节 locale（`C`/`POSIX`）下码点 `<=0xFF`
+输出单字节、`>0xFF` 回退字面 `\uXXXX`（`>0xFFFF` 则 `\UXXXXXXXX`）；多字节
+（`*.UTF-8`）下按 Unicode 字符输出。`\xNN`/`\NNN` 恒为裸字节（不受 locale 影响）；
+任何转义产生 NUL 会截断其后全部内容（bash 用 C 字符串保存）。实现位于
+`lexer::read_ansi_c` + `i18n::is_utf8_ctype`（优先级 `LC_ALL`>`LC_CTYPE`>`LANG`，
+空值视为未设置，默认单字节）；lexer 新生成的 `U+E100` 必须双写以免与紧邻 PUA 碰撞。
 
 ## 有意偏离（唯一真源）
 

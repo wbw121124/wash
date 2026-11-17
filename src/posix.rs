@@ -417,7 +417,11 @@ pub fn read_file(path: &str) -> Option<String> {
         return None;
     }
     buf.truncate(n as usize);
-    Some(String::from_utf8_lossy(&buf).into_owned())
+    // 源文件是「原始字节 ingress」：非法 UTF-8（如裸 0xff）在 bash 下是
+    // 源码里的真实字节，不能用 from_utf8_lossy 变成 U+FFFD。统一走 byteval
+    // 编码，调用方直接把结果交给 parser，不再额外 escape_literal（encode_raw
+    // 已把字面哨兵一并编码，重复 escape 会把 ESC 标记双写）。
+    Some(crate::byteval::encode_raw(&buf))
 }
 
 /// `read_file` 的字节级版本：不做 UTF-8 有损转换，供 execve 失败分类器

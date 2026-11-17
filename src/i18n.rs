@@ -142,6 +142,28 @@ pub fn locale() -> &'static str {
     current_locale()
 }
 
+/// 字符分类 locale 是否为多字节（UTF-8）。
+///
+/// 与 [`current_locale`] 不同，这里**保留**编码后缀：bash 的 `$'\uHHHH'` 行为
+/// 取决于 `MB_CUR_MAX`，`C` / `POSIX` 是单字节，`C.UTF-8` / `zh_CN.UTF-8` 是
+/// 多字节。实测（MSYS2 bash 5.3）：
+/// * 单字节 locale：`\u00e9` → 单字节 `e9`；`\uE000` → 字面 `\uE000`；
+///   `\U0001F600` → 字面 `\U0001F600`。
+/// * 多字节 locale：`\u00e9` → UTF-8 `c3 a9`；`\uE000` → `ee 80 80`。
+///
+/// 优先级与 POSIX 一致：`LC_ALL` > `LC_CTYPE` > `LANG`；空值视为未设置，
+/// 全未设置时按 `C`（单字节）。不含消息专用的 `LC_MESSAGES`。
+pub(crate) fn is_utf8_ctype() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        let raw = ["LC_ALL", "LC_CTYPE", "LANG"]
+            .iter()
+            .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
+            .unwrap_or_default();
+        raw.to_ascii_lowercase().contains("utf")
+    })
+}
+
 /// fish 风格的翻译宏：`tr!("text")`。
 ///
 /// fish 用的是 C/C++ 的 `_()` 宏，但 Rust 把 `_` 保留为通配符标识符，不能

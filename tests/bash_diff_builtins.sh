@@ -26,7 +26,7 @@
 #       'cd <WASH_REPO> && bash tests/bash_diff_builtins.sh'
 #
 # Optional: ONLY_GROUP=A|K|B|C|D runs a single group.
-#   A = core semantics + finished builtins (573 cases: 340 + 33 brace-range
+#   A = core semantics + finished builtins (590 cases: 340 + 33 brace-range
 #       + 24 brace word-boundary + 15 brace nest/escape/quote-removal
 #       + 1 brace deep-nesting stack guard + 37 heredoc / herestring
 #       + 11 unclosed `$(` syntax-error fence
@@ -49,6 +49,12 @@
 #          literal U+E100+U+E000 sentinel forgery via -c source, command
 #          substitution, source file, mapfile and inherited-env ingress;
 #          stderr diagnostics must not leak encoded values)
+#       + 12 ANSI-C quoting fence ($'...' raw bytes for \x/\0, locale-dependent
+#          \u/\U fallback, NUL truncation, generated-sentinel escaping;
+#          9 under LC_ALL=C + 3 under LC_ALL=C.UTF-8)
+#       + 5 from_utf8_lossy fence (script/source ingress, printf invalid
+#          format char, shebang bad interpreter, command-name errno diagnostic;
+#          raw 0xff must survive, never become U+FFFD or U+00FF)
 #       -> MUST stay green (regressions)
 #   K = KNOWN-DIFF: cannot be byte-equal by design (documented, not fixed)
 #   B = regression fence for already-fixed defects (GROUP B, 21 cases, green today)
@@ -114,6 +120,12 @@ printf 'echo FROM-EXECFIX\n'                    > "$SANDBOX/execfix/pdir1/nonexe
 printf '\356\204\200\356\200\200' > "$SANDBOX/execfix/forge.bin"
 printf 'printf %%s "\356\204\200\356\200\200" | od -An -tx1\n' > "$SANDBOX/execfix/forge_src.sh"
 printf '\377' > "$SANDBOX/execfix/ff.bin"
+# from_utf8_lossy 修复夹具：源码 / printf spec / shebang 解释器 / 命令名各含
+# 裸 0xff。这些字节必须原样保真，不得变成 U+FFFD(ef bf bd) 或 U+00FF(c3 bf)。
+printf 'printf %%s "\377" | od -An -tx1\n'      > "$SANDBOX/execfix/lossy_src.sh"
+printf '%%\377'                                > "$SANDBOX/execfix/lossy_fmt.bin"
+printf '#!/tmp/no_such_\377\necho LOSSY-HI\n'  > "$SANDBOX/execfix/lossy_shebang"
+printf '/tmp/no_such_\377'                     > "$SANDBOX/execfix/rawname.bin"
 printf 'echo "hello from src"\n' > "$SANDBOX/script.sh"
 printf 'echo "1=$1 2=$2 n=$#"\n'  > "$SANDBOX/args.sh"
 printf 'exit 7\n'                 > "$SANDBOX/exit7.sh"
@@ -1319,6 +1331,38 @@ run_case A byteval-diag-cd 'v=$(cat @SANDBOX@/execfix/ff.bin); cd "$v"; echo "rc
 run_case A byteval-diag-cmdnotfound 'v=$(cat @SANDBOX@/execfix/ff.bin); "$v"; echo "rc=$?"'
 run_case A byteval-diag-source 'v=$(cat @SANDBOX@/execfix/ff.bin); source "$v"; echo "rc=$?"'
 run_case A byteval-diag-type 'v=$(cat @SANDBOX@/execfix/ff.bin); type "$v"; echo "rc=$?"'
+# ANSI-C quoting（$'...'）字节保真。bash 实测：
+# * \xNN / \NNN 在任何 locale 下都产生裸字节（0xff 不得变成 UTF-8 的 c3 bf）；
+# * \uHHHH / \UHHHHHHHH 取决于字符分类 locale：单字节 locale（C/POSIX）下
+#   码点 <=0xff 输出单字节，>0xff 回退成字面 \uXXXX（>0xffff 则 \UXXXXXXXX）；
+#   多字节 locale（*.UTF-8）下按 Unicode 字符输出；
+# * 任何转义产生 NUL 都会截断其后全部内容（bash 用 C 字符串保存）；
+# * 多字节 locale 下 \uE100 是新生成的字面哨兵，必须双写否则与紧邻 PUA 碰撞。
+run_case A ansi-u-e000-c       "printf %s \$'\\uE000' | od -An -tx1"
+run_case A ansi-u-latin1-c     "printf %s \$'\\u00e9' | od -An -tx1"
+run_case A ansi-u-short-c      "printf %s \$'\\uE00' | od -An -tx1"
+run_case A ansi-U-big-c        "printf %s \$'\\U0001F600' | od -An -tx1"
+run_case A ansi-sentinel-c     "printf %s \$'\\uE100\\uE000' | od -An -tx1"
+run_case A ansi-x-ff           "printf %s \$'\\xff' | od -An -tx1"
+run_case A ansi-oct-377        "printf %s \$'\\377' | od -An -tx1"
+run_case A ansi-nul-x          "printf %s \$'a\\x00b' | od -An -tx1"
+run_case A ansi-nul-u          "printf %s \$'a\\u0000b' | od -An -tx1"
+CASE_ENV=(env LC_ALL=C.UTF-8 LANG=C.UTF-8)
+run_case A ansi-u-e000-utf8    "printf %s \$'\\uE000' | od -An -tx1"
+run_case A ansi-u-latin1-utf8  "printf %s \$'\\u00e9' | od -An -tx1"
+run_case A ansi-sentinel-utf8  "printf %s \$'\\uE100\\uE000' | od -An -tx1"
+CASE_ENV=()
+# from_utf8_lossy 站点：非法 UTF-8 裸字节必须原样保真（不变量=各站点不再
+# 用 from_utf8_lossy / to_string_lossy 丢失字节）。oracle 实测：
+# * 脚本源码 / source 文件内容含裸 0xff → printf 输出 0xff；
+# * printf 格式串的非法转换字符 → 诊断写裸 0xff（不是 c3 bf / ef bf bd）；
+# * shebang 解释器路径含裸 0xff（间接 -c 路径）→ bad interpreter 诊断写裸字节；
+# * 不存在的命令名含裸 0xff → errno 诊断写裸字节。
+run_case A fromlossy-script     '@SANDBOX@/execfix/lossy_src.sh'
+run_case A fromlossy-source     'source @SANDBOX@/execfix/lossy_src.sh'
+run_case A fromlossy-printf-spec 'fmt=$(cat @SANDBOX@/execfix/lossy_fmt.bin); printf "$fmt" x; echo "rc=$?"'
+run_case A fromlossy-shebang    '@SANDBOX@/execfix/lossy_shebang; echo "rc=$?"'
+run_case A fromlossy-cmd-enoent 'v=$(cat @SANDBOX@/execfix/rawname.bin); "$v"; echo "rc=$?"'
 run_case A plain-script         '@SANDBOX@/execfix/plain; echo "rc=$?"'
 # stderr 本身写失败（2>&1 指向 /dev/full）：bash 静默放弃诊断并保留命令自身
 # 的 rc；Rust 的 eprintln!/println! 在写失败时 panic(rc=101)，属逐字节/rc

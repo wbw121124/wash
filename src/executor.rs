@@ -164,8 +164,12 @@ fn exec_classified(
     let st = posix::stat_path(display, true);
     if let Some(s) = &st {
         if s.file_type == posix::FT_DIR {
-            let msg = format!("{}: Is a directory", display);
-            return exec_fail(&msg, 126, parent_shell);
+            // display 是 byteval 编码串；路径含非法 UTF-8 时按裸字节写诊断。
+            return exec_fail_bytes(
+                &[&crate::byteval::decode_raw(display), b": Is a directory"],
+                126,
+                parent_shell,
+            );
         }
     }
     let is_reg = matches!(&st, Some(s) if s.file_type == posix::FT_REG);
@@ -176,17 +180,21 @@ fn exec_classified(
             // 字节仍走脚本回退）。
             let head = &bytes[..bytes.len().min(80)];
             if head.contains(&0u8) || head.starts_with(b"\x7fELF") {
-                let msg = format!(
-                    "{}: cannot execute binary file: Exec format error",
-                    display
+                return exec_fail_bytes(
+                    &[
+                        &crate::byteval::decode_raw(display),
+                        b": cannot execute binary file: Exec format error",
+                    ],
+                    126,
+                    parent_shell,
                 );
-                return exec_fail(&msg, 126, parent_shell);
             }
             if let Some(interp) = shebang_interpreter(head) {
                 // bash 的 re-exec：execve(解释器, [解释器, 脚本, 参数...])。
                 // 解释器不存在/不可执行时按其实际 errno 报
                 // `bad interpreter: <strerror>`（rc 126，无行号前缀）。
-                let ic = CString::new(interp.clone()).unwrap_or_default();
+                // interp 是 byteval 编码串，execve 前必须 decode_raw 还原字节。
+                let ic = CString::new(crate::byteval::decode_raw(&interp)).unwrap_or_default();
                 let script_c = CString::new(display).unwrap_or_default();
                 let mut ptrs: Vec<*const c_char> =
                     vec![ic.as_ptr(), script_c.as_ptr()];
@@ -199,13 +207,21 @@ fn exec_classified(
                 ptrs.push(std::ptr::null());
                 posix::execve(&ic, &ptrs, envp);
                 let e2 = posix::errno();
-                let msg = format!(
-                    "{}: {}: bad interpreter: {}",
-                    display,
-                    interp,
-                    posix::errno_message(e2)
+                // interp 含原始字节，诊断必须按裸字节写，不能用 format!
+                // （那会把 byteval 编码串或 U+FFFD 写进 stderr）。
+                let interp_raw = crate::byteval::decode_raw(&interp);
+                let estr = posix::errno_message(e2);
+                return exec_fail_bytes(
+                    &[
+                        &crate::byteval::decode_raw(display),
+                        b": ",
+                        &interp_raw,
+                        b": bad interpreter: ",
+                        estr.as_bytes(),
+                    ],
+                    126,
+                    parent_shell,
                 );
-                return exec_fail(&msg, 126, parent_shell);
             }
             // ENOEXEC 纯文本：作为 shell 脚本执行。
             return run_as_script(display, argv_strs, envp, shell_env, parent_shell);
@@ -217,8 +233,12 @@ fn exec_classified(
     } else {
         126
     };
-    let msg = format!("{}: {}", display, posix::errno_message(e));
-    exec_fail(&msg, code, parent_shell)
+    let estr = posix::errno_message(e);
+    exec_fail_bytes(
+        &[&crate::byteval::decode_raw(display), b": ", estr.as_bytes()],
+        code,
+        parent_shell,
+    )
 }
 
 /// Print `wash: MSG` and terminate.  交互 REPL 下不打印、不退出
@@ -228,6 +248,22 @@ fn exec_fail(msg_full: &str, code: i32, parent_shell: bool) -> i32 {
         return code;
     }
     safe_eprintln!("wash: {}", msg_full);
+    let _ = std::io::stdout().flush();
+    posix::exit(code);
+}
+
+/// 与 [`exec_fail`] 同语义，但诊断体是原始字节（如 shebang 解释器路径含
+/// 非法 UTF-8）。byteval 编码串必须先 `decode_raw` 再传进来。
+fn exec_fail_bytes(parts: &[&[u8]], code: i32, parent_shell: bool) -> i32 {
+    if parent_shell && posix::INTERACTIVE_REPL.load(std::sync::atomic::Ordering::Relaxed) {
+        return code;
+    }
+    let mut buf: Vec<u8> = b"wash: ".to_vec();
+    for p in parts {
+        buf.extend_from_slice(p);
+    }
+    buf.push(b'\n');
+    let _ = std::io::stderr().write_all(&buf);
     let _ = std::io::stdout().flush();
     posix::exit(code);
 }
@@ -250,7 +286,10 @@ fn shebang_interpreter(head: &[u8]) -> Option<String> {
     if start == i {
         return None;
     }
-    Some(String::from_utf8_lossy(&head[start..i]).into_owned())
+    // 解释器路径来自文件的原始字节：裸高位字节必须保真，不能
+    // from_utf8_lossy 成 U+FFFD（bash 把它当路径里的真实字节）。
+    // 返回 byteval 编码串；execve 前用 decode_raw 还原，诊断按裸字节写。
+    Some(crate::byteval::encode_raw(&head[start..i]))
 }
 
 /// ENOEXEC 纯文本回退：把文件当 shell 脚本执行并以其状态退出。
@@ -284,7 +323,8 @@ fn run_as_script(
 /// 位置参数=脚本参数），然后退出进程。
 fn run_script_in_shell(display: &str, argv_strs: &[String], shell_env: &HashMap<String, String>) {
     let content = match posix::read_file(display) {
-        Some(c) => crate::byteval::escape_literal(&c),
+        // read_file 已做 byteval 原始字节编码，不能再 escape_literal。
+        Some(c) => c,
         None => {
             safe_eprintln!("wash: {}: {}", display, posix::errno_message(posix::errno()));
             let _ = std::io::stdout().flush();

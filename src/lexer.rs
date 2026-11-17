@@ -1962,31 +1962,86 @@ fn collect_heredocs(
 fn read_ansi_c(chars: &[char], i: usize) -> Option<(String, usize)> {
     let mut out = String::new();
     let mut j = i + 2;
+    // bash 用 C 字符串保存 $'...'，任何转义产生 NUL 都会截断其后全部内容。
+    let mut nul_seen = false;
+    // $'\uHHHH' 的解释取决于字符分类 locale，而不是消息 locale。
+    let utf8 = crate::i18n::is_utf8_ctype();
+
     while j < chars.len() {
         let c = chars[j];
         if c == '\'' {
             return Some((out, j + 1));
         }
         if c != '\\' || j + 1 >= chars.len() {
-            out.push(c);
+            if !nul_seen {
+                out.push(c);
+            }
             j += 1;
             continue;
         }
         let n = chars[j + 1];
         j += 2;
         match n {
-            'a' => out.push('\u{07}'),
-            'b' => out.push('\u{08}'),
-            'e' | 'E' => out.push('\u{1b}'),
-            'f' => out.push('\u{0c}'),
-            'n' => out.push('\n'),
-            'r' => out.push('\r'),
-            't' => out.push('\t'),
-            'v' => out.push('\u{0b}'),
-            '\\' => out.push('\\'),
-            '\'' => out.push('\''),
-            '"' => out.push('"'),
-            '?' => out.push('?'),
+            'a' => {
+                if !nul_seen {
+                    out.push('\u{07}')
+                }
+            }
+            'b' => {
+                if !nul_seen {
+                    out.push('\u{08}')
+                }
+            }
+            'e' | 'E' => {
+                if !nul_seen {
+                    out.push('\u{1b}')
+                }
+            }
+            'f' => {
+                if !nul_seen {
+                    out.push('\u{0c}')
+                }
+            }
+            'n' => {
+                if !nul_seen {
+                    out.push('\n')
+                }
+            }
+            'r' => {
+                if !nul_seen {
+                    out.push('\r')
+                }
+            }
+            't' => {
+                if !nul_seen {
+                    out.push('\t')
+                }
+            }
+            'v' => {
+                if !nul_seen {
+                    out.push('\u{0b}')
+                }
+            }
+            '\\' => {
+                if !nul_seen {
+                    out.push('\\')
+                }
+            }
+            '\'' => {
+                if !nul_seen {
+                    out.push('\'')
+                }
+            }
+            '"' => {
+                if !nul_seen {
+                    out.push('"')
+                }
+            }
+            '?' => {
+                if !nul_seen {
+                    out.push('?')
+                }
+            }
             '0'..='7' => {
                 let mut val = n.to_digit(8).unwrap();
                 let mut cnt = 1;
@@ -1995,7 +2050,9 @@ fn read_ansi_c(chars: &[char], i: usize) -> Option<(String, usize)> {
                     j += 1;
                     cnt += 1;
                 }
-                out.push((val & 0xff) as u8 as char);
+                if !nul_seen {
+                    emit_ansi_byte(&mut out, &mut nul_seen, (val & 0xff) as u8);
+                }
             }
             'x' => {
                 let mut val = 0u32;
@@ -2006,9 +2063,11 @@ fn read_ansi_c(chars: &[char], i: usize) -> Option<(String, usize)> {
                     cnt += 1;
                 }
                 if cnt == 0 {
-                    out.push_str("\\x");
+                    if !nul_seen {
+                        out.push_str("\\x");
+                    }
                 } else {
-                    out.push((val & 0xff) as u8 as char);
+                    emit_ansi_byte(&mut out, &mut nul_seen, (val & 0xff) as u8);
                 }
             }
             'u' | 'U' => {
@@ -2020,20 +2079,60 @@ fn read_ansi_c(chars: &[char], i: usize) -> Option<(String, usize)> {
                     j += 1;
                     cnt += 1;
                 }
+                if nul_seen {
+                    continue;
+                }
                 if cnt == 0 {
                     out.push('\\');
                     out.push(n);
+                } else if utf8 {
+                    match char::from_u32(val) {
+                        Some('\0') => nul_seen = true,
+                        // 源码里的字面哨兵由入口 escape_literal 双写；这里是
+                        // lexer 新生成的字符，必须同样双写，否则与后续 PUA
+                        // 拼成 ESC+PUA 会在 egress 被误当成编码字节。
+                        Some('\u{e100}') => {
+                            out.push('\u{e100}');
+                            out.push('\u{e100}');
+                        }
+                        Some(ch) => out.push(ch),
+                        None => out.push('\u{fffd}'),
+                    }
+                } else if val <= 0xff {
+                    // 单字节 locale：\u00e9 是一个裸字节 e9，不是 U+00E9
+                    // （后者会被 UTF-8 编码成两个字节）。走 byteval 编码。
+                    emit_ansi_byte(&mut out, &mut nul_seen, val as u8);
+                } else if val <= 0xffff {
+                    // bash 把不能单字节表示的码点回退成 \uXXXX（大写十六进制），
+                    // 包括 \U0000E000 这类 8 位写法。
+                    out.push_str(&format!("\\u{:04X}", val));
                 } else {
-                    out.push(char::from_u32(val).unwrap_or('\u{fffd}'));
+                    out.push_str(&format!("\\U{:08X}", val));
                 }
             }
             other => {
-                out.push('\\');
-                out.push(other);
+                if !nul_seen {
+                    out.push('\\');
+                    out.push(other);
+                }
             }
         }
     }
     None
+}
+
+/// ANSI-C 转义产生的单个字节写入 `out`：NUL 触发截断，高位字节走 byteval
+/// 编码（直接 `as char` 会得到 UTF-8 双字节，不是原始单字节）。
+fn emit_ansi_byte(out: &mut String, nul_seen: &mut bool, b: u8) {
+    if b == 0 {
+        *nul_seen = true;
+        return;
+    }
+    if b < 0x80 {
+        out.push(b as char);
+    } else {
+        out.push_str(&crate::byteval::encode_raw(&[b]));
+    }
 }
 
 pub(crate) fn read_var_name(chars: &[char], i: usize) -> String {
