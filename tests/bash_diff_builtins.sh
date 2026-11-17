@@ -26,7 +26,7 @@
 #       'cd <WASH_REPO> && bash tests/bash_diff_builtins.sh'
 #
 # Optional: ONLY_GROUP=A|K|B|C|D runs a single group.
-#   A = core semantics + finished builtins (558 cases: 340 + 33 brace-range
+#   A = core semantics + finished builtins (564 cases: 340 + 33 brace-range
 #       + 24 brace word-boundary + 15 brace nest/escape/quote-removal
 #       + 1 brace deep-nesting stack guard + 37 heredoc / herestring
 #       + 11 unclosed `$(` syntax-error fence
@@ -44,6 +44,8 @@
 #          printf empty format)
 #       + 8 stderr-write-failure fence (`fd2` also /dev/full: diagnostics must
 #          be dropped silently, never panic with rc=101)
+#       + 6 byteval raw-byte fence (truncated UTF-8 via REPLY/printf -v,
+#          ${#v} byte length, substring, declare -p audit; no PUA leakage)
 #       -> MUST stay green (regressions)
 #   K = KNOWN-DIFF: cannot be byte-equal by design (documented, not fixed)
 #   B = regression fence for already-fixed defects (GROUP B, 21 cases, green today)
@@ -1274,6 +1276,16 @@ run_case A read-n-byte1         'read -n 1 v < @SANDBOX@/execfix/utf8; printf %s
 run_case A read-n-byte4         'read -n 4 v < @SANDBOX@/execfix/utf8; printf %s "$v" | od -An -tx1; echo "rc=$?"'
 run_case A read-n-zero          'read -n 0 v < @SANDBOX@/execfix/utf8; echo "[$v] rc=$?"; read w < @SANDBOX@/execfix/utf8; echo "[$w]"'
 run_case A read-N-byte4         'read -N 4 v < @SANDBOX@/execfix/utf8; printf %s "$v" | od -An -tx1; echo "rc=$?"'
+# byteval 无损字节编码：截断字节经 REPLY / printf -v 两个独立 ingress 后，
+# 必须在 echo/printf 的 egress 逐字节还原，不能出现 PUA 泄漏或 U+FFFD。
+run_case A read-reply-raw-byte  'read -n 4 < @SANDBOX@/execfix/utf8; printf %s "$REPLY" | od -An -tx1; echo "rc=$?"'
+run_case A printf-v-raw-byte    'printf -v v "\xff"; printf %s "$v" | od -An -tx1; echo "rc=$?"'
+# QA 复核新增回归：所有「按字节解释变量」的操作必须先 decode_raw，
+# 不能用编码后 String 的 .len()/.chars() 当作字节长度。
+run_case A byteval-len-trunc    'read -n 4 v < @SANDBOX@/execfix/utf8; echo "len=${#v}"'
+run_case A byteval-len-utf8     'v=中文; echo "len=${#v}"'
+run_case A byteval-substring    'read -n 4 v < @SANDBOX@/execfix/utf8; printf %s "${v:0:2}" | od -An -tx1; echo "rc=$?"'
+run_case A byteval-declare-raw  'printf -v v "\xff"; declare -p v; echo "rc=$?"'
 run_case A plain-script         '@SANDBOX@/execfix/plain; echo "rc=$?"'
 # stderr 本身写失败（2>&1 指向 /dev/full）：bash 静默放弃诊断并保留命令自身
 # 的 rc；Rust 的 eprintln!/println! 在写失败时 panic(rc=101)，属逐字节/rc

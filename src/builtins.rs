@@ -506,7 +506,7 @@ fn print_exported_variables(sh: &Shell) {
         let value = sh.env.get(name);
         match value {
             Some(v) if !sh.null_exported.contains(name) => {
-                println!("declare -{} {}={}", attrs, name, quote_double(v))
+                println!("declare -{} {}={}", attrs, name, quote_value_for_audit(v))
             }
             _ => println!("declare -{} {}", attrs, name),
         }
@@ -863,7 +863,7 @@ fn format_array(elems: &[String]) -> String {
         if i > 0 {
             out.push(' ');
         }
-        out.push_str(&format!("[{}]={}", i, quote_double(e)));
+        out.push_str(&format!("[{}]={}", i, quote_value_for_audit(e)));
     }
     out.push(')');
     out
@@ -2241,12 +2241,9 @@ fn read_fields(input: &[u8], ifs: &[char], nvars: usize) -> Vec<String> {
     let is_ws_seq = |seq: &[u8]| -> bool {
         seq.len() == 1 && matches!(seq[0], b' ' | b'\t' | b'\n')
     };
-    let bytes_to_string = |b: &[u8]| -> String {
-        match std::str::from_utf8(b) {
-            Ok(s) => s.to_string(),
-            Err(_) => unsafe { String::from_utf8_unchecked(b.to_vec()) },
-        }
-    };
+    // 用合法 UTF-8 的可逆编码保存原始字节（见 crate::byteval），绝不再把
+    // 非法 UTF-8 塞进 String —— 那违反 String 有效性不变式（UB）。
+    let bytes_to_string = |b: &[u8]| -> String { crate::byteval::encode_raw(b) };
 
     let mut pos = 0usize;
     let mut fields: Vec<String> = Vec::new();
@@ -2295,25 +2292,13 @@ fn read_fields(input: &[u8], ifs: &[char], nvars: usize) -> Vec<String> {
     fields
 }
 
-/// 把 `read` 收集到的**原始字节流**还原成 String。
-///
-/// bash 的 `read` 是字节保真的：变量里存的就是 stdin 的原始字节。合法
-/// UTF-8 时 String 的内部字节与原始字节逐字节相同；非法/不完整 UTF-8（
-/// 例如 `read -n` 截断在多字节字符中间）时 String 没有合法的逐字节表示，
-/// 用 `from_utf8_unchecked` 原样装箱——输出路径（echo/printf 按
-/// `as_bytes()` 写出）会逐字节还原，绝不二次编码（这是 `read -n 4` 曾把
-/// `e6` 补全成 `c3 a6` 的根因）。字段切分因此也必须在字节层进行
-/// （见 [`read_fields`]）。
-///
-/// 注意：这处 unsafe 越过 Rust 的 String UTF-8 不变式，是当前 Shell env
-/// 全用 `String` 换取逐字节兼容的已知取舍（QA 已独立标记）。长期方案是把
-/// env 值改为字节容器（OsString/byte side-table）并在所有输出与 argv 边界
-/// 解码，以彻底消除该不变式风险；不要在此处叠加更多 char 层逻辑。
+/// 把 `read` 收集到的**原始字节流**编码成可安全存入 `String` 的合法 UTF-8
+/// 文本（见 [`crate::byteval`]）。所有高位字节 `0x80..=0xFF` 一一映射到私有
+/// 区字符，因此任意字节序列都可无损往返；字节长度与切片语义保持不变。
+/// 合法 UTF-8 文本在输出边界经 [`crate::byteval::decode_raw`] 还原后仍是
+/// 原字节，不会失真。
 fn decode_read_bytes(bytes: &[u8]) -> String {
-    match std::str::from_utf8(bytes) {
-        Ok(s) => s.to_string(),
-        Err(_) => unsafe { String::from_utf8_unchecked(bytes.to_vec()) },
-    }
+    crate::byteval::encode_raw(bytes)
 }
 
 /// The `read` builtin: read a line from the standard input and split it
@@ -2468,13 +2453,16 @@ fn builtin_read(argv: &[String], sh: &mut Shell) -> i32 {
         // The input ended with a lone backslash: it is dropped.
         input_bytes.pop();
     }
+    // 字段切分必须基于**原始字节**：read_fields 内部只会做一次 encode_raw。
+    // 若先把 input_bytes 编码再传 .as_bytes()，PUA 字符的 UTF-8 字节会被
+    // 二次编码（read -n 截断场景曾由此输出 ee 81 a4 而非 e4）。
     let input = decode_read_bytes(&input_bytes);
 
     // bash returns 1 when the end of the file was reached.
     let status = if eof { 1 } else { 0 };
 
     if names.is_empty() {
-        // Without a variable the whole line goes into $REPLY.
+        // Without a variable the whole line goes into $REPLY（已编码一次）。
         sh.env.insert("REPLY".to_string(), input);
         return status;
     }
@@ -2493,7 +2481,7 @@ fn builtin_read(argv: &[String], sh: &mut Shell) -> i32 {
         Some(value) => value.chars().collect(),
         None => vec![' ', '\t', '\n'],
     };
-    let fields = read_fields(input.as_bytes(), &ifs_chars, names.len());
+    let fields = read_fields(&input_bytes, &ifs_chars, names.len());
     for (name, value) in names.iter().zip(fields.iter()) {
         sh.env.insert(name.clone(), value.clone());
     }
@@ -3543,14 +3531,15 @@ fn builtin_echo(argv: &[String]) -> i32 {
     let mut out: Vec<u8> = Vec::new();
     if eflag {
         let joined = text_args.join(" ");
-        let (bytes, stopped) = interpret_escapes(joined.as_bytes(), true);
+        let raw_joined = crate::byteval::decode_raw(&joined);
+        let (bytes, stopped) = interpret_escapes(&raw_joined, true);
         out.extend_from_slice(&bytes);
         if !stopped && !nflag {
             out.push(b'\n');
         }
     } else {
         let s = text_args.join(" ");
-        out.extend_from_slice(s.as_bytes());
+        out.extend_from_slice(&crate::byteval::decode_raw(&s));
         if !nflag {
             out.push(b'\n');
         }
@@ -3665,7 +3654,7 @@ fn builtin_printf(argv: &[String], sh: Option<&mut Shell>) -> i32 {
             let args = argv.get(format_idx + 1..).unwrap_or(&[]);
             let (value, conv_error) = printf_format(&format, args);
             if let Some(sh) = sh {
-                sh.env.insert(var, String::from_utf8_lossy(&value).into_owned());
+                sh.env.insert(var, crate::byteval::encode_raw(&value));
             }
             if conv_error {
                 1
@@ -3704,7 +3693,10 @@ fn builtin_printf(argv: &[String], sh: Option<&mut Shell>) -> i32 {
 /// code 1). This is the shared core used by both the child (stdout) and the
 /// parent (`-v`, store to env).
 fn printf_format(format: &str, args: &[String]) -> (Vec<u8>, bool) {
-    let bytes = format.as_bytes();
+    // 格式串与参数可能含 byteval 编码的裸字节（read -n 截断），先解码为
+    // 原始字节再做逐字节格式化，避免 PUA 编码泄漏到输出。
+    let format_raw = crate::byteval::decode_raw(format);
+    let bytes = &format_raw[..];
     let mut out: Vec<u8> = Vec::new();
     let mut conv_error = false;
     let mut ai: usize = 0;
@@ -3886,18 +3878,19 @@ fn parse_printf_spec(
         ""
     };
     let arg_missing = *ai >= args.len();
+    let arg_raw = crate::byteval::decode_raw(arg);
 
     match conv {
         b's' | b'b' => {
             let content: Vec<u8> = if conv == b'b' {
-                let (bts, stop) = interpret_escapes(arg.as_bytes(), true);
+                let (bts, stop) = interpret_escapes(&arg_raw, true);
                 if stop {
                     *ai += 1;
                     return (i, true);
                 }
                 bts
             } else {
-                arg.as_bytes().to_vec()
+                arg_raw.clone()
             };
             let content = truncate_prec(&content, have_prec, rprec);
             let padded =
@@ -3906,7 +3899,7 @@ fn parse_printf_spec(
             *ai += 1;
         }
         b'q' => {
-            let content = sh_quote(arg.as_bytes());
+            let content = sh_quote(&arg_raw);
             let content = truncate_prec(&content, have_prec, rprec);
             // `%q` ignores the `0` flag (space padding only).
             let padded =
@@ -3918,7 +3911,7 @@ fn parse_printf_spec(
             let content: Vec<u8> = if arg.is_empty() {
                 vec![0u8] // empty → NUL byte (bash behaviour)
             } else {
-                vec![arg.as_bytes()[0]]
+                vec![arg_raw[0]]
             };
             let padded = apply_field(&content, minus, zero, if have_width { rwidth } else { 0 }, true);
             out.extend_from_slice(&padded);
@@ -4981,7 +4974,7 @@ fn builtin_readonly(argv: &[String], sh: &mut Shell) -> i32 {
                     println!("declare -r {}", name);
                 }
                 Some(v) => {
-                    println!("declare -r {}={}", name, quote_double(v));
+                    println!("declare -r {}={}", name, quote_value_for_audit(v));
                 }
                 None => {
                     println!("declare -r {}", name);
@@ -5116,7 +5109,7 @@ fn print_declared(sh: &Shell, names: &[String]) {
                 println!("declare {} {}", attr_str, name);
             }
             Some(v) => {
-                println!("declare {} {}={}", attr_str, name, quote_double(v));
+                println!("declare {} {}={}", attr_str, name, quote_value_for_audit(v));
             }
             None => {
                 println!("declare {} {}", attr_str, name);
@@ -5747,6 +5740,50 @@ fn quote_double(value: &str) -> String {
         }
     }
     out.push('"');
+    out
+}
+
+/// 把 byteval 编码的变量值先还原成裸字节，再按 bash 的审计输出规则引用。
+/// 直接把编码串交给 [`quote_double`] 会把 PUA 转义序列当成普通字符输出
+/// （例如裸字节 0xff 会打印成 `$'\356\201\277'` 而不是 `$'\377'`）。
+fn quote_value_for_audit(value: &str) -> String {
+    let raw = crate::byteval::decode_raw(value);
+    if raw.iter().any(|&b| b < 0x20 || b == 0x7f || b >= 0x80) {
+        return ansi_quote_bytes(&raw);
+    }
+    let mut out = String::from("\"");
+    for &b in &raw {
+        match b {
+            b'"' => out.push_str("\\\""),
+            b'\\' => out.push_str("\\\\"),
+            b'$' => out.push_str("\\$"),
+            b'`' => out.push_str("\\`"),
+            _ => out.push(b as char),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn ansi_quote_bytes(value: &[u8]) -> String {
+    let mut out = String::from("$'");
+    for &b in value {
+        match b {
+            0x07 => out.push_str("\\a"),
+            0x08 => out.push_str("\\b"),
+            0x09 => out.push_str("\\t"),
+            0x0a => out.push_str("\\n"),
+            0x0b => out.push_str("\\v"),
+            0x0c => out.push_str("\\f"),
+            0x0d => out.push_str("\\r"),
+            0x1b => out.push_str("\\E"),
+            b'\\' => out.push_str("\\\\"),
+            b'\'' => out.push_str("\\'"),
+            0x20..=0x7e => out.push(b as char),
+            _ => out.push_str(&format!("\\{:03o}", b)),
+        }
+    }
+    out.push('\'');
     out
 }
 

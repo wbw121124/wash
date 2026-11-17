@@ -131,13 +131,18 @@ pub const S_ISUID: i32 = 0o4000;
 pub const S_ISGID: i32 = 0o2000;
 pub const S_ISVTX: i32 = 0o1000;
 
+/// 把 shell 层的路径字符串转成 C 字符串；byteval 编码的裸字节在此还原。
+pub(crate) fn path_cstr(path: &str) -> CString {
+    CString::new(crate::byteval::decode_raw(path)).unwrap_or_default()
+}
+
 /// The metadata of `path`.
 ///
 /// With `follow` set a symbolic link is resolved (like `stat(2)`), otherwise
 /// the link itself is described (like `lstat(2)`).  Returns `None` when the
 /// file does not exist or cannot be examined.
 pub fn stat_path(path: &str, follow: bool) -> Option<StatBuf> {
-    let c = CString::new(path).unwrap_or_default();
+    let c = path_cstr(path);
     let mut out = StatBuf {
         size: 0,
         mtime: 0,
@@ -210,7 +215,8 @@ pub fn pipe() -> [i32; 2] {
 /// return its descriptor in the msys fd space (the same space `dup2`/`close`
 /// use).  Returns -1 on failure.  See `wash_heredoc_fd` in posix_shim.c.
 pub fn heredoc_fd(text: &str) -> i32 {
-    unsafe { wash_heredoc_fd(text.as_ptr(), text.len()) }
+    let raw = crate::byteval::decode_raw(text);
+    unsafe { wash_heredoc_fd(raw.as_ptr(), raw.len()) }
 }
 
 pub fn dup2(oldfd: i32, newfd: i32) -> i32 {
@@ -222,12 +228,12 @@ pub fn close(fd: i32) -> i32 {
 }
 
 pub fn chdir(path: &str) -> i32 {
-    let c = CString::new(path).unwrap_or_default();
+    let c = path_cstr(path);
     unsafe { wash_chdir(c.as_ptr()) }
 }
 
 pub fn open_write(path: &str, append: bool, noclobber: bool) -> i32 {
-    let c = CString::new(path).unwrap_or_default();
+    let c = path_cstr(path);
     unsafe { wash_open_write(c.as_ptr(), if append { 1 } else { 0 }, if noclobber { 1 } else { 0 }) }
 }
 
@@ -297,7 +303,7 @@ pub fn rlimit_hard(which: u8) -> Option<u64> {
 }
 
 pub fn open_read(path: &str) -> i32 {
-    let c = CString::new(path).unwrap_or_default();
+    let c = path_cstr(path);
     unsafe { wash_open_read(c.as_ptr()) }
 }
 
@@ -318,7 +324,7 @@ pub fn getcwd() -> String {
 /// resolves symbolic links (bash's `cd -P`); otherwise the logical path is
 /// returned (bash's `cd -L`, the default).
 pub fn chdir_getcwd(path: &str, physical: bool) -> String {
-    let c = CString::new(path).unwrap_or_default();
+    let c = path_cstr(path);
     unsafe {
         let p = wash_chdir_getcwd(c.as_ptr(), if physical { 1 } else { 0 });
         if p.is_null() {
@@ -331,7 +337,7 @@ pub fn chdir_getcwd(path: &str, physical: bool) -> String {
 
 /// Resolve symbolic links in `path`, returning the canonical absolute path.
 pub fn realpath(path: &str) -> String {
-    let c = CString::new(path).unwrap_or_default();
+    let c = path_cstr(path);
     unsafe {
         let p = wash_realpath(c.as_ptr());
         if p.is_null() {
@@ -354,7 +360,7 @@ pub fn nsig() -> i32 {
 }
 
 pub fn access(path: &str, mode: i32) -> i32 {
-    let c = CString::new(path).unwrap_or_default();
+    let c = path_cstr(path);
     unsafe { wash_access(c.as_ptr(), mode) }
 }
 
@@ -394,7 +400,7 @@ pub fn errno_message(code: i32) -> String {
 /// Read a whole file into memory. Returns `None` when the file cannot be
 /// read (the caller can then inspect `errno()`).
 pub fn read_file(path: &str) -> Option<String> {
-    let c = CString::new(path).unwrap_or_default();
+    let c = path_cstr(path);
     let size = unsafe { wash_read_file(c.as_ptr(), std::ptr::null_mut(), 0) };
     if size < 0 {
         return None;
@@ -417,7 +423,7 @@ pub fn read_file(path: &str) -> Option<String> {
 /// `read_file` 的字节级版本：不做 UTF-8 有损转换，供 execve 失败分类器
 /// 判定二进制文件（NUL / ELF 魔数）使用。
 pub fn read_file_bytes(path: &str) -> Option<Vec<u8>> {
-    let c = CString::new(path).unwrap_or_default();
+    let c = path_cstr(path);
     let size = unsafe { wash_read_file(c.as_ptr(), std::ptr::null_mut(), 0) };
     if size < 0 {
         return None;
@@ -727,7 +733,7 @@ pub fn strftime_local(fmt: &str) -> String {
 
 /// 打开共享库，成功返回 shim 句柄槽位（>= 0），失败返回带诊断的 Err。
 pub fn dl_open(path: &str) -> Result<i32, String> {
-    let c = CString::new(path).unwrap_or_default();
+    let c = path_cstr(path);
     let slot = unsafe { wash_dlopen(c.as_ptr()) };
     if slot < 0 {
         Err(dl_error())

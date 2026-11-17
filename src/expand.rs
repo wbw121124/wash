@@ -750,7 +750,7 @@ fn eval_braced(body: &str, ctx: &ExpandCtx) -> Expansion {
                 _ => {
                     let len = match (elems, subscript.parse::<i64>()) {
                         (Some(e), Ok(i)) if i >= 0 && (i as usize) < e.len() => {
-                            e[i as usize].chars().count()
+                            crate::byteval::decoded_len(&e[i as usize])
                         }
                         _ => 0,
                     };
@@ -765,7 +765,10 @@ fn eval_braced(body: &str, ctx: &ExpandCtx) -> Expansion {
             return Expansion::Scalar("0".to_string());
         }
         return Expansion::Scalar(
-            ctx.env.get(name).map(|v| v.len().to_string()).unwrap_or_else(|| "0".to_string()),
+            ctx.env
+                .get(name)
+                .map(|v| crate::byteval::decoded_len(v).to_string())
+                .unwrap_or_else(|| "0".to_string()),
         );
     }
     if body.starts_with('!') && !body.contains(':') && !body.contains('/') && !body.contains('%')
@@ -1194,8 +1197,10 @@ fn substring(value: &str, arg: &str) -> String {
     let mut parts = arg.splitn(2, ':');
     let off_s = parts.next().unwrap_or("");
     let len_s = parts.next().unwrap_or("");
-    let chars: Vec<char> = value.chars().collect();
-    let n = chars.len() as i64;
+    // LC_ALL=C 下 bash 按裸字节切片：先解码 byteval 编码得到原始字节，
+    // 每个字节算一个单位；结果再编码回 byteval，绝不让裸字节直接进 String。
+    let raw = crate::byteval::decode_raw(value);
+    let n = raw.len() as i64;
     // A space is required before a negative offset (`${v: -3}`), otherwise
     // `:-` would be parsed as the "use default" operator.  Trim it here.
     let mut off = off_s.trim().parse::<i64>().unwrap_or(0);
@@ -1210,7 +1215,7 @@ fn substring(value: &str, arg: &str) -> String {
     }
     let start = off as usize;
     let taken = if len_s.is_empty() {
-        chars.len() - start
+        raw.len() - start
     } else {
         let len = len_s.trim().parse::<i64>().unwrap_or(0);
         if len < 0 {
@@ -1228,7 +1233,8 @@ fn substring(value: &str, arg: &str) -> String {
             len as usize
         }
     };
-    chars[start..].iter().take(taken).collect()
+    let selected: Vec<u8> = raw[start..].iter().take(taken).copied().collect();
+    crate::byteval::encode_raw(&selected)
 }
 
 fn strip_prefix(value: &str, pat: &str, longest: bool) -> String {
@@ -1306,7 +1312,7 @@ fn split_replacement(arg: &str) -> (&str, &str) {
 /// lets `glob_match` (which compares and ranges over `char`) implement exactly
 /// that byte semantics.
 fn bytes_as_chars(s: &str) -> Vec<char> {
-    s.as_bytes().iter().map(|&b| b as char).collect()
+    crate::byteval::decode_raw(s).iter().map(|&b| b as char).collect()
 }
 
 fn chars_as_bytes(cs: &[char]) -> Vec<u8> {
@@ -1425,9 +1431,8 @@ fn replace_pattern(value: &str, arg: &str, all: bool) -> String {
         }
     }
     out.extend_from_slice(&chars[copied..]);
-    // Reconstruct the original bytes: a replacement may legally leave an
-    // incomplete multibyte sequence, so use lossy decoding (bash keeps bytes).
-    String::from_utf8_lossy(&chars_as_bytes(&out)).into_owned()
+    // 结果字节流编码回 byteval；裸字节绝不直接进 String（否则又是 UB）。
+    crate::byteval::encode_raw(&chars_as_bytes(&out))
 }
 
 // ---------------------------------------------------------------------------

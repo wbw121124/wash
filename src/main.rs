@@ -9,6 +9,7 @@
 
 mod arith;
 mod builtins;
+mod byteval;
 mod error;
 mod executor;
 mod expand;

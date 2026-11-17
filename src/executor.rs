@@ -42,7 +42,8 @@ impl ArgVec {
         let mut cstrings = Vec::with_capacity(args.len());
         let mut ptrs = Vec::with_capacity(args.len() + 1);
         for a in args {
-            let c = CString::new(a.as_str()).unwrap_or_default();
+            // 变量值中的 byteval 编码字节在此还原为原始 argv 字节。
+            let c = CString::new(crate::byteval::decode_raw(a)).unwrap_or_default();
             ptrs.push(c.as_ptr());
             cstrings.push(c);
         }
@@ -54,11 +55,19 @@ impl ArgVec {
     }
 }
 
+/// 构造 `NAME=VALUE` 的 C 字符串，VALUE 中的 byteval 编码在此还原为裸字节。
+fn env_entry(k: &str, v: &str) -> CString {
+    let mut kv = crate::byteval::decode_raw(k);
+    kv.push(b'=');
+    kv.extend_from_slice(&crate::byteval::decode_raw(v));
+    CString::new(kv).unwrap_or_default()
+}
+
 /// Build the null-terminated `envp` vector for an environment map.
 pub(crate) fn build_env_ptrs(env: &HashMap<String, String>) -> (Vec<CString>, Vec<*const c_char>) {
     let cstrings: Vec<CString> = env
         .iter()
-        .map(|(k, v)| CString::new(format!("{}={}", k, v)).unwrap_or_default())
+        .map(|(k, v)| env_entry(k, v))
         .collect();
     let mut ptrs: Vec<*const c_char> = cstrings.iter().map(|c| c.as_ptr()).collect();
     ptrs.push(std::ptr::null());
@@ -80,11 +89,9 @@ pub(crate) fn build_shell_env_ptrs(sh: &Shell) -> (Vec<CString>, Vec<*const c_ch
         if k == "PWD" || !sh.exported.contains(k) {
             continue;
         }
-        cstrings.push(CString::new(format!("{}={}", k, v)).unwrap_or_default());
+        cstrings.push(env_entry(k, v));
     }
-    cstrings.push(
-        CString::new(format!("PWD={}", sh.cwd)).unwrap_or_default(),
-    );
+    cstrings.push(env_entry("PWD", &sh.cwd));
     let mut ptrs: Vec<*const c_char> = cstrings.iter().map(|c| c.as_ptr()).collect();
     ptrs.push(std::ptr::null());
     (cstrings, ptrs)
