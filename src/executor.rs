@@ -1071,7 +1071,10 @@ fn execute_for(var: &str, words: &[Vec<WordPart>], body: &CommandList, sh: &mut 
         code = execute_loop_body(body, sh);
         // bash leaves the loop variable set to its final value (the loop body
         // shares the caller's scope), so we keep it rather than unsetting it.
-        if sh.exit_requested.is_some() || sh.return_requested.is_some() {
+        if sh.exit_requested.is_some()
+            || sh.return_requested.is_some()
+            || sh.fatal_error.is_some()
+        {
             return code;
         }
         if let Some(n) = sh.break_requested.take() {
@@ -1080,9 +1083,15 @@ fn execute_for(var: &str, words: &[Vec<WordPart>], body: &CommandList, sh: &mut 
             }
             break;
         }
-        // `continue` (if set after the body) starts the next iteration; clear
-        // it so the flag does not leak into the next pass.
-        sh.continue_requested = None;
+        // A plain `continue` starts the next iteration.  A level > 1 belongs
+        // to an enclosing loop: decrement it and leave this loop so that the
+        // outer loop can consume the flag instead of swallowing it here.
+        if let Some(n) = sh.continue_requested.take() {
+            if n > 1 {
+                sh.continue_requested = Some(n - 1);
+                break;
+            }
+        }
     }
     code
 }
@@ -1165,7 +1174,10 @@ fn execute_arith_for(
             }
         }
         code = execute_loop_body(body, sh);
-        if sh.exit_requested.is_some() || sh.return_requested.is_some() {
+        if sh.exit_requested.is_some()
+            || sh.return_requested.is_some()
+            || sh.fatal_error.is_some()
+        {
             return code;
         }
         if let Some(n) = sh.break_requested.take() {
@@ -1211,7 +1223,10 @@ fn execute_while(condition: &CommandList, body: &CommandList, is_until: bool, sh
         let cond = execute(condition, sh);
         sh.last_status = cond;
         sh.loop_depth -= 1;
-        if sh.exit_requested.is_some() || sh.return_requested.is_some() {
+        if sh.exit_requested.is_some()
+            || sh.return_requested.is_some()
+            || sh.fatal_error.is_some()
+        {
             return cond;
         }
         if let Some(n) = sh.break_requested.take() {
@@ -1220,15 +1235,23 @@ fn execute_while(condition: &CommandList, body: &CommandList, is_until: bool, sh
             }
             break;
         }
-        if sh.continue_requested.take().is_some() {
-            // `continue` in the condition just re-evaluates it.
+        if let Some(n) = sh.continue_requested.take() {
+            // `continue` in the condition re-evaluates it; a level > 1 is
+            // aimed at an enclosing loop and must be carried outwards.
+            if n > 1 {
+                sh.continue_requested = Some(n - 1);
+                break;
+            }
             continue;
         }
 
         let stop = if is_until { cond == 0 } else { cond != 0 };
         if !stop {
             code = execute_loop_body(body, sh);
-            if sh.exit_requested.is_some() || sh.return_requested.is_some() {
+            if sh.exit_requested.is_some()
+                || sh.return_requested.is_some()
+                || sh.fatal_error.is_some()
+            {
                 return code;
             }
             if let Some(n) = sh.break_requested.take() {
@@ -1237,7 +1260,11 @@ fn execute_while(condition: &CommandList, body: &CommandList, is_until: bool, sh
                 }
                 break;
             }
-            if sh.continue_requested.take().is_some() {
+            if let Some(n) = sh.continue_requested.take() {
+                if n > 1 {
+                    sh.continue_requested = Some(n - 1);
+                    break;
+                }
                 continue;
             }
         } else {
@@ -2799,6 +2826,11 @@ fn execute_andor(andor: &AndOr, sh: &mut Shell, path: Option<&str>, last: &mut i
         if crate::expand::arith_failed() || crate::expand::expansion_abort_code().is_some() {
             return true;
         }
+        // A fatal builtin error (e.g. `continue abc`) is not a command failure
+        // that `&&` / `||` may recover from: bash aborts the whole list.
+        if sh.fatal_error.is_some() {
+            return true;
+        }
         // `exit` stops the shell, `set -e` stops it on a failure.
         if sh.exit_requested.is_some() {
             return false;
@@ -2847,12 +2879,15 @@ pub fn execute(list: &CommandList, sh: &mut Shell) -> i32 {
         }
         // `exit` stops the shell; `return` / `break` / `continue` stop the
         // current command list and leave their flags set so the enclosing
-        // function or loop can consume them (at the top level they are
-        // harmless leftovers, cleared by `run_str`).
+        // function or loop can consume them.
+        // A `break N` / `continue N` whose level exceeds the actual nesting
+        // depth is simply exhausted by the outermost loop; bash then keeps
+        // executing the rest of the command list.  Only stop a list while a
+        // loop is still active to consume the flag.
         if sh.exit_requested.is_some()
             || sh.return_requested.is_some()
-            || sh.break_requested.is_some()
-            || sh.continue_requested.is_some()
+            || (sh.loop_depth > 0
+                && (sh.break_requested.is_some() || sh.continue_requested.is_some()))
         {
             break;
         }

@@ -359,7 +359,14 @@ fn parse_group_compound(tokens: &[Token], start: usize) -> Result<(Compound, usi
         j += 1;
     }
     let close = close.ok_or_else(|| {
-        WashError::syntax("syntax error: unexpected end of file from `{' command")
+        // `{ }` is not an empty group in bash: `}` is only a reserved word in
+        // command position (after `;`), so here it is the offending token of
+        // a two-line yacc diagnostic, not an unterminated group.
+        if is_word_text(tokens.get(start + 1), "}") {
+            WashError::syntax("syntax error near unexpected token `}'")
+        } else {
+            WashError::syntax("syntax error: unexpected end of file from `{' command")
+        }
     })?;
     let body = parse_command_list(&tokens[start + 1..close])?;
     if body.andors.is_empty() {
@@ -631,6 +638,43 @@ fn parse_if_compound(tokens: &[Token], start: usize) -> Result<(Compound, usize)
     Ok((Compound::If { branches, else_body }, i))
 }
 
+/// Where a loop's body begins after its header.
+///
+/// bash's grammar accepts two spellings for the body of `for` / `for (( ))`:
+/// the usual `do LIST; done`, and a brace group `{ LIST; }` in place of both
+/// keywords (`for i in 1 2; { echo "$i"; }`).  The latter is a real,
+/// documented boundary that used to be rejected as a syntax error.
+enum LoopBodyStart {
+    Do(usize),
+    Brace(usize),
+}
+
+/// Return the parsed body and the index just after its closer.
+///
+/// Keeping this in one place makes the `do ... done` and `{ ... }` forms share
+/// the same downstream execution model: the brace group's command list becomes
+/// the loop body verbatim (a brace group runs in the current shell anyway).
+fn finish_loop_body(
+    tokens: &[Token],
+    start: usize,
+    body_start: LoopBodyStart,
+) -> Result<(CommandList, usize)> {
+    match body_start {
+        LoopBodyStart::Do(do_index) => {
+            let end = find_matching_closer(tokens, start)?; // just after `done`
+            let done_index = end - 1;
+            Ok((parse_command_list(&tokens[do_index + 1..done_index])?, end))
+        }
+        LoopBodyStart::Brace(brace_start) => {
+            let (group, end) = parse_group_compound(tokens, brace_start)?;
+            match group {
+                Compound::Group { body } => Ok((body, end)),
+                _ => unreachable!("parse_group_compound always returns a Group"),
+            }
+        }
+    }
+}
+
 /// Parse `for NAME [in WORDS] ; do BODY ; done` starting at the `for` token.
 fn parse_for_compound(tokens: &[Token], start: usize) -> Result<(Compound, usize)> {
     // The C-style form begins with a single `(( ... ))` token emitted by the
@@ -648,50 +692,79 @@ fn parse_for_compound(tokens: &[Token], start: usize) -> Result<(Compound, usize
         }
     };
 
-    // Expect `in` (a plain word, never a reserved word) after the NAME.
-    if !is_word_text(tokens.get(start + 2), "in") {
-        return Err(WashError::syntax(
-            "syntax error near unexpected token (expected `in')",
-        ));
-    }
-
-    // Collect iteration words up to the `do` reserved word.  A `;` (or newline,
-    // which the lexer also turns into a `;`) between the word list and `do` is
-    // optional (`for i in a b c; do ...`).
+    // `for NAME [in WORDS] ; BODY` — `in WORDS` is optional; without it bash
+    // iterates the positional parameters (`for i; do ...; done`).  Both body
+    // spellings are handled below.
     let mut words: Vec<Vec<WordPart>> = Vec::new();
-    let mut do_index = 0usize;
-    let mut i = start + 3; // index just past `in`
-    loop {
-        if i >= tokens.len() {
+    let mut i = start + 2;
+    let body_start;
+    if is_word_text(tokens.get(i), "in") {
+        i += 1;
+        // Collect iteration words up to `do` or a brace group.  A `;` (or a
+        // newline, which the lexer also turns into `;`) between the word list
+        // and the body is optional (`for i in a b c; do ...`).
+        loop {
+            if i >= tokens.len() {
+                return Err(WashError::syntax(
+                    "syntax error: unexpected end of file",
+                ));
+            }
+            match &tokens[i] {
+                Token::Word(parts) if is_plain_text(parts) && plain_text(parts) == "}" => {
+                    return Err(WashError::syntax(
+                        "syntax error near unexpected token `}'",
+                    ));
+                }
+                Token::Word(parts) => {
+                    words.push(parts.clone());
+                    i += 1;
+                }
+                Token::Semicolon => {
+                    // end of the word list; `do` or `{` follows.
+                    i += 1;
+                    if is_word_text(tokens.get(i), "{") {
+                        body_start = LoopBodyStart::Brace(i);
+                        break;
+                    }
+                }
+                Token::Reserved(r, _) if r == "do" => {
+                    body_start = LoopBodyStart::Do(i);
+                    break;
+                }
+                _ => {
+                    return Err(WashError::syntax(
+                        "syntax error near unexpected token (expected `do')",
+                    ))
+                }
+            }
+        }
+    } else {
+        // No `in`: `do` may follow NAME directly, but a brace group still
+        // needs the separating `;` (`for i { ...; }` is a yacc error).
+        if matches!(tokens.get(i), Some(Token::Semicolon)) {
+            i += 1;
+        } else if is_word_text(tokens.get(i), "{") {
             return Err(WashError::syntax(
-                "syntax error: unexpected end of file",
+                "syntax error near unexpected token `{'",
             ));
         }
-        match &tokens[i] {
-            Token::Word(parts) => {
-                words.push(parts.clone());
-                i += 1;
-            }
-            Token::Semicolon => {
-                // end of the word list; the `do` keyword follows.
-                i += 1;
-            }
-            Token::Reserved(r, _) if r == "do" => {
-                do_index = i;
-                break;
-            }
-            _ => {
-                return Err(WashError::syntax(
-                    "syntax error near unexpected token (expected `do')",
-                ))
-            }
+        if is_word_text(tokens.get(i), "{") {
+            body_start = LoopBodyStart::Brace(i);
+        } else if matches!(tokens.get(i), Some(Token::Reserved(r, _)) if r == "do") {
+            body_start = LoopBodyStart::Do(i);
+        } else {
+            return Err(WashError::syntax(
+                "syntax error near unexpected token (expected `do')",
+            ));
         }
+        // Without `in WORDS`, bash iterates the positional parameters as if
+        // `"$@"` had been written (each parameter stays one field, even when
+        // it contains IFS whitespace).  A quoted `$@` word has that exact
+        // expansion semantics in `expand_word`.
+        words.push(vec![WordPart::Var("@".to_string(), true)]);
     }
 
-    let end = find_matching_closer(tokens, start)?; // index just after `done`
-    let done_index = end - 1;
-    let body = parse_command_list(&tokens[do_index + 1..done_index])?;
-
+    let (body, end) = finish_loop_body(tokens, start, body_start)?;
     Ok((
         Compound::For {
             var: name,
@@ -795,14 +868,27 @@ fn arith_for_do_index(tokens: &[Token], start: usize) -> Result<usize> {
     }
 }
 
+/// Locate the body opener of a C-style `for`.  bash accepts both `do ... done`
+/// and a brace group `{ ... }` after the header; the latter has no `done`.
+fn arith_for_body_index(tokens: &[Token], start: usize) -> Result<LoopBodyStart> {
+    let mut i = start + 2;
+    if matches!(tokens.get(i), Some(Token::Semicolon)) {
+        i += 1;
+    }
+    if is_word_text(tokens.get(i), "{") {
+        return Ok(LoopBodyStart::Brace(i));
+    }
+    arith_for_do_index(tokens, start).map(LoopBodyStart::Do)
+}
+
 /// Parse `for (( INIT ; COND ; INCR )); do BODY; done` starting at `for`.
 fn parse_arith_for_compound(
     tokens: &[Token],
     start: usize,
     expr: &str,
 ) -> Result<(Compound, usize)> {
-    // Grammar level: the header must be followed by `do`.
-    let do_index = arith_for_do_index(tokens, start)?;
+    // Grammar level: the header must be followed by `do` or `{`.
+    let body_start = arith_for_body_index(tokens, start)?;
 
     // Action level: bash's `make_arith_for_command` then checks that the
     // header holds exactly three clauses and reports the raw `((...))`.
@@ -826,9 +912,7 @@ fn parse_arith_for_compound(
     let cond = clauses.next().unwrap_or_default();
     let incr = clauses.next().unwrap_or_default();
 
-    let end = find_matching_closer(tokens, start)?;
-    let done_index = end - 1;
-    let body = parse_command_list(&tokens[do_index + 1..done_index])?;
+    let (body, end) = finish_loop_body(tokens, start, body_start)?;
     Ok((
         Compound::ArithFor {
             init,

@@ -1917,6 +1917,288 @@ fn render_compound(c: &crate::parser::Compound) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// `declare -f` source rendering
+// ---------------------------------------------------------------------------
+//
+// `type` only needs a human-readable reconstruction; `declare -f` is compared
+// byte-for-byte against bash, whose formatter has its own fixed layout:
+//   * the header and the opening brace each carry a trailing space;
+//   * every command sits on its own line, four spaces deeper per block;
+//   * simple commands inside a block end with `;`, the final command of the
+//     *function* body does not;
+//   * `do`, `done`, `else`, `fi`, `;;` and `}` start a new line, while `then`
+//     stays on the condition's line;
+//   * `elif` is rendered as a nested `else / if / fi;`.
+// The renderer below is deliberately separate from `render_command_list` so
+// the long-standing `type` output cannot be perturbed by these rules.
+
+fn bash_fmt_pad(indent: usize) -> String {
+    "    ".repeat(indent)
+}
+
+/// A word as `declare -f` prints it.  The synthesized no-`in` loop word is a
+/// quoted `$@` in the AST, and bash spells it that way in the reconstructed
+/// source (`for i in "$@";`).
+fn bash_fmt_word(word: &[crate::lexer::WordPart]) -> String {
+    if matches!(word, [crate::lexer::WordPart::Var(n, true)] if n == "@") {
+        return "\"$@\"".to_string();
+    }
+    render_word(word)
+}
+
+fn bash_fmt_simple(c: &crate::parser::SimpleCommand, indent: usize) -> Vec<String> {
+    if let Some(cmp) = &c.compound {
+        return bash_fmt_compound(cmp, indent);
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for (name, value, append) in &c.assignments {
+        parts.push(format!(
+            "{}{}={}",
+            name,
+            if *append { "+" } else { "" },
+            render_word(value)
+        ));
+    }
+    for (name, values, append) in &c.array_assignments {
+        let elems = values
+            .iter()
+            .map(|w| render_word(w))
+            .collect::<Vec<_>>()
+            .join(" ");
+        parts.push(format!("{}{}=({})", name, if *append { "+" } else { "" }, elems));
+    }
+    parts.extend(c.argv.iter().map(|w| bash_fmt_word(w)));
+    parts.extend(c.redirs.iter().map(render_redir));
+    vec![format!("{}{}", bash_fmt_pad(indent), parts.join(" "))]
+}
+
+/// Continuation pipelines in one AND-OR / pipe chain stay on the same line,
+/// so their already-applied indent must be removed before joining.
+fn bash_fmt_dedent(line: &str, indent: usize) -> String {
+    let pad = bash_fmt_pad(indent);
+    line.strip_prefix(&pad).unwrap_or(line).to_string()
+}
+
+fn bash_fmt_pipeline(p: &crate::parser::Pipeline, indent: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for cmd in &p.commands {
+        let mut part = bash_fmt_simple(cmd, indent);
+        if lines.is_empty() {
+            lines.append(&mut part);
+        } else {
+            let first = bash_fmt_dedent(&part.remove(0), indent);
+            if let Some(last) = lines.last_mut() {
+                last.push_str(" | ");
+                last.push_str(&first);
+            }
+            lines.append(&mut part);
+        }
+    }
+    if p.background {
+        if let Some(last) = lines.last_mut() {
+            last.push_str(" &");
+        }
+    }
+    lines
+}
+
+fn bash_fmt_andor(a: &crate::parser::AndOr, indent: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for (i, pipeline) in a.pipelines.iter().enumerate() {
+        let mut part = bash_fmt_pipeline(pipeline, indent);
+        if i > 0 && !lines.is_empty() && !part.is_empty() {
+            let op = match a.ops[i - 1] {
+                crate::parser::AndOrOp::And => " && ",
+                crate::parser::AndOrOp::Or => " || ",
+            };
+            let first = bash_fmt_dedent(&part.remove(0), indent);
+            if let Some(last) = lines.last_mut() {
+                last.push_str(op);
+                last.push_str(&first);
+            }
+        }
+        lines.append(&mut part);
+    }
+    lines
+}
+
+/// `trail` marks a nested block: its last command also gets a `;` because the
+/// source has one before `fi` / `done` / `}`.  The outermost function body is
+/// rendered with `trail == false` (bash drops that final separator).
+fn bash_fmt_list(cl: &crate::parser::CommandList, indent: usize, trail: bool) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    // Nested definitions precede their uses in the reconstructed source.
+    for fd in &cl.func_defs {
+        let mut lines = bash_fmt_function(&fd.name, &fd.body, indent, true);
+        if let Some(last) = lines.last_mut() {
+            last.push(';');
+        }
+        out.append(&mut lines);
+    }
+    let n = cl.andors.len();
+    for (i, andor) in cl.andors.iter().enumerate() {
+        let mut lines = bash_fmt_andor(andor, indent);
+        if i + 1 < n || trail {
+            if let Some(last) = lines.last_mut() {
+                last.push(';');
+            }
+        }
+        out.append(&mut lines);
+    }
+    out
+}
+
+fn bash_fmt_inline(cl: &crate::parser::CommandList) -> String {
+    cl.andors
+        .iter()
+        .map(|a| {
+            bash_fmt_andor(a, 0)
+                .iter()
+                .map(|s| s.trim_start())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn bash_fmt_if(
+    branches: &[(crate::parser::CommandList, crate::parser::CommandList)],
+    else_body: &Option<crate::parser::CommandList>,
+    indent: usize,
+) -> Vec<String> {
+    let pad = bash_fmt_pad(indent);
+    let (cond, body) = &branches[0];
+    let mut out = vec![format!("{}if {}; then", pad, bash_fmt_inline(cond))];
+    out.extend(bash_fmt_list(body, indent + 1, true));
+    for (cond, body) in &branches[1..] {
+        out.push(format!("{}else", pad));
+        let mut nested = bash_fmt_if(&[(cond.clone(), body.clone())], &None, indent + 1);
+        // The nested `fi` is followed by the outer `fi`, so bash keeps the
+        // source separator (`fi;`) on that line.
+        if let Some(last) = nested.last_mut() {
+            last.push(';');
+        }
+        out.extend(nested);
+    }
+    if let Some(eb) = else_body {
+        out.push(format!("{}else", pad));
+        out.extend(bash_fmt_list(eb, indent + 1, true));
+    }
+    out.push(format!("{}fi", pad));
+    out
+}
+
+fn bash_fmt_compound(c: &crate::parser::Compound, indent: usize) -> Vec<String> {
+    let pad = bash_fmt_pad(indent);
+    match c {
+        crate::parser::Compound::If { branches, else_body } => {
+            bash_fmt_if(branches, else_body, indent)
+        }
+        crate::parser::Compound::For { var, words, body } => {
+            let w = words
+                .iter()
+                .map(|w| bash_fmt_word(w))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let mut out = vec![format!("{}for {} in {};", pad, var, w), format!("{}do", pad)];
+            out.extend(bash_fmt_list(body, indent + 1, true));
+            out.push(format!("{}done", pad));
+            out
+        }
+        crate::parser::Compound::ArithFor { init, cond, incr, body } => {
+            let norm = |s: &str| if s.trim().is_empty() { "1".to_string() } else { s.trim().to_string() };
+            let mut out = vec![format!(
+                "{}for (({}; {}; {}))",
+                pad,
+                norm(init),
+                norm(cond),
+                norm(incr)
+            )];
+            out.push(format!("{}do", pad));
+            out.extend(bash_fmt_list(body, indent + 1, true));
+            out.push(format!("{}done", pad));
+            out
+        }
+        crate::parser::Compound::While { condition, body, is_until } => {
+            let kw = if *is_until { "until" } else { "while" };
+            let mut out = vec![format!("{}{} {}; do", pad, kw, bash_fmt_inline(condition))];
+            out.extend(bash_fmt_list(body, indent + 1, true));
+            out.push(format!("{}done", pad));
+            out
+        }
+        crate::parser::Compound::Case { word, arms } => {
+            let mut out = vec![format!("{}case {} in ", pad, bash_fmt_word(word))];
+            for arm in arms {
+                let pats = arm
+                    .patterns
+                    .iter()
+                    .map(|p| bash_fmt_word(p))
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                out.push(format!("{}    {})", pad, pats));
+                out.extend(bash_fmt_list(&arm.body, indent + 2, false));
+                out.push(format!("{}    ;;", pad));
+            }
+            out.push(format!("{}esac", pad));
+            out
+        }
+        crate::parser::Compound::Group { body } => {
+            let mut out = vec![format!("{}{{ ", pad)];
+            out.extend(bash_fmt_list(body, indent + 1, false));
+            out.push(format!("{}}}", pad));
+            out
+        }
+        crate::parser::Compound::Subshell { body } => {
+            // bash keeps a one-command subshell on a single line.
+            if body.andors.len() == 1
+                && body.andors[0].pipelines.len() == 1
+                && body.andors[0].pipelines[0].commands.len() == 1
+                && body.andors[0].pipelines[0].commands[0].compound.is_none()
+            {
+                let inner = bash_fmt_list(body, 0, false);
+                return vec![format!("{}( {} )", pad, inner.join("; ").trim_start())];
+            }
+            let mut out = vec![format!("{}(", pad)];
+            out.extend(bash_fmt_list(body, indent + 1, false));
+            out.push(format!("{})", pad));
+            out
+        }
+        crate::parser::Compound::Arith { expr, .. } => vec![format!("{}(( {} ))", pad, expr.trim())],
+        crate::parser::Compound::Cond { expr, .. } => {
+            vec![format!("{}[[ {} ]]", pad, crate::cond::render_cond(expr))]
+        }
+    }
+}
+
+fn bash_fmt_function(
+    name: &str,
+    body: &crate::parser::CommandList,
+    indent: usize,
+    nested: bool,
+) -> Vec<String> {
+    let pad = bash_fmt_pad(indent);
+    let mut out = vec![
+        format!(
+            "{}{}{} () ",
+            pad,
+            if nested { "function " } else { "" },
+            name
+        ),
+        format!("{}{{ ", pad),
+    ];
+    out.extend(bash_fmt_list(body, indent + 1, false));
+    out.push(format!("{}}}", pad));
+    out
+}
+
+fn print_function_bash(name: &str, body: &crate::parser::CommandList) {
+    for line in bash_fmt_function(name, body, 0, false) {
+        println!("{}", line);
+    }
+}
+
 /// Quote `text` the way bash's `sh_single_quote` does.
 fn single_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
@@ -4882,12 +5164,13 @@ fn builtin_return(argv: &[String], sh: &mut Shell) -> i32 {
 fn builtin_break(argv: &[String], sh: &mut Shell) -> i32 {
     if sh.loop_depth == 0 {
         safe_eprintln!("wash: break: only meaningful in a `for', `while', or `until' loop");
-        return 1;
+        // bash reports the error but the builtin itself succeeds (`$?` is 0);
+        // only the diagnostic is observable.
+        return 0;
     }
-    let n = if argv.len() >= 2 {
-        argv[1].trim().parse::<i32>().unwrap_or(1)
-    } else {
-        1
+    let n = match parse_loop_count(argv, "break", sh) {
+        Ok(n) => n,
+        Err(code) => return code,
     };
     sh.break_requested = Some(n);
     0
@@ -4897,15 +5180,50 @@ fn builtin_break(argv: &[String], sh: &mut Shell) -> i32 {
 fn builtin_continue(argv: &[String], sh: &mut Shell) -> i32 {
     if sh.loop_depth == 0 {
         safe_eprintln!("wash: continue: only meaningful in a `for', `while', or `until' loop");
-        return 1;
+        return 0;
     }
-    let n = if argv.len() >= 2 {
-        argv[1].trim().parse::<i32>().unwrap_or(1)
-    } else {
-        1
+    let n = match parse_loop_count(argv, "continue", sh) {
+        Ok(n) => n,
+        Err(code) => return code,
     };
     sh.continue_requested = Some(n);
     0
+}
+
+/// Validate the optional `break` / `continue` level argument exactly as bash
+/// does.  The three error classes do not behave alike in bash:
+///   * too many arguments / non-numeric text abort the whole command list
+///     (and therefore every enclosing loop) with rc 1 / rc 2;
+///   * a level below one merely ends the current loop with rc 1 and lets the
+///     rest of the script run.
+/// The first two use `fatal_error`, the last one reuses the normal `break`
+/// channel so the enclosing loop consumes it.
+fn parse_loop_count(
+    argv: &[String],
+    name: &str,
+    sh: &mut Shell,
+) -> std::result::Result<i32, i32> {
+    if argv.len() > 2 {
+        safe_eprintln!("wash: {}: too many arguments", name);
+        sh.fatal_error = Some(1);
+        return Err(1);
+    }
+    let Some(arg) = argv.get(1) else {
+        return Ok(1);
+    };
+    match arg.trim().parse::<i32>() {
+        Ok(n) if n >= 1 => Ok(n),
+        Ok(_) => {
+            safe_eprintln!("wash: {}: {}: loop count out of range", name, arg);
+            sh.break_requested = Some(1);
+            Err(1)
+        }
+        Err(_) => {
+            safe_eprintln!("wash: {}: {}: numeric argument required", name, arg);
+            sh.fatal_error = Some(2);
+            Err(2)
+        }
+    }
 }
 
 /// The `local` builtin: declare a variable local to a function.
@@ -5009,6 +5327,8 @@ fn builtin_declare(argv: &[String], sh: &mut Shell, _is_typeset: bool) -> i32 {
     let mut array_attr = false;
     let mut assoc_attr = false;
     let mut print = false;
+    let mut functions = false;
+    let mut function_names = false;
     let mut i = 1usize;
 
     while i < argv.len() {
@@ -5031,7 +5351,9 @@ fn builtin_declare(argv: &[String], sh: &mut Shell, _is_typeset: bool) -> i32 {
                     'a' => array_attr = true,
                     'p' => print = true,
                     'A' => assoc_attr = true,
-                    'g' | 'n' | 't' | 'l' | 'u' | 'c' | 'f' | 'F' => {} // 已接受但暂未实现
+                    'f' => functions = true,
+                    'F' => function_names = true,
+                    'g' | 'n' | 't' | 'l' | 'u' | 'c' => {} // 已接受但暂未实现
                     _ => {
                         safe_eprintln!("wash: declare: {}: invalid option", a);
                         safe_eprintln!("declare: usage: declare [-aAfFgilrtux] [-p] [name[=value] ...]");
@@ -5043,6 +5365,34 @@ fn builtin_declare(argv: &[String], sh: &mut Shell, _is_typeset: bool) -> i32 {
             continue;
         }
         break;
+    }
+
+    // `declare -f` / `declare -F`: list shell functions.  `-p` combined with
+    // either flag is a no-op in bash (the function listing wins), and both
+    // flags ignore variable operands entirely.
+    if functions || function_names {
+        let names: Vec<&String> = argv[i..].iter().collect();
+        let mut status = 0;
+        if names.is_empty() {
+            let mut all: Vec<&String> = sh.functions.keys().collect();
+            all.sort();
+            for name in all {
+                if function_names {
+                    println!("declare -f {}", name);
+                } else if let Some(body) = sh.functions.get(name) {
+                    print_function_bash(name, body);
+                }
+            }
+            return 0;
+        }
+        for name in names {
+            match sh.functions.get(name) {
+                Some(body) if function_names => println!("{}", name),
+                Some(body) => print_function_bash(name, body),
+                None => status = 1,
+            }
+        }
+        return status;
     }
 
     // `declare -p [NAME...]`: print attributes of the named variable(s).

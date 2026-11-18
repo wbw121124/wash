@@ -26,7 +26,7 @@
 #       'cd <WASH_REPO> && bash tests/bash_diff_builtins.sh'
 #
 # Optional: ONLY_GROUP=A|K|B|C|D runs a single group.
-#   A = core semantics + finished builtins (709 cases: 340 + 33 brace-range
+#   A = core semantics + finished builtins (753 cases: 340 + 33 brace-range
 #       + 24 brace word-boundary + 15 brace nest/escape/quote-removal
 #       + 1 brace deep-nesting stack guard + 37 heredoc / herestring
 #       + 11 unclosed `$(` syntax-error fence
@@ -73,6 +73,13 @@
 #          OPTIND/OPTARG + silent/illegal/noarg, signal table, (( )) status)
 #       + 2 cmdsub-inheritance fence (positional params inherited into command
 #          substitution, incl. under `set -u`)
+#       + 11 brace-group loop-body fence (`{ LIST; }` in place of `do ... done`
+#          for both `for NAME` and `for (( ))`, no-`in` positional iteration,
+#          and malformed-group diagnostics)
+#       + 10 break/continue level fence (N>1 propagation through for/while,
+#          out-of-range vs numeric-argument vs too-many-arguments errors)
+#       + 23 declare -f / -F fence (function listing, sorted names, rc for
+#          missing names, and bash's pretty-printed body layout)
 #       -> MUST stay green (regressions)
 #   K = KNOWN-DIFF: cannot be byte-equal by design (documented, not fixed)
 #   B = regression fence for already-fixed defects (GROUP B, 21 cases, green today)
@@ -1566,6 +1573,61 @@ run_case A compound-trail-forc   'for ((i=0;i<1;i++)); do echo x; done extra'
 # parameters from the parent shell (`$1`/`$#` inside `$(...)`).
 run_case A cmdsub-positional    'set -- aa bb; echo "$(echo $1)-$(echo $#)-$(echo ${2})"'
 run_case A cmdsub-positional-u  'set -u; set -- aa; echo "$(echo $1)"'
+
+# --- loop bodies spelled as a brace group + `continue N` levels -------------
+# bash's `for` grammar accepts `{ LIST; }` in place of `do LIST; done`; the
+# no-`in` form iterates `"$@"`.  `continue N` / `break N` must be carried out
+# through every enclosing loop (a plain `for`/`while` used to swallow N>1),
+# and the three distinct argument errors have distinct rc / abort behaviour.
+run_case A for-brace-basic       'for i in 1 2; { echo "i=$i"; }'
+run_case A for-brace-tight       'for i in a b;{ echo x$i;}'
+run_case A for-noin-do           'set -- p q; for i; do echo $i; done'
+run_case A for-noin-brace        'set -- "a b" c; for i; { echo "[$i]"; }'
+run_case A forc-brace            'for ((i=0;i<2;i++)); { echo i=$i; }'
+run_case A for-brace-nested      'for i in 1; { for j in a b; do echo $i$j; done; }'
+run_case A for-brace-redir       'for i in 1; { echo $i; } > /dev/null; echo rc=$?'
+run_case A for-brace-tail        'for i in 1 2; { echo $i; }; echo after'
+run_case A for-brace-eof-diag    'for i in 1 2; { echo $i }'
+run_case A for-brace-empty-diag  'for i in 1 2; { }'
+run_case A forc-brace-eof-diag   'for ((i=0;i<2;i++)); { echo $i }'
+run_case A continue-level2       'for i in 1 2 3; do for j in a b; do [ $j = a ] && continue 2; echo $i$j; done; done; echo end'
+run_case A continue-from-while   'for i in 1 2; do while :; do continue 2; done; echo never; done; echo end'
+run_case A continue-while-for    'i=0; while [ $i -lt 2 ]; do i=$((i+1)); for j in a b; do [ $j = a ] && continue 2; echo $i$j; done; done; echo end'
+run_case A continue-level3       'for i in 1 2 3; do for j in a b; do for k in x y; do [ $k = x ] && continue 3; echo $i$j$k; done; done; done; echo end'
+run_case A continue-over-loop    'for i in 1 2; do continue 9; echo no; done; echo rc=$?'
+run_case A continue-zero         'for i in 1 2; do continue 0; echo z$i; done; echo rc=$?'
+run_case A continue-nonnumeric   'for i in 1 2; do continue abc; echo z$i; done; echo rc=$?'
+run_case A break-too-many        'for i in 1 2; do break 1 2; done; echo rc=$?'
+run_case A continue-fatal-or     'for i in 1 2; do continue abc || echo recovery; echo z; done; echo rc=$?'
+run_case A break-outside-loop    'break 2; echo rc=$?'
+
+# --- `declare -f` / `declare -F` source listing -----------------------------
+# bash's pretty-printer has its own fixed layout (header/brace trailing space,
+# 4-space indent, `do`/`fi`/`;;` on their own lines, `elif` as a nested if,
+# `for i in "$@";` for the no-`in` loop).  All forms below are byte-compared.
+run_case A declare-f-empty       'declare -f'
+run_case A declare-f-list        'f(){ echo hi; }; declare -f'
+run_case A declare-f-named       'f(){ echo hi; }; declare -f f'
+run_case A declare-F-list        'f(){ echo hi; }; declare -F'
+run_case A declare-f-missing     'f(){ echo hi; }; declare -f f g; echo rc=$?'
+run_case A declare-f-nosuch      'declare -f nosuch; echo rc=$?'
+run_case A declare-f-if          'f(){ local x=1; if [ $x = 1 ]; then echo yes; fi; }; declare -f f'
+run_case A declare-f-two         'f(){ echo hi; }; g(){ f; }; declare -f'
+run_case A declare-fp            'f(){ echo hi; }; declare -fp f'
+run_case A declare-f-sorted      'zeta(){ echo z; }; alpha(){ echo a; }; mid(){ echo m; }; declare -f'
+run_case A declare-f-else        'f(){ if true; then echo y; else echo n; fi; }; declare -f f'
+run_case A declare-f-while       'f(){ while :; do echo x; done; }; declare -f f'
+run_case A declare-f-for         'f(){ for i in 1 2; do echo $i; done; }; declare -f f'
+run_case A declare-f-case        'f(){ case x in a) echo a;; esac; }; declare -f f'
+run_case A declare-f-subshell    'f(){ ( echo sub ); }; declare -f f'
+run_case A declare-f-group       'f(){ { echo grp; }; }; declare -f f'
+run_case A declare-f-andor       'f(){ echo a && echo b; }; declare -f f'
+run_case A declare-f-elif        'f(){ if a; then b; elif c; then d; fi; }; declare -f f'
+run_case A declare-f-nested-fn   'f(){ g(){ echo g; }; g; }; declare -f f'
+run_case A declare-f-forc        'f(){ for ((i=0;i<3;i++)); do echo $i; done; }; declare -f f'
+run_case A declare-f-cond        'f(){ [[ x = x ]]; }; declare -f f'
+run_case A declare-F-named       'f(){ echo hi; }; declare -F f g; echo rc=$?'
+run_case A declare-f-kw-function 'function f { echo hi; }; declare -f f'
 
 # GROUP B -- regression fence for already-fixed defects (21 cases, green today).
 # (每条用例都曾是真实缺陷，修复后留在这里作为回归栅栏：通过 run_case 同时跑

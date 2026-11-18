@@ -140,14 +140,23 @@ oracle 实测：`(( ))` 算术命令、**C 风格 `for ((...))`**、`declare -A`
   原始 `((...))` 回显）、缺右括号（词法 EOF）、缺 `done` / 不匹配 closer
   （yacc near-token）、省略分号 `for ((...)) do ... done` 合法形态，全部对齐。
 
-仍存的窄边界（如实登记，非本轮引入，均有 oracle 实测）：
-- `for NAME in ...; { LIST; }`（用 brace group 代替 `do ... done`）是 bash 合法
-  语法，wash 报语法错误；普通 for / C-for 均受影响。修复需扩展循环 AST 接受
-  非 `do` body，超出本轮范围。
-- `done extra` / `fi zz` 这类**复合命令 closer 后紧跟裸词**：本轮已修（报 near
-  词 + 回显源行）；但 closer 后跟重定向 / `&` / `&&` / `||` 保持合法。
-- `x=1; echo ${!x}` 间接展开、`declare -f` 空输出、普通 for 的 `continue N`
-  层级传播为既有差异，本轮未扩大。
+此前如实登记的四处窄边界已逐项修复，均有 GROUP A 栅栏（oracle 逐字节对拍）：
+- **brace group 作循环 body**：`for NAME in ...; { LIST; }` 与
+  `for ((...)); { LIST; }` 现在与 `do ... done` 等价执行；无 `in` 的
+  `for NAME; { ...; }` 按 `"$@"` 逐参数迭代。未闭合的 `{` 与空 `{ }`
+  分别复刻 bash 的 EOF 消息和 near-`}` 两行诊断。
+- **`declare -f` / `declare -F`**：按名称排序输出函数定义，`-f NAME` /
+  `-F NAME` 支持多名字与缺失名字 rc=1；函数体采用 bash 的固定版式（尾部
+  空格、4 空格缩进、`do` / `fi` / `;;` 独立行、`elif` 嵌套为 `else / if /
+  fi;`、`for i in "$@";`）。`declare -p` 路径不受影响。
+- **循环层级传播**：普通 `for` / `while` 的 `continue N`（N>1）现在与
+  C 风格 for 一致地递减并向上传播，不再被内层吞掉（此前
+  `continue 2` 在 `while :` 内甚至会死循环）。`continue 0` / 非数字 /
+  参数过多三类错误分别复刻 out-of-range(rc 1)、numeric argument
+  required(rc 2，终止整条命令列表)、too many arguments(rc 1)。
+- `x=1; echo ${!y}` 间接展开经复核本已对齐（既有栅栏），无需修复。
+- 此前已修的 `done extra` / `fi zz` near-token 诊断保持不变；closer 后跟
+  重定向 / `&` / `&&` / `||` 仍为合法语法。
 `[[ ]]` 已实现并与 bash 5.3 逐字节对齐（49 条栅栏见 `tests/bash_diff_builtins.sh`
 GROUP A）：单目/双目/文件/数值/字符串/模式/ERE 运算、`BASH_REMATCH` 捕获组、
 `!`/`&&`/`||`/分组、`[[ ]]` 内不做词分割，以及畸形表达式的两行诊断（含 yacc
