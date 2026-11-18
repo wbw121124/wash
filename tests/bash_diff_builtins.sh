@@ -26,7 +26,7 @@
 #       'cd <WASH_REPO> && bash tests/bash_diff_builtins.sh'
 #
 # Optional: ONLY_GROUP=A|K|B|C|D runs a single group.
-#   A = core semantics + finished builtins (639 cases: 340 + 33 brace-range
+#   A = core semantics + finished builtins (666 cases: 340 + 33 brace-range
 #       + 24 brace word-boundary + 15 brace nest/escape/quote-removal
 #       + 1 brace deep-nesting stack guard + 37 heredoc / herestring
 #       + 11 unclosed `$(` syntax-error fence
@@ -59,6 +59,11 @@
 #          no word splitting, bash's two-line malformed-expression diagnostics)
 #       + 5 quoted-token diagnostic fence (raw yytext quotes/escapes/$ prefix
 #          in the cond message, whitespace-truncated yacc near, escaped `=`)
+#       + 25 array/associative/getopts/trap -l/arithmetic-command fence
+#          (indexed & symbolic subscripts, declare -A + FNV bucket order,
+#          OPTIND/OPTARG + silent/illegal/noarg, signal table, (( )) status)
+#       + 2 cmdsub-inheritance fence (positional params inherited into command
+#          substitution, incl. under `set -u`)
 #       -> MUST stay green (regressions)
 #   K = KNOWN-DIFF: cannot be byte-equal by design (documented, not fixed)
 #   B = regression fence for already-fixed defects (GROUP B, 21 cases, green today)
@@ -1446,6 +1451,48 @@ run_case A cond-quoted-op-sq    "[[ a '=' a ]]; echo R=\$?"
 run_case A cond-quoted-op-esc   '[[ a \= a ]]; echo R=$?'
 run_case A cond-quoted-op-ansi  '[[ a $'"'"'='"'"' a ]]; echo R=$?'
 run_case A cond-quoted-space    '[[ a "b c" d ]]; echo R=$?'
+
+# --- arrays / declare -A fence (indexed subscript assignment, associative
+#     arrays, sparse indexing) -------------------------------------------------
+run_case A arr-indexed-set      'a[2]=x; echo "v=${a[2]} n=${#a[@]} keys=${!a[@]}"'
+run_case A arr-symbolic-sub     'a[key]=x; echo "v=${a[key]}"'
+run_case A arr-var-sub          'k=foo; a[$k]=v; echo "${a[foo]}"'
+run_case A assoc-basic          'declare -A m; m[k]=v; echo "v=${m[k]} n=${#m[@]} keys=${!m[@]}"'
+run_case A assoc-order          'declare -A m; m[a]=1; m[b]=2; echo "${!m[@]}"'
+run_case A assoc-literal        'declare -A m=([k]=v); echo "v=${m[k]}"'
+run_case A assoc-declare-p      'declare -A m; m[k]=v; declare -p m'
+run_case A assoc-var-sub        'declare -A m; k=foo; m[$k]=v; echo "${m[foo]}"'
+
+# --- getopts fence (OPTIND/OPTARG, silent mode, error diagnostics, exhaustion)
+run_case A getopts-basic        'set -- -a -b foo; while getopts "ab:" o; do echo "$o:${OPTARG-unset}:$OPTIND"; done; echo "rc=$? o=$o ind=$OPTIND"'
+run_case A getopts-silent       'set -- -b; getopts ":ab:" o; echo "rc=$? o=$o arg=${OPTARG-unset}"'
+run_case A getopts-illegal      'set -- -x; getopts "ab:" o; echo "rc=$? o=$o arg=${OPTARG-unset}"'
+run_case A getopts-noarg        'set -- -b; getopts "ab:" o; echo "rc=$? o=$o arg=${OPTARG-unset}"'
+run_case A getopts-explicit     'OPTIND=1; getopts "a" o -a; echo "rc=$? o=$o ind=$OPTIND"'
+run_case A getopts-dashdash     'set -- -- -a; getopts "a" o; echo "rc=$? o=$o ind=$OPTIND"'
+
+# --- trap -l fence -----------------------------------------------------------
+run_case A trap-list            'trap -l'
+run_case A trap-list-lp         'trap -lp > /dev/null; echo "rc=$?"'
+run_case A trap-list-operand    'trap -l SIGINT | head -1'
+
+# --- (( )) arithmetic command fence ------------------------------------------
+run_case A arith-basic          '(( 1 + 2 )); echo "rc=$?"'
+run_case A arith-zero           '(( 0 )); echo "rc=$?"'
+run_case A arith-assign         'x=5; (( x++ )); echo "x=$x rc=$?"'
+run_case A arith-compound       'x=5; (( x += 3 )); echo "x=$x"'
+run_case A arith-compare        '(( 2 > 3 )); echo "rc=$?"'
+run_case A arith-in-if          'if (( 1 )); then echo yes; else echo no; fi'
+run_case A arith-and            '(( 1 + 2 )) && echo ok'
+run_case A arith-setvar         '(( x = 7 )); echo "x=$x"'
+
+# --- parse-error prefix recovery + cmdsub subshell inheritance fence ---------
+# P1-3: the forward O(n²) prefix scan took ~39s on a 2000-line script with a
+# trailing syntax error; the backward scan is semantically identical but O(1)
+# parses in that case.  P1-5: a command substitution must inherit positional
+# parameters from the parent shell (`$1`/`$#` inside `$(...)`).
+run_case A cmdsub-positional    'set -- aa bb; echo "$(echo $1)-$(echo $#)-$(echo ${2})"'
+run_case A cmdsub-positional-u  'set -u; set -- aa; echo "$(echo $1)"'
 
 # GROUP B -- regression fence for already-fixed defects (21 cases, green today).
 # (每条用例都曾是真实缺陷，修复后留在这里作为回归栅栏：通过 run_case 同时跑

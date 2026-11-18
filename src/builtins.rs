@@ -54,6 +54,7 @@ pub const BUILTINS: &[&str] = &[
     "export",
     "false",
     "fg",
+    "getopts",
     "hash",
     "help",
     "jobs",
@@ -131,6 +132,7 @@ pub fn run_builtin(argv: &[String], sh: &mut Shell) -> Option<i32> {
         "true" => builtin_true(argv, sh),
         "false" => builtin_false(argv, sh),
         "hash" => builtin_hash(argv, sh),
+        "getopts" => builtin_getopts(argv, sh),
         "read" => builtin_read(argv, sh),
         ":" => builtin_colon(argv, sh),
         "command" => builtin_command(argv, sh),
@@ -1897,6 +1899,9 @@ fn render_compound(c: &crate::parser::Compound) -> String {
             s.push_str("esac");
             s
         }
+        crate::parser::Compound::Arith { expr, .. } => {
+            format!("(( {} ))", expr)
+        }
         crate::parser::Compound::Cond { expr, .. } => {
             format!("[[ {} ]]", crate::cond::render_cond(expr))
         }
@@ -2084,6 +2089,132 @@ fn print_hashed_commands(sh: &Shell, portable: bool) {
             println!("{:>4}\t{}", hits, path);
         }
     }
+}
+
+/// The `getopts` builtin: parse one option per call from the positional
+/// parameters (or the explicit arguments), updating `OPTIND`/`OPTARG` and the
+/// caller-named variable the way bash 5.3 does.
+fn builtin_getopts(argv: &[String], sh: &mut Shell) -> i32 {
+    if argv.len() < 3 {
+        safe_eprintln!("getopts: usage: getopts optstring name [arg ...]");
+        return 2;
+    }
+    let optstring = argv[1].clone();
+    let name = argv[2].clone();
+    let args: Vec<String> = if argv.len() > 3 {
+        argv[3..].to_vec()
+    } else {
+        sh.positional.clone()
+    };
+    // A leading colon selects bash's silent error mode.
+    let silent = optstring.starts_with(':');
+    let opt_chars: Vec<char> = if silent {
+        optstring.chars().skip(1).collect()
+    } else {
+        optstring.chars().collect()
+    };
+    let mut optind: usize = sh
+        .env
+        .get("OPTIND")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1);
+    if optind == 0 {
+        optind = 1;
+    }
+    let (saved_ind, saved_off) = sh.getopts_offset;
+    let mut offset = if saved_ind == optind { saved_off } else { 0 };
+
+    loop {
+        if optind > args.len() {
+            break;
+        }
+        let cur = &args[optind - 1];
+        if cur == "--" {
+            optind += 1;
+            offset = 0;
+            break;
+        }
+        if !cur.starts_with('-') || cur == "-" {
+            break;
+        }
+        let chars: Vec<char> = cur.chars().collect();
+        if offset == 0 {
+            offset = 1; // skip the leading '-'
+        }
+        if offset >= chars.len() {
+            optind += 1;
+            offset = 0;
+            continue;
+        }
+        let c = chars[offset];
+        let pos = match opt_chars.iter().position(|x| *x == c) {
+            Some(p) => p,
+            None => {
+                if !silent {
+                    safe_eprintln!("wash: illegal option -- {}", c);
+                }
+                sh.env.insert(name.clone(), "?".to_string());
+                sh.env.insert("OPTIND".to_string(), optind.to_string());
+                offset += 1;
+                if offset >= chars.len() {
+                    optind += 1;
+                    offset = 0;
+                }
+                sh.getopts_offset = (optind, offset);
+                sh.env.insert("OPTIND".to_string(), optind.to_string());
+                return 0;
+            }
+        };
+        let needs_arg = opt_chars.get(pos + 1) == Some(&':');
+        offset += 1;
+        let mut optarg: Option<String> = None;
+        if needs_arg {
+            if offset < chars.len() {
+                optarg = Some(chars[offset..].iter().collect());
+                offset = chars.len();
+            } else if optind < args.len() {
+                optind += 1;
+                optarg = Some(args[optind - 1].clone());
+            } else {
+                if !silent {
+                    safe_eprintln!("wash: option requires an argument -- {}", c);
+                }
+                sh.env.insert(
+                    name.clone(),
+                    if silent { ":" } else { "?" }.to_string(),
+                );
+                if silent {
+                    sh.env.insert("OPTARG".to_string(), c.to_string());
+                }
+                optind += 1;
+                offset = 0;
+                sh.getopts_offset = (optind, offset);
+                sh.env.insert("OPTIND".to_string(), optind.to_string());
+                return 0;
+            }
+        }
+        if offset >= chars.len() {
+            optind += 1;
+            offset = 0;
+        }
+        sh.env.insert(name.clone(), c.to_string());
+        match optarg {
+            Some(v) => {
+                sh.env.insert("OPTARG".to_string(), v);
+            }
+            None => {
+                sh.env.remove("OPTARG");
+            }
+        }
+        sh.getopts_offset = (optind, offset);
+        sh.env.insert("OPTIND".to_string(), optind.to_string());
+        return 0;
+    }
+    // No more options: bash sets the caller's variable to `?` and returns 1.
+    sh.env.insert(name, "?".to_string());
+    sh.env.insert("OPTIND".to_string(), optind.to_string());
+    sh.getopts_offset = (0, 0);
+    1
 }
 
 /// The `hash` builtin: manage the table of the hashed commands.
@@ -4867,6 +4998,7 @@ fn builtin_declare(argv: &[String], sh: &mut Shell, _is_typeset: bool) -> i32 {
     let mut readonly_attr = false;
     let mut integer_attr = false;
     let mut array_attr = false;
+    let mut assoc_attr = false;
     let mut print = false;
     let mut i = 1usize;
 
@@ -4889,7 +5021,8 @@ fn builtin_declare(argv: &[String], sh: &mut Shell, _is_typeset: bool) -> i32 {
                     'i' => integer_attr = true,
                     'a' => array_attr = true,
                     'p' => print = true,
-                    'A' | 'g' | 'n' | 't' | 'l' | 'u' | 'c' | 'f' | 'F' => {} // 已接受但暂未实现
+                    'A' => assoc_attr = true,
+                    'g' | 'n' | 't' | 'l' | 'u' | 'c' | 'f' | 'F' => {} // 已接受但暂未实现
                     _ => {
                         safe_eprintln!("wash: declare: {}: invalid option", a);
                         safe_eprintln!("declare: usage: declare [-aAfFgilrtux] [-p] [name[=value] ...]");
@@ -4923,7 +5056,53 @@ fn builtin_declare(argv: &[String], sh: &mut Shell, _is_typeset: bool) -> i32 {
     }
 
     let mut status = 0;
-    for arg in &argv[i..] {
+    while i < argv.len() {
+        let arg = &argv[i];
+        // `declare -A m=([k]=v [j]=w)` and `declare -a a=(x y)`: the lexer
+        // splits a compound literal into separate argv words (`m=`, `(`,
+        // `[k]=v`, `)`), so consume the whole run here.
+        if let Some(eq) = arg.find('=') {
+            let name = &arg[..eq];
+            let value = &arg[eq + 1..];
+            if is_valid_ident(name)
+                && value.is_empty()
+                && argv.get(i + 1).map(String::as_str) == Some("(")
+            {
+                let mut j = i + 2;
+                let mut elements: Vec<String> = Vec::new();
+                while j < argv.len() && argv[j] != ")" {
+                    elements.push(argv[j].clone());
+                    j += 1;
+                }
+                i = if j < argv.len() { j + 1 } else { j };
+                if assoc_attr {
+                    sh.assoc_declared.insert(name.to_string());
+                    let entries = sh.assoc_arrays.entry(name.to_string()).or_default();
+                    for el in elements {
+                        if let Some(close) = el.find(']') {
+                            if el.starts_with('[')
+                                && el.as_bytes().get(close + 1) == Some(&b'=')
+                            {
+                                let key = &el[1..close];
+                                let val = &el[close + 2..];
+                                if let Some(pair) = entries.iter_mut().find(|(k, _)| k == key) {
+                                    pair.1 = val.to_string();
+                                } else {
+                                    entries.push((key.to_string(), val.to_string()));
+                                }
+                                continue;
+                            }
+                        }
+                        let key = entries.len().to_string();
+                        entries.push((key, el));
+                    }
+                } else {
+                    sh.array_assigned.insert(name.to_string());
+                    sh.arrays.insert(name.to_string(), elements);
+                }
+                continue;
+            }
+        }
         match arg.find('=') {
             Some(eq) => {
                 let name = &arg[..eq];
@@ -4931,6 +5110,7 @@ fn builtin_declare(argv: &[String], sh: &mut Shell, _is_typeset: bool) -> i32 {
                 if !is_valid_ident(name) {
                     safe_eprintln!("wash: declare: `{}': not a valid identifier", arg);
                     status = 1;
+                    i += 1;
                     continue;
                 }
                 if !apply_var_attrs(
@@ -4948,11 +5128,18 @@ fn builtin_declare(argv: &[String], sh: &mut Shell, _is_typeset: bool) -> i32 {
                 if !is_valid_ident(arg) {
                     safe_eprintln!("wash: declare: `{}': not a valid identifier", arg);
                     status = 1;
+                    i += 1;
                     continue;
                 }
-                // `declare -a NAME` creates an (empty) array variable.
+                // `declare -a NAME` creates an (empty) indexed array;
+                // `declare -A NAME` creates an empty associative array and
+                // makes later `NAME[key]=value` use string keys.
                 if array_attr {
                     sh.arrays.entry(arg.clone()).or_insert_with(Vec::new);
+                }
+                if assoc_attr {
+                    sh.assoc_declared.insert(arg.clone());
+                    sh.assoc_arrays.entry(arg.clone()).or_insert_with(Vec::new);
                 }
                 if !apply_var_attrs(
                     sh,
@@ -4966,6 +5153,7 @@ fn builtin_declare(argv: &[String], sh: &mut Shell, _is_typeset: bool) -> i32 {
                 }
             }
         }
+        i += 1;
     }
     status
 }
@@ -5122,6 +5310,20 @@ fn print_declared(sh: &Shell, names: &[String]) {
         // `declare -a NAME` (declared but never assigned) prints without a
         // value, while an array that WAS assigned -- even an empty one from
         // `mapfile`/`readarray` -- prints the explicit `=()` body (bash 5.3).
+        if sh.assoc_declared.contains(name) {
+            let entries = sh.assoc_arrays.get(name).cloned().unwrap_or_default();
+            if entries.is_empty() {
+                println!("declare -A {}", name);
+            } else {
+                let body = entries
+                    .iter()
+                    .map(|(k, v)| format!("[{}]={}", k, quote_value_for_audit(v)))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                println!("declare -A {}=({} )", name, body);
+            }
+            continue;
+        }
         if let Some(elems) = sh.arrays.get(name) {
             if elems.is_empty() {
                 if sh.array_assigned.contains(name) {
@@ -5528,6 +5730,13 @@ pub fn dispatch_signal_trap(sh: &mut Shell, signo: i32) -> bool {
 ///   * `trap - SIG ...`        → reset (remove) the handler.
 ///   * `trap "" SIG ...`       → ignore the signal.
 fn builtin_trap(argv: &[String], sh: &mut Shell) -> i32 {
+    // `trap -l` (and its `-lp` / `-l -p` spellings) prints the numbered
+    // signal table and ignores any following signal_spec operands.
+    let action = argv.get(1).map(String::as_str).unwrap_or("");
+    if action == "-l" || (action.starts_with('-') && action.contains('l')) {
+        print_signal_table();
+        return 0;
+    }
     if argv.len() < 2 {
         // List every installed trap.
         print_traps(sh);

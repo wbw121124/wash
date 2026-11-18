@@ -127,6 +127,11 @@ pub enum Token {
     /// recognised only where a command may start, exactly like a reserved
     /// word, so `echo [[` prints `[[`.
     CondStart(usize),
+    /// `(( EXPR ))` — an arithmetic command.  Recognised only in command
+    /// position, like `[[`.  The body is the raw arithmetic source between
+    /// the opening `((` and the matching `))`; its exit status is 0 when the
+    /// expression is non-zero, 1 when it is zero.
+    ArithCmd(String, usize),
     /// `]]` — closes a conditional expression (bash's COND_END).  It must
     /// be a word of its own: bash lexes the *word* `]]` as the reserved
     /// word COND_END, so `abc]]` stays an ordinary word and the expression
@@ -356,6 +361,10 @@ fn cond_angle(
 fn word_is_assignment(parts: &[WordPart], pending: &str) -> bool {
     let mut name = String::new();
     let mut found_eq = false;
+    // A subscript may contain expansions (`m[$k]=v`), so non-text parts are
+    // tolerated while we are inside `[...]`; they are opaque here and are
+    // expanded later by the executor.
+    let mut in_subscript = false;
     for p in parts {
         match p {
             WordPart::Text(s, _) => {
@@ -365,7 +374,15 @@ fn word_is_assignment(parts: &[WordPart], pending: &str) -> bool {
                     break;
                 }
                 name.push_str(s);
+                for ch in s.chars() {
+                    if ch == '[' {
+                        in_subscript = true;
+                    } else if ch == ']' {
+                        in_subscript = false;
+                    }
+                }
             }
+            _ if in_subscript => {}
             _ => return false,
         }
     }
@@ -376,7 +393,16 @@ fn word_is_assignment(parts: &[WordPart], pending: &str) -> bool {
         }
     }
     let base = name.strip_suffix('+').unwrap_or(&name);
-    let b = base.as_bytes();
+    let ident = match base.find('[') {
+        Some(open) => {
+            if !base.ends_with(']') || open + 1 >= base.len() - 1 {
+                return false;
+            }
+            &base[..open]
+        }
+        None => base,
+    };
+    let b = ident.as_bytes();
     !b.is_empty()
         && (b[0].is_ascii_alphabetic() || b[0] == b'_')
         && b[1..].iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_')
@@ -1718,6 +1744,39 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
             // bash only special-cases `(` and `|` in PST_REGEXP: a lone `)`
             // stays a delimiter, so it falls through to the normal branch and
             // the conditional parser rejects it.
+            '(' if at_command_start && chars.get(i + 1) == Some(&'(') => {
+                // `(( EXPR ))` arithmetic command.  Only recognised where a
+                // command may start, like `[[`.  Reuse the `$((` bracket
+                // reader: it returns the index just after the matching `)`;
+                // a second `)` must follow to close the command.
+                flush_text(&mut pending, &mut parts, pending_quoted);
+                if !parts.is_empty() {
+                    push_word(
+                        &mut tokens,
+                        std::mem::take(&mut parts),
+                        line_no,
+                        &mut at_command_start,
+                        &mut redirect_target,
+                        &mut cond_depth,
+                        &mut cond_regex_rhs,
+                        &chars[word_start..i],
+                    );
+                }
+                if let Some((body, ni)) = read_paren(&chars, i + 2) {
+                    if chars.get(ni) == Some(&')') {
+                        tokens.push(Token::ArithCmd(body, line_no));
+                        i = ni + 1;
+                        at_command_start = false;
+                        continue;
+                    }
+                }
+                // Unterminated `((`: let the generic path emit two `(` words
+                // so the parser produces bash's syntax error rather than
+                // silently accepting a partial command.
+                tokens.push(Token::Word(vec![WordPart::Text("(".to_string(), false)]));
+                i += 1;
+                at_command_start = false;
+            }
             '(' | ')' => {
                 // `(` and `)` are word delimiters in bash: `f() { ... }` must
                 // tokenize as the separate words `f`, `(`, `)`, `{`.  Flush any

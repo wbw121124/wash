@@ -119,13 +119,20 @@ glob / 多 pattern / 空 pattern / 其余清单显示值 / 别名路径全部仍
 | ---- | ---- | ---- |
 | `jobs` / `fg` / `bg` / `wait` / `disown` | 需要完整作业控制（后台进程组、`SIGTSTP`/`SIGCONT`、`$!` 与 jobs 表）；当前执行模型是每条命令 fork/exec | Phase 2 |
 | `mapfile` / `readarray` / `coproc` | 需要协进程双向管道与文件→数组读取 | Phase 4 |
-| 数组 `-a` / `-A`（下标展开） | 赋值 `ARR=(a b)` 已落地；`declare -a`/`-A`、`${arr[@]}` 待补 | Phase 4 |
+| 数组 `-a` / `-A`（下标展开） | 赋值 `ARR=(a b)`、下标赋值 `a[i]=v`、`declare -A` 关联数组（FNV 桶序遍历）已落地 | Phase 4 已完成 |
 | `compgen` / `complete` / `bind` | 补全与键绑定属交互层；Phase 6 已有自研 Tab 补全但未暴露成 bash 风格内建 | Phase 4 之后 |
 | `fc` / `history` | 历史由 REPL 持久化，但需以 bash 格式暴露 / 支持范围展开与编辑 | Phase 4 之后 |
 
 ## 已知未实现特性（功能缺失，非覆盖空洞）
 
-oracle 实测：`(( ))` 算术命令 → `command not found`（但 `$(( ))` **展开**已实现对齐）；
+oracle 实测：`(( ))` 算术命令、`declare -A`、`getopts`、`trap -l` 均已实现并与
+bash 5.3 逐字节对齐（含 OPTIND/OPTARG/静默模式、FNV 哈希桶序遍历的关联数组、
+完整 64 信号表）。数组下标赋值 `a[i]=v` 与稀疏下标计数也已对齐。
+唯一已知边界：关联数组 `${!m[@]}` 在**多字符键恰好哈希冲突**时，bash 内部哈希
+表的 rehash 时机导致顺序与 FNV-1 朴素桶序不同（如 `foo/bar/baz/qux`）；单字符
+键及绝大多数常见场景逐字节一致，不做假 PASS。另有一处历史边界（非本轮引入）：
+同一条命令里 `$(( x++ ))` 与后续 `$x` 的展开顺序，bash 输出 `1 2`、wash 输出
+`1 1`（算术自增写回与参数展开快照的时序差异）。
 `[[ ]]` 已实现并与 bash 5.3 逐字节对齐（49 条栅栏见 `tests/bash_diff_builtins.sh`
 GROUP A）：单目/双目/文件/数值/字符串/模式/ERE 运算、`BASH_REMATCH` 捕获组、
 `!`/`&&`/`||`/分组、`[[ ]]` 内不做词分割，以及畸形表达式的两行诊断（含 yacc
@@ -134,8 +141,8 @@ GROUP A）：单目/双目/文件/数值/字符串/模式/ERE 运算、`BASH_REM
 yacc `near` 行只取最后一个空白之后的部分；被转义的 `=` 是字面词而非运算符（rc=2）。
 heredoc `<<`/`<<-`/herestring `<<<` 曾为 rc=2
 （后续已实现）；`select` → 语法错误；`shopt -s nullglob` → `invalid shell option name`；
-`declare -A`、`getopts`、`trap -l` → **静默 rc=0 但功能未生效**（最危险，勿把它当成功）。
 已对齐：if/for/while/until/case、函数、eval、mapfile、local、`>|`、`exec 3>&-`、
+`declare -A`、`getopts`、`trap -l`、`(( ))`、数组下标赋值、
 `${!pre*}`、`$(( ))`、heredoc/herestring、未闭合 `$(`、重定向逐行部分执行等。
 
 详细根因存档见 `AGENTS.md`「内建兼容性矩阵 → 已修复缺陷的根因存档」。

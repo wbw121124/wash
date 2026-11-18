@@ -6,7 +6,7 @@
 // globbed. Arithmetic results are never split/globbed.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::lexer::WordPart;
 use crate::parser;
@@ -124,6 +124,11 @@ pub struct ExpandCtx<'a> {
     pub functions: &'a HashMap<String, parser::CommandList>,
     /// Array variables (`name=(a b c)`).  Indexed by the (scalar) array name.
     pub arrays: &'a HashMap<String, Vec<String>>,
+    /// Assigned indices of each indexed array (sparse arrays).
+    pub array_set_indices: &'a HashMap<String, HashSet<i64>>,
+    /// Associative arrays (`declare -A`).  Read-only during expansion, same
+    /// borrow discipline as `arrays`.
+    pub assoc_arrays: &'a HashMap<String, Vec<(String, String)>>,
     /// The assignments requested by the `${var=word}` / `${var:=word}`
     /// expansions.
     ///
@@ -192,6 +197,8 @@ pub fn expand_scalar(parts: &[WordPart], ctx: &ExpandCtx) -> String {
                     ctx.arrays,
                     ctx.nounset,
                     ctx.bg_pid,
+                    ctx.positional,
+                    ctx.dollar_zero,
                 ));
             }
             WordPart::Arith(body, _) => out.push_str(&eval_arith(body, ctx)),
@@ -426,6 +433,8 @@ pub fn expand_word(parts: &[WordPart], ctx: &ExpandCtx) -> Vec<String> {
                     ctx.arrays,
                     ctx.nounset,
                     ctx.bg_pid,
+                    ctx.positional,
+                    ctx.dollar_zero,
                 );
                 candidates = apply_value(candidates, Expansion::Scalar(val), *quoted, ctx);
             }
@@ -745,14 +754,38 @@ fn eval_braced(body: &str, ctx: &ExpandCtx) -> Expansion {
         // `${#arr[@]}` / `${#arr[*]}`: the number of elements.
         // `${#arr[i]}`: the length of element `i`.
         if let Some((arr, subscript)) = split_subscript(name) {
+            if let Some(entries) = ctx.assoc_arrays.get(arr) {
+                return match subscript {
+                    "@" | "*" => Expansion::Scalar(entries.len().to_string()),
+                    key => {
+                        let len = entries
+                            .iter()
+                            .find(|(k, _)| k.as_str() == key)
+                            .map(|(_, v)| crate::byteval::decoded_len(v))
+                            .unwrap_or(0);
+                        Expansion::Scalar(len.to_string())
+                    }
+                };
+            }
             let elems = ctx.arrays.get(arr);
             return match subscript {
-                "@" | "*" => {
-                    Expansion::Scalar(elems.map(|e| e.len()).unwrap_or(0).to_string())
-                }
+            "@" | "*" => {
+                let n = match ctx.array_set_indices.get(arr) {
+                    Some(indices) => indices.len(),
+                    None => elems.map(|e| e.len()).unwrap_or(0),
+                };
+                Expansion::Scalar(n.to_string())
+            }
                 _ => {
-                    let len = match (elems, subscript.parse::<i64>()) {
-                        (Some(e), Ok(i)) if i >= 0 && (i as usize) < e.len() => {
+                    let idx = subscript.parse::<i64>().ok().or_else(|| {
+                        crate::arith::eval(
+                            subscript,
+                            &mut crate::arith::ReadOnlyEnv { vars: ctx.env },
+                        )
+                        .ok()
+                    });
+                    let len = match (elems, idx) {
+                        (Some(e), Some(i)) if i >= 0 && (i as usize) < e.len() => {
                             crate::byteval::decoded_len(&e[i as usize])
                         }
                         _ => 0,
@@ -820,10 +853,21 @@ fn eval_braced(body: &str, ctx: &ExpandCtx) -> Expansion {
                 } else {
                     ifs_join_sep(ctx)
                 };
-                let keys: Vec<String> = match ctx.arrays.get(arr_name) {
-                    Some(elems) => (0..elems.len()).map(|i| i.to_string()).collect(),
-                    None if ctx.env.contains_key(arr_name) => vec!["0".to_string()],
-                    None => Vec::new(),
+                let keys: Vec<String> = if let Some(entries) = ctx.assoc_arrays.get(arr_name) {
+                    assoc_iter_keys(entries)
+                } else {
+                    match ctx.array_set_indices.get(arr_name) {
+                        Some(indices) => {
+                            let mut sorted: Vec<i64> = indices.iter().copied().collect();
+                            sorted.sort_unstable();
+                            sorted.into_iter().map(|i| i.to_string()).collect()
+                        }
+                        None => match ctx.arrays.get(arr_name) {
+                            Some(elems) => (0..elems.len()).map(|i| i.to_string()).collect(),
+                            None if ctx.env.contains_key(arr_name) => vec!["0".to_string()],
+                            None => Vec::new(),
+                        },
+                    }
                 };
                 return Expansion::Scalar(keys.join(&sep));
             }
@@ -903,9 +947,55 @@ fn eval_braced(body: &str, ctx: &ExpandCtx) -> Expansion {
     // `${a[i]}` yields element `i` (0-based) as a scalar.  A `:off:len`
     // suffix slices the element list before it is turned into fields.
     if let Some((name, subscript)) = split_subscript(rawname) {
+        if let Some(entries) = ctx.assoc_arrays.get(name) {
+            let fields: Vec<String> = match subscript {
+                "@" | "*" => assoc_iter_values(entries),
+                key => entries
+                    .iter()
+                    .find(|(k, _)| k.as_str() == key)
+                    .map(|(_, v)| vec![v.clone()])
+                    .unwrap_or_default(),
+            };
+            return match subscript {
+                "@" | "*" => {
+                    let fields = if op == ":" {
+                        slice_fields(fields, arg, ctx)
+                    } else {
+                        fields
+                    };
+                    if subscript == "@" {
+                        Expansion::At(fields)
+                    } else {
+                        Expansion::Star(fields)
+                    }
+                }
+                _ => {
+                    let val = fields.into_iter().next().unwrap_or_default();
+                    Expansion::Scalar(apply_scalar_op(
+                        &val, name, op, arg, !val.is_empty(), val.is_empty(), ctx,
+                    ))
+                }
+            };
+        }
         let elems = ctx.arrays.get(name).cloned().unwrap_or_default();
         match subscript {
             "@" | "*" => {
+                let elems = if let Some(indices) = ctx.array_set_indices.get(name) {
+                    let mut sorted: Vec<i64> = indices.iter().copied().collect();
+                    sorted.sort_unstable();
+                    sorted
+                        .into_iter()
+                        .filter_map(|i| {
+                            if i >= 0 && (i as usize) < elems.len() {
+                                Some(elems[i as usize].clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect()
+                } else {
+                    elems
+                };
                 let fields = if op == ":" {
                     slice_fields(elems, arg, ctx)
                 } else {
@@ -918,14 +1008,21 @@ fn eval_braced(body: &str, ctx: &ExpandCtx) -> Expansion {
                 };
             }
             _ => {
-                let val = if let Ok(i) = subscript.parse::<i64>() {
-                    if i >= 0 && (i as usize) < elems.len() {
+                // An indexed subscript is an arithmetic expression, so a
+                // symbolic name (`a[key]`) evaluates the same way bash does
+                // (an unbound variable evaluates to 0).
+                let idx = subscript.parse::<i64>().ok().or_else(|| {
+                    crate::arith::eval(
+                        subscript,
+                        &mut crate::arith::ReadOnlyEnv { vars: ctx.env },
+                    )
+                    .ok()
+                });
+                let val = match idx {
+                    Some(i) if i >= 0 && (i as usize) < elems.len() => {
                         elems[i as usize].clone()
-                    } else {
-                        String::new()
                     }
-                } else {
-                    String::new()
+                    _ => String::new(),
                 };
                 return Expansion::Scalar(apply_scalar_op(
                     &val,
@@ -952,6 +1049,38 @@ fn eval_braced(body: &str, ctx: &ExpandCtx) -> Expansion {
 
     let result = apply_scalar_op(&value, rawname, op, arg, is_set, unset_or_empty, ctx);
     Expansion::Scalar(result)
+}
+
+/// Keys of an associative array in the order bash's `${!m[@]}` iterates.
+///
+/// bash 5.3 stores associative arrays in a chained hash table:
+/// `hash_string` is FNV-1 (`i *= 16777619; i ^= *s`, starting from
+/// 2166136261), the bucket count starts at 16 (a power of two, so the index
+/// is `hash & 15`), entries are head-inserted into their bucket, and
+/// `${!m[@]}` walks buckets 0..15 emitting each chain from head to tail.
+/// Reproducing that here keeps short-string keys (the overwhelming common
+/// case) byte-identical to the oracle.
+fn assoc_iter_keys(entries: &[(String, String)]) -> Vec<String> {
+    const FNV_OFFSET: u32 = 2166136261;
+    const FNV_PRIME: u32 = 16777619;
+    const NBUCKETS: usize = 16;
+    let mut buckets: Vec<Vec<&str>> = vec![Vec::new(); NBUCKETS];
+    for (key, _) in entries {
+        let mut hash = FNV_OFFSET;
+        for byte in key.bytes() {
+            hash = hash.wrapping_mul(FNV_PRIME) ^ u32::from(byte);
+        }
+        buckets[(hash as usize) & (NBUCKETS - 1)].insert(0, key.as_str());
+    }
+    buckets.into_iter().flatten().map(str::to_string).collect()
+}
+
+/// Values of an associative array in the same order `${!m[@]}` lists keys.
+fn assoc_iter_values(entries: &[(String, String)]) -> Vec<String> {
+    let keys = assoc_iter_keys(entries);
+    keys.iter()
+        .filter_map(|k| entries.iter().find(|(ek, _)| ek == k).map(|(_, v)| v.clone()))
+        .collect()
 }
 
 /// Split `raw` into `(name, subscript)` when it has the form `name[subscript]`.

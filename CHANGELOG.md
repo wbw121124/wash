@@ -53,8 +53,32 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   未闭合 `(` 的词法 EOF 行）。`tests/bash_diff_builtins.sh` GROUP A 新增 44 条
   逐字节栅栏（rc + stdout + 仅剥 shell 名前缀的 stderr），A 组 590 → 634。
 
+### Added
+
+- **`declare -A` 关联数组与数组下标赋值**：此前 `a[0]=x` 被误判为命令
+  （`command not found`），`declare -A` 静默吞掉 `-A` 标志。新增独立的
+  `Shell::assoc_arrays`（FNV-1 哈希、16 桶、桶内头插，复刻 bash `${!m[@]}` 的
+  遍历顺序）与 `array_set_indices`（稀疏数组计数）；lexer/parser 让
+  `name[subscript]=value`（含 `m[$k]=v`）识别为赋值词；executor 对关联数组用
+  字符串键、对索引数组用算术下标。支持 `declare -A m=([k]=v)` 复合字面量与
+  `declare -p m` 的 `([k]="v" )` 格式。已知窄边界：多字符键哈希冲突时 bash
+  内部 rehash 时机导致顺序与朴素 FNV 桶序不同，如实登记不假 PASS。
+- **`getopts` 内建**：实现 OPTIND/OPTARG、前导冒号静默模式、非法选项与缺参数
+  诊断、`--`/非选项终止、bundled 选项（`-ab`）跨调用续扫，与 bash 5.3 逐字节对齐。
+- **`trap -l` 信号列表**：复用现有 64 信号表打印器，支持 `-l`/`-lp`/`-l -p`，
+  与 bash 逐字节一致。
+- **`(( ))` 算术命令**：新增 `Token::ArithCmd` 与 `Compound::Arith`，复用现有
+  算术求值器；退出码按表达式结果 0/非 0 为 1/0，赋值写回 shell 变量。
+  已知边界：C 风格 `for ((i=0;i<3;i++))` 循环属独立语法，尚未支持。
+
 ### Fixed
 
+- **review P1-3：`largest_parseable_prefix` 的 O(n²) 语法错恢复**：2000 行脚本
+  尾部语法错从 ~39s 降到 ~0.23s（bash 0.25s）。整串已知解析失败，改为从末行
+  往前找首个可解析前缀即停，语义与原来的前向扫描完全等价。
+- **review P1-5：命令替换不继承位置参数**：`capture_command` 新增 `positional` /
+  `dollar_zero` 参数并由 `ExpandCtx` 两处调用点透传；`set -- aa bb; echo "$(echo $1)"`
+  从空变为 `aa`，`set -u` 下也不再误报 unbound。新增 2 条 GROUP A 栅栏。
 - **`[[ ]]` 畸形诊断的 quoted token 渲染**：此前 `WordPart` 只记录「是否 quoted」，
   丢失引号类型与原始源码文本，导致 `[[ a "=" a ]]` 输出 `unexpected token \`='`
   而不是 bash 的 `` `"="'``。词法层为 cond 词新增 `Token::CondWord(parts, raw)`，

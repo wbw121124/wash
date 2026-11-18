@@ -793,6 +793,8 @@ pub fn capture_command(
     arrays: &HashMap<String, Vec<String>>,
     nounset: bool,
     bg_pid: i32,
+    positional: &[String],
+    dollar_zero: &str,
 ) -> String {
     let list = match parse_cmdsub_cached(cmd) {
         Some(list) => list,
@@ -834,6 +836,11 @@ pub fn capture_command(
         // Array variables are inherited as well (bash copies them into the
         // subshell).
         sh.arrays = arrays.clone();
+        // A command substitution runs in a subshell of the current shell: it
+        // inherits positional parameters and `$0` (bash 5.3).  Without this,
+        // `set -- aa; echo "$(echo $1)"` loses `$1`.
+        sh.positional = positional.to_vec();
+        sh.dollar_zero = dollar_zero.to_string();
         let code = crate::executor::execute(&list, &mut sh);
         // Inside a command substitution, an unbound variable under `set -u`
         // (or a failed `${var?word}`) fails the substitution with status 1,
@@ -939,6 +946,21 @@ fn execute_compound(compound: &Compound, sh: &mut Shell) -> i32 {
         // `[[ EXPR ]]` — a conditional command.  It succeeds when the
         // expression is true and fails when it is false; nothing else in
         // the shell changes.
+        // `(( EXPR ))` — evaluate as arithmetic; status is 0 when the result
+        // is non-zero, 1 when it is zero.  Assignments inside the expression
+        // mutate shell variables through the same MapEnv `$(( ))` uses.
+        Compound::Arith { expr, .. } => {
+            match arith::eval(expr, &mut arith::MapEnv { vars: &mut sh.env }) {
+                Ok(value) => {
+                    sh.last_status = if value != 0 { 0 } else { 1 };
+                    sh.last_status
+                }
+                Err(_) => {
+                    sh.last_status = 1;
+                    1
+                }
+            }
+        }
         Compound::Cond { expr, .. } => {
             let attrs = sh.attr_refs();
             let ctx = ExpandCtx {
@@ -955,6 +977,8 @@ fn execute_compound(compound: &Compound, sh: &mut Shell) -> i32 {
                 attrs: &attrs,
                 functions: &sh.functions,
                 arrays: &sh.arrays,
+                assoc_arrays: &sh.assoc_arrays,
+            array_set_indices: &sh.array_set_indices,
                 pending_assign: None,
             };
             let status = if crate::cond::eval_cond(expr, &ctx) { 0 } else { 1 };
@@ -1025,6 +1049,8 @@ fn execute_for(var: &str, words: &[Vec<WordPart>], body: &CommandList, sh: &mut 
         attrs: &attrs,
         functions: &sh.functions,
         arrays: &sh.arrays,
+        assoc_arrays: &sh.assoc_arrays,
+            array_set_indices: &sh.array_set_indices,
         pending_assign: None,
     };
     let mut fields: Vec<String> = Vec::new();
@@ -1143,6 +1169,8 @@ fn execute_case(word: &[WordPart], arms: &[crate::parser::CaseArm], sh: &mut She
         attrs: &attrs,
         functions: &sh.functions,
         arrays: &sh.arrays,
+        assoc_arrays: &sh.assoc_arrays,
+            array_set_indices: &sh.array_set_indices,
         pending_assign: None,
     };
     let value = expand_scalar(word, &ctx);
@@ -1492,6 +1520,87 @@ fn child_run_exp(argv: &[String], path: Option<&str>, ctx: &ChildContext) -> ! {
     posix::exit(127)
 }
 
+/// Assign to an array element (`a[i]=v` / `m[k]=v`).  The subscript source is
+/// expanded first; associative arrays use the result as a literal key, while
+/// indexed arrays evaluate it arithmetically exactly like bash.
+fn assign_subscript_var(
+    sh: &mut Shell,
+    base: &str,
+    sub_src: &str,
+    value: String,
+    append: bool,
+) -> bool {
+    let subscript = {
+        let attrs = sh.attr_refs();
+        let ctx = ExpandCtx {
+            env: &sh.env,
+            positional: &sh.positional,
+            last_status: sh.last_status,
+            self_pid: sh.self_pid,
+            noglob: sh.options.noglob,
+            nounset: sh.options.nounset,
+            shell_flags: sh.dash_flags(),
+            set_options: &sh.options,
+            bg_pid: sh.bg_pid,
+            dollar_zero: &sh.dollar_zero,
+            attrs: &attrs,
+            functions: &sh.functions,
+            arrays: &sh.arrays,
+            assoc_arrays: &sh.assoc_arrays,
+            array_set_indices: &sh.array_set_indices,
+            pending_assign: None,
+        };
+        // `sub_src` is source text (`$k`, `${k}`), not an already-expanded
+        // value: re-lex it so `$k` becomes a Var part and is expanded by
+        // `expand_scalar` instead of being written as a literal key.
+        let parts = crate::lexer::tokenize(sub_src)
+            .ok()
+            .and_then(|toks| toks.into_iter().next())
+            .and_then(|tok| match tok {
+                crate::lexer::Token::Word(p) => Some(p),
+                _ => None,
+            })
+            .unwrap_or_else(|| vec![WordPart::Text(sub_src.to_string(), false)]);
+        expand_scalar(&parts, &ctx)
+    };
+    if sh.assoc_declared.contains(base) {
+        let entries = sh.assoc_arrays.entry(base.to_string()).or_default();
+        match entries.iter_mut().find(|(k, _)| k == &subscript) {
+            Some(pair) => {
+                if append {
+                    pair.1.push_str(&value);
+                } else {
+                    pair.1 = value;
+                }
+            }
+            None => entries.push((subscript, value)),
+        }
+    } else {
+        let idx_i64 = arith::eval(&subscript, &mut arith::MapEnv { vars: &mut sh.env })
+            .unwrap_or(0);
+        if idx_i64 < 0 {
+            safe_eprintln!("wash: {}: bad array subscript", base);
+            return false;
+        }
+        let entries = sh.arrays.entry(base.to_string()).or_default();
+        let idx = idx_i64 as usize;
+        if entries.len() <= idx {
+            entries.resize(idx + 1, String::new());
+        }
+        if append {
+            entries[idx].push_str(&value);
+        } else {
+            entries[idx] = value;
+        }
+        sh.array_set_indices
+            .entry(base.to_string())
+            .or_default()
+            .insert(idx_i64);
+    }
+    sh.array_assigned.insert(base.to_string());
+    true
+}
+
 /// Apply a single assignment to the shell, honouring the `readonly` and
 /// integer (`declare -i`) attributes the way bash does.
 ///
@@ -1503,6 +1612,11 @@ fn child_run_exp(argv: &[String], path: Option<&str>, ctx: &ChildContext) -> ! {
 /// Returns `false` when the assignment was refused (a `readonly` variable);
 /// the caller turns that into a non-zero exit status the way bash does.
 fn assign_var(sh: &mut Shell, name: &str, value: String, append: bool) -> bool {
+    if let Some(open) = name.find('[') {
+        if name.ends_with(']') && open + 1 < name.len() - 1 {
+            return assign_subscript_var(sh, &name[..open], &name[open + 1..name.len() - 1], value, append);
+        }
+    }
     if sh.readonly.contains(name) {
         safe_eprintln!("wash: {}: readonly variable", name);
         return false;
@@ -1550,6 +1664,8 @@ fn apply_command_assignments(
             attrs: &attrs,
             functions: &sh.functions,
             arrays: &sh.arrays,
+            assoc_arrays: &sh.assoc_arrays,
+            array_set_indices: &sh.array_set_indices,
             pending_assign: Some(&pending),
         };
         assigns
@@ -1609,6 +1725,8 @@ fn apply_array_assignments(
             attrs: &attrs,
             functions: &sh.functions,
             arrays: &sh.arrays,
+            assoc_arrays: &sh.assoc_arrays,
+            array_set_indices: &sh.array_set_indices,
             pending_assign: None,
         };
         arrays
@@ -1628,10 +1746,17 @@ fn apply_array_assignments(
         if append {
             // `name+=(...)` appends to the existing elements.
             let mut all = sh.arrays.get(&name).cloned().unwrap_or_default();
-            all.extend(v);
-            sh.arrays.insert(name, all);
+            let base = all.len() as i64;
+            all.extend(v.iter().cloned());
+            sh.arrays.insert(name.clone(), all);
+            let indices = sh.array_set_indices.entry(name).or_default();
+            for k in base..base + v.len() as i64 {
+                indices.insert(k);
+            }
         } else {
-            sh.arrays.insert(name, v);
+            sh.arrays.insert(name.clone(), v.iter().cloned().collect());
+            sh.array_set_indices
+                .insert(name, (0..v.len() as i64).collect());
         }
     }
     saved
@@ -1755,6 +1880,8 @@ fn run_standalone_exp(
                     attrs: &attrs,
                     functions: &sh.functions,
             arrays: &sh.arrays,
+            assoc_arrays: &sh.assoc_arrays,
+            array_set_indices: &sh.array_set_indices,
                     pending_assign: Some(&pending),
                 };
                 assigns
@@ -2172,6 +2299,8 @@ fn prepare_stage(c: &SimpleCommand, sh: &mut Shell) -> Prepared {
             attrs: &attrs,
             functions: &sh.functions,
             arrays: &sh.arrays,
+            assoc_arrays: &sh.assoc_arrays,
+            array_set_indices: &sh.array_set_indices,
             pending_assign: Some(&pending),
         };
         let argv = expand_argv(&c.argv, &ctx);
@@ -2209,6 +2338,8 @@ fn prepare_stage(c: &SimpleCommand, sh: &mut Shell) -> Prepared {
             attrs: &attrs,
             functions: &sh.functions,
             arrays: &sh.arrays,
+            assoc_arrays: &sh.assoc_arrays,
+            array_set_indices: &sh.array_set_indices,
             pending_assign: Some(&pending),
         };
         let values: Vec<(String, String, bool)> = c

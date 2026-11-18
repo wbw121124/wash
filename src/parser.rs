@@ -97,6 +97,12 @@ pub enum Compound {
         /// The 1-based line of the `[[`, used for bash's diagnostics.
         line: usize,
     },
+    /// `(( EXPR ))` — an arithmetic command.  The body is evaluated at
+    /// execution time; status 0 means the expression evaluated non-zero.
+    Arith {
+        expr: String,
+        line: usize,
+    },
 }
 
 /// One arm of a `case` command: a set of patterns and the body to run.
@@ -228,6 +234,13 @@ fn parse_compounds(tokens: &[Token]) -> Result<(Vec<Token>, Vec<FuncDef>)> {
                     )))
                 }
             },
+            Token::ArithCmd(body, line) => {
+                out.push(Token::Compound(Compound::Arith {
+                    expr: body.clone(),
+                    line: *line,
+                }));
+                i += 1;
+            }
             Token::CondStart(line) => {
                 // `[[ EXPR ]]` — a conditional command.  The lexer only emits
                 // the opener where a command may start, so no command-position
@@ -1139,19 +1152,72 @@ fn as_assignment(parts: &[WordPart]) -> Option<(String, Vec<WordPart>, bool)> {
     if parts.is_empty() {
         return None;
     }
-    if let WordPart::Text(first, _) = &parts[0] {
-        if let Some(eq) = first.find('=') {
-            let (pre, valstart) = first.split_at(eq);
-            let append = pre.ends_with('+');
-            let ident = if append { &pre[..pre.len() - 1] } else { pre };
-            if is_valid_ident(ident) {
-                let mut value: Vec<WordPart> = vec![WordPart::Text(valstart[1..].to_string(), false)];
-                value.extend_from_slice(&parts[1..]);
-                return Some((ident.to_string(), value, append));
+    // Find the `=` that separates the lhs from the value.  A subscript may
+    // contain expansions (`m[$k]=v`), so scan across parts while inside
+    // `[...]`.  The returned name keeps its raw subscript (`m[$k]`); the
+    // executor expands it and decides between indexed/associative storage.
+    let mut eq_at: Option<(usize, usize)> = None;
+    let mut in_subscript = false;
+    for (i, p) in parts.iter().enumerate() {
+        match p {
+            WordPart::Text(s, _) => {
+                if let Some(pos) = s.find('=') {
+                    eq_at = Some((i, pos));
+                    break;
+                }
+                for ch in s.chars() {
+                    if ch == '[' {
+                        in_subscript = true;
+                    } else if ch == ']' {
+                        in_subscript = false;
+                    }
+                }
             }
+            _ if in_subscript => {}
+            _ => return None,
         }
     }
-    None
+    let (eq_part, eq_pos) = eq_at?;
+    let mut lhs = String::new();
+    for p in &parts[..eq_part] {
+        lhs.push_str(&word_part_source(p)?);
+    }
+    match &parts[eq_part] {
+        WordPart::Text(s, _) => lhs.push_str(&s[..eq_pos]),
+        _ => return None,
+    }
+    let append = lhs.ends_with('+');
+    let lhs = if append { &lhs[..lhs.len() - 1] } else { &lhs };
+    let valid = if let Some(open) = lhs.find('[') {
+        lhs.ends_with(']')
+            && open + 1 < lhs.len() - 1
+            && is_valid_ident(&lhs[..open])
+    } else {
+        is_valid_ident(lhs)
+    };
+    if !valid {
+        return None;
+    }
+    let mut value = Vec::new();
+    if let WordPart::Text(s, _) = &parts[eq_part] {
+        value.push(WordPart::Text(s[eq_pos + 1..].to_string(), false));
+    }
+    value.extend_from_slice(&parts[eq_part + 1..]);
+    Some((lhs.to_string(), value, append))
+}
+
+/// Reconstruct the source spelling of a word part so a subscript containing
+/// an expansion (`m[$k]`, `m[${k}]`) can be expanded again by the executor.
+fn word_part_source(p: &WordPart) -> Option<String> {
+    Some(match p {
+        WordPart::Text(s, _) => s.clone(),
+        WordPart::Var(n, _) => format!("${}", n),
+        WordPart::Braced(n, _) => format!("${{{}}}", n),
+        WordPart::CmdSub(n, _) => format!("$({})", n),
+        WordPart::Backtick(n, _) => format!("`{}`", n),
+        WordPart::Arith(n, _) => format!("$(({}))", n),
+        _ => return None,
+    })
 }
 
 /// True when `parts` is the head of an array assignment: a `name=` word with an
@@ -1258,6 +1324,12 @@ fn parse_simple(tokens: &[Token]) -> Result<SimpleCommand> {    let mut argv: Ve
 
     while i < tokens.len() {
         match &tokens[i] {
+            // `ArithCmd` is already turned into a Compound by
+            // `parse_compounds`; reaching it here means it appeared in an
+            // unexpected command tail, which bash rejects as a syntax error.
+            Token::ArithCmd(_, _) => {
+                return Err(WashError::syntax("syntax error near unexpected token `('"));
+            }
             // `CondWord` only occurs inside `[[ ... ]]` and is consumed by
             // `parse_cond_compound`; treat it as an ordinary word here so an
             // unexpected one degrades gracefully instead of panicking.

@@ -436,6 +436,22 @@ pub struct Shell {
     /// Array variables (`ARR=(a b)`). Each maps a name to an ordered list of
     /// elements (bash arrays).
     pub arrays: HashMap<String, Vec<String>>,
+    /// Indices actually assigned in each indexed array.  `a[2]=x` must be a
+    /// one-element sparse array in bash; without this set the hole filler
+    /// would be counted as two extra elements by `${#a[@]}` / `${!a[@]}`.
+    pub array_set_indices: HashMap<String, HashSet<i64>>,
+    /// Offset (in characters) inside `positional[OPTIND-1]` where the next
+    /// `getopts` call resumes a bundled option cluster (`-ab`), and the
+    /// position index the offset belongs to.  bash keeps the same state
+    /// across separate `getopts` invocations.
+    pub getopts_offset: (usize, usize),
+    /// Associative arrays (`declare -A m; m[k]=v`).  Kept separate from
+    /// `arrays` so the indexed-array fast paths stay unchanged.  Each entry
+    /// stores insertion-ordered `(key, value)` pairs; `${!m[@]}` must be
+    /// rendered in bash's hash-bucket order (see `assoc_key_order`).
+    pub assoc_arrays: HashMap<String, Vec<(String, String)>>,
+    /// Names declared associative by `declare -A` even when still empty.
+    pub assoc_declared: HashSet<String>,
     /// 记录被显式赋予过数组值（哪怕是空数组）的变量名。bash 区分「仅
     /// `declare -a X` 声明」与「`X=()` / `mapfile` 赋过值」：前者
     /// `declare -p` 打印 `declare -a X`，后者打印 `declare -a X=()`。
@@ -582,6 +598,10 @@ impl Shell {
             jobs: Vec::new(),
             job_table: Vec::new(),
             arrays: HashMap::new(),
+            array_set_indices: HashMap::new(),
+            getopts_offset: (0, 0),
+            assoc_arrays: HashMap::new(),
+            assoc_declared: HashSet::new(),
             array_assigned: HashSet::new(),
             completion_specs: Vec::new(),
             history: Vec::new(),
@@ -748,18 +768,26 @@ impl Shell {
     /// for these speculative prefix parses.
     fn largest_parseable_prefix(s: &str) -> usize {
         let lines: Vec<&str> = s.split('\n').collect();
-        let mut best = 0usize;
-        for k in 1..lines.len() {
+        // The whole string has already failed to parse (this is the parse-error
+        // recovery path), so the answer is strictly less than `lines.len()`.
+        // Walk BACKWARDS and stop at the first prefix that parses: for the
+        // overwhelmingly common "syntax error at the end of the script" case
+        // that is one tokenize+parse instead of one per prefix.  The old
+        // forward loop re-parsed every prefix (O(n²) tokenizations: 2000 lines
+        // took ~39s here vs bash's ~0.25s).  "prefix(k) parses" is not monotone
+        // in general (an unclosed `if` can close later), but the largest
+        // satisfying k is identical whichever direction we scan.
+        for k in (1..lines.len()).rev() {
             let prefix = lines[..k].join("\n");
-            let ok = lexer::tokenize_nested(&prefix)
+            if lexer::tokenize_nested(&prefix)
                 .ok()
                 .and_then(|t| parser::parse_command_list(&t).ok())
-                .is_some();
-            if ok {
-                best = k;
+                .is_some()
+            {
+                return k;
             }
         }
-        best
+        0
     }
 
     /// Execute the completed prefix of a command string that failed to parse.

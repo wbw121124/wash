@@ -455,6 +455,7 @@ fn raw_token(tok: &Token) -> String {
         Token::Background => "&".to_string(),
         Token::Reserved(name, _) => name.clone(),
         Token::CondStart(_) => "[[".to_string(),
+        Token::ArithCmd(body, _) => format!("(( {} ))", body),
         Token::Compound(_) => "compound".to_string(),
         Token::FunctionDef(name) => name.clone(),
         Token::Redirect { .. } => "redirection".to_string(),
