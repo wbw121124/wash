@@ -26,7 +26,7 @@
 #       'cd <WASH_REPO> && bash tests/bash_diff_builtins.sh'
 #
 # Optional: ONLY_GROUP=A|K|B|C|D runs a single group.
-#   A = core semantics + finished builtins (666 cases: 340 + 33 brace-range
+#   A = core semantics + finished builtins (709 cases: 340 + 33 brace-range
 #       + 24 brace word-boundary + 15 brace nest/escape/quote-removal
 #       + 1 brace deep-nesting stack guard + 37 heredoc / herestring
 #       + 11 unclosed `$(` syntax-error fence
@@ -59,7 +59,16 @@
 #          no word splitting, bash's two-line malformed-expression diagnostics)
 #       + 5 quoted-token diagnostic fence (raw yytext quotes/escapes/$ prefix
 #          in the cond message, whitespace-truncated yacc near, escaped `=`)
-#       + 25 array/associative/getopts/trap -l/arithmetic-command fence
+#       + 10 arithmetic side-effect visibility fence (immediate `x++` / `x=`
+#          write-back visible to later `$x` on the SAME command line)
+#       + 20 C-style `for ((...))` fence (12 loop semantics: init/cond/incr,
+#          empty clauses, break/continue incl. level 2, nested loops, div-by-0
+#          diagnostic; + 8 diagnostics: clause-count yacc error with the raw
+#          `((...))` echo, lexer EOF, and near-token errors)
+#       + 7 C-for grammar completion / compound trailing-token fence
+#          (`do` after `))` without `;`, mismatched closer near-token,
+#          bare word after a compound closer rejected while redir/&/&& legal)
+#       + 31 array/associative/getopts/trap -l/arithmetic-command fence
 #          (indexed & symbolic subscripts, declare -A + FNV bucket order,
 #          OPTIND/OPTARG + silent/illegal/noarg, signal table, (( )) status)
 #       + 2 cmdsub-inheritance fence (positional params inherited into command
@@ -588,6 +597,19 @@ run_case A cmdsub-strip-newlines 'x=$(printf "a\n\n\n"); echo "[${#x}]"'
 # 展开后的 glob 多匹配必须是多个词（旧 glob_one 用 join(" ") 折叠成一个词）。
 run_case A arith-assign-persist 'x=0; echo $((x=5)); echo $x'
 run_case A arith-comma          'echo $((1,2,3))'
+# --- arithmetic side effects are visible immediately within one command line
+#     (bash evaluates expansion words left-to-right and writes assignments
+#     back at once; the expander's command-wide `arith_overlay` mirrors this).
+run_case A arith-inc-next-word   'x=1; echo $(( x++ )) $x'
+run_case A arith-preinc-next     'x=1; echo $(( ++x )) $x'
+run_case A arith-inc-prev-word   'x=1; echo $x $(( x++ ))'
+run_case A arith-inc-assign-rhs  'x=1; y=$(( x++ )); echo "$y $x"'
+run_case A arith-inc-twice       'x=1; echo $(( x++ )) $(( x++ )) $x'
+run_case A arith-inc-braced      'x=1; echo ${x} $(( x++ )) ${x}'
+run_case A arith-inc-cmdsub      'x=1; echo $(( x++ )) $(echo $x)'
+run_case A arith-inc-quoted      'x=1; echo "$(( x++ )) $x"'
+run_case A arith-assign-chain    'x=1; echo $(( x=5 )) $x $(( x+=1 )) $x'
+run_case A arith-inc-concat      'x=1; echo $(( x++ ))$x'
 run_case A glob-multiword-printf 'mkdir -p @SANDBOX@/gsub/gtest; touch @SANDBOX@/gsub/gtest/a.txt @SANDBOX@/gsub/gtest/b.txt; cd @SANDBOX@/gsub; x=gtest/*.txt; printf "[%s]" $x; echo'
 run_case A glob-multiword-for    'mkdir -p @SANDBOX@/gsub/gtest; touch @SANDBOX@/gsub/gtest/a.txt @SANDBOX@/gsub/gtest/b.txt; cd @SANDBOX@/gsub; x=gtest/*.txt; for f in $x; do echo "F=$f"; done'
 # 第三轮 review P0 #1：`{ LIST; }` 命令组。lexer 已把词边界的 `{`/`}` 切成
@@ -1459,9 +1481,17 @@ run_case A arr-symbolic-sub     'a[key]=x; echo "v=${a[key]}"'
 run_case A arr-var-sub          'k=foo; a[$k]=v; echo "${a[foo]}"'
 run_case A assoc-basic          'declare -A m; m[k]=v; echo "v=${m[k]} n=${#m[@]} keys=${!m[@]}"'
 run_case A assoc-order          'declare -A m; m[a]=1; m[b]=2; echo "${!m[@]}"'
+run_case A assoc-order-values   'declare -A m; m[a]=1; m[b]=2; echo "${m[@]}"'
 run_case A assoc-literal        'declare -A m=([k]=v); echo "v=${m[k]}"'
 run_case A assoc-declare-p      'declare -A m; m[k]=v; declare -p m'
 run_case A assoc-var-sub        'declare -A m; k=foo; m[$k]=v; echo "${m[foo]}"'
+# --- associative-array hash-bucket order fence (FNV-1 / 1024 buckets /
+#     head insertion, matching bash 5.3's hash_create (HASH_BUCKETS)) --------
+run_case A assoc-fnv-order-keys 'declare -A m; m[foo]=1; m[bar]=2; m[baz]=3; m[qux]=4; echo "${!m[@]}"'
+run_case A assoc-fnv-order-vals 'declare -A m; m[foo]=1; m[bar]=2; m[baz]=3; m[qux]=4; echo "${m[@]}"'
+run_case A assoc-fnv-declare-p  'declare -A m; m[foo]=1; m[bar]=2; m[baz]=3; m[qux]=4; declare -p m'
+run_case A assoc-fnv-collide-ab 'declare -A m; m[a]=1; m[sz]=2; echo "${!m[@]}"'
+run_case A assoc-fnv-collide-ba 'declare -A m; m[sz]=1; m[a]=2; echo "${!m[@]}"'
 
 # --- getopts fence (OPTIND/OPTARG, silent mode, error diagnostics, exhaustion)
 run_case A getopts-basic        'set -- -a -b foo; while getopts "ab:" o; do echo "$o:${OPTARG-unset}:$OPTIND"; done; echo "rc=$? o=$o ind=$OPTIND"'
@@ -1485,6 +1515,49 @@ run_case A arith-compare        '(( 2 > 3 )); echo "rc=$?"'
 run_case A arith-in-if          'if (( 1 )); then echo yes; else echo no; fi'
 run_case A arith-and            '(( 1 + 2 )) && echo ok'
 run_case A arith-setvar         '(( x = 7 )); echo "x=$x"'
+
+# --- C-style `for (( INIT ; COND ; INCR ))` fence -----------------------------
+run_case A forc-basic           'for ((i=0;i<3;i++)); do echo -n $i; done; echo'
+run_case A forc-spaces          'for (( i=0; i<3; i++ )); do echo $i; done'
+run_case A forc-final-var       'for ((i=0;i<3;i++)); do echo $i; done; echo "after=$i rc=$?"'
+run_case A forc-infinite-break  'for ((;;)); do echo once; break; done; echo rc=$?'
+run_case A forc-continue        'for ((i=0;i<5;i++)); do if [ $i -eq 2 ]; then continue; fi; echo -n $i; done; echo " after=$i"'
+run_case A forc-break           'for ((i=0;i<3;i++)); do if [ $i -eq 1 ]; then break; fi; echo -n $i; done; echo " after=$i"'
+run_case A forc-empty-cond      'for ((i=0; ; i++)); do echo -n $i; if [ $i -ge 2 ]; then break; fi; done; echo'
+run_case A forc-empty-incr      'for ((i=0;i<3;)); do echo -n $i; ((i++)); done; echo'
+run_case A forc-status          'for ((i=0;i<3;i++)); do false; done; echo rc=$?'
+run_case A forc-nested          'for ((i=0;i<2;i++)); do for ((j=0;j<2;j++)); do echo -n "$i$j "; done; done; echo'
+run_case A forc-continue-level  'for ((i=0;i<3;i++)); do for ((j=0;j<3;j++)); do if [ $j -eq 1 ]; then continue 2; fi; echo -n "$i$j "; done; done; echo'
+run_case A forc-divzero         'for (( x=1/0; x<3; x++ )); do echo hi; done; echo rc=$?'
+
+# --- C-style `for (( ... ))` diagnostic fence (bash's three distinct layers:
+#     yacc "arithmetic expression required" + raw `((...))` echo, the lexer's
+#     "unexpected EOF while looking for matching `)'", and the yacc
+#     "syntax error near unexpected token `X'" with the source line echoed) --
+run_case A forc-diag-clause-few  'for ((1+1)); do echo hi; done'
+run_case A forc-diag-clause-two  'for ((i=0;i<3)); do echo x; done'
+run_case A forc-diag-clause-many 'for ((a=1;b=2;c=3;d=4)); do echo x; done'
+run_case A forc-diag-eof-paren   'for ((i=0;i<3;i++ echo x; done'
+run_case A forc-diag-near-then   'if for ((i=0;i<1;i++)); then echo x; fi'
+run_case A forc-diag-near-echo   'for ((i=0;i<3;i++)) echo hi'
+run_case A forc-diag-nested-ok   'if for ((i=0;i<1;i++)); do echo x; done; then echo y; fi'
+run_case A forc-diag-nested-bad  'if for ((1+1)); do echo x; done; then echo y; fi'
+
+# --- C-for grammar completion + compound trailing-token fence ---------------
+# bash's grammar recognises `do` by syntactic position, so a C-style header's
+# `))` terminator allows `do` with no separating `;`; the lexer emits that
+# `do` as a plain word (not at command start).  A closer that does not match
+# the nesting level (e.g. `... done; fi` vs `... done; done`) is a yacc-layer
+# near-token error, not a generic EOF.  A compound command is complete at its
+# closer: a following bare word is a syntax error, while redirections / `&` /
+# `&&` / `||` after the closer stay legal.
+run_case A forc-nosemi-space     'for ((i=0;i<1;i++)) do echo x; done'
+run_case A forc-nosemi-tight     'for ((i=0;i<1;i++))do echo x; done'
+run_case A forc-diag-near-fi     'for ((i=0;i<1;i++)); do echo x; fi'
+run_case A compound-trail-for    'for i in a; do echo x; done extra'
+run_case A compound-trail-while  'while false; do echo x; done extra'
+run_case A compound-trail-if     'if true; then echo y; fi zz'
+run_case A compound-trail-forc   'for ((i=0;i<1;i++)); do echo x; done extra'
 
 # --- parse-error prefix recovery + cmdsub subshell inheritance fence ---------
 # P1-3: the forward O(n²) prefix scan took ~39s on a 2000-line script with a

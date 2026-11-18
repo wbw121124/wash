@@ -57,6 +57,13 @@ pub enum DiagnosticFamily {
     /// argument to conditional binary operator" line on the virtual line
     /// past end of input.
     CondRegexEof,
+    /// The `for (( ... ))` header does not hold exactly three `;`-separated
+    /// clauses.  bash prints "syntax error: arithmetic expression required"
+    /// (fewer than three clauses) or "syntax error: `;' unexpected" (more
+    /// than three) on the `for` line, then a second line that echoes the raw
+    /// `((...))` fragment.  `open_line` is the `for` line and `near` carries
+    /// the fragment's inner text.
+    ArithForHeader,
 }
 
 #[derive(Debug, Clone)]
@@ -105,6 +112,30 @@ impl WashError {
             family,
             open_line,
             near: String::new(),
+        }
+    }
+
+    /// Build the diagnostic bash emits for a `for (( ... ))` header that does
+    /// not hold exactly three clauses.
+    ///
+    /// `fragment` is the raw text between the parentheses, exactly as the
+    /// lexer captured it; bash echoes it back as `` `((fragment))' ``.
+    pub fn syntax_arith_for_header(
+        open_line: usize,
+        fragment: impl Into<String>,
+        too_many: bool,
+    ) -> Self {
+        let message = if too_many {
+            "syntax error: `;' unexpected".to_string()
+        } else {
+            "syntax error: arithmetic expression required".to_string()
+        };
+        WashError {
+            message,
+            exit_code: 2,
+            family: DiagnosticFamily::ArithForHeader,
+            open_line,
+            near: fragment.into(),
         }
     }
 }

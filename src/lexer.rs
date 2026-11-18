@@ -1769,10 +1769,21 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                         at_command_start = false;
                         continue;
                     }
+                    // A single closing parenthesis: bash's `parse_arith_cmd`
+                    // pushes the `(` back and treats the construct as a
+                    // nested subshell, so let the generic path handle it.
+                } else {
+                    // End of input before the matching `)': bash's lexer
+                    // reports the unclosed delimiter and produces no token.
+                    return Err(WashError::syntax_unclosed(
+                        DiagnosticFamily::OtherDelimiterEof,
+                        line_no,
+                        "unexpected EOF while looking for matching `)'",
+                    ));
                 }
-                // Unterminated `((`: let the generic path emit two `(` words
-                // so the parser produces bash's syntax error rather than
-                // silently accepting a partial command.
+                // A `((` that is not a double-paren construct: let the generic
+                // path emit two `(` words so the parser produces bash's syntax
+                // error rather than silently accepting a partial command.
                 tokens.push(Token::Word(vec![WordPart::Text("(".to_string(), false)]));
                 i += 1;
                 at_command_start = false;

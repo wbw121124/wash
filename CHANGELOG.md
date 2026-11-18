@@ -73,6 +73,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **三项字节级兼容边界修复（关联数组哈希 / 算术自增时序 / C 风格 for）**：
+  - 关联数组 `${!m[@]}` 遍历顺序按 bash 5.3 `assoc.h` 的
+    `ASSOC_HASH_BUCKETS=1024` 复刻（FNV-1 + 头插 + 2048/2049 键 rehash 仿真）；
+    此前用 16 桶导致 `foo/bar/baz/qux` 输出 `bar foo qux baz`，现与 oracle 的
+    `qux foo bar baz` 逐字节一致；`declare -p` 同根因修复。
+  - 算术展开自增写回：命令级 overlay 让 `$(( x++ ))` / `(( ++x ))` 的赋值立即
+    对同一命令行后续 `$x` 可见（`1 2` / `2 2`），跨命令仍落回 sh.env；前序 `$x`
+    场景（`echo $x $(( x++ ))` → `1 1`）不回退。
+  - 新增 C 风格 `for (( init ; cond ; incr ))`（复用 `arith::eval`），并补齐畸形
+    诊断：段数错（`arithmetic expression required` + 原始 `((...))` 回显）、缺右
+    括号（词法 EOF）、缺 `do` / 不匹配 closer（yacc near-token）、省略分号
+    `for ((...)) do ... done` 合法形态，均与 bash 5.3 逐字节对齐。
+  - 复合命令 closer 后紧跟裸词（`done extra` / `fi zz`）现报 near-token 语法错，
+    不再把尾随词当独立命令执行；重定向 / `&` / `&&` 后跟保持合法。
+  - 新增 35 条 GROUP A 栅栏（A 666→709，全量 912→955）。
 - **review P1-3：`largest_parseable_prefix` 的 O(n²) 语法错恢复**：2000 行脚本
   尾部语法错从 ~39s 降到 ~0.23s（bash 0.25s）。整串已知解析失败，改为从末行
   往前找首个可解析前缀即停，语义与原来的前向扫描完全等价。

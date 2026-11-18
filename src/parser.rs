@@ -66,6 +66,18 @@ pub enum Compound {
         words: Vec<Vec<WordPart>>,
         body: CommandList,
     },
+    /// `for (( INIT ; COND ; INCR )); do BODY; done` — the C-style form.
+    ///
+    /// The three expressions are raw arithmetic source text; they are
+    /// evaluated at execution time by `arith::eval` (INIT once, COND before
+    /// every iteration, INCR after every iteration including `continue`).
+    /// Any of the three may be empty; an empty COND means "always true".
+    ArithFor {
+        init: String,
+        cond: String,
+        incr: String,
+        body: CommandList,
+    },
     /// `while CONDITION; do BODY; done` (`is_until == false`) and
     /// `until CONDITION; do BODY; done` (`is_until == true`).
     While {
@@ -504,6 +516,23 @@ fn find_matching_closer(tokens: &[Token], start: usize) -> Result<usize> {
             )))
         }
     };
+    // A C-style `for (( ... ))` header must be followed by `do`.  bash's
+    // grammar rejects the header before the compound is scanned, so the
+    // offending token is reported even when the compound appears nested in
+    // another command's condition (e.g. `if for ((...)); then ...`).
+    let is_cfor = opener == "for" && matches!(tokens.get(start + 1), Some(Token::ArithCmd(..)));
+    if is_cfor {
+        arith_for_do_index(tokens, start)?;
+    }
+    // A C-style `for` that reaches a closer which does not match the current
+    // nesting level is a yacc-layer error in bash: it reports the offending
+    // token (e.g. `for ((...)); do ...; fi` -> near `fi`), not the generic
+    // "unexpected EOF from `for'".  Plain loops share this scanner, so keep
+    // the near-token reporting scoped to the C-style form to avoid changing
+    // long-standing behaviour for `for NAME in` / `while` / `until`.
+    let cfor_near = |tok: &str| -> WashError {
+        WashError::syntax(format!("syntax error near unexpected token `{}'", tok))
+    };
     let mut stack: Vec<&str> = vec![kind];
     let mut i = start + 1;
     while i < tokens.len() {
@@ -519,16 +548,22 @@ fn find_matching_closer(tokens: &[Token], start: usize) -> Result<usize> {
                 "fi" => {
                     if *stack.last().unwrap_or(&"") == "if" {
                         stack.pop();
+                    } else if is_cfor {
+                        return Err(cfor_near(name));
                     }
                 }
                 "esac" => {
                     if *stack.last().unwrap_or(&"") == "case" {
                         stack.pop();
+                    } else if is_cfor {
+                        return Err(cfor_near(name));
                     }
                 }
                 "done" => {
                     if *stack.last().unwrap_or(&"") == "loop" {
                         stack.pop();
+                    } else if is_cfor {
+                        return Err(cfor_near(name));
                     }
                 }
                 _ => {}
@@ -598,6 +633,11 @@ fn parse_if_compound(tokens: &[Token], start: usize) -> Result<(Compound, usize)
 
 /// Parse `for NAME [in WORDS] ; do BODY ; done` starting at the `for` token.
 fn parse_for_compound(tokens: &[Token], start: usize) -> Result<(Compound, usize)> {
+    // The C-style form begins with a single `(( ... ))` token emitted by the
+    // lexer (it consumes the three `;`-separated clauses verbatim).
+    if let Some(Token::ArithCmd(expr, _)) = tokens.get(start + 1) {
+        return parse_arith_for_compound(tokens, start, expr);
+    }
     // NAME is the word right after `for`.
     let name = match tokens.get(start + 1) {
         Some(Token::Word(parts)) if is_plain_ident(parts) => plain_text(parts),
@@ -656,6 +696,144 @@ fn parse_for_compound(tokens: &[Token], start: usize) -> Result<(Compound, usize
         Compound::For {
             var: name,
             words,
+            body,
+        },
+        end,
+    ))
+}
+
+/// Split the body of `(( INIT ; COND ; INCR ))` into its clauses.
+///
+/// Semicolons inside quotes or nested brackets belong to the expression and
+/// are not separators.  bash counts the clauses the same way (`nsemi` in
+/// `make_arith_for_command`): the number of `;` plus one.  A well-formed
+/// header has exactly three; any other count is a syntax error.
+fn split_arith_clauses(expr: &str) -> Vec<String> {
+    let mut parts: Vec<String> = Vec::with_capacity(3);
+    let mut cur = String::new();
+    let mut depth: i32 = 0;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for ch in expr.chars() {
+        if escaped {
+            cur.push(ch);
+            escaped = false;
+            continue;
+        }
+        if let Some(q) = quote {
+            cur.push(ch);
+            if ch == q {
+                quote = None;
+            } else if q == '"' && ch == '\\' {
+                escaped = true;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => {
+                quote = Some(ch);
+                cur.push(ch);
+            }
+            '(' | '[' => {
+                depth += 1;
+                cur.push(ch);
+            }
+            ')' | ']' => {
+                depth -= 1;
+                cur.push(ch);
+            }
+            ';' if depth == 0 => {
+                // bash strips leading whitespace from each clause but keeps
+                // trailing whitespace (it echoes the raw text in diagnostics).
+                parts.push(cur.trim_start().to_string());
+                cur.clear();
+            }
+            _ => cur.push(ch),
+        }
+    }
+    parts.push(cur.trim_start().to_string());
+    parts
+}
+
+/// Locate the `do` that opens the body of a C-style `for (( ... ))`.
+///
+/// bash's grammar expects `do` right after the header, so a header followed
+/// by anything else is a *grammar* error ("syntax error near unexpected
+/// token `X'"), which is reported before the header's clause count is ever
+/// examined.  Returns the index of the `do` token.
+fn arith_for_do_index(tokens: &[Token], start: usize) -> Result<usize> {
+    let mut i = start + 2;
+    if matches!(tokens.get(i), Some(Token::Semicolon)) {
+        i += 1;
+    }
+    match tokens.get(i) {
+        None => {
+            // End of input inside the header: bash reports the unterminated
+            // compound, naming the innermost opener.
+            let (kw, open_line) = reserved_at(tokens, start).unwrap_or_else(|| (String::new(), 1));
+            Err(WashError::syntax_unclosed(
+                DiagnosticFamily::CompoundEof,
+                0,
+                compound_eof_message(&kw, open_line),
+            ))
+        }
+        Some(Token::Reserved(r, _)) if r == "do" => Ok(i),
+        // bash's grammar recognises `do` by its syntactic position, not only
+        // where the lexer happened to mark a reserved word.  After a C-style
+        // header the `))` is an unambiguous terminator, so bash accepts `do`
+        // even with no separating `;`.  In that case the lexer did not see a
+        // command position and emitted `do` as an ordinary word.  Accept it
+        // by literal text (but never a quoted `do`, which is not a keyword).
+        Some(tok) if is_word_text(Some(tok), "do") => Ok(i),
+        Some(tok) => {
+            // bash names the token it could not use there.
+            Err(WashError::syntax(format!(
+                "syntax error near unexpected token `{}'",
+                token_near_text(tok)
+            )))
+        }
+    }
+}
+
+/// Parse `for (( INIT ; COND ; INCR )); do BODY; done` starting at `for`.
+fn parse_arith_for_compound(
+    tokens: &[Token],
+    start: usize,
+    expr: &str,
+) -> Result<(Compound, usize)> {
+    // Grammar level: the header must be followed by `do`.
+    let do_index = arith_for_do_index(tokens, start)?;
+
+    // Action level: bash's `make_arith_for_command` then checks that the
+    // header holds exactly three clauses and reports the raw `((...))`.
+    let clauses = split_arith_clauses(expr);
+    if clauses.len() != 3 {
+        // bash: "syntax error: arithmetic expression required" for too few
+        // clauses, "syntax error: `;' unexpected" for too many, then the raw
+        // `((...))` fragment on a second line.
+        let open_line = match tokens.get(start) {
+            Some(Token::Reserved(_, line)) => *line,
+            _ => 1,
+        };
+        return Err(WashError::syntax_arith_for_header(
+            open_line,
+            expr.to_string(),
+            clauses.len() > 3,
+        ));
+    }
+    let mut clauses = clauses.into_iter();
+    let init = clauses.next().unwrap_or_default();
+    let cond = clauses.next().unwrap_or_default();
+    let incr = clauses.next().unwrap_or_default();
+
+    let end = find_matching_closer(tokens, start)?;
+    let done_index = end - 1;
+    let body = parse_command_list(&tokens[do_index + 1..done_index])?;
+    Ok((
+        Compound::ArithFor {
+            init,
+            cond,
+            incr,
             body,
         },
         end,
@@ -1287,19 +1465,22 @@ fn parse_array_assignment(
     None
 }
 
-/// The token bash names in `syntax error near unexpected token `X'` when a
-/// heredoc/herestring has no delimiter/string word: the token that follows
-/// the operator (or `newline` at end of input).
-fn unexpected_token_name(tokens: &[Token], i: usize) -> String {
-    match tokens.get(i) {
-        None => "newline".to_string(),
-        Some(Token::Semicolon) => ";".to_string(),
-        Some(Token::Pipe) => "|".to_string(),
-        Some(Token::AndAnd) => "&&".to_string(),
-        Some(Token::OrOr) => "||".to_string(),
-        Some(Token::Background) => "&".to_string(),
-        Some(Token::Reserved(name, _)) => name.clone(),
-        Some(Token::Redirect { kind, .. }) => match kind {
+/// The token bash names in `syntax error near unexpected token `X'`.
+///
+/// `Token::Word` renders the word's plain text; every other token kind has a
+/// fixed spelling.  Anything bash has no name for falls back to "newline",
+/// the same way the heredoc/herestring diagnostic does.
+fn token_near_text(tok: &Token) -> String {
+    match tok {
+        Token::Reserved(name, _) => name.clone(),
+        Token::Word(parts) => plain_text(parts),
+        Token::Semicolon => ";".to_string(),
+        Token::Pipe => "|".to_string(),
+        Token::AndAnd => "&&".to_string(),
+        Token::OrOr => "||".to_string(),
+        Token::Background => "&".to_string(),
+        Token::ArithCmd(_, _) => "(( ))".to_string(),
+        Token::Redirect { kind, .. } => match kind {
             RedirKind::In => "<".to_string(),
             RedirKind::Out => ">".to_string(),
             RedirKind::Clobber => ">|".to_string(),
@@ -1310,11 +1491,25 @@ fn unexpected_token_name(tokens: &[Token], i: usize) -> String {
             RedirKind::HereDoc | RedirKind::HereDocDash => "<<".to_string(),
             RedirKind::HereString => "<<<".to_string(),
         },
-        Some(_) => "newline".to_string(),
+        _ => "newline".to_string(),
     }
 }
 
-fn parse_simple(tokens: &[Token]) -> Result<SimpleCommand> {    let mut argv: Vec<Vec<WordPart>> = Vec::new();
+/// The token bash names in `syntax error near unexpected token `X'` when a
+/// heredoc/herestring has no delimiter/string word: the token that follows
+/// the operator (or `newline` at end of input).
+fn unexpected_token_name(tokens: &[Token], i: usize) -> String {
+    match tokens.get(i) {
+        None => "newline".to_string(),
+        // A heredoc/herestring operator is completed by the end of the line,
+        // so a word there still counts as "newline" for bash.
+        Some(Token::Word(_)) => "newline".to_string(),
+        Some(tok) => token_near_text(tok),
+    }
+}
+
+fn parse_simple(tokens: &[Token]) -> Result<SimpleCommand> {
+    let mut argv: Vec<Vec<WordPart>> = Vec::new();
     let mut redirs = Vec::new();
     let mut assignments = Vec::new();
     let mut array_assignments = Vec::new();
@@ -1355,14 +1550,36 @@ fn parse_simple(tokens: &[Token]) -> Result<SimpleCommand> {    let mut argv: Ve
                         continue;
                     }
                 }
+                // A compound command (`for ...; done`, `if ...; fi`, ...) is a
+                // complete command: bash rejects a following bare word as a
+                // yacc-layer syntax error (`... done extra` -> near `extra`)
+                // instead of treating it as an argument or a new command.
+                // Redirections and `&`/`&&`/`||` are handled by their own arms
+                // and remain legal after the closer.
+                if compound.is_some() {
+                    return Err(WashError::syntax(format!(
+                        "syntax error near unexpected token `{}'",
+                        plain_text(parts)
+                    )));
+                }
                 seen_command = true;
                 argv.push(parts.clone());
             }
             Token::Compound(c) => {
-                if !argv.is_empty() {
-                    return Err(WashError::syntax(
-                        "syntax error near unexpected token `if'",
-                    ));
+                if !argv.is_empty() || compound.is_some() {
+                    return Err(WashError::syntax(format!(
+                        "syntax error near unexpected token `{}'",
+                        match c {
+                            Compound::If { .. } => "if",
+                            Compound::For { .. } | Compound::ArithFor { .. } => "for",
+                            Compound::While { .. } => "while",
+                            Compound::Case { .. } => "case",
+                            Compound::Group { .. } => "{",
+                            Compound::Subshell { .. } => "(",
+                            Compound::Cond { .. } => "[[",
+                            Compound::Arith { .. } => "((",
+                        }
+                    )));
                 }
                 compound = Some(c.clone());
                 seen_command = true;

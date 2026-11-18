@@ -125,14 +125,29 @@ glob / 多 pattern / 空 pattern / 其余清单显示值 / 别名路径全部仍
 
 ## 已知未实现特性（功能缺失，非覆盖空洞）
 
-oracle 实测：`(( ))` 算术命令、`declare -A`、`getopts`、`trap -l` 均已实现并与
-bash 5.3 逐字节对齐（含 OPTIND/OPTARG/静默模式、FNV 哈希桶序遍历的关联数组、
+oracle 实测：`(( ))` 算术命令、**C 风格 `for ((...))`**、`declare -A`、`getopts`、
+`trap -l` 均已实现并与 bash 5.3 逐字节对齐（含 OPTIND/OPTARG/静默模式、
 完整 64 信号表）。数组下标赋值 `a[i]=v` 与稀疏下标计数也已对齐。
-唯一已知边界：关联数组 `${!m[@]}` 在**多字符键恰好哈希冲突**时，bash 内部哈希
-表的 rehash 时机导致顺序与 FNV-1 朴素桶序不同（如 `foo/bar/baz/qux`）；单字符
-键及绝大多数常见场景逐字节一致，不做假 PASS。另有一处历史边界（非本轮引入）：
-同一条命令里 `$(( x++ ))` 与后续 `$x` 的展开顺序，bash 输出 `1 2`、wash 输出
-`1 1`（算术自增写回与参数展开快照的时序差异）。
+
+以下三处历史边界已在本轮修复（均有 GROUP A 栅栏）：
+- **关联数组遍历顺序**：按 bash 5.3 `assoc.h` 的 `ASSOC_HASH_BUCKETS=1024`
+  复刻（FNV-1 桶序 + 头插 + 2048/2049 键 rehash 仿真），`foo/bar/baz/qux`、
+  单字符键、2047/2048/2049/5000 键大表全部逐字节一致；`declare -p` 同根因修复。
+- **算术自增写回时序**：`$(( x++ ))` 的赋值经命令级 overlay 立即对同一命令行
+  后续 `$x` 可见（`echo $(( x++ )) $x` → `1 2`、`(( ++x ))` → `2 2`），跨命令仍
+  经 pending_assign 落回 sh.env；前序 `$x` 不回退。
+- **C 风格 for 诊断**：段数错（`syntax error: arithmetic expression required` +
+  原始 `((...))` 回显）、缺右括号（词法 EOF）、缺 `done` / 不匹配 closer
+  （yacc near-token）、省略分号 `for ((...)) do ... done` 合法形态，全部对齐。
+
+仍存的窄边界（如实登记，非本轮引入，均有 oracle 实测）：
+- `for NAME in ...; { LIST; }`（用 brace group 代替 `do ... done`）是 bash 合法
+  语法，wash 报语法错误；普通 for / C-for 均受影响。修复需扩展循环 AST 接受
+  非 `do` body，超出本轮范围。
+- `done extra` / `fi zz` 这类**复合命令 closer 后紧跟裸词**：本轮已修（报 near
+  词 + 回显源行）；但 closer 后跟重定向 / `&` / `&&` / `||` 保持合法。
+- `x=1; echo ${!x}` 间接展开、`declare -f` 空输出、普通 for 的 `continue N`
+  层级传播为既有差异，本轮未扩大。
 `[[ ]]` 已实现并与 bash 5.3 逐字节对齐（49 条栅栏见 `tests/bash_diff_builtins.sh`
 GROUP A）：单目/双目/文件/数值/字符串/模式/ERE 运算、`BASH_REMATCH` 捕获组、
 `!`/`&&`/`||`/分组、`[[ ]]` 内不做词分割，以及畸形表达式的两行诊断（含 yacc

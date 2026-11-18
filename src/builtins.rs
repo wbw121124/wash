@@ -1866,6 +1866,15 @@ fn render_compound(c: &crate::parser::Compound) -> String {
                 render_command_list(body, 1)
             )
         }
+        crate::parser::Compound::ArithFor { init, cond, incr, body } => {
+            format!(
+                "for (( {}; {}; {} )); do\n{}\ndone",
+                init,
+                cond,
+                incr,
+                render_command_list(body, 1)
+            )
+        }
         crate::parser::Compound::While { condition, body, is_until } => {
             let kw = if *is_until { "until" } else { "while" };
             format!(
@@ -5315,9 +5324,17 @@ fn print_declared(sh: &Shell, names: &[String]) {
             if entries.is_empty() {
                 println!("declare -A {}", name);
             } else {
-                let body = entries
+                // bash prints associative-array elements in hash-bucket
+                // order (the same order `${!m[@]}` uses), not insertion
+                // order -- reuse the expander's exact bucket walk.
+                let body = crate::expand::assoc_iter_keys(&entries)
                     .iter()
-                    .map(|(k, v)| format!("[{}]={}", k, quote_value_for_audit(v)))
+                    .filter_map(|k| {
+                        entries
+                            .iter()
+                            .find(|(ek, _)| ek == k)
+                            .map(|(_, v)| format!("[{}]={}", k, quote_value_for_audit(v)))
+                    })
                     .collect::<Vec<_>>()
                     .join(" ");
                 println!("declare -A {}=({} )", name, body);

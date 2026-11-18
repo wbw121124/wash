@@ -862,6 +862,14 @@ impl Shell {
                     "unexpected argument to conditional binary operator".to_string(),
                 )),
             ),
+            // A `for (( ... ))` header without exactly three clauses: bash
+            // reports the reason on the `for` line and then echoes the raw
+            // `((...))` fragment on a second line with the same prefix.
+            DiagnosticFamily::ArithForHeader => (
+                e.open_line,
+                None,
+                Some((e.open_line, format!("syntax error: `(({}))'", e.near))),
+            ),
             DiagnosticFamily::NearToken => {
                 let consumed = tokens.map(Self::heredoc_consumed_lines).unwrap_or(0);
                 (

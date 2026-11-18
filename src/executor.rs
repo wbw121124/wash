@@ -937,6 +937,12 @@ fn execute_compound(compound: &Compound, sh: &mut Shell) -> i32 {
             }
         }
         Compound::For { var, words, body } => execute_for(var, words, body, sh),
+        Compound::ArithFor {
+            init,
+            cond,
+            incr,
+            body,
+        } => execute_arith_for(init, cond, incr, body, sh),
         Compound::While {
             condition,
             body,
@@ -980,6 +986,7 @@ fn execute_compound(compound: &Compound, sh: &mut Shell) -> i32 {
                 assoc_arrays: &sh.assoc_arrays,
             array_set_indices: &sh.array_set_indices,
                 pending_assign: None,
+                arith_overlay: None,
             };
             let status = if crate::cond::eval_cond(expr, &ctx) { 0 } else { 1 };
             // A successful (or failed) `=~` publishes its captures through
@@ -1052,6 +1059,7 @@ fn execute_for(var: &str, words: &[Vec<WordPart>], body: &CommandList, sh: &mut 
         assoc_arrays: &sh.assoc_arrays,
             array_set_indices: &sh.array_set_indices,
         pending_assign: None,
+        arith_overlay: None,
     };
     let mut fields: Vec<String> = Vec::new();
     for w in words {
@@ -1075,6 +1083,116 @@ fn execute_for(var: &str, words: &[Vec<WordPart>], body: &CommandList, sh: &mut 
         // `continue` (if set after the body) starts the next iteration; clear
         // it so the flag does not leak into the next pass.
         sh.continue_requested = None;
+    }
+    code
+}
+
+/// bash reports the error token as the raw remainder of the expression,
+/// including trailing whitespace, so `x/0 ` reports token `"0 "`.
+fn arith_error_token(expr: &str, token: &str) -> String {
+    if token.is_empty() {
+        return String::new();
+    }
+    let trailing: String = expr
+        .chars()
+        .rev()
+        .take_while(|c| c.is_whitespace())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .collect();
+    format!("{}{}", token, trailing)
+}
+
+/// Evaluate one clause of a C-style `for (( ... ))` loop.
+///
+/// Returns `false` when bash would abort the whole command (arithmetic
+/// error).  The expression text is already trimmed; empty clauses are
+/// skipped by the caller.
+fn eval_arith_clause(expr: &str, sh: &mut Shell) -> bool {
+    match arith::eval(expr, &mut arith::MapEnv { vars: &mut sh.env }) {
+        Ok(_) => true,
+        Err(e) => {
+            let token = if e.token.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " (error token is \"{}\")",
+                    arith_error_token(expr, &e.token)
+                )
+            };
+            safe_eprintln!("wash: ((: {}: {}{}", expr, e.message, token);
+            sh.last_status = 1;
+            false
+        }
+    }
+}
+
+/// Run `for (( INIT ; COND ; INCR )); do BODY; done`.
+///
+/// INIT runs once; COND runs before each iteration (an empty COND means
+/// "forever"); INCR runs after each iteration, including one ended by
+/// `continue`, but not after `break`.  The loop's status is the status of
+/// the last body command, or 0 when the body never ran.
+fn execute_arith_for(
+    init: &str,
+    cond: &str,
+    incr: &str,
+    body: &CommandList,
+    sh: &mut Shell,
+) -> i32 {
+    if !init.is_empty() && !eval_arith_clause(init, sh) {
+        return 1;
+    }
+    let mut code = 0;
+    loop {
+        if !cond.is_empty() {
+            match arith::eval(cond, &mut arith::MapEnv { vars: &mut sh.env }) {
+                Ok(value) if value != 0 => {}
+                Ok(_) => return code,
+                Err(e) => {
+                    let token = if e.token.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                    " (error token is \"{}\")",
+                    arith_error_token(cond, &e.token)
+                )
+                    };
+                    safe_eprintln!("wash: ((: {}: {}{}", cond, e.message, token);
+                    sh.last_status = 1;
+                    return 1;
+                }
+            }
+        }
+        code = execute_loop_body(body, sh);
+        if sh.exit_requested.is_some() || sh.return_requested.is_some() {
+            return code;
+        }
+        if let Some(n) = sh.break_requested.take() {
+            if n > 1 {
+                sh.break_requested = Some(n - 1);
+            }
+            break;
+        }
+        // `continue` still runs the increment clause.  A level > 1 belongs
+        // to an enclosing loop: decrement it, then leave this loop so that
+        // the outer one can consume the flag before its own body resets it.
+        let continue_level = sh.continue_requested.take();
+        if let Some(n) = continue_level {
+            if n > 1 {
+                sh.continue_requested = Some(n - 1);
+            }
+            if !incr.is_empty() && !eval_arith_clause(incr, sh) {
+                return 1;
+            }
+            if n > 1 {
+                break;
+            }
+            continue;
+        }
+        if !incr.is_empty() && !eval_arith_clause(incr, sh) {
+            return 1;
+        }
     }
     code
 }
@@ -1172,6 +1290,7 @@ fn execute_case(word: &[WordPart], arms: &[crate::parser::CaseArm], sh: &mut She
         assoc_arrays: &sh.assoc_arrays,
             array_set_indices: &sh.array_set_indices,
         pending_assign: None,
+        arith_overlay: None,
     };
     let value = expand_scalar(word, &ctx);
     for arm in arms {
@@ -1549,6 +1668,7 @@ fn assign_subscript_var(
             assoc_arrays: &sh.assoc_arrays,
             array_set_indices: &sh.array_set_indices,
             pending_assign: None,
+            arith_overlay: None,
         };
         // `sub_src` is source text (`$k`, `${k}`), not an already-expanded
         // value: re-lex it so `$k` becomes a Var part and is expanded by
@@ -1649,6 +1769,10 @@ fn apply_command_assignments(
     }
     let attrs = sh.attr_refs();
     let pending: RefCell<Vec<(String, String)>> = RefCell::new(Vec::new());
+    // Arithmetic assignments become visible to later expansions on this
+    // command immediately (bash semantics); `pending` still writes them back
+    // to `sh.env` once expansion of the command is complete.
+    let overlay: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
     let applied: Vec<(String, String, bool)> = {
         let ctx = ExpandCtx {
             env: &sh.env,
@@ -1667,6 +1791,7 @@ fn apply_command_assignments(
             assoc_arrays: &sh.assoc_arrays,
             array_set_indices: &sh.array_set_indices,
             pending_assign: Some(&pending),
+            arith_overlay: Some(&overlay),
         };
         assigns
             .iter()
@@ -1728,6 +1853,7 @@ fn apply_array_assignments(
             assoc_arrays: &sh.assoc_arrays,
             array_set_indices: &sh.array_set_indices,
             pending_assign: None,
+            arith_overlay: None,
         };
         arrays
             .iter()
@@ -1863,6 +1989,10 @@ fn run_standalone_exp(
             let mut assign_failed = false;
             let attrs = sh.attr_refs();
             let pending: RefCell<Vec<(String, String)>> = RefCell::new(Vec::new());
+            // Arithmetic assignments become visible to later expansions on this
+            // command immediately (bash semantics); `pending` still writes them back
+            // to `sh.env` once expansion of the command is complete.
+            let overlay: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
             // Expand all RHS values first (immutable borrow of sh.env), then
             // mutate sh.env once the borrow is released.
             let applied: Vec<(String, String, bool)> = {
@@ -1883,6 +2013,7 @@ fn run_standalone_exp(
             assoc_arrays: &sh.assoc_arrays,
             array_set_indices: &sh.array_set_indices,
                     pending_assign: Some(&pending),
+                    arith_overlay: Some(&overlay),
                 };
                 assigns
                     .iter()
@@ -2275,6 +2406,10 @@ fn expand_alias_in_pipeline(
 /// whole command line.
 fn prepare_stage(c: &SimpleCommand, sh: &mut Shell) -> Prepared {
     let pending: RefCell<Vec<(String, String)>> = RefCell::new(Vec::new());
+    // Arithmetic assignments become visible to later expansions on this
+    // command immediately (bash semantics); `pending` still writes them back
+    // to `sh.env` once expansion of the command is complete.
+    let overlay: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
 
     // `$-` is derived only from option/startup flags, never from `env`.
     // Both expansion passes below need the same snapshot, and the only
@@ -2302,6 +2437,7 @@ fn prepare_stage(c: &SimpleCommand, sh: &mut Shell) -> Prepared {
             assoc_arrays: &sh.assoc_arrays,
             array_set_indices: &sh.array_set_indices,
             pending_assign: Some(&pending),
+            arith_overlay: Some(&overlay),
         };
         let argv = expand_argv(&c.argv, &ctx);
         let redirs = expand_redirs(&c.redirs, &ctx);
@@ -2341,6 +2477,7 @@ fn prepare_stage(c: &SimpleCommand, sh: &mut Shell) -> Prepared {
             assoc_arrays: &sh.assoc_arrays,
             array_set_indices: &sh.array_set_indices,
             pending_assign: Some(&pending),
+            arith_overlay: Some(&overlay),
         };
         let values: Vec<(String, String, bool)> = c
             .assignments

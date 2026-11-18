@@ -136,6 +136,14 @@ pub struct ExpandCtx<'a> {
     /// the assignments are collected here and written back to the shell by
     /// the executor once the expansion is done.
     pub pending_assign: Option<&'a RefCell<Vec<(String, String)>>>,
+    /// Variables assigned by arithmetic expansions earlier on the same
+    /// command line.  bash applies `$(( x++ ))` immediately, so a later
+    /// `$x` in the *same* command sees the incremented value even though
+    /// the executor only writes `pending_assign` into `sh.env` after the
+    /// whole command has been expanded.  The overlay is shared by every
+    /// `ExpandCtx` built for one command (argv, redirections, assignment
+    /// RHSes) but discarded at the end of that command.
+    pub arith_overlay: Option<&'a RefCell<HashMap<String, String>>>,
     /// The current value of `$-`, snapshotted from the shell's option state
     /// and startup flags when this expansion context is built.  It is kept as
     /// an owned String (not injected into `env`) so it stays in sync with
@@ -425,9 +433,26 @@ pub fn expand_word(parts: &[WordPart], ctx: &ExpandCtx) -> Vec<String> {
                 candidates = apply_value(candidates, exp, *quoted, ctx);
             }
             WordPart::CmdSub(body, quoted) | WordPart::Backtick(body, quoted) => {
+                // A subshell spawned by an earlier word on this command line
+                // inherits arithmetic assignments already applied by bash.
+                // Merge the overlay into the env snapshot handed to the child.
+                let merged_env;
+                let child_env: &HashMap<String, String> = match &ctx.arith_overlay {
+                    Some(overlay) if !overlay.borrow().is_empty() => {
+                        merged_env = {
+                            let mut m = ctx.env.clone();
+                            for (name, value) in overlay.borrow().iter() {
+                                m.insert(name.clone(), value.clone());
+                            }
+                            m
+                        };
+                        &merged_env
+                    }
+                    _ => ctx.env,
+                };
                 let val = crate::executor::capture_command(
                     body,
-                    ctx.env,
+                    child_env,
                     ctx.attrs,
                     ctx.functions,
                     ctx.arrays,
@@ -724,8 +749,8 @@ fn eval_var(name: &str, ctx: &ExpandCtx) -> Expansion {
                 }
                 return Expansion::Scalar(elems[0].clone());
             }
-            match ctx.env.get(name) {
-                Some(value) => Expansion::Scalar(value.clone()),
+            match expand_env_get(ctx, name) {
+                Some(value) => Expansion::Scalar(value),
                 None => {
                     if ctx.nounset {
                         unbound_variable(name);
@@ -888,7 +913,7 @@ fn eval_braced(body: &str, ctx: &ExpandCtx) -> Expansion {
         //   * VAR empty           -> ": invalid variable name"
         //   * VAR = valid name    -> the named variable's value (empty if unset)
         //   * VAR = invalid name  -> "VAR: invalid variable name"
-        return match ctx.env.get(name) {
+        return match expand_env_get(ctx, name) {
             None => {
                 flag_invalid_indirect(&format!("{}: invalid indirect expansion", name));
                 Expansion::Scalar(String::new())
@@ -897,8 +922,8 @@ fn eval_braced(body: &str, ctx: &ExpandCtx) -> Expansion {
                 if target.is_empty() {
                     flag_invalid_indirect(": invalid variable name");
                     Expansion::Scalar(String::new())
-                } else if is_valid_name(target) {
-                    Expansion::Scalar(ctx.env.get(target).cloned().unwrap_or_default())
+                } else if is_valid_name(&target) {
+                    Expansion::Scalar(expand_env_get(ctx, &target).unwrap_or_default())
                 } else {
                     flag_invalid_indirect(&format!("{}: invalid variable name", target));
                     Expansion::Scalar(String::new())
@@ -1040,10 +1065,10 @@ fn eval_braced(body: &str, ctx: &ExpandCtx) -> Expansion {
     // A name that names an array (with no subscript) expands to element 0,
     // just like `$arr` / `${arr}` does in bash.
     let arr_elems = ctx.arrays.get(rawname);
-    let is_set = ctx.env.contains_key(rawname) || arr_elems.is_some();
+    let is_set = expand_env_contains(ctx, rawname) || arr_elems.is_some();
     let value = match arr_elems {
         Some(e) if !e.is_empty() => e[0].clone(),
-        _ => ctx.env.get(rawname).cloned().unwrap_or_default(),
+        _ => expand_env_get(ctx, rawname).unwrap_or_default(),
     };
     let unset_or_empty = !is_set || value.is_empty();
 
@@ -1053,24 +1078,43 @@ fn eval_braced(body: &str, ctx: &ExpandCtx) -> Expansion {
 
 /// Keys of an associative array in the order bash's `${!m[@]}` iterates.
 ///
-/// bash 5.3 stores associative arrays in a chained hash table:
-/// `hash_string` is FNV-1 (`i *= 16777619; i ^= *s`, starting from
-/// 2166136261), the bucket count starts at 16 (a power of two, so the index
-/// is `hash & 15`), entries are head-inserted into their bucket, and
-/// `${!m[@]}` walks buckets 0..15 emitting each chain from head to tail.
-/// Reproducing that here keeps short-string keys (the overwhelming common
-/// case) byte-identical to the oracle.
-fn assoc_iter_keys(entries: &[(String, String)]) -> Vec<String> {
+/// bash 5.3 stores associative arrays in a chained hash table created with
+/// `hash_create (HASH_BUCKETS)`, where `HASH_BUCKETS` is 1024.  `hash_string`
+/// is FNV-1 (`i *= 16777619; i ^= *s`, starting from 2166136261), the bucket
+/// index is `hash & 1023`, new entries are *head*-inserted into their bucket,
+/// and `${!m[@]}` walks buckets 0..1023 emitting each chain from head to
+/// tail.  When `nentries >= 2 * nbuckets` bash grows the table by 4x and
+/// rehashes every entry (walking the old chains head-to-tail and head-
+/// inserting into the new table); that is reproduced here too, so even
+/// arrays past the 2048-entry boundary stay byte-identical to the oracle.
+fn assoc_hash(key: &str) -> usize {
     const FNV_OFFSET: u32 = 2166136261;
     const FNV_PRIME: u32 = 16777619;
-    const NBUCKETS: usize = 16;
-    let mut buckets: Vec<Vec<&str>> = vec![Vec::new(); NBUCKETS];
+    let mut hash = FNV_OFFSET;
+    for byte in key.bytes() {
+        hash = hash.wrapping_mul(FNV_PRIME) ^ u32::from(byte);
+    }
+    hash as usize
+}
+
+pub(crate) fn assoc_iter_keys(entries: &[(String, String)]) -> Vec<String> {
+    const INITIAL_BUCKETS: usize = 1024;
+    let mut nbuckets = INITIAL_BUCKETS;
+    let mut buckets: Vec<Vec<&str>> = vec![Vec::new(); nbuckets];
+    let mut nentries = 0usize;
     for (key, _) in entries {
-        let mut hash = FNV_OFFSET;
-        for byte in key.bytes() {
-            hash = hash.wrapping_mul(FNV_PRIME) ^ u32::from(byte);
+        // `HASH_SHOULDGROW` is tested before the new entry is inserted.
+        if nentries >= nbuckets * 2 {
+            let old = std::mem::replace(&mut buckets, vec![Vec::new(); nbuckets * 4]);
+            nbuckets *= 4;
+            for chain in old {
+                for k in chain {
+                    buckets[assoc_hash(k) & (nbuckets - 1)].insert(0, k);
+                }
+            }
         }
-        buckets[(hash as usize) & (NBUCKETS - 1)].insert(0, key.as_str());
+        buckets[assoc_hash(key) & (nbuckets - 1)].insert(0, key.as_str());
+        nentries += 1;
     }
     buckets.into_iter().flatten().map(str::to_string).collect()
 }
@@ -1263,6 +1307,28 @@ fn assign_default(ctx: &ExpandCtx, name: &str, value: &str) {
     if let Some(cell) = &ctx.pending_assign {
         cell.borrow_mut().push((name.to_string(), value.to_string()));
     }
+}
+
+/// Read a scalar variable during expansion, honouring assignments made by
+/// earlier `$(( ... ))` expansions on this command line.
+fn expand_env_get(ctx: &ExpandCtx, name: &str) -> Option<String> {
+    if let Some(overlay) = &ctx.arith_overlay {
+        if let Some(value) = overlay.borrow().get(name) {
+            return Some(value.clone());
+        }
+    }
+    ctx.env.get(name).cloned()
+}
+
+/// Whether a scalar variable is set during expansion, including values
+/// introduced by an earlier arithmetic assignment on this command line.
+fn expand_env_contains(ctx: &ExpandCtx, name: &str) -> bool {
+    if let Some(overlay) = &ctx.arith_overlay {
+        if overlay.borrow().contains_key(name) {
+            return true;
+        }
+    }
+    ctx.env.contains_key(name)
 }
 
 /// Report a failed `${var?word}` expansion and abort the current command
@@ -1786,7 +1852,7 @@ impl<'a> crate::arith::ArithEnv for ArithCtx<'a> {
             "0" => return self.ctx.dollar_zero.parse::<i64>().ok(),
             _ => {}
         }
-        let val = self.ctx.env.get(name).and_then(|v| v.parse::<i64>().ok());
+        let val = expand_env_get(self.ctx, name).and_then(|v| v.parse::<i64>().ok());
         if may_unbound && val.is_none() && self.ctx.nounset && !is_special_param(name) {
             unbound_variable(name);
             return None;
@@ -1795,9 +1861,15 @@ impl<'a> crate::arith::ArithEnv for ArithCtx<'a> {
     }
     fn set(&mut self, name: &str, value: i64) {
         self.assigned.borrow_mut().insert(name.to_string(), value);
-        // Persist the assignment through the same channel used by
-        // `${var=word}`; the executor drains it into `sh.env` after expansion,
-        // so `x=0; echo $((x=5)); echo $x` prints 5 / 5 like bash.
+        // bash applies arithmetic assignments immediately: a later `$x` on
+        // the same command line must read the new value.  Publish it through
+        // the command-wide overlay as well as through `pending_assign`, which
+        // the executor drains into `sh.env` for subsequent commands.
+        if let Some(overlay) = &self.ctx.arith_overlay {
+            overlay
+                .borrow_mut()
+                .insert(name.to_string(), value.to_string());
+        }
         if let Some(cell) = &self.ctx.pending_assign {
             cell.borrow_mut().push((name.to_string(), value.to_string()));
         }
@@ -1864,6 +1936,6 @@ fn resolve_param(name: &str, ctx: &ExpandCtx) -> String {
         "#" => ctx.positional.len().to_string(),
         "?" => ctx.last_status.to_string(),
         "0" => ctx.dollar_zero.to_string(),
-        _ => ctx.env.get(name).cloned().unwrap_or_default(),
+        _ => expand_env_get(ctx, name).unwrap_or_default(),
     }
 }
