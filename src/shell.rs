@@ -252,13 +252,14 @@ impl Shell {
 /// The `shopt` options wash understands, in bash's display order
 /// (alphabetical).  These are the shell options that are NOT reachable
 /// through `set -o`.
-pub const SHOPT_ORDER: &[&str] = &["expand_aliases", "sourcepath"];
+pub const SHOPT_ORDER: &[&str] = &["expand_aliases", "nullglob", "sourcepath"];
 
 impl Shell {
     /// Look up a `shopt` option by its name.
     pub fn shopt_get(&self, name: &str) -> Option<bool> {
         Some(match name {
             "expand_aliases" => self.expand_aliases,
+            "nullglob" => self.nullglob,
             "sourcepath" => self.sourcepath,
             _ => return None,
         })
@@ -268,6 +269,7 @@ impl Shell {
     pub fn shopt_set(&mut self, name: &str, value: bool) -> bool {
         match name {
             "expand_aliases" => self.expand_aliases = value,
+            "nullglob" => self.nullglob = value,
             "sourcepath" => self.sourcepath = value,
             _ => return false,
         }
@@ -394,6 +396,10 @@ pub struct Shell {
     /// When it is on, aliases are expanded even in non-interactive shells.
     pub expand_aliases: bool,
 
+    /// The `nullglob` shell option.  When on, an unquoted pathname pattern
+    /// that matches nothing expands to zero fields instead of staying literal.
+    pub nullglob: bool,
+
     /// The `sourcepath` shell option (bash's `shopt -u sourcepath`).  It is
     /// ON by default: `source` then looks for a file without a slash in
     /// `$PATH` FIRST and in the current directory afterwards.  With
@@ -412,7 +418,7 @@ pub struct Shell {
     /// only legal inside a sourced script (or a function) — the depth lets the
     /// `return` builtin tell a top-level call from a sourced one.
     pub sourcing_depth: usize,
-    /// How many `for`/`while`/`until` loop bodies are currently executing.
+    /// How many `for`/`select`/`while`/`until` loop bodies are currently executing.
     /// `break`/`continue` are only legal inside a loop.
     pub loop_depth: usize,
     /// How many shell-function calls are currently active. `local` is only
@@ -489,12 +495,10 @@ impl Shell {
         // 继承的环境是「外部文本 ingress」：字面 U+E100 必须双写，否则
         // decode_raw 会把紧邻的 U+E000 误当编码字节。与 -c / 脚本 / source
         // 三个源码入口同一纪律。
-        let mut env: HashMap<String, String> = std::env::vars()
-            .map(|(k, v)| {
-                (
-                    crate::byteval::escape_literal(&k),
-                    crate::byteval::escape_literal(&v),
-                )
+        let mut env: HashMap<String, String> = std::env::vars_os()
+            .filter_map(|(k, v)| {
+                // 安全地将键/值转换为 String；非法 UTF-8 直接忽略该变量
+                k.to_str().ok().map(|k| (k.to_string(), v.to_string_lossy().into_owned()))
             })
             .collect();
 
@@ -585,6 +589,7 @@ impl Shell {
             reading_stdin: false,
             dash_interactive: false,
             expand_aliases: false,
+            nullglob: false,
             sourcepath: true,
             return_requested: None,
             break_requested: None,

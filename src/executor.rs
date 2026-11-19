@@ -24,6 +24,7 @@ use std::io::Write;
 
 use crate::arith;
 use crate::builtins;
+use crate::safe_eprint_bytes;
 use crate::safe_eprintln;
 use crate::expand::{expand_argv, expand_scalar, expand_word, ExpandCtx};
 use crate::lexer::WordPart;
@@ -792,6 +793,7 @@ pub fn capture_command(
     functions: &HashMap<String, crate::parser::CommandList>,
     arrays: &HashMap<String, Vec<String>>,
     nounset: bool,
+    nullglob: bool,
     bg_pid: i32,
     positional: &[String],
     dollar_zero: &str,
@@ -824,6 +826,9 @@ pub fn capture_command(
         // `$(...)`.  `Shell::from_env` can only build default options, so the
         // parent's `nounset` flag is threaded through explicitly here.
         sh.options.nounset = nounset;
+        // `shopt` options are subshell-inherited too: a nullglob enabled in
+        // the parent must suppress unmatched patterns inside `$(...)`.
+        sh.nullglob = nullglob;
         // A command substitution also inherits the parent's background-job
         // table, so `$!` inside `$(...)` refers to the most recent background
         // job started *before* the substitution (bash behaviour).  `bg_pid` is
@@ -937,6 +942,12 @@ fn execute_compound(compound: &Compound, sh: &mut Shell) -> i32 {
             }
         }
         Compound::For { var, words, body } => execute_for(var, words, body, sh),
+        Compound::Select {
+            var,
+            words,
+            body,
+            line,
+        } => execute_select(var, words, body, *line, sh),
         Compound::ArithFor {
             init,
             cond,
@@ -975,6 +986,7 @@ fn execute_compound(compound: &Compound, sh: &mut Shell) -> i32 {
                 last_status: sh.last_status,
                 self_pid: sh.self_pid,
                 noglob: sh.options.noglob,
+                nullglob: sh.nullglob,
                 nounset: sh.options.nounset,
                 shell_flags: sh.dash_flags(),
                 set_options: &sh.options,
@@ -1048,6 +1060,7 @@ fn execute_for(var: &str, words: &[Vec<WordPart>], body: &CommandList, sh: &mut 
         last_status: sh.last_status,
         self_pid: sh.self_pid,
         noglob: sh.options.noglob,
+        nullglob: sh.nullglob,
         nounset: sh.options.nounset,
         shell_flags: sh.dash_flags(),
         set_options: &sh.options,
@@ -1086,6 +1099,163 @@ fn execute_for(var: &str, words: &[Vec<WordPart>], body: &CommandList, sh: &mut 
         // A plain `continue` starts the next iteration.  A level > 1 belongs
         // to an enclosing loop: decrement it and leave this loop so that the
         // outer loop can consume the flag instead of swallowing it here.
+        if let Some(n) = sh.continue_requested.take() {
+            if n > 1 {
+                sh.continue_requested = Some(n - 1);
+                break;
+            }
+        }
+    }
+    code
+}
+
+/// Run a `select NAME [in WORDS]; do BODY; done` loop.
+///
+/// bash prints the numbered menu and `PS3` on stderr, reads one raw line from
+/// stdin into `REPLY`, and runs the body once per line — including an invalid
+/// choice (NAME is then empty) and EOF (NAME empty, final status 1).  A blank
+/// line only redisplays the menu.
+fn execute_select(
+    var: &str,
+    words: &[Vec<WordPart>],
+    body: &CommandList,
+    line: usize,
+    sh: &mut Shell,
+) -> i32 {
+    // bash validates the loop variable before printing anything.
+    if !crate::parser::is_valid_ident(var) {
+        safe_eprintln!("wash: line {}: `{}': not a valid identifier", line, var);
+        return 1;
+    }
+    let attrs = sh.attr_refs();
+    let ctx = ExpandCtx {
+        env: &sh.env,
+        positional: &sh.positional,
+        last_status: sh.last_status,
+        self_pid: sh.self_pid,
+        noglob: sh.options.noglob,
+        nullglob: sh.nullglob,
+        nounset: sh.options.nounset,
+        shell_flags: sh.dash_flags(),
+        set_options: &sh.options,
+        bg_pid: sh.bg_pid,
+        dollar_zero: &sh.dollar_zero,
+        attrs: &attrs,
+        functions: &sh.functions,
+        arrays: &sh.arrays,
+        assoc_arrays: &sh.assoc_arrays,
+        array_set_indices: &sh.array_set_indices,
+        pending_assign: None,
+        arith_overlay: None,
+    };
+    let mut fields: Vec<String> = Vec::new();
+    for w in words {
+        fields.extend(expand_word(w, &ctx));
+    }
+    // With an empty word list bash does not print a menu or read at all.
+    if fields.is_empty() {
+        return 0;
+    }
+
+    for (i, field) in fields.iter().enumerate() {
+        safe_eprint_bytes!(
+            format!("{}) ", i + 1),
+            crate::byteval::decode_raw(field),
+            b"\n"
+        );
+    }
+
+    let mut code = 0;
+    let mut first = true;
+    loop {
+        // bash redisplays the menu whenever `$REPLY` is empty at the start
+        // of a selection cycle -- after a blank line, after a body that
+        // cleared it, or after a nested `select` hit EOF.
+        if !first && sh.env.get("REPLY").map(String::is_empty).unwrap_or(true) {
+            for (i, field) in fields.iter().enumerate() {
+                safe_eprint_bytes!(
+                    format!("{}) ", i + 1),
+                    crate::byteval::decode_raw(field),
+                    b"\n"
+                );
+            }
+        }
+        first = false;
+        let prompt = match sh.env.get("PS3") {
+            Some(p) => p.clone(),
+            None => "#? ".to_string(),
+        };
+        safe_eprint_bytes!(crate::byteval::decode_raw(&prompt));
+
+        // `select` reads a whole line with bash's default `read` semantics
+        // (NOT `read -r`): a backslash quotes the next character, and a
+        // backslash-newline pair disappears (line continuation).
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut eof = false;
+        let mut pass_next = false;
+        loop {
+            match posix::read_byte_from(0) {
+                Some(b'\n') => {
+                    if pass_next {
+                        // Backslash-newline: continue with the next line.
+                        pass_next = false;
+                        continue;
+                    }
+                    break;
+                }
+                Some(b'\\') if !pass_next => {
+                    pass_next = true;
+                }
+                Some(b) => {
+                    pass_next = false;
+                    bytes.push(b);
+                }
+                None => {
+                    eof = true;
+                    break;
+                }
+            }
+        }
+
+        if eof {
+            // bash prints one newline for the failed read, clears `REPLY`,
+            // and leaves the loop without running the body (status 1).
+            sh.env.insert("REPLY".to_string(), String::new());
+            let _ = std::io::stdout().write_all(b"\n");
+            code = 1;
+            break;
+        }
+        if bytes.is_empty() {
+            // A blank reply sets `REPLY` to empty and redisplays the menu at
+            // the next cycle without running the body.
+            sh.env.insert("REPLY".to_string(), String::new());
+            continue;
+        }
+        sh.env.insert("REPLY".to_string(), crate::byteval::encode_raw(&bytes));
+
+        let reply = sh.env.get("REPLY").map(String::as_str).unwrap_or("");
+        let chosen = reply.trim().parse::<i64>().ok().and_then(|n| {
+            if n >= 1 && n <= fields.len() as i64 {
+                Some(n as usize - 1)
+            } else {
+                None
+            }
+        });
+        let selected = chosen.map(|i| fields[i].clone()).unwrap_or_default();
+        sh.env.insert(var.to_string(), selected);
+        code = execute_loop_body(body, sh);
+        if sh.exit_requested.is_some()
+            || sh.return_requested.is_some()
+            || sh.fatal_error.is_some()
+        {
+            return code;
+        }
+        if let Some(n) = sh.break_requested.take() {
+            if n > 1 {
+                sh.break_requested = Some(n - 1);
+            }
+            break;
+        }
         if let Some(n) = sh.continue_requested.take() {
             if n > 1 {
                 sh.continue_requested = Some(n - 1);
@@ -1306,6 +1476,7 @@ fn execute_case(word: &[WordPart], arms: &[crate::parser::CaseArm], sh: &mut She
         last_status: sh.last_status,
         self_pid: sh.self_pid,
         noglob: sh.options.noglob,
+        nullglob: sh.nullglob,
         nounset: sh.options.nounset,
         shell_flags: sh.dash_flags(),
         set_options: &sh.options,
@@ -1517,6 +1688,9 @@ struct ChildContext<'a> {
     /// the parent's arrays, just like bash does).
     arrays: &'a HashMap<String, Vec<String>>,
     options: &'a SetOptions,
+    /// `shopt nullglob` is not part of `SetOptions`, so forked children need
+    /// this explicit snapshot to expand patterns the same way as the parent.
+    nullglob: bool,
     positional: &'a [String],
     dollar_zero: &'a str,
     attrs: &'a crate::shell::AttrRefs<'a>,
@@ -1573,6 +1747,7 @@ fn child_run_exp(argv: &[String], path: Option<&str>, ctx: &ChildContext) -> ! {
             sub.arrays = ctx.arrays.clone();
             sub.positional = ctx.positional.to_vec();
             sub.options = ctx.options.clone();
+            sub.nullglob = ctx.nullglob;
             sub.dollar_zero = ctx.dollar_zero.to_string();
             let code = execute_compound(compound, &mut sub);
             let _ = std::io::stdout().flush();
@@ -1614,6 +1789,7 @@ fn child_run_exp(argv: &[String], path: Option<&str>, ctx: &ChildContext) -> ! {
     sub.arrays = ctx.arrays.clone();
     sub.positional = ctx.positional.to_vec();
     sub.options = ctx.options.clone();
+    sub.nullglob = ctx.nullglob;
     sub.dollar_zero = ctx.dollar_zero.to_string();
     // 管道阶段 / fork 子进程里的 shell 函数：父进程 execute_simple 通过
     // execute_function 直接执行，但子进程由 Shell::from_env 重建，必须显式
@@ -1684,6 +1860,7 @@ fn assign_subscript_var(
             last_status: sh.last_status,
             self_pid: sh.self_pid,
             noglob: sh.options.noglob,
+            nullglob: sh.nullglob,
             nounset: sh.options.nounset,
             shell_flags: sh.dash_flags(),
             set_options: &sh.options,
@@ -1787,11 +1964,15 @@ fn assign_var(sh: &mut Shell, name: &str, value: String, append: bool) -> bool {
 
 /// Apply the assignments of a command (e.g. `IFS=: read x') and return the
 /// previous values, so that they can be restored afterwards.
+/// 
+/// The `env_values` slice contains the already-expanded RHS values from
+/// `prepare_stage`, so we avoid re‑expanding the original `WordPart`s
+/// (which would double‑expand `$(…)` etc.).
 fn apply_command_assignments(
-    assigns: &[(String, Vec<WordPart>, bool)],
+    env_values: &[(String, String, bool)],
     sh: &mut Shell,
 ) -> Vec<(String, Option<String>)> {
-    if assigns.is_empty() {
+    if env_values.is_empty() {
         return Vec::new();
     }
     let attrs = sh.attr_refs();
@@ -1800,31 +1981,10 @@ fn apply_command_assignments(
     // command immediately (bash semantics); `pending` still writes them back
     // to `sh.env` once expansion of the command is complete.
     let overlay: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
-    let applied: Vec<(String, String, bool)> = {
-        let ctx = ExpandCtx {
-            env: &sh.env,
-            positional: &sh.positional,
-            last_status: sh.last_status,
-            self_pid: sh.self_pid,
-            noglob: sh.options.noglob,
-            nounset: sh.options.nounset,
-        shell_flags: sh.dash_flags(),
-        set_options: &sh.options,
-        bg_pid: sh.bg_pid,
-            dollar_zero: &sh.dollar_zero,
-            attrs: &attrs,
-            functions: &sh.functions,
-            arrays: &sh.arrays,
-            assoc_arrays: &sh.assoc_arrays,
-            array_set_indices: &sh.array_set_indices,
-            pending_assign: Some(&pending),
-            arith_overlay: Some(&overlay),
-        };
-        assigns
-            .iter()
-            .map(|(n, vp, ap)| (n.clone(), expand_scalar(vp, &ctx), *ap))
-            .collect()
-    };
+    let applied: Vec<(String, String, bool)> = env_values
+        .iter()
+        .map(|(n, v, ap)| (n.clone(), v.clone(), *ap))
+        .collect();
     let mut saved: Vec<(String, Option<String>)> = Vec::new();
     for (name, value, append) in applied {
         saved.push((name.clone(), sh.env.get(&name).cloned()));
@@ -1869,6 +2029,7 @@ fn apply_array_assignments(
             last_status: sh.last_status,
             self_pid: sh.self_pid,
             noglob: sh.options.noglob,
+            nullglob: sh.nullglob,
             nounset: sh.options.nounset,
         shell_flags: sh.dash_flags(),
         set_options: &sh.options,
@@ -2029,6 +2190,7 @@ fn run_standalone_exp(
                     last_status: sh.last_status,
                     self_pid: sh.self_pid,
                     noglob: sh.options.noglob,
+                    nullglob: sh.nullglob,
                     nounset: sh.options.nounset,
         shell_flags: sh.dash_flags(),
         set_options: &sh.options,
@@ -2122,7 +2284,10 @@ fn run_standalone_exp(
         // An assignment in front of the builtin (e.g. `IFS=: read x') is
         // visible to it.  It is always temporary: bash undoes it after the
         // command, even for the POSIX special builtins.
-        let assignments = apply_command_assignments(assigns, sh);
+        let assignments = apply_command_assignments(
+            env_values.as_deref().unwrap_or(&[]),
+            sh,
+        );
         let array_saves = apply_array_assignments(array_assigns, sh);
         let code = builtins::run_builtin(argv, sh).unwrap_or(0);
         restore_array_assignments(array_saves, sh);
@@ -2173,6 +2338,7 @@ fn run_standalone_exp(
             shell_env: &sh.env,
             arrays: &sh.arrays,
             options: &sh.options,
+            nullglob: sh.nullglob,
             positional: &sh.positional,
             dollar_zero: &sh.dollar_zero,
             attrs: &attrs,
@@ -2453,6 +2619,7 @@ fn prepare_stage(c: &SimpleCommand, sh: &mut Shell) -> Prepared {
             last_status: sh.last_status,
             self_pid: sh.self_pid,
             noglob: sh.options.noglob,
+            nullglob: sh.nullglob,
             nounset: sh.options.nounset,
             shell_flags: shell_flags.clone(),
             set_options: &sh.options,
@@ -2493,6 +2660,7 @@ fn prepare_stage(c: &SimpleCommand, sh: &mut Shell) -> Prepared {
             last_status: sh.last_status,
             self_pid: sh.self_pid,
             noglob: sh.options.noglob,
+            nullglob: sh.nullglob,
             nounset: sh.options.nounset,
             shell_flags,
             set_options: &sh.options,
@@ -2571,6 +2739,7 @@ fn child_prepare_and_run(c: &SimpleCommand, sh: &mut Shell, path: Option<&str>, 
         shell_env: &shell_env,
         arrays: &sh.arrays,
         options: &sh.options,
+        nullglob: sh.nullglob,
         positional: &sh.positional,
         dollar_zero: &sh.dollar_zero,
         attrs: &attrs,

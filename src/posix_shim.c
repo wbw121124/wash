@@ -38,7 +38,13 @@
 // 并丢失历史。handler 只设置一个 volatile sig_atomic_t 标志，绝不做任何非
 // async-signal-safe 的调用；Rust 侧在 REPL 循环里读取该标志，派发对应 trap
 // 并回到提示符。非交互（-c / 脚本）路径不安装这些 handler，保持默认语义。
+//
+// 待处理信号使用位图（bit i 对应信号号 signo），以免 Ctrl-C 后紧跟 SIGTERM
+// 时丢失先前的信号。位图位 i 置 1 表示信号号 i 已被捕获且尚未被取走。
+//
+#define WASH_NCAUGHT 6
 static volatile sig_atomic_t g_pending_signal = 0;
+static uint64_t g_pending_signal_bits = 0;
 static int g_handlers_installed = 0;
 
 // bash 允许 trap 的常见终止类信号；SIGKILL / SIGSTOP 不可捕获，不列入。
@@ -87,11 +93,67 @@ int wash_install_signal_handlers(void) {
     return 0;
 }
 
+static void wash_on_signal(int signo) {
+    // 只记录信号号，后续处理全部交给 Rust 侧（异步信号安全）。
+    // 使用位图记录，避免后续信号覆盖先前的信号。
+    if (signo > 0 && signo < 64) {
+        g_pending_signal_bits |= (1ULL << signo);
+    }
+}
+
+static void wash_do_install(void) {
+    struct sigaction sa;
+    int i;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = wash_on_signal;
+    sigemptyset(&sa.sa_mask);
+    // SA_RESTART：避免阻塞的 read() 被信号打断后 REPL 把 EINTR 误判成 EOF
+    // 而退出；前台子进程被 SIGINT 终止后 waitpid 仍会正常返回。
+    sa.sa_flags = SA_RESTART;
+    for (i = 0; i < WASH_NCAUGHT; i++) {
+        sigaction(g_caught_signals[i], &sa, NULL);
+    }
+}
+
+static void wash_do_reset(void) {
+    struct sigaction sa;
+    int i;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = SIG_DFL;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    for (i = 0; i < WASH_NCAUGHT; i++) {
+        sigaction(g_caught_signals[i], &sa, NULL);
+    }
+}
+
+// 安装（或重新安装）交互 shell 的信号捕获 handler。每次调用都重新执行
+// sigaction，因此前台命令 wait 结束后可再次调用以恢复 handler（executor 侧
+// 用法）；不清空待处理信号标志，避免丢掉刚收到的 SIGINT。
+int wash_install_signal_handlers(void) {
+    wash_do_install();
+    g_handlers_installed = 1;
+    return 0;
+}
+
 // 读取并清除待处理信号号（返回 0 表示没有）。
+// 返回值是信号号，调用者须负责在信号 trap 中使用。
 int wash_take_pending_signal(void) {
-    int s = (int)g_pending_signal;
-    g_pending_signal = 0;
+    uint64_t bits = g_pending_signal_bits;
+    if (bits == 0) {
+        return 0;
+    }
+    // 取出最低位对应的信号号
+    int s = __builtin_ctzll(bits);  // 计算最低有效位的索引
+    g_pending_signal_bits &= ~(1ULL << s);  // 清除该位
     return s;
+}
+
+// 供 fork 后的子进程 / exec 内建显式恢复默认信号处理。
+int wash_reset_signals_default(void) {
+    wash_do_reset();
+    g_pending_signal_bits = 0;
+    return 0;
 }
 
 // 供 fork 后的子进程 / exec 内建显式恢复默认信号处理。

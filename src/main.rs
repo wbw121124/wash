@@ -148,7 +148,7 @@ fn main() {
         // 读取期间把 wash 自己的语法错误静音：bash 读同一个文件不会报错，
         // wash 的语法覆盖还不全，失败不应该污染命令的输出。
         sh.quiet_errors = true;
-        for f in [
+        'profile: for f in [
             "/etc/profile",
             "~/.bash_profile",
             "~/.bash_login",
@@ -157,13 +157,15 @@ fn main() {
             let path = if let Some(rest) = f.strip_prefix("~/") {
                 match std::env::var("HOME") {
                     Ok(home) => format!("{}/{}", home, rest),
-                    Err(_) => continue,
+                    Err(_) => break 'profile,
                 }
             } else {
                 f.to_string()
             };
             if std::path::Path::new(&path).is_file() {
+                sh.quiet_errors = false;
                 sh.run_str(&format!(". {}", quote_for_shell(&path)));
+                break 'profile;
             }
         }
         sh.quiet_errors = false;

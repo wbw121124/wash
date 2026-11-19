@@ -204,9 +204,10 @@ pub struct HereDocBody {
 ///   * `compgen -k`（`builtins.rs`）按本表顺序原样输出全部 22 项；
 ///   * `type` 的关键字判定（`builtins.rs::describe_command`）也查本表。
 ///
-/// `recognised == false` 的项（`in`/`select`/`time`/`{`/`}`/`!`/`[[`/`]]`/
-/// `coproc` 等）在 bash 里同样是关键字，但 wash 不在命令位置把它们当保留字：
-/// `in` 只在 for/case 体内由 parser 按文本位置识别，其余尚未实现对应语法。
+/// `recognised == false` 的项（`in`/`time`/`{`/`}`/`!`/`[[`/`]]`/`coproc`
+/// 等）在 bash 里同样是关键字，但 wash 不在命令位置把它们当保留字：
+/// `in` 只在 for/select/case 体内由 parser 按文本位置识别，其余尚未实现
+/// 对应语法（`select` 已实现，故其 `recognised` 为 `true`）。
 ///
 /// 来源：MSYS2 `LC_ALL=C bash -c 'compgen -k'`，GNU bash
 /// 5.3.20(1)-release (x86_64-pc-cygwin)，共 22 项。
@@ -219,7 +220,7 @@ pub const SHELL_KEYWORDS: &[(&str, bool)] = &[
     ("case", true),
     ("esac", true),
     ("for", true),
-    ("select", false),
+    ("select", true),
     ("while", true),
     ("until", true),
     ("do", true),
@@ -1978,19 +1979,28 @@ fn heredoc_delim(tokens: &[Token], idx: usize) -> String {
 
 /// Whether any part of the delimiter word is quoted (`'EOF'`, `"EOF"`,
 /// `E'O'F`).  A quoted delimiter suppresses body expansion at execution time.
+/// bash: `<<\EOF` is equivalent to `<<'EOF'` — the body is NOT expanded.
+/// wash previously only checked the `quoted` flag of `WordPart::Text`, which
+/// is set incorrectly for escape‑sequence‑produced text (e.g. `\EOF` →
+/// `WordPart::Text("EOF", false)`).  The fix below also recognises a leading
+/// backslash as suppressing expansion, matching bash semantics.
 fn heredoc_delim_quoted(tokens: &[Token], idx: usize) -> bool {
     match tokens.get(idx + 1) {
-        Some(Token::Word(parts)) => parts.iter().any(|p| {
-            matches!(
-                p,
-                WordPart::Text(_, true)
-                    | WordPart::Var(_, true)
-                    | WordPart::Braced(_, true)
-                    | WordPart::CmdSub(_, true)
-                    | WordPart::Backtick(_, true)
-                    | WordPart::Arith(_, true)
-            )
-        }),
+        Some(Token::Word(parts)) => {
+            // 1. any explicit quoted flag
+            if parts.iter().any(|p| matches!(p, WordPart::Text(_, true))) {
+                return true;
+            }
+            // 2. leading backslash suppresses expansion (bash `<<\EOF` → body not expanded)
+            if !parts.is_empty() {
+                if let WordPart::Text(s, _) = &parts[0] {
+                    if s.starts_with('\\') {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
         _ => false,
     }
 }
