@@ -242,7 +242,15 @@ impl<'a> CondParser<'a> {
                         Ok(CondExpr::Group(Box::new(inner)))
                     }
                     other => {
-                        let full = other.map(render_token).unwrap_or_default();
+                        let full = other.map(|t| {
+                            // Prefer the raw source text for CondWord (preserves quotes),
+                            // fall back to render_token for ordinary Word tokens.
+                            if matches!(t, Token::CondWord(_, _)) {
+                                raw_token(t).to_string()
+                            } else {
+                                render_token(t)
+                            }
+                        }).unwrap_or_default();
                         let near = other.map(render_token_near).unwrap_or_default();
                         Err(CondError::new(
                             format!("unexpected token `{}', expected `)'", full),
@@ -268,7 +276,15 @@ impl<'a> CondParser<'a> {
                         Ok(CondExpr::Unary { op, operand })
                     }
                     other => {
-                        let full = other.map(render_token).unwrap_or_default();
+                        let full = other.map(|t| {
+                            // Prefer the raw source text for CondWord (preserves quotes),
+                            // fall back to render_token for ordinary Word tokens.
+                            if matches!(t, Token::CondWord(_, _)) {
+                                raw_token(t).to_string()
+                            } else {
+                                render_token(t)
+                            }
+                        }).unwrap_or_default();
                         let near = other.map(render_token_near).unwrap_or_default();
                         Err(CondError::new(
                             format!(
@@ -321,7 +337,18 @@ impl<'a> CondParser<'a> {
                         })
                     }
                     other => {
-                        let full = other.as_ref().map(render_token).unwrap_or_default();
+                        let full = other
+                            .as_ref()
+                            .map(|t| {
+                                // Prefer the raw source text for CondWord (preserves quotes),
+                                // fall back to render_token for ordinary Word tokens.
+                                if matches!(t, Token::CondWord(_, _)) {
+                                    raw_token(t).to_string()
+                                } else {
+                                    render_token(t)
+                                }
+                            })
+                            .unwrap_or_default();
                         let near = other.as_ref().map(render_token_near).unwrap_or_default();
                         Err(CondError::new(
                             format!(

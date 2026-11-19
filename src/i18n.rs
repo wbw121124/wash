@@ -39,6 +39,10 @@ fn current_locale() -> &'static str {
 /// 把一个 locale 名规范化成 `语言[_地区]` 的形式：`zh_CN.UTF-8` → `zh_CN`，
 /// `en_US.utf8` → `en_US`，`C` / `POSIX` 保持原样（表示英文）。
 fn normalize_locale(raw: &str) -> String {
+    // C / POSIX 保持原样，不做小写化处理
+    if raw == "C" || raw == "POSIX" {
+        return raw.to_string();
+    }
     // 去掉编码后缀（`.UTF-8`）与修饰符（`@euro`）。
     let mut name = raw.split('@').next().unwrap_or(raw);
     if let Some(dot) = name.find('.') {
