@@ -944,11 +944,15 @@ fn builtin_shift(argv: &[String], sh: &mut Shell) -> i32 {
 ///   * `shopt -o` — print the `set -o` table instead.
 fn builtin_shopt(argv: &[String], sh: &mut Shell) -> i32 {
     let mut print = false;
+    let mut query = false;
     let mut enable = false;
     let mut disable = false;
     let mut show_set_options = false;
     let mut i = 1usize;
 
+    // bash accepts bundled short options (`-qs`, `-pqsu`, `-oq`), so parse
+    // every flag character of a `-xyz` cluster rather than matching whole
+    // words.  `--` ends option parsing.
     while i < argv.len() {
         let a = &argv[i];
         if a == "--" {
@@ -956,15 +960,18 @@ fn builtin_shopt(argv: &[String], sh: &mut Shell) -> i32 {
             break;
         }
         if a.len() > 1 && a.starts_with('-') {
-            match a.as_str() {
-                "-p" => print = true,
-                "-s" => enable = true,
-                "-u" => disable = true,
-                "-o" => show_set_options = true,
-                _ => {
-                    safe_eprintln!("wash: shopt: {}: invalid option", a);
-                    safe_eprintln!("shopt: usage: shopt [-psu] [-o] [option ...]");
-                    return 2;
+            for ch in a[1..].chars() {
+                match ch {
+                    'p' => print = true,
+                    'q' => query = true,
+                    's' => enable = true,
+                    'u' => disable = true,
+                    'o' => show_set_options = true,
+                    _ => {
+                        safe_eprintln!("wash: shopt: -{}: invalid option", ch);
+                        safe_eprintln!("shopt: usage: shopt [-pqsu] [-o] [optname ...]");
+                        return 2;
+                    }
                 }
             }
             i += 1;
@@ -973,28 +980,50 @@ fn builtin_shopt(argv: &[String], sh: &mut Shell) -> i32 {
         break;
     }
 
-    // `shopt -o` shows the options of the `set -o` table.
-    if show_set_options {
-        if print {
-            print_option_list(sh);
-        } else {
-            print_option_table(sh);
-        }
-        return 0;
+    // `shopt -s -u` (either order, bundled or separate) is a hard error.
+    if enable && disable {
+        safe_eprintln!("wash: shopt: cannot set and unset shell options simultaneously");
+        return 1;
     }
 
     let names: Vec<String> = argv[i..].to_vec();
 
+    // `shopt -o` operates on the `set -o` option table.
+    if show_set_options {
+        return shopt_set_options(sh, &names, print, query, enable, disable);
+    }
+
+    // `-s` / `-u` with an explicit name list: change those options.
     if enable || disable {
         if names.is_empty() {
-            safe_eprintln!("wash: shopt: usage: shopt [-psu] [-o] [option ...]");
-            return 2;
+            // `shopt -s` / `shopt -u` with no names list the on/off subset.
+            return shopt_list_subset(sh, enable, query);
         }
         let mut status = 0;
         for name in &names {
             if !sh.shopt_set(name, enable) {
                 safe_eprintln!("wash: shopt: {}: invalid shell option name", name);
                 status = 1;
+            }
+        }
+        return status;
+    }
+
+    // Query-only mode (`-q` without set/unset): no output; rc reflects state.
+    if query {
+        if names.is_empty() {
+            // `shopt -q` with no names succeeds unconditionally in bash.
+            return 0;
+        }
+        let mut status = 0;
+        for name in &names {
+            match sh.shopt_get(name) {
+                Some(true) => {}
+                Some(false) => status = 1,
+                None => {
+                    safe_eprintln!("wash: shopt: {}: invalid shell option name", name);
+                    status = 1;
+                }
             }
         }
         return status;
@@ -1007,40 +1036,131 @@ fn builtin_shopt(argv: &[String], sh: &mut Shell) -> i32 {
         } else {
             print_shopt_table(sh);
         }
-    } else {
-        for name in &names {
-            match sh.shopt_get(name) {
-                None => {
-                    safe_eprintln!("wash: shopt: {}: invalid shell option name", name);
-                    return 1;
+        return 0;
+    }
+    let mut status = 0;
+    for name in &names {
+        match sh.shopt_get(name) {
+            None => {
+                safe_eprintln!("wash: shopt: {}: invalid shell option name", name);
+                status = 1;
+            }
+            Some(value) => {
+                if print {
+                    println!("shopt {} {}", if value { "-s" } else { "-u" }, name);
+                } else {
+                    println!(
+                        "{:<width$}\t{}",
+                        name,
+                        if value { "on" } else { "off" },
+                        width = SHOPT_WIDTH
+                    );
                 }
-                Some(value) => {
-                    if print {
-                        println!("shopt {} {}", if value { "-s" } else { "-u" }, name);
-                    } else {
-                        println!(
-                            "{:<width$}\t{}",
-                            name,
-                            if value { "on" } else { "off" },
-                            width = shopt_name_width()
-                        );
+                if !value {
+                    status = 1;
+                }
+            }
+        }
+    }
+    status
+}
+
+/// `shopt -o [name ...]`: list / query / change the `set -o` option table.
+fn shopt_set_options(
+    sh: &mut Shell,
+    names: &[String],
+    print: bool,
+    query: bool,
+    enable: bool,
+    disable: bool,
+) -> i32 {
+    if enable || disable {
+        if names.is_empty() {
+            // `shopt -o -s` / `-o -u` with no names list the on/off subset.
+            if !query {
+                let want = enable;
+                for name in SET_O_ORDER {
+                    if sh.options.get(name).unwrap_or(false) == want {
+                        // The `-s`/-`-u` subset uses the same 15-column table
+                        // as the full `shopt -o` listing (only the *named*
+                        // `shopt -o NAME` form uses width 20).
+                        println!("{:<15}\t{}", name, if want { "on" } else { "off" });
                     }
                 }
             }
+            return 0;
+        }
+        let mut status = 0;
+        for name in names {
+            if sh.options.set(name, enable) {
+                // applied
+            } else {
+                safe_eprintln!("wash: shopt: {}: invalid option name", name);
+                status = 1;
+            }
+        }
+        return status;
+    }
+    if names.is_empty() {
+        if print {
+            print_option_list(sh);
+        } else if !query {
+            print_option_table(sh);
+        }
+        return 0;
+    }
+    let mut status = 0;
+    for name in names {
+        match sh.options.get(name) {
+            None => {
+                safe_eprintln!("wash: shopt: {}: invalid option name", name);
+                status = 1;
+            }
+            Some(value) => {
+                if print {
+                    println!("set {}o {}", if value { '-' } else { '+' }, name);
+                } else if !query && !value {
+                    println!("{:<width$}\t{}", name, "off", width = SET_O_WIDTH);
+                } else if !query {
+                    println!("{:<width$}\t{}", name, "on", width = SET_O_WIDTH);
+                }
+                if !value {
+                    status = 1;
+                }
+            }
+        }
+    }
+    status
+}
+
+/// `shopt -s` / `shopt -u` with no names: list the options currently on/off.
+fn shopt_list_subset(sh: &Shell, want_on: bool, query: bool) -> i32 {
+    if query {
+        return 0;
+    }
+    for name in SHOPT_ORDER {
+        if sh.shopt_get(name).unwrap_or(false) == want_on {
+            println!(
+                "{:<width$}\t{}",
+                name,
+                if want_on { "on" } else { "off" },
+                width = SHOPT_WIDTH
+            );
         }
     }
     0
 }
 
-/// The width of the option-name column in the `shopt` listing: bash pads
-/// the names to the length of the longest one plus two columns.
-fn shopt_name_width() -> usize {
-    SHOPT_ORDER.iter().map(|n| n.len()).max().unwrap_or(0) + 2
-}
+/// bash pads `shopt` option names to a fixed 20-column field before the tab
+/// (verified byte-for-byte: `sourcepath` + 10 spaces + `\\t`).  It is NOT
+/// derived from the longest implemented name — wash knows only three options
+/// but bash's column is still 20.
+const SHOPT_WIDTH: usize = 20;
+const SET_O_WIDTH: usize = 20;
 
 /// Print every `shopt` option and its state, the way bash's `shopt` does.
 fn print_shopt_table(sh: &Shell) {
-    let width = shopt_name_width();
+    let width = SHOPT_WIDTH;
     for name in SHOPT_ORDER {
         let state = if sh.shopt_get(name).unwrap_or(false) {
             "on"
@@ -1866,6 +1986,19 @@ fn render_compound(c: &crate::parser::Compound) -> String {
                 render_command_list(body, 1)
             )
         }
+        crate::parser::Compound::Select { var, words, body, .. } => {
+            let w = words
+                .iter()
+                .map(|w| render_word(w))
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!(
+                "select {} in {}; do\n{}\ndone",
+                var,
+                w,
+                render_command_list(body, 1)
+            )
+        }
         crate::parser::Compound::ArithFor { init, cond, incr, body } => {
             format!(
                 "for (( {}; {}; {} )); do\n{}\ndone",
@@ -2103,6 +2236,17 @@ fn bash_fmt_compound(c: &crate::parser::Compound, indent: usize) -> Vec<String> 
                 .collect::<Vec<_>>()
                 .join(" ");
             let mut out = vec![format!("{}for {} in {};", pad, var, w), format!("{}do", pad)];
+            out.extend(bash_fmt_list(body, indent + 1, true));
+            out.push(format!("{}done", pad));
+            out
+        }
+        crate::parser::Compound::Select { var, words, body, .. } => {
+            let w = words
+                .iter()
+                .map(|w| bash_fmt_word(w))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let mut out = vec![format!("{}select {} in {};", pad, var, w), format!("{}do", pad)];
             out.extend(bash_fmt_list(body, indent + 1, true));
             out.push(format!("{}done", pad));
             out

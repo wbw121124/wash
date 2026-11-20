@@ -1080,6 +1080,13 @@ fn execute_for(var: &str, words: &[Vec<WordPart>], body: &CommandList, sh: &mut 
     }
     let mut code = 0;
     for field in fields {
+        // bash still attempts (and fails) the loop-variable assignment for a
+        // readonly NAME, reporting the error and aborting the loop before the
+        // body runs.  Keep the fast path for the ordinary case untouched.
+        if sh.readonly.contains(var) {
+            safe_eprintln!("wash: {}: readonly variable", var);
+            return 1;
+        }
         sh.env.insert(var.to_string(), field);
         code = execute_loop_body(body, sh);
         // bash leaves the loop variable set to its final value (the loop body
@@ -1107,6 +1114,43 @@ fn execute_for(var: &str, words: &[Vec<WordPart>], body: &CommandList, sh: &mut 
         }
     }
     code
+}
+
+/// Print bash's numbered `select` menu.  bash lays the choices out in
+/// columns like `ls -C`: each cell is `N) ITEM`, cells are padded to the
+/// widest cell plus two, and COLUMNS (default 80) decides how many columns
+/// fit.  Items fill column-major then print row-major.  Widths are in BYTES
+/// (LC_ALL=C).  Output goes to stderr.
+fn print_select_menu(fields: &[String], sh: &Shell) {
+    if fields.is_empty() { return; }
+    let cells: Vec<Vec<u8>> = fields.iter().enumerate().map(|(i, f)| {
+        let mut c = format!("{}) ", i + 1).into_bytes();
+        c.extend(crate::byteval::decode_raw(f));
+        c
+    }).collect();
+    let widest = cells.iter().map(|c| c.len()).max().unwrap_or(0);
+    let cellw = widest + 2;
+    let columns: usize = sh.env.get("COLUMNS")
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(80);
+    let mut ncols = std::cmp::max(1, columns / cellw);
+    // bash falls back to a single column whenever all choices would fit
+    // in one row (that is, ncols >= number of items).
+    if ncols >= cells.len() { ncols = 1; }
+    let nrows = (cells.len() + ncols - 1) / ncols;
+    let mut out: Vec<u8> = Vec::new();
+    for r in 0..nrows {
+        let row_idxs: Vec<usize> = (0..ncols).map(|c| r + c * nrows).filter(|&i| i < cells.len()).collect();
+        for (k, &i) in row_idxs.iter().enumerate() {
+            out.extend_from_slice(&cells[i]);
+            if k + 1 < row_idxs.len() {
+                for _ in 0..(cellw - cells[i].len()) { out.push(b' '); }
+            }
+        }
+        out.push(b'\n');
+    }
+    safe_eprint_bytes!(out);
 }
 
 /// Run a `select NAME [in WORDS]; do BODY; done` loop.
@@ -1157,13 +1201,7 @@ fn execute_select(
         return 0;
     }
 
-    for (i, field) in fields.iter().enumerate() {
-        safe_eprint_bytes!(
-            format!("{}) ", i + 1),
-            crate::byteval::decode_raw(field),
-            b"\n"
-        );
-    }
+    print_select_menu(&fields, sh);
 
     let mut code = 0;
     let mut first = true;
@@ -1172,13 +1210,7 @@ fn execute_select(
         // of a selection cycle -- after a blank line, after a body that
         // cleared it, or after a nested `select` hit EOF.
         if !first && sh.env.get("REPLY").map(String::is_empty).unwrap_or(true) {
-            for (i, field) in fields.iter().enumerate() {
-                safe_eprint_bytes!(
-                    format!("{}) ", i + 1),
-                    crate::byteval::decode_raw(field),
-                    b"\n"
-                );
-            }
+            print_select_menu(&fields, sh);
         }
         first = false;
         let prompt = match sh.env.get("PS3") {
@@ -1242,6 +1274,14 @@ fn execute_select(
             }
         });
         let selected = chosen.map(|i| fields[i].clone()).unwrap_or_default();
+        // As with `for`, a readonly NAME makes bash report the failed
+        // assignment after PS3 / REPLY are handled, skip the body and end the
+        // loop with status 1 (the menu/prompt/REPLY side effects stay intact).
+        if sh.readonly.contains(var) {
+            safe_eprintln!("wash: {}: readonly variable", var);
+            code = 1;
+            break;
+        }
         sh.env.insert(var.to_string(), selected);
         code = execute_loop_body(body, sh);
         if sh.exit_requested.is_some()

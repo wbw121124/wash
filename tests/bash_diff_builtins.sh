@@ -26,7 +26,7 @@
 #       'cd <WASH_REPO> && bash tests/bash_diff_builtins.sh'
 #
 # Optional: ONLY_GROUP=A|K|B|C|D runs a single group.
-#   A = core semantics + finished builtins (753 cases: 340 + 33 brace-range
+#   A = core semantics + finished builtins (815 cases: 340 + 33 brace-range
 #       + 24 brace word-boundary + 15 brace nest/escape/quote-removal
 #       + 1 brace deep-nesting stack guard + 37 heredoc / herestring
 #       + 11 unclosed `$(` syntax-error fence
@@ -80,6 +80,17 @@
 #          out-of-range vs numeric-argument vs too-many-arguments errors)
 #       + 23 declare -f / -F fence (function listing, sorted names, rc for
 #          missing names, and bash's pretty-printed body layout)
+#       + 44 select / nullglob / shopt fence (21 select via stdin injection:
+#          menu/PS3/REPLY/EOF/blank/backslash/nested/break-N/bad-name/malformed;
+#          6 nullglob expansion+inheritance; 17 shopt semantics: 20-col layout,
+#          named-query rc, bundled flags, -su conflict, -o validation).  The
+#          >=10-choice multi-column menu and bash's 60-option shopt table are
+#          documented narrow edges, intentionally not byte-fenced here.
+#       + 18 QA-review residual fence (6 comment lexing: word-start `#` eats to
+#          EOL, word-internal/quoted `#` literal, `>#` is a redirection without
+#          target; 9 empty-body near-token: `;;` vs newline-`;` vs literal `;`,
+#          for/select/while/until; 3 readonly loop variable).  comment-lines
+#          and while-newline-body use $'...' ANSI-C quoting in the harness.
 #       -> MUST stay green (regressions)
 #   K = KNOWN-DIFF: cannot be byte-equal by design (documented, not fixed)
 #   B = regression fence for already-fixed defects (GROUP B, 21 cases, green today)
@@ -249,7 +260,18 @@ fail=0
 #   has to match.  The message body, the number of lines and the trailing
 #   newline are all left untouched, so the comparison stays byte-for-byte.
 normalize_stderr() {
-    sed -E 's#^[^:]*bash(\.exe)?: (line [0-9]+: )?##; s#^wash(\.exe)?: (line [0-9]+: )?##' "$1"
+    # Strip ONLY the shell-name prefix (and the optional `line N: `) from each
+    # stderr line, symmetrically for both shells.  `[^:]*` before the name lets
+    # a prompt written to stderr without a trailing newline (e.g. select's
+    # PS3 `#? `) precede the prefix on the same physical line:
+    #   bash: "#? /d/.../bash: line 1: x: readonly variable" -> "#? x: readonly variable"
+    #   wash: "#? wash: x: readonly variable"                -> "#? x: readonly variable"
+    # The wash rule used to be anchored (`^wash: `), so the `#? ` case left the
+    # whole wash prefix in place while bash's rule stripped it -- a harness
+    # asymmetry, not an implementation DIFF.  Both rules now allow the same
+    # non-colon prefix.  A colon in the leading text stops the match, so real
+    # message bodies are never eaten.
+    sed -E 's#^[^:]*bash(\.exe)?: (line [0-9]+: )?##; s#^[^:]*wash(\.exe)?: (line [0-9]+: )?##' "$1"
 }
 
 # `cmp` is not available in this MSYS2 installation -> compare hex dumps.
@@ -379,6 +401,43 @@ run_case() {
     # Candidate: wash.
     "${RUNNER[@]}" "$WASH_BIN" -c "$case_text" \
         >"$TMP/wash.out" 2>"$TMP/wash.err" </dev/null
+    rw=$?
+
+    normalize_stderr "$TMP/bash.err" > "$TMP/bash.err.n"
+    normalize_stderr "$TMP/wash.err" > "$TMP/wash.err.n"
+
+    if [ "$(hexdump "$TMP/bash.out")" = "$(hexdump "$TMP/wash.out")" ] &&
+       [ "$rb" = "$rw" ] &&
+       [ "$(hexdump "$TMP/bash.err.n")" = "$(hexdump "$TMP/wash.err.n")" ]; then
+        pass=$((pass + 1))
+        g_pass[$group]=$(( ${g_pass[$group]:-0} + 1 ))
+    else
+        fail=$((fail + 1))
+        g_fail[$group]=$(( ${g_fail[$group]:-0} + 1 ))
+        report_failure "$label" "$case_text" "$rb" "$rw"
+    fi
+}
+
+# Like run_case but feeds a fixed stdin to BOTH shells — needed for `select`,
+# which reads the choice from stdin.  stdin text uses printf %b escapes so a
+# test can write `\n` for a newline.  Everything else (stdout/rc/normalized
+# stderr comparison) is identical to run_case.
+run_case_in() {
+    local group="$1" label="$2" stdin_text="$3" case_text="$4"
+    local rb rw
+
+    if [ -n "$ONLY_GROUP" ] && [ "$group" != "$ONLY_GROUP" ]; then
+        return 0
+    fi
+
+    case_text="${case_text//@SANDBOX@/$SANDBOX}"
+    g_total[$group]=$(( ${g_total[$group]:-0} + 1 ))
+
+    printf '%b' "$stdin_text" | "${RUNNER[@]}" "${CASE_ENV[@]}" "$BASH_BIN" -c "$case_text" \
+        >"$TMP/bash.out" 2>"$TMP/bash.err"
+    rb=$?
+    printf '%b' "$stdin_text" | "${RUNNER[@]}" "${CASE_ENV[@]}" "$WASH_BIN" -c "$case_text" \
+        >"$TMP/wash.out" 2>"$TMP/wash.err"
     rw=$?
 
     normalize_stderr "$TMP/bash.err" > "$TMP/bash.err.n"
@@ -1628,6 +1687,90 @@ run_case A declare-f-forc        'f(){ for ((i=0;i<3;i++)); do echo $i; done; };
 run_case A declare-f-cond        'f(){ [[ x = x ]]; }; declare -f f'
 run_case A declare-F-named       'f(){ echo hi; }; declare -F f g; echo rc=$?'
 run_case A declare-f-kw-function 'function f { echo hi; }; declare -f f'
+
+# --- `select` compound command + `shopt -s nullglob` + shopt semantics --------
+# `select` prints a numbered menu on stderr, reads a raw line (bash's default
+# `read` semantics: backslash quotes the next char), and re-displays the menu
+# only when `$REPLY` is empty at the start of a cycle.  EOF writes a bare
+# newline to stdout, clears REPLY and skips the body.  The menu is single
+# column for <= 9 choices; the >= 10-choice multi-column tab-stop layout is a
+# documented narrow edge and is deliberately not fenced here.  stdin is fed
+# to both shells via run_case_in.
+run_case_in A select-basic        '1\n'      'select x in a b c; do echo "x=$x r=$REPLY"; break; done'
+run_case_in A select-invalid      '9\n'      'select x in a b; do echo "x=[$x] r=$REPLY"; break; done'
+run_case_in A select-eof          ''         'select x in a b; do echo BODY; done; echo "after rc=$?"'
+run_case_in A select-blank        '\n2\n'    'select x in a b; do echo "x=$x r=$REPLY"; done'
+run_case_in A select-ps3          '1\n'      'PS3="Choose> "; select x in a b; do echo "x=$x"; break; done'
+run_case_in A select-ps3-empty    '1\n'      'PS3=; select x in a; do echo "x=$x"; break; done'
+run_case_in A select-nomenu       ''         'select x in; do echo BODY; done; echo "rc=$?"'
+run_case_in A select-badname      '1\n'      'select 1bad in a b; do echo BODY; done; echo "rc=$?"'
+run_case_in A select-number-name  '1\n'      'select 1 in a; do echo BODY; done; echo rc=$?'
+run_case_in A select-comma-name   '1\n'      'select x,y in a; do echo BODY; done; echo rc=$?'
+run_case_in A select-quoted-name  '1\n'      'select "x" in a; do echo BODY; done; echo rc=$?'
+run_case_in A select-name-extra   '1\n'      'select x y in a; do echo hi; done'
+run_case_in A select-contbreak    '1\n2\n'   'select x in a b; do echo "x=$x"; case $x in a) continue;; b) break;; esac; done'
+run_case_in A select-nested       '1\n1\n'   'select x in a; do select y in p q; do echo "x=$x y=$y"; break 2; done; done'
+run_case_in A select-brace-body   '1\n'      'select x in a b; { echo "x=$x"; break; }'
+run_case_in A select-break2       '1\n1\n'   'for i in 1 2; do select x in a; do echo "i=$i x=$x"; break 2; done; done'
+run_case_in A select-reply-clear  '1\n\n2\n' 'select x in a b; do echo "x=$x"; REPLY=; done'
+run_case_in A select-backslash    '1\\\n'    'select x in a b; do echo "r=[$REPLY] x=[$x]"; break; done'
+run_case_in A select-empty-body   '1\n'      'select x in a; do; done'
+run_case_in A select-mismatch     '1\n'      'select x in a; do echo hi; fi'
+run_case_in A select-no-do        '1\n'      'select x in a; echo hi; done'
+run_case A select-close-extra     'select x in a; do echo hi; done extra'
+# nullglob: an unmatched unquoted pattern expands to zero fields; inherits
+# into command substitutions and forked children; quoted patterns never glob.
+run_case A nullglob-off           'echo *.zzzzz; echo "rc=$?"'
+run_case A nullglob-on            'shopt -s nullglob; echo *.zzzzz; echo "rc=$?"'
+run_case A nullglob-cmdsub        'shopt -s nullglob; echo "[$(echo *.zzzzz)]"'
+run_case A nullglob-quoted        'shopt -s nullglob; echo "*.zzzzz"'
+run_case A nullglob-set-u         'shopt -s nullglob; shopt -u nullglob; echo *.zzzzz'
+run_case A nullglob-loop          'shopt -s nullglob; for f in *.zzzzz; do echo "F=$f"; done; echo done'
+# shopt semantics: fixed 20-column layout, named query rc reflects state,
+# bundled flags, -s/-u conflict, -o names go through set -o validation.
+run_case A shopt-named            'shopt sourcepath; echo "rc=$?"'
+run_case A shopt-named-off        'shopt expand_aliases; echo "rc=$?"'
+run_case A shopt-unknown          'shopt nosuch; echo "rc=$?"'
+run_case A shopt-mixed-unknown    'shopt sourcepath nosuch expand_aliases; echo rc=$?'
+run_case A shopt-s                'shopt -s expand_aliases; shopt expand_aliases; echo rc=$?'
+run_case A shopt-u                'shopt -s sourcepath; shopt -u sourcepath; shopt sourcepath; echo rc=$?'
+run_case A shopt-p-named          'shopt -p sourcepath'
+run_case A shopt-q                'shopt -q sourcepath; echo rc=$?'
+run_case A shopt-qoff             'shopt -q expand_aliases; echo rc=$?'
+run_case A shopt-qs               'shopt -qs expand_aliases; shopt -q expand_aliases; echo rc=$?'
+run_case A shopt-su-conflict      'shopt -su expand_aliases; echo rc=$?'
+run_case A shopt-o                'shopt -o'
+run_case A shopt-o-p              'shopt -o -p'
+run_case A shopt-o-named          'shopt -o vi; echo rc=$?'
+run_case A shopt-o-bad            'shopt -o nosuch; echo rc=$?'
+run_case A shopt-o-q              'shopt -oq vi; echo rc=$?'
+
+# QA 独立复核残留 DIFF 栅栏（18 条）：注释词法（wash 此前完全没有 `#` 注释）、
+# 循环空 body 的 near-token 区分、readonly 循环变量。每条都先在 MSYS2 bash
+# 5.3.20 下用 LC_ALL=C 实测确认预期，再与 wash 逐字节对拍。
+# 注释：词首 `#` 吃掉到行尾；词中/引号内 `#` 是字面量；`>` 后的 `#` 是
+# 重定向缺 target（near newline），不是注释。
+run_case A comment-eol            'echo a # comment'
+run_case A comment-only           '# just a comment'
+run_case A comment-lines          $'echo a\n# comment\necho b'
+run_case A comment-word           'echo a#b'
+run_case A comment-quoted         'echo "a # b"'
+run_case A comment-redir-target   'echo hi >#f'
+# 空 body 诊断：`;;` 紧邻报 near `;;`；换行产生的分号报 near `done`；
+# 字面 `;` 报 near `;`。四种循环形态都覆盖。
+run_case A sel-novar              'select; do echo hi; done'
+run_case A for-novar              'for; do echo hi; done'
+run_case A sel-doublesemi         'select x in a b; do ;; done'
+run_case A while-doublesemi       'while true; do ;; done'
+run_case A while-newline-body     $'while true; do\ndone'
+run_case A while-semi-body        'while true; do; done'
+run_case A while-spaced2-body     'while true; do ; ; done'
+run_case_in A sel-comment-body    ''   $'select x in a b; do # comment\n done'
+run_case_in A while-comment-body  ''   $'while true; do # comment\n done'
+# readonly 循环变量：bash 在赋值时报错、跳过 body、循环状态 1。
+run_case_in A sel-readonly        '1\n' 'declare -r x=old; select x in a b; do echo "GOT:$x"; break; done; echo "after=$?"'
+run_case A for-readonly           'declare -r x=old; for x in a b; do echo "GOT:$x"; done; echo "after=$?"'
+run_case A for-readonly-rc        'readonly x=old; for x in a b; do echo hi; done'
 
 # GROUP B -- regression fence for already-fixed defects (21 cases, green today).
 # (每条用例都曾是真实缺陷，修复后留在这里作为回归栅栏：通过 run_case 同时跑

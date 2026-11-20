@@ -108,6 +108,9 @@ pub struct ExpandCtx<'a> {
     pub last_status: i32,
     pub self_pid: i32,
     pub noglob: bool,
+    /// `shopt -s nullglob`: an unquoted glob pattern matching nothing expands
+    /// to zero fields instead of staying literal.
+    pub nullglob: bool,
     pub nounset: bool,
     /// The pid of the most recently started background job (`$!`).
     pub bg_pid: i32,
@@ -204,6 +207,7 @@ pub fn expand_scalar(parts: &[WordPart], ctx: &ExpandCtx) -> String {
                     ctx.functions,
                     ctx.arrays,
                     ctx.nounset,
+                    ctx.nullglob,
                     ctx.bg_pid,
                     ctx.positional,
                     ctx.dollar_zero,
@@ -397,7 +401,7 @@ pub fn expand_word(parts: &[WordPart], ctx: &ExpandCtx) -> Vec<String> {
                             globbed.push(c);
                             continue;
                         }
-                        let matches = glob(&c.text);
+                        let matches = glob(&c.text, ctx.nullglob);
                         let n = matches.len();
                         for (k, m) in matches.into_iter().enumerate() {
                             globbed.push(Candidate { text: m, open: k + 1 == n, droppable: false });
@@ -457,6 +461,7 @@ pub fn expand_word(parts: &[WordPart], ctx: &ExpandCtx) -> Vec<String> {
                     ctx.functions,
                     ctx.arrays,
                     ctx.nounset,
+                    ctx.nullglob,
                     ctx.bg_pid,
                     ctx.positional,
                     ctx.dollar_zero,
@@ -597,7 +602,7 @@ fn expansion_fields(exp: Expansion, quoted: bool, ctx: &ExpandCtx) -> (Vec<Strin
     }
     let mut out = Vec::new();
     for f in &fields {
-        out.extend(glob_fields("", f, ctx.noglob));
+        out.extend(glob_fields("", f, ctx.noglob, ctx.nullglob));
     }
     (out, true)
 }
@@ -1644,15 +1649,19 @@ fn has_glob(p: &str) -> bool {
 /// Expand one unquoted field into **one word per glob match**.  Joining all
 /// matches with a space (the old `glob_one`) collapsed them into a single
 /// argument, breaking `x=dir/*.txt; printf "[%s]" $x`, `for f in $x`, etc.
-fn glob_fields(prefix: &str, field: &str, noglob: bool) -> Vec<String> {
+fn glob_fields(prefix: &str, field: &str, noglob: bool, nullglob: bool) -> Vec<String> {
     if noglob || !has_glob(field) {
         // `glob()` on a wildcard-free field returns exactly one element
         // (the field itself); build that result directly instead of
         // allocating an intermediate Vec + String first.
         return vec![format!("{}{}", prefix, field)];
     }
-    let matches = glob(field);
+    let matches = glob(field, nullglob);
     if matches.is_empty() {
+        // nullglob: a pattern matching nothing contributes zero fields.
+        if nullglob {
+            return Vec::new();
+        }
         vec![format!("{}{}", prefix, field)]
     } else {
         matches
@@ -1675,9 +1684,10 @@ fn translate_msys_path(p: &str) -> Option<String> {
     None
 }
 
-/// Expand a filename pattern to matching paths. If no matches, returns the
-/// pattern itself (bash default; nullglob is off in Phase 1).
-pub fn glob(pattern: &str) -> Vec<String> {
+/// Expand a filename pattern to matching paths.  With `nullglob` off (bash's
+/// default) a pattern matching nothing stays literal; with it on the pattern
+/// expands to zero fields.
+pub fn glob(pattern: &str, nullglob: bool) -> Vec<String> {
     if !has_glob(pattern) {
         return vec![pattern.to_string()];
     }
@@ -1722,7 +1732,11 @@ pub fn glob(pattern: &str) -> Vec<String> {
     out.sort();
     // bash default (nullglob off): a pattern with glob metacharacters that
     // matches nothing yields the literal pattern, not an empty result.
+    // With nullglob on it contributes nothing at all.
     if out.is_empty() {
+        if nullglob {
+            return Vec::new();
+        }
         return vec![pattern.to_string()];
     }
     out

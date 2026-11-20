@@ -492,13 +492,19 @@ pub struct Shell {
 
 impl Shell {
     pub fn new() -> Self {
-        // 继承的环境是「外部文本 ingress」：字面 U+E100 必须双写，否则
-        // decode_raw 会把紧邻的 U+E000 误当编码字节。与 -c / 脚本 / source
-        // 三个源码入口同一纪律。
+        // 继承的环境是「原始字节 ingress」（cygwin target 支持
+        // OsStrExt::as_bytes）：既不让 `vars()` 在非法 UTF-8 上 panic
+        // （rc=101），也不像 `to_string_lossy()` 那样把裸 0xff 替换成
+        // U+FFFD。用 encode_raw 把每个字节编成 byteval 内部串，egress 时
+        // decode_raw 原样还原。与 read -n / printf -v 等裸字节入口同一纪律。
+        #[cfg(unix)]
+        use std::os::unix::ffi::OsStrExt as _;
         let mut env: HashMap<String, String> = std::env::vars_os()
-            .filter_map(|(k, v)| {
-                // 安全地将键/值转换为 String；非法 UTF-8 直接忽略该变量
-                k.to_str().ok().map(|k| (k.to_string(), v.to_string_lossy().into_owned()))
+            .map(|(k, v)| {
+                (
+                    crate::byteval::encode_raw(k.as_bytes()),
+                    crate::byteval::encode_raw(v.as_bytes()),
+                )
             })
             .collect();
 
@@ -876,12 +882,23 @@ impl Shell {
                 Some((e.open_line, format!("syntax error: `(({}))'", e.near))),
             ),
             DiagnosticFamily::NearToken => {
-                let consumed = tokens.map(Self::heredoc_consumed_lines).unwrap_or(0);
-                (
-                    k + 1 + consumed,
-                    Some(lines.get(k).copied().unwrap_or("")),
-                    None,
-                )
+                // A structured near-token error carries the exact 1-based
+                // physical line of the offending token.  Report that line and
+                // echo its source text verbatim (including leading spaces),
+                // matching bash's two-line diagnostic.  Only producers that
+                // cannot pinpoint a line leave `open_line` at 0, in which case
+                // the legacy prefix heuristic still applies.
+                if e.open_line > 0 {
+                    let ln = e.open_line;
+                    (ln, lines.get(ln - 1).copied(), None)
+                } else {
+                    let consumed = tokens.map(Self::heredoc_consumed_lines).unwrap_or(0);
+                    (
+                        k + 1 + consumed,
+                        Some(lines.get(k).copied().unwrap_or("")),
+                        None,
+                    )
+                }
             }
             DiagnosticFamily::Unspecified => {
                 let at_eof = e.message.starts_with("syntax error: unexpected end of file")

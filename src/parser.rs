@@ -17,7 +17,7 @@
 // their internal structure.
 
 use crate::error::{DiagnosticFamily, Result, WashError};
-use crate::lexer::{HereDocBody, RedirKind, Token, WordPart};
+use crate::lexer::{HereDocBody, RedirKind, SemicolonKind, Token, WordPart};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Redir {
@@ -65,6 +65,16 @@ pub enum Compound {
         var: String,
         words: Vec<Vec<WordPart>>,
         body: CommandList,
+    },
+    /// `select NAME [in WORDS]; do BODY; done` — like `for`, but presents a
+    /// numbered menu and reads the choice from stdin into `REPLY`.  `line` is
+    /// the source line of the `select` keyword, used for the identifier
+    /// validation diagnostic.
+    Select {
+        var: String,
+        words: Vec<Vec<WordPart>>,
+        body: CommandList,
+        line: usize,
     },
     /// `for (( INIT ; COND ; INCR )); do BODY; done` — the C-style form.
     ///
@@ -215,6 +225,12 @@ fn parse_compounds(tokens: &[Token]) -> Result<(Vec<Token>, Vec<FuncDef>)> {
                     out.push(Token::Compound(compound));
                     i = end;
                 }
+                "select" => {
+                    let (compound, end) = parse_select_compound(tokens, i, *kw_line)
+                        .map_err(|e| wrap_compound_eof(e, "select", *kw_line))?;
+                    out.push(Token::Compound(compound));
+                    i = end;
+                }
                 "while" => {
                     let (compound, end) = parse_while_until_compound(tokens, i, false)
                         .map_err(|e| wrap_compound_eof(e, "while", *kw_line))?;
@@ -308,7 +324,7 @@ fn parse_compounds(tokens: &[Token]) -> Result<(Vec<Token>, Vec<FuncDef>)> {
 fn at_command_position(out: &[Token]) -> bool {
     match out.last() {
         None => true,
-        Some(Token::Semicolon | Token::Pipe | Token::AndAnd | Token::OrOr | Token::Background) => {
+        Some(Token::Semicolon(_) | Token::Pipe | Token::AndAnd | Token::OrOr | Token::Background) => {
             true
         }
         Some(Token::Reserved(..)) => true,
@@ -330,7 +346,7 @@ fn group_may_close(tokens: &[Token], start: usize, close: usize) -> bool {
     }
     matches!(
         tokens.get(close - 1),
-        Some(Token::Semicolon | Token::Background)
+        Some(Token::Semicolon(_) | Token::Background)
     )
 }
 
@@ -478,7 +494,7 @@ fn split_until_reserved(
     while i < tokens.len() {
         if let Token::Reserved(name, _) = &tokens[i] {
             match name.as_str() {
-                "if" | "for" | "while" | "until" | "case" => {
+                "if" | "for" | "select" | "while" | "until" | "case" => {
                     let end = find_matching_closer(tokens, i)?;
                     out.extend_from_slice(&tokens[i..end]);
                     i = end;
@@ -514,7 +530,7 @@ fn find_matching_closer(tokens: &[Token], start: usize) -> Result<usize> {
     })?;
     let kind = match opener.as_str() {
         "if" => "if",
-        "for" | "while" | "until" => "loop",
+        "for" | "select" | "while" | "until" => "loop",
         "case" => "case",
         _ => {
             return Err(WashError::syntax(format!(
@@ -531,12 +547,13 @@ fn find_matching_closer(tokens: &[Token], start: usize) -> Result<usize> {
     if is_cfor {
         arith_for_do_index(tokens, start)?;
     }
-    // A C-style `for` that reaches a closer which does not match the current
-    // nesting level is a yacc-layer error in bash: it reports the offending
-    // token (e.g. `for ((...)); do ...; fi` -> near `fi`), not the generic
-    // "unexpected EOF from `for'".  Plain loops share this scanner, so keep
-    // the near-token reporting scoped to the C-style form to avoid changing
-    // long-standing behaviour for `for NAME in` / `while` / `until`.
+    // A C-style `for` or a `select` that reaches a closer which does not
+    // match the current nesting level is a yacc-layer error in bash: it
+    // reports the offending token (e.g. `for ((...)); do ...; fi` -> near
+    // `fi`, `select x in a; do ...; fi` -> near `fi`), not the generic
+    // "unexpected EOF".  Plain loops keep the historical EOF behaviour.
+    let is_select = opener == "select";
+    let near_on_mismatch = is_cfor || is_select;
     let cfor_near = |tok: &str| -> WashError {
         WashError::syntax(format!("syntax error near unexpected token `{}'", tok))
     };
@@ -545,7 +562,7 @@ fn find_matching_closer(tokens: &[Token], start: usize) -> Result<usize> {
     while i < tokens.len() {
         if let Token::Reserved(name, _) = &tokens[i] {
             match name.as_str() {
-                "if" | "for" | "while" | "until" | "case" => {
+                "if" | "for" | "select" | "while" | "until" | "case" => {
                     stack.push(match name.as_str() {
                         "if" => "if",
                         "case" => "case",
@@ -555,21 +572,21 @@ fn find_matching_closer(tokens: &[Token], start: usize) -> Result<usize> {
                 "fi" => {
                     if *stack.last().unwrap_or(&"") == "if" {
                         stack.pop();
-                    } else if is_cfor {
+                    } else if near_on_mismatch {
                         return Err(cfor_near(name));
                     }
                 }
                 "esac" => {
                     if *stack.last().unwrap_or(&"") == "case" {
                         stack.pop();
-                    } else if is_cfor {
+                    } else if near_on_mismatch {
                         return Err(cfor_near(name));
                     }
                 }
                 "done" => {
                     if *stack.last().unwrap_or(&"") == "loop" {
                         stack.pop();
-                    } else if is_cfor {
+                    } else if near_on_mismatch {
                         return Err(cfor_near(name));
                     }
                 }
@@ -649,6 +666,63 @@ enum LoopBodyStart {
     Brace(usize),
 }
 
+/// Reject an empty loop body.  bash treats `do; done`, `do ;; done` and
+/// `do done` as yacc errors, but it names the offending token according to
+/// what is actually between `do` and the closer:
+///
+///   * a typed `;`          -> near `;'`
+///   * a `;;` pair          -> near `;;'
+///   * only newlines (or nothing) -> near the closer (`done`)
+///
+/// Only separators may appear between `do` and its closer for the body to
+/// count as empty; any other token means a real body.
+fn reject_empty_loop_body(body: &[Token], closer: Option<&Token>) -> Result<()> {
+    let only_seps = !body.is_empty() && body.iter().all(|t| matches!(t, Token::Semicolon(_)));
+    if !body.is_empty() && !only_seps {
+        return Ok(());
+    }
+    let closer_name = || match closer {
+        Some(Token::Reserved(n, _)) => n.clone(),
+        _ => "done".to_string(),
+    };
+    let closer_line = match closer {
+        Some(Token::Reserved(_, line)) => *line,
+        _ => 1,
+    };
+    // bash reports the physical line of the first offending separator when a
+    // typed `;` / `;;` is present (`while true; do; \ndone` -> line 1), and the
+    // closer's line when the body holds only newline separators or nothing
+    // (`while true; do\ndone` -> line 2).  NearToken makes the shell echo that
+    // source line instead of guessing from the compound opener.
+    let first_typed = body.iter().find_map(|t| match t {
+        Token::Semicolon(o)
+            if matches!(o.kind, SemicolonKind::Literal | SemicolonKind::DoubleLead) =>
+        {
+            Some(o)
+        }
+        _ => None,
+    });
+    let has_double = body.iter().any(|t| {
+        matches!(t, Token::Semicolon(o) if o.kind == SemicolonKind::DoubleLead)
+    });
+    let (line, shown) = match first_typed {
+        Some(o) => (
+            o.line,
+            if has_double {
+                ";;".to_string()
+            } else {
+                ";".to_string()
+            },
+        ),
+        None => (closer_line, closer_name()),
+    };
+    Err(WashError::syntax_unclosed(
+        DiagnosticFamily::NearToken,
+        line,
+        format!("syntax error near unexpected token `{}'", shown),
+    ))
+}
+
 /// Return the parsed body and the index just after its closer.
 ///
 /// Keeping this in one place makes the `do ... done` and `{ ... }` forms share
@@ -663,7 +737,12 @@ fn finish_loop_body(
         LoopBodyStart::Do(do_index) => {
             let end = find_matching_closer(tokens, start)?; // just after `done`
             let done_index = end - 1;
-            Ok((parse_command_list(&tokens[do_index + 1..done_index])?, end))
+            let body_tokens = &tokens[do_index + 1..done_index];
+            // bash rejects an empty loop body (`do; done` / `do done`) as a
+            // yacc error near the offending token.  Applies to every loop
+            // form: for / select / while / until.
+            reject_empty_loop_body(body_tokens, tokens.get(done_index))?;
+            Ok((parse_command_list(body_tokens)?, end))
         }
         LoopBodyStart::Brace(brace_start) => {
             let (group, end) = parse_group_compound(tokens, brace_start)?;
@@ -685,6 +764,14 @@ fn parse_for_compound(tokens: &[Token], start: usize) -> Result<(Compound, usize
     // NAME is the word right after `for`.
     let name = match tokens.get(start + 1) {
         Some(Token::Word(parts)) if is_plain_ident(parts) => plain_text(parts),
+        // bash's yacc layer names the actual token where the loop variable
+        // should be (`for; do ...` -> `;`, not a fixed "expected" message).
+        Some(tok) if !matches!(tok, Token::Word(_)) => {
+            return Err(WashError::syntax(format!(
+                "syntax error near unexpected token `{}'",
+                token_near_text(tok)
+            )))
+        }
         _ => {
             return Err(WashError::syntax(
                 "syntax error near unexpected token (expected a loop variable)",
@@ -719,7 +806,7 @@ fn parse_for_compound(tokens: &[Token], start: usize) -> Result<(Compound, usize
                     words.push(parts.clone());
                     i += 1;
                 }
-                Token::Semicolon => {
+                Token::Semicolon(_) => {
                     // end of the word list; `do` or `{` follows.
                     i += 1;
                     if is_word_text(tokens.get(i), "{") {
@@ -741,7 +828,7 @@ fn parse_for_compound(tokens: &[Token], start: usize) -> Result<(Compound, usize
     } else {
         // No `in`: `do` may follow NAME directly, but a brace group still
         // needs the separating `;` (`for i { ...; }` is a yacc error).
-        if matches!(tokens.get(i), Some(Token::Semicolon)) {
+        if matches!(tokens.get(i), Some(Token::Semicolon(_))) {
             i += 1;
         } else if is_word_text(tokens.get(i), "{") {
             return Err(WashError::syntax(
@@ -770,6 +857,128 @@ fn parse_for_compound(tokens: &[Token], start: usize) -> Result<(Compound, usize
             var: name,
             words,
             body,
+        },
+        end,
+    ))
+}
+
+/// Parse `select NAME [in WORDS] ; do BODY ; done` starting at the `select`
+/// token.  Unlike `for`, bash accepts *any* word as NAME here and defers the
+/// identifier check to execution time (so `select 1 in a; do ...; done` parses
+/// and then reports `` `1': not a valid identifier'') — that is why the
+/// executor carries `line` and calls `is_valid_ident` itself.
+fn parse_select_compound(tokens: &[Token], start: usize, line: usize) -> Result<(Compound, usize)> {
+    // NAME is the word right after `select`; keep its raw source text so the
+    // execution-time diagnostic renders it the way bash does.
+    let var = match tokens.get(start + 1) {
+        Some(Token::Word(parts)) => word_source_text(parts),
+        // `select; do ...` is a yacc error naming the offending token,
+        // e.g. `select; do echo hi; done` -> near `;`.
+        Some(tok) if !matches!(tok, Token::Word(_)) => {
+            return Err(WashError::syntax(format!(
+                "syntax error near unexpected token `{}'",
+                token_near_text(tok)
+            )))
+        }
+        _ => {
+            return Err(WashError::syntax(
+                "syntax error near unexpected token (expected a loop variable)",
+            ))
+        }
+    };
+
+    let mut words: Vec<Vec<WordPart>> = Vec::new();
+    let mut i = start + 2;
+    let body_start;
+    if is_word_text(tokens.get(i), "in") {
+        i += 1;
+        loop {
+            if i >= tokens.len() {
+                return Err(WashError::syntax(
+                    "syntax error: unexpected end of file",
+                ));
+            }
+            match &tokens[i] {
+                Token::Word(parts) if is_plain_text(parts) && plain_text(parts) == "}" => {
+                    return Err(WashError::syntax(
+                        "syntax error near unexpected token `}'",
+                    ));
+                }
+                Token::Word(parts) => {
+                    words.push(parts.clone());
+                    i += 1;
+                }
+                Token::Semicolon(_) => {
+                    i += 1;
+                    if is_word_text(tokens.get(i), "{") {
+                        body_start = LoopBodyStart::Brace(i);
+                        break;
+                    }
+                    if matches!(tokens.get(i), Some(Token::Reserved(r, _)) if r == "do") {
+                        body_start = LoopBodyStart::Do(i);
+                        break;
+                    }
+                    // After the word list's `;`, bash requires `do` or `{`.
+                    // Anything else is a yacc error near that token.
+                    let shown = match tokens.get(i) {
+                        Some(Token::Word(parts)) => plain_text(parts),
+                        Some(Token::Reserved(n, _)) => n.clone(),
+                        Some(Token::Semicolon(_)) => ";".to_string(),
+                        _ => return Err(WashError::syntax("syntax error: unexpected end of file")),
+                    };
+                    return Err(WashError::syntax(format!(
+                        "syntax error near unexpected token `{}'",
+                        shown
+                    )));
+                }
+                Token::Reserved(r, _) if r == "do" => {
+                    body_start = LoopBodyStart::Do(i);
+                    break;
+                }
+                _ => {
+                    return Err(WashError::syntax(
+                        "syntax error near unexpected token (expected `do')",
+                    ))
+                }
+            }
+        }
+    } else {
+        // `select NAME` with no `in`: a following bare word is a yacc error
+        // (bash: `select x y in ...` -> near `y`); select does not treat extra
+        // words as an implicit list the way a malformed `for` might.
+        if let Some(shown) = match tokens.get(i) {
+            Some(Token::Word(parts)) => Some(plain_text(parts)),
+            Some(Token::Reserved(n, _)) => Some(n.clone()),
+            _ => None,
+        } {
+            return Err(WashError::syntax(format!(
+                "syntax error near unexpected token `{}'",
+                shown
+            )));
+        }
+        if matches!(tokens.get(i), Some(Token::Semicolon(_))) {
+            i += 1;
+        }
+        if is_word_text(tokens.get(i), "{") {
+            body_start = LoopBodyStart::Brace(i);
+        } else if matches!(tokens.get(i), Some(Token::Reserved(r, _)) if r == "do") {
+            body_start = LoopBodyStart::Do(i);
+        } else {
+            return Err(WashError::syntax(
+                "syntax error near unexpected token (expected `do')",
+            ));
+        }
+        // Without `in`, select iterates the positional parameters as `"$@"`.
+        words.push(vec![WordPart::Var("@".to_string(), true)]);
+    }
+
+    let (body, end) = finish_loop_body(tokens, start, body_start)?;
+    Ok((
+        Compound::Select {
+            var,
+            words,
+            body,
+            line,
         },
         end,
     ))
@@ -836,7 +1045,7 @@ fn split_arith_clauses(expr: &str) -> Vec<String> {
 /// examined.  Returns the index of the `do` token.
 fn arith_for_do_index(tokens: &[Token], start: usize) -> Result<usize> {
     let mut i = start + 2;
-    if matches!(tokens.get(i), Some(Token::Semicolon)) {
+    if matches!(tokens.get(i), Some(Token::Semicolon(_))) {
         i += 1;
     }
     match tokens.get(i) {
@@ -872,7 +1081,7 @@ fn arith_for_do_index(tokens: &[Token], start: usize) -> Result<usize> {
 /// and a brace group `{ ... }` after the header; the latter has no `done`.
 fn arith_for_body_index(tokens: &[Token], start: usize) -> Result<LoopBodyStart> {
     let mut i = start + 2;
-    if matches!(tokens.get(i), Some(Token::Semicolon)) {
+    if matches!(tokens.get(i), Some(Token::Semicolon(_))) {
         i += 1;
     }
     if is_word_text(tokens.get(i), "{") {
@@ -952,8 +1161,13 @@ fn parse_while_until_compound(
     };
     let end = find_matching_closer(tokens, start)?; // just after `done`
     let done_index = end - 1;
+    let body_tokens = &tokens[do_index + 1..done_index];
+    // `while`/`until` need the same empty-body rejection as `for`/`select`:
+    // without it `while true; do ; ; done` parses as an endless no-op loop
+    // instead of yacc-failing near the stray separator / closer.
+    reject_empty_loop_body(body_tokens, tokens.get(done_index))?;
     let condition = parse_command_list(&tokens[start + 1..do_index])?;
-    let body = parse_command_list(&tokens[do_index + 1..done_index])?;
+    let body = parse_command_list(body_tokens)?;
     Ok((
         Compound::While {
             condition,
@@ -1061,10 +1275,10 @@ fn parse_case_compound(tokens: &[Token], start: usize) -> Result<(Compound, usiz
                 {
                     depth -= 1;
                 }
-                Token::Semicolon
+                Token::Semicolon(_)
                     if depth == 0
                         && body_end + 1 < tokens.len()
-                        && matches!(tokens.get(body_end + 1), Some(Token::Semicolon)) =>
+                        && matches!(tokens.get(body_end + 1), Some(Token::Semicolon(_))) =>
                 {
                     break;
                 }
@@ -1078,9 +1292,9 @@ fn parse_case_compound(tokens: &[Token], start: usize) -> Result<(Compound, usiz
 
         // Advance past the `;;` terminator if present.
         if body_end < tokens.len()
-            && matches!(tokens.get(body_end), Some(Token::Semicolon))
+            && matches!(tokens.get(body_end), Some(Token::Semicolon(_)))
             && body_end + 1 < tokens.len()
-            && matches!(tokens.get(body_end + 1), Some(Token::Semicolon))
+            && matches!(tokens.get(body_end + 1), Some(Token::Semicolon(_)))
         {
             i = body_end + 2;
         } else {
@@ -1231,6 +1445,56 @@ fn plain_text(parts: &[WordPart]) -> String {
     s
 }
 
+/// Reconstruct a word's source spelling for diagnostics (e.g. the NAME of a
+/// `select` that fails identifier validation).  Quoted parts are re-wrapped so
+/// `select "x" in ...` renders as `"x"`.  This is intentionally best-effort:
+/// single-quoted forms collapse to the double-quoted spelling, a documented
+/// narrow edge (see docs/compatibility.md).
+fn word_source_text(parts: &[WordPart]) -> String {
+    let mut s = String::new();
+    for p in parts {
+        match p {
+            WordPart::Text(t, true) => {
+                s.push('"');
+                s.push_str(t);
+                s.push('"');
+            }
+            WordPart::Text(t, false) => s.push_str(t),
+            WordPart::Var(n, _) => {
+                s.push('$');
+                s.push_str(n);
+            }
+            WordPart::Braced(b, _) => {
+                s.push_str("${");
+                s.push_str(b);
+                s.push('}');
+            }
+            WordPart::CmdSub(b, _) => {
+                s.push_str("$(");
+                s.push_str(b);
+                s.push(')');
+            }
+            WordPart::Backtick(b, _) => {
+                s.push('`');
+                s.push_str(b);
+                s.push('`');
+            }
+            WordPart::Arith(b, _) => {
+                s.push_str("((");
+                s.push_str(b);
+                s.push_str("))");
+            }
+            WordPart::Tilde => s.push('~'),
+            WordPart::Brace(alts) => {
+                s.push('{');
+                s.push_str(&alts.join(","));
+                s.push('}');
+            }
+        }
+    }
+    s
+}
+
 /// If `text` is `IDENT(...)` (an identifier followed by balanced parens and
 /// nothing else), return the identifier.  `f` and `f()` both yield `f`.
 fn ident_in_parens(text: &str) -> Option<String> {
@@ -1300,7 +1564,7 @@ pub fn parse_command_list(tokens: &[Token]) -> Result<CommandList> {
                     _ => AndOrOp::Or,
                 });
             }
-            Token::Semicolon => {
+            Token::Semicolon(_) => {
                 if !stage.is_empty() {
                     if is_bare_coproc(&stage) {
                         return Err(WashError::syntax(
@@ -1399,7 +1663,7 @@ fn flush_andor(
     Ok(())
 }
 
-fn is_valid_ident(s: &str) -> bool {
+pub fn is_valid_ident(s: &str) -> bool {
     let mut chars = s.chars();
     match chars.next() {
         Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
@@ -1558,7 +1822,7 @@ fn token_near_text(tok: &Token) -> String {
     match tok {
         Token::Reserved(name, _) => name.clone(),
         Token::Word(parts) => plain_text(parts),
-        Token::Semicolon => ";".to_string(),
+        Token::Semicolon(_) => ";".to_string(),
         Token::Pipe => "|".to_string(),
         Token::AndAnd => "&&".to_string(),
         Token::OrOr => "||".to_string(),
@@ -1656,6 +1920,7 @@ fn parse_simple(tokens: &[Token]) -> Result<SimpleCommand> {
                         match c {
                             Compound::If { .. } => "if",
                             Compound::For { .. } | Compound::ArithFor { .. } => "for",
+                            Compound::Select { .. } => "select",
                             Compound::While { .. } => "while",
                             Compound::Case { .. } => "case",
                             Compound::Group { .. } => "{",
@@ -1739,7 +2004,7 @@ fn parse_simple(tokens: &[Token]) -> Result<SimpleCommand> {
                 i += 2;
                 continue;
             }
-            Token::Pipe | Token::Semicolon | Token::Background | Token::AndAnd | Token::OrOr => {
+            Token::Pipe | Token::Semicolon(_) | Token::Background | Token::AndAnd | Token::OrOr => {
                 return Err(WashError::syntax("syntax error: unexpected token in command"));
             }
             Token::FunctionDef(_) => {

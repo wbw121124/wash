@@ -102,6 +102,27 @@ pub enum RedirKind {
     HereString,
 }
 
+/// Where a command-separating `;` came from.  bash's yacc layer names the
+/// offending token differently for a typed `;`, a `;;` case terminator and a
+/// newline acting as a separator, so the origin must survive tokenization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemicolonKind {
+    /// A literal `;` typed by the user.
+    Literal,
+    /// The first `;` of a `;;` pair (the second one is tokenized next).
+    DoubleLead,
+    /// A newline standing in for `;`.
+    Newline,
+}
+
+/// A separator's kind together with its 1-based physical source line, so a
+/// parse error can report and echo the exact offending line like bash does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SemicolonOrigin {
+    pub kind: SemicolonKind,
+    pub line: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Token {
     Word(Vec<WordPart>),
@@ -159,7 +180,7 @@ pub enum Token {
     /// The `||` operator: run the next pipeline only when the previous one
     /// failed.
     OrOr,
-    Semicolon,
+    Semicolon(SemicolonOrigin),
     Background,
     Redirect {
         kind: RedirKind,
@@ -416,7 +437,7 @@ fn word_is_assignment(parts: &[WordPart], pending: &str) -> bool {
 fn in_assignment_prefix(tokens: &[Token]) -> bool {
     for t in tokens.iter().rev() {
         match t {
-            Token::Semicolon | Token::Background | Token::Pipe
+            Token::Semicolon(_) | Token::Background | Token::Pipe
             | Token::AndAnd | Token::OrOr => return true,
             Token::Word(parts) => {
                 if !word_is_assignment(parts, "") {
@@ -1297,6 +1318,17 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                     i += 1;
                 }
             }
+            '#' if parts.is_empty() && pending.is_empty() && cond_depth == 0 => {
+                // bash starts a comment only at the start of a word, outside
+                // quotes and `[[ ]]`.  A `#` in the middle of a word (`a#b`),
+                // inside quotes, or in a conditional expression is literal.
+                // Skip to end of line WITHOUT consuming the newline: the next
+                // iteration turns it into the usual command separator, which
+                // is also what makes `> #f` report a missing redirect target.
+                while i < n && chars[i] != '\n' {
+                    i += 1;
+                }
+            }
             ' ' | '\t' => {
                 flush_text(&mut pending, &mut parts, pending_quoted);
                 if !parts.is_empty() {
@@ -1333,13 +1365,17 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                 // text until the terminator and tokenization resumes after.
                 let (next_i, body_lines) =
                     collect_heredocs(&mut tokens, &mut pending_heredocs, &chars, i + 1);
+                let sep_line = line_no;
                 line_no += 1 + body_lines;
                 if cond_depth > 0 {
                     // Inside `[[ ]]` a newline is a token of its own: the
                     // conditional parser skips it only at the start of a term.
                     tokens.push(Token::CondNewline);
                 } else {
-                    tokens.push(Token::Semicolon);
+                    tokens.push(Token::Semicolon(SemicolonOrigin {
+                        kind: SemicolonKind::Newline,
+                        line: sep_line,
+                    }));
                     at_command_start = true;
                 }
                 i = next_i;
@@ -1407,7 +1443,15 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                     redirect_missing_target = true;
                     redirect_target = false;
                 }
-                tokens.push(Token::Semicolon);
+                // A `;;` pair is tokenized as two semicolons (the case parser
+                // still sees both), but the first one is marked so an empty
+                // loop body can report bash's `;;` instead of `;`.
+                let kind = if i + 1 < n && chars[i + 1] == ';' {
+                    SemicolonKind::DoubleLead
+                } else {
+                    SemicolonKind::Literal
+                };
+                tokens.push(Token::Semicolon(SemicolonOrigin { kind, line: line_no }));
                 at_command_start = true;
                 i += 1;
             }

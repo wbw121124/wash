@@ -337,18 +337,7 @@ impl<'a> CondParser<'a> {
                         })
                     }
                     other => {
-                        let full = other
-                            .as_ref()
-                            .map(|t| {
-                                // Prefer the raw source text for CondWord (preserves quotes),
-                                // fall back to render_token for ordinary Word tokens.
-                                if matches!(t, Token::CondWord(_, _)) {
-                                    raw_token(t).to_string()
-                                } else {
-                                    render_token(t)
-                                }
-                            })
-                            .unwrap_or_default();
+                        let full = other.as_ref().map(render_token).unwrap_or_default();
                         let near = other.as_ref().map(render_token_near).unwrap_or_default();
                         Err(CondError::new(
                             format!(
@@ -475,7 +464,7 @@ fn raw_token(tok: &Token) -> String {
         Token::CondOp(op) => op.clone(),
         Token::CondNumber(n) => n.clone(),
         Token::CondNewline => "newline".to_string(),
-        Token::Semicolon => ";".to_string(),
+        Token::Semicolon(_) => ";".to_string(),
         Token::AndAnd => "&&".to_string(),
         Token::OrOr => "||".to_string(),
         Token::Pipe => "|".to_string(),
@@ -495,7 +484,14 @@ fn raw_token(tok: &Token) -> String {
 /// ``$'='``).
 fn render_token(tok: &Token) -> String {
     let raw = raw_token(tok);
-    if matches!(tok, Token::CondWord(_, _)) && (raw.starts_with("$'") || raw.starts_with("$\"")) {
+    // bash drops the `$` of an ANSI-C / locale quoted word in the
+    // conditional parser's own message (`[[ a $'=' a ]]` -> ``'=''').  The
+    // word may arrive here as a plain `Word` (when the `$'...'` scanner
+    // produced a single quoted Text part) rather than a `CondWord`, so key
+    // off the rendered text itself instead of only the token variant.  The
+    // yacc-layer `syntax error near` line deliberately keeps the `$` and is
+    // rendered by `render_token_near`, which is untouched.
+    if raw.starts_with("$'") || raw.starts_with("$\"") {
         return raw[1..].to_string();
     }
     raw

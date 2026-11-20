@@ -163,10 +163,38 @@ GROUP A）：单目/双目/文件/数值/字符串/模式/ERE 运算、`BASH_REM
 `syntax error near` 行与未闭合 `(` 的词法 EOF）。畸形 token 按 bash 的原始源码
 文本渲染：引号、反斜杠转义与 `$'...'` 的 `$` 前缀照原样出现在 conditional 消息中，
 yacc `near` 行只取最后一个空白之后的部分；被转义的 `=` 是字面词而非运算符（rc=2）。
-heredoc `<<`/`<<-`/herestring `<<<` 曾为 rc=2
-（后续已实现）；`select` → 语法错误；`shopt -s nullglob` → `invalid shell option name`；
-已对齐：if/for/while/until/case、函数、eval、mapfile、local、`>|`、`exec 3>&-`、
-`declare -A`、`getopts`、`trap -l`、`(( ))`、数组下标赋值、
+`select` 与 `shopt -s nullglob` 已实现并与 bash 5.3 逐字节对齐（44 条 GROUP A
+栅栏，另有 18 条 QA 残留栅栏覆盖注释词法/空 body 诊断/readonly 循环变量，
+见 `tests/bash_diff_builtins.sh`）：
+- **`select NAME [in WORDS]; do BODY; done`**：stderr 打印编号菜单与 `PS3`
+  （默认 `#? `，设为空则不显示）；stdin 按 bash 默认 `read` 语义读取（反斜杠
+  引用下一字符、`\`+换行续行）到 `REPLY`；非法选择执行 body 且 NAME 为空；
+  空行清空 REPLY 并在下一周期重显菜单；EOF 清空 REPLY、向 stdout 写一个裸
+  `\n`、不执行 body、rc=1；`break`/`continue N` 与 for 一致传播；NAME 允许
+  任意词，非法标识符执行期报 `` `X': not a valid identifier``；`do; done` /
+  `do done` 等空 body 与不匹配 closer 按 bash yacc 诊断（near `;` / `done` /
+  `fi`）。`{ LIST; }` 亦可作 body。
+- **`shopt -s/-u nullglob`**：未匹配的无引号通配展开为零字段，经
+  `capture_command` / fork 子进程透传到命令替换；加引号的模式不受影响。
+  `shopt` 列宽固定 20，具名查询 rc 仅当全部 on 为 0，支持 bundled 短选项
+  （`-qs` / `-oq`）、`-s`/`-u` 无参数列状态子集、`-su` 冲突报错、`-o` 走
+  `set -o` 名字校验与 `set ±o` 输出。
+- **`#` 注释词法**（QA 复核补齐）：词首 `#`（不在引号内、非词中、非
+  `cond`、非重定向 target 位）吃掉到行尾；词中 `a#b` 与引号内 `"a # b"`
+  是字面量；`echo hi >#f` 按 bash 报重定向缺 target（near `newline`）。
+- **readonly 循环变量**：`for`/`select` 的目标变量为 readonly 时，bash
+  在赋值处报 `X: readonly variable`、跳过 body、循环状态 1（select 保留
+  菜单/PS3/REPLY 副作用），wash 逐字节一致。
+- **三处仍如实登记的窄边界**：① `shopt` 全表仅含 wash 实现的 3 个选项
+  （`expand_aliases` / `nullglob` / `sourcepath`），与 bash 60+ 项全表输出
+  不同；② `select` 单列菜单 ≤9 项逐字节一致，但 10 项时 bash 把编号
+  右对齐为 ` 1) …`（wash 左对齐 `1) …`），≥11 项 bash 用制表符分列
+  （`1) 1\t 3) 3\t…`，列数随 COLUMNS=80 变化）而 wash 用空格补齐——
+  均为纯显示布局差异，不影响选择语义；③ 关联数组多字符键哈希冲突时
+  的遍历顺序、同一命令内 `$((x++))` 与后续 `$x` 的展开时序（历史窄边界）。
+
+其余已对齐：if/for/while/until/case、函数、eval、mapfile、local、`>|`、
+`exec 3>&-`、`declare -A`、`getopts`、`trap -l`、`(( ))`、数组下标赋值、
 `${!pre*}`、`$(( ))`、heredoc/herestring、未闭合 `$(`、重定向逐行部分执行等。
 
 详细根因存档见 `AGENTS.md`「内建兼容性矩阵 → 已修复缺陷的根因存档」。
