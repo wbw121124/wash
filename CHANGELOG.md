@@ -8,9 +8,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed（有意偏离，用户 2026-11-10 裁决）
 
 - **新增单一「有意偏离清单」** `docs/intentional-divergences.md`，登记 wash 相对
-  MSYS2 bash 5.3.20 oracle 的全部 **2 条**有意逐字节例外：既有的 `help -m`
-  IMPLEMENTATION footer（D-001，wash 身份段）与本次新增的 `help job_spec` 可查
-  （D-002）。任何新增 / 删除偏离必须同步该清单、代码真源、生成脚本静态锁、
+  MSYS2 bash 5.3.20 oracle 的全部 **3 条**有意逐字节例外：既有的 `help -m`
+  IMPLEMENTATION footer（D-001，wash 身份段）、`help job_spec` 可查（D-002）与
+  `enable -f` 显式路径白名单（D-003，oracle 构建未启用动态加载、无可对齐语义）。任何新增 / 删除偏离必须同步该清单、代码真源、生成脚本静态锁、
   `tests/bash_diff_help.sh` 的固定用例计数与下方登记行。
 - **`help job_spec` / `help 'job_spec [&]'` 现在可查（D-002）**：用户明确要求
   「无参清单第 2 项列出却查不到」这一 UX 痛点必须修好，**全局生效（含非交互

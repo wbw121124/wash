@@ -629,6 +629,9 @@ fn parse_if_compound(tokens: &[Token], start: usize) -> Result<(Compound, usize)
     loop {
         // The condition list ends at the `then`.
         let (condition, next) = split_until_reserved(tokens, i, &["then"])?;
+        // An empty condition (`if then ...; fi`, `if ; then ...; fi`) is a
+        // bash syntax error near the offending token.
+        reject_empty_if_condition(&condition, tokens.get(next))?;
         // The body list ends at the next `elif`, `else` or `fi`.
         let (body, next) = split_until_reserved(tokens, next + 1, &["elif", "else", "fi"])?;
         branches.push((parse_command_list(&condition)?, parse_command_list(&body)?));
@@ -653,6 +656,41 @@ fn parse_if_compound(tokens: &[Token], start: usize) -> Result<(Compound, usize)
     }
 
     Ok((Compound::If { branches, else_body }, i))
+}
+
+/// Reject an empty `if` / `elif` condition.  bash treats `if then ...; fi`,
+/// `if ; then ...; fi` and `if\nthen ...` as yacc errors, naming the
+/// offending token:
+///
+///   * a typed `;` -> near `;'
+///   * nothing (or only newlines) -> near `then' (reported at its line)
+fn reject_empty_if_condition(condition: &[Token], then_tok: Option<&Token>) -> Result<()> {
+    let only_seps =
+        !condition.is_empty() && condition.iter().all(|t| matches!(t, Token::Semicolon(_)));
+    if !condition.is_empty() && !only_seps {
+        return Ok(());
+    }
+    let then_line = match then_tok {
+        Some(Token::Reserved(_, line)) => *line,
+        _ => 1,
+    };
+    let first_typed = condition.iter().find_map(|t| match t {
+        Token::Semicolon(o)
+            if matches!(o.kind, SemicolonKind::Literal | SemicolonKind::DoubleLead) =>
+        {
+            Some(o)
+        }
+        _ => None,
+    });
+    let (line, shown) = match first_typed {
+        Some(o) => (o.line, ";".to_string()),
+        None => (then_line, "then".to_string()),
+    };
+    Err(WashError::syntax_unclosed(
+        DiagnosticFamily::NearToken,
+        line,
+        format!("syntax error near unexpected token `{}'", shown),
+    ))
 }
 
 /// Where a loop's body begins after its header.
@@ -1166,6 +1204,9 @@ fn parse_while_until_compound(
     // without it `while true; do ; ; done` parses as an endless no-op loop
     // instead of yacc-failing near the stray separator / closer.
     reject_empty_loop_body(body_tokens, tokens.get(done_index))?;
+    // An empty condition (`while do ...; done`, `while ; do ...; done`) is a
+    // bash syntax error near `do' / the typed separator.
+    reject_empty_loop_body(&tokens[start + 1..do_index], tokens.get(do_index))?;
     let condition = parse_command_list(&tokens[start + 1..do_index])?;
     let body = parse_command_list(body_tokens)?;
     Ok((
@@ -1227,6 +1268,12 @@ fn parse_case_compound(tokens: &[Token], start: usize) -> Result<(Compound, usiz
             match &tokens[i] {
                 Token::Word(parts) if is_plain_text(parts) => {
                     let text = plain_text(parts);
+                    // A single leading `(` before the first pattern is
+                    // decoration (`case x in (a) ...`), exactly like bash.
+                    if text == "(" && current.is_empty() && !saw_pipe {
+                        i += 1;
+                        continue;
+                    }
                     // The arm head ends at the `)` delimiter.
                     if text == ")" {
                         if !current.is_empty() || saw_pipe {
@@ -1323,6 +1370,17 @@ fn parse_function_kw(tokens: &[Token], start: usize) -> Result<(FuncDef, usize)>
     {
         i += 1;
     }
+    // Body forms: `{ LIST; }`, `( LIST )` or a compound command
+    // (`function f (subshell)`, `function f for ...; done`).
+    if matches!(tokens.get(i), Some(Token::Word(parts)) if is_plain_text(parts) && plain_text(parts) == "(")
+    {
+        let (compound, end) = parse_subshell_compound(tokens, i)?;
+        return Ok((FuncDef { name, body: compound_body_list(compound) }, end));
+    }
+    if is_reserved_compound_kw(tokens.get(i)) {
+        let (compound, end) = parse_reserved_body_compound(tokens, i)?;
+        return Ok((FuncDef { name, body: compound_body_list(compound) }, end));
+    }
     // Skip the `{` that opens the function body so `parse_func_body` scans the
     // body (it expects `open_index` to be just past the opener).
     if matches!(tokens.get(i), Some(Token::Word(parts)) if is_plain_text(parts) && plain_text(parts) == "{")
@@ -1333,44 +1391,140 @@ fn parse_function_kw(tokens: &[Token], start: usize) -> Result<(FuncDef, usize)>
     Ok((FuncDef { name, body }, end))
 }
 
-/// Detect and parse a `NAME() { BODY }` or `NAME () { BODY }` definition at
-/// index `i` (a plain word).  Returns the definition and the index just after
-/// the closing `}` when one is found, otherwise `None`.
+/// The reserved words that may open a compound command used as a function
+/// body (`f() for ...`, `f() if ...`, `f() case ... esac`).
+fn is_reserved_compound_kw(tok: Option<&Token>) -> bool {
+    matches!(tok, Some(Token::Reserved(r, _))
+        if matches!(r.as_str(), "if" | "for" | "while" | "until" | "case" | "select"))
+}
+
+/// Parse a compound command (if/for/while/until/case/select) at reserved-word
+/// index `i`.  Used for compound function bodies.
+fn parse_reserved_body_compound(tokens: &[Token], i: usize) -> Result<(Compound, usize)> {
+    match tokens.get(i) {
+        Some(Token::Reserved(name, line)) => match name.as_str() {
+            "if" => parse_if_compound(tokens, i),
+            "for" => parse_for_compound(tokens, i),
+            "while" => parse_while_until_compound(tokens, i, false),
+            "until" => parse_while_until_compound(tokens, i, true),
+            "case" => parse_case_compound(tokens, i),
+            "select" => parse_select_compound(tokens, i, *line),
+            _ => Err(WashError::syntax(format!(
+                "syntax error near unexpected token `{}'",
+                name
+            ))),
+        },
+        _ => Err(WashError::syntax("syntax error near unexpected token")),
+    }
+}
+
+/// Wrap a single compound command as a one-command `CommandList` so it can
+/// serve as a function body (`f() (subshell)`, `f() for ...`, ...).  The
+/// executor dispatches `SimpleCommand.compound` exactly like a standalone
+/// `( ... )` / `for ... done` — keeping the subshell semantics intact.
+fn compound_body_list(c: Compound) -> CommandList {
+    CommandList {
+        andors: vec![AndOr::single(Pipeline {
+            commands: vec![SimpleCommand {
+                argv: Vec::new(),
+                redirs: Vec::new(),
+                assignments: Vec::new(),
+                array_assignments: Vec::new(),
+                compound: Some(c),
+            }],
+            background: false,
+        })],
+        func_defs: Vec::new(),
+    }
+}
+
+/// Detect and parse a `NAME() { BODY }` / `NAME () { BODY }` definition at
+/// index `i` (a plain word).  The body may also be a subshell (`f() ( ... )`)
+/// or a compound command (`f() for ...; done`) — both are valid bash.  Returns
+/// the definition and the index just after the body, otherwise `None`.
 fn try_parse_funcdef(tokens: &[Token], i: usize) -> Result<Option<(FuncDef, usize)>> {
-    // Compact form: `NAME()` directly followed by `{`.
+    // Compact form: `NAME()` directly followed by the body opener.
     if let Some(Token::Word(parts)) = tokens.get(i) {
         if is_plain_text(parts) {
             let text = plain_text(parts);
             if let Some(name) = ident_in_parens(&text) {
-                if matches!(tokens.get(i + 1), Some(Token::Word(p)) if is_plain_text(p) && plain_text(p) == "{")
-                {
-                    let (body, end) = parse_func_body(tokens, i + 2)?;
-                    return Ok(Some((FuncDef { name, body }, end)));
+                if let Some(Token::Word(p)) = tokens.get(i + 1) {
+                    if is_plain_text(p) && plain_text(p) == "{" {
+                        let (body, end) = parse_func_body(tokens, i + 2)?;
+                        return Ok(Some((FuncDef { name, body }, end)));
+                    }
+                    if is_plain_text(p) && plain_text(p) == "(" {
+                        // `f() (subshell)`
+                        let (compound, end) = parse_subshell_compound(tokens, i + 1)?;
+                        return Ok(Some((
+                            FuncDef {
+                                name,
+                                body: compound_body_list(compound),
+                            },
+                            end,
+                        )));
+                    }
+                }
+                if is_reserved_compound_kw(tokens.get(i + 1)) {
+                    // `f() for ...; done` etc.
+                    let (compound, end) = parse_reserved_body_compound(tokens, i + 1)?;
+                    return Ok(Some((
+                        FuncDef {
+                            name,
+                            body: compound_body_list(compound),
+                        },
+                        end,
+                    )));
                 }
             }
         }
     }
-    // Spaced form: `NAME` `(` `)` `{`.
+    // Spaced form: `NAME` `(` `)` then the body opener.
     if let (
         Some(Token::Word(a)),
         Some(Token::Word(b)),
         Some(Token::Word(c)),
-        Some(Token::Word(d)),
-    ) = (tokens.get(i), tokens.get(i + 1), tokens.get(i + 2), tokens.get(i + 3))
+    ) = (tokens.get(i), tokens.get(i + 1), tokens.get(i + 2))
     {
         if is_plain_ident(a)
             && is_plain_text(b)
             && plain_text(b) == "("
             && is_plain_text(c)
             && plain_text(c) == ")"
-            && is_plain_text(d)
-            && plain_text(d) == "{"
         {
-            let (body, end) = parse_func_body(tokens, i + 4)?;
-            return Ok(Some((FuncDef {
-                name: plain_text(a),
-                body,
-            }, end)));
+            match tokens.get(i + 3) {
+                Some(Token::Word(p)) if is_plain_text(p) && plain_text(p) == "{" => {
+                    let (body, end) = parse_func_body(tokens, i + 4)?;
+                    return Ok(Some((
+                        FuncDef {
+                            name: plain_text(a),
+                            body,
+                        },
+                        end,
+                    )));
+                }
+                Some(Token::Word(p)) if is_plain_text(p) && plain_text(p) == "(" => {
+                    let (compound, end) = parse_subshell_compound(tokens, i + 3)?;
+                    return Ok(Some((
+                        FuncDef {
+                            name: plain_text(a),
+                            body: compound_body_list(compound),
+                        },
+                        end,
+                    )));
+                }
+                _ => {}
+            }
+            if is_reserved_compound_kw(tokens.get(i + 3)) {
+                let (compound, end) = parse_reserved_body_compound(tokens, i + 3)?;
+                return Ok(Some((
+                    FuncDef {
+                        name: plain_text(a),
+                        body: compound_body_list(compound),
+                    },
+                    end,
+                )));
+            }
         }
     }
     Ok(None)
@@ -1533,6 +1687,9 @@ pub fn parse_command_list(tokens: &[Token]) -> Result<CommandList> {
     ) {
         return Err(WashError::syntax("syntax error: unexpected end of file"));
     }
+    // bash treats reserved words inside `name=( ... )` as literal array
+    // elements; rewrite them before compound extraction would reject them.
+    let tokens = &literalize_array_reserved(tokens)[..];
     // Extract compounds + function definitions first: each becomes a single
     // token that carries the parsed branches.
     let (tokens, funcs) = parse_compounds(tokens)?;
@@ -1541,14 +1698,41 @@ pub fn parse_command_list(tokens: &[Token]) -> Result<CommandList> {
     let mut ops: Vec<AndOrOp> = Vec::new();
     let mut current_cmds: Vec<SimpleCommand> = Vec::new();
     let mut stage: Vec<Token> = Vec::new();
+    // True directly after a `|`: bash requires a command there (`a | | b`
+    // and `a | ; b` are syntax errors near the offending token).
+    let mut after_pipe = false;
+    // True when the previous flat token was a function definition (a piped
+    // funcdef keeps its old empty-command pipeline behaviour).
+    let mut last_was_funcdef = false;
 
     for t in &tokens {
         match t {
             Token::Pipe => {
-                current_cmds.push(parse_simple(&stage)?);
-                stage.clear();
+                if stage.is_empty() {
+                    if last_was_funcdef {
+                        // `f() { :; } | cat` — a function definition piped
+                        // into a command runs as an (empty) pipeline member.
+                        current_cmds.push(parse_simple(&[])?);
+                    } else {
+                        return Err(WashError::syntax(
+                            "syntax error near unexpected token `|'",
+                        ));
+                    }
+                } else {
+                    current_cmds.push(parse_simple(&stage)?);
+                    stage.clear();
+                }
+                after_pipe = true;
+                last_was_funcdef = false;
             }
             Token::AndAnd | Token::OrOr => {
+                if after_pipe && stage.is_empty() {
+                    let shown = if matches!(t, Token::AndAnd) { "&&" } else { "||" };
+                    return Err(WashError::syntax(format!(
+                        "syntax error near unexpected token `{}'",
+                        shown
+                    )));
+                }
                 if !stage.is_empty() {
                     current_cmds.push(parse_simple(&stage)?);
                     stage.clear();
@@ -1563,8 +1747,15 @@ pub fn parse_command_list(tokens: &[Token]) -> Result<CommandList> {
                     Token::AndAnd => AndOrOp::And,
                     _ => AndOrOp::Or,
                 });
+                after_pipe = false;
+                last_was_funcdef = false;
             }
             Token::Semicolon(_) => {
+                if after_pipe && stage.is_empty() {
+                    return Err(WashError::syntax(
+                        "syntax error near unexpected token `;'",
+                    ));
+                }
                 if !stage.is_empty() {
                     if is_bare_coproc(&stage) {
                         return Err(WashError::syntax(
@@ -1581,8 +1772,15 @@ pub fn parse_command_list(tokens: &[Token]) -> Result<CommandList> {
                     });
                 }
                 flush_andor(&mut andors, &mut pipelines, &mut ops)?;
+                after_pipe = false;
+                last_was_funcdef = false;
             }
             Token::Background => {
+                if after_pipe && stage.is_empty() {
+                    return Err(WashError::syntax(
+                        "syntax error near unexpected token `&'",
+                    ));
+                }
                 if !stage.is_empty() {
                     if is_bare_coproc(&stage) {
                         return Err(WashError::syntax(
@@ -1599,10 +1797,13 @@ pub fn parse_command_list(tokens: &[Token]) -> Result<CommandList> {
                     });
                 }
                 flush_andor(&mut andors, &mut pipelines, &mut ops)?;
+                after_pipe = false;
+                last_was_funcdef = false;
             }
             // A function definition is a whole command that registers itself;
             // it produces no executable, so it is skipped here.
             Token::FunctionDef(_) => {
+                last_was_funcdef = true;
                 if !stage.is_empty() {
                     current_cmds.push(parse_simple(&stage)?);
                     stage.clear();
@@ -1614,9 +1815,18 @@ pub fn parse_command_list(tokens: &[Token]) -> Result<CommandList> {
                     });
                 }
                 flush_andor(&mut andors, &mut pipelines, &mut ops)?;
+                after_pipe = false;
             }
-            _ => stage.push(t.clone()),
+            _ => {
+                stage.push(t.clone());
+                after_pipe = false;
+                last_was_funcdef = false;
+            }
         }
+    }
+
+    if after_pipe && stage.is_empty() {
+        return Err(WashError::syntax("syntax error near unexpected token `newline'"));
     }
 
     if !stage.is_empty() {
@@ -1649,12 +1859,27 @@ fn flush_andor(
 ) -> Result<()> {
     if pipelines.is_empty() {
         if !ops.is_empty() {
-            return Err(WashError::syntax("syntax error near unexpected token"));
+            // bash names the dangling operator (`&& echo x` errors near `&&').
+            let shown = match ops.last() {
+                Some(AndOrOp::And) => "&&",
+                _ => "||",
+            };
+            return Err(WashError::syntax(format!(
+                "syntax error near unexpected token `{}'",
+                shown
+            )));
         }
         return Ok(());
     }
     if ops.len() + 1 != pipelines.len() {
-        return Err(WashError::syntax("syntax error near unexpected token"));
+        let shown = match ops.last() {
+            Some(AndOrOp::And) => "&&",
+            _ => "||",
+        };
+        return Err(WashError::syntax(format!(
+            "syntax error near unexpected token `{}'",
+            shown
+        )));
     }
     andors.push(AndOr {
         pipelines: std::mem::take(pipelines),
@@ -1686,7 +1911,15 @@ fn as_assignment(parts: &[WordPart]) -> Option<(String, Vec<WordPart>, bool)> {
     let mut in_subscript = false;
     for (i, p) in parts.iter().enumerate() {
         match p {
-            WordPart::Text(s, _) => {
+            WordPart::Text(s, quoted) => {
+                // bash: quoting any character in the name region (or the `=`
+                // itself) turns the word into an ordinary command word
+                // (`"x=y"` is `x=y: command not found`, not an assignment).
+                // Quoted text inside a subscript (`m["x"]`) is still part of
+                // the name.
+                if *quoted && !in_subscript {
+                    return None;
+                }
                 if let Some(pos) = s.find('=') {
                     eq_at = Some((i, pos));
                     break;
@@ -1811,6 +2044,79 @@ fn parse_array_assignment(
         j += 1;
     }
     None
+}
+
+/// bash treats every word inside `name=( ... )` as an array element, including
+/// reserved words (`a=(fi)` stores the literal string `fi`).  The lexer marks
+/// keywords positionally, so reserved tokens inside an array body must be
+/// rewritten into ordinary words before compound extraction sees them.
+fn literalize_array_reserved(tokens: &[Token]) -> Vec<Token> {
+    let mut out: Vec<Token> = Vec::with_capacity(tokens.len());
+    let mut i = 0usize;
+    let mut cmd_start = true;
+    while i < tokens.len() {
+        let tok = &tokens[i];
+        let cur_cmd_start = cmd_start;
+        // Track the command position for the NEXT token.  Assignment words
+        // (`a=1`) keep the command in its assignment prefix, so `a=1 b=(fi)`
+        // is two array/scalar assignments — bash accepts both.
+        match tok {
+            Token::Word(p) => {
+                cmd_start = cur_cmd_start && as_assignment(p).is_some();
+            }
+            Token::Semicolon(_)
+            | Token::Pipe
+            | Token::AndAnd
+            | Token::OrOr
+            | Token::Background
+            | Token::Reserved(..)
+            | Token::Redirect { .. } => cmd_start = true,
+            _ => cmd_start = false,
+        }
+        if cur_cmd_start {
+            if let Token::Word(p) = tok {
+                if is_array_assignment_head(p, tokens, i) {
+                    // Copy the head and the `(`, then convert reserved words
+                    // into plain words until the matching `)`.
+                    out.push(tok.clone());
+                    out.push(tokens[i + 1].clone());
+                    let mut j = i + 2;
+                    let mut depth = 1i32;
+                    while j < tokens.len() {
+                        match &tokens[j] {
+                            Token::Word(p) if is_plain_text(p) && plain_text(p) == "(" => {
+                                depth += 1;
+                                out.push(tokens[j].clone());
+                            }
+                            Token::Word(p) if is_plain_text(p) && plain_text(p) == ")" => {
+                                depth -= 1;
+                                out.push(tokens[j].clone());
+                                if depth == 0 {
+                                    j += 1;
+                                    break;
+                                }
+                            }
+                            Token::Reserved(name, _) => {
+                                out.push(Token::Word(vec![WordPart::Text(
+                                    name.clone(),
+                                    false,
+                                )]));
+                            }
+                            _ => out.push(tokens[j].clone()),
+                        }
+                        j += 1;
+                    }
+                    // An assignment prefix continues: `a=(1) b=(2)`.
+                    cmd_start = true;
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        out.push(tok.clone());
+        i += 1;
+    }
+    out
 }
 
 /// The token bash names in `syntax error near unexpected token `X'`.

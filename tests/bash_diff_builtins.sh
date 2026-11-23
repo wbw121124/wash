@@ -26,7 +26,7 @@
 #       'cd <WASH_REPO> && bash tests/bash_diff_builtins.sh'
 #
 # Optional: ONLY_GROUP=A|K|B|C|D runs a single group.
-#   A = core semantics + finished builtins (815 cases: 340 + 33 brace-range
+#   A = core semantics + finished builtins (833 cases: 340 + 33 brace-range
 #       + 24 brace word-boundary + 15 brace nest/escape/quote-removal
 #       + 1 brace deep-nesting stack guard + 37 heredoc / herestring
 #       + 11 unclosed `$(` syntax-error fence
@@ -91,7 +91,12 @@
 #          target; 9 empty-body near-token: `;;` vs newline-`;` vs literal `;`,
 #          for/select/while/until; 3 readonly loop variable).  comment-lines
 #          and while-newline-body use $'...' ANSI-C quoting in the harness.
-#       -> MUST stay green (regressions)
+#       + 18 P2-review fence (quoted assignment, case-paren in cmdsub, f()
+#          subshell body, array reserved words, empty pipe/if condition,
+#          $((x)) arithmetic string eval, byte-prefix strip, scalar [@],
+#          printf %n (incl. format-repeat counter reset), jobs invalid option
+#          / bare-word warning, bad jobspec, bad fd dup, ambiguous redirect,
+#          wait %N).  -> MUST stay green (regressions)
 #   K = KNOWN-DIFF: cannot be byte-equal by design (documented, not fixed)
 #   B = regression fence for already-fixed defects (GROUP B, 21 cases, green today)
 #   C = third-priority builtins (may not be implemented yet)
@@ -1771,6 +1776,27 @@ run_case_in A while-comment-body  ''   $'while true; do # comment\n done'
 run_case_in A sel-readonly        '1\n' 'declare -r x=old; select x in a b; do echo "GOT:$x"; break; done; echo "after=$?"'
 run_case A for-readonly           'declare -r x=old; for x in a b; do echo "GOT:$x"; done; echo "after=$?"'
 run_case A for-readonly-rc        'readonly x=old; for x in a b; do echo hi; done'
+
+# P2 修复轮回归栅栏（18 条）：review.md P2 清单逐条对拍后的关键语义，
+# 覆盖 lexer/parser/expand/arith/executor/builtins/help 六个域的修复。
+run_case A p2-quoted-assign       '"x=y"; echo rc=$?'
+run_case A p2-case-paren-sub      'echo $(case a in a) echo yes;; esac)'
+run_case A p2-func-subshell-body  'f() (echo sub;); f'
+run_case A p2-array-reserved      'a=(fi if then); printf "%s|" "${a[@]}"'
+run_case A p2-empty-pipe          'echo a | | cat; echo rc=$?'
+run_case A p2-empty-if-cond       'if then echo hi; fi; echo rc=$?'
+run_case A p2-arith-var-str       'x="1+2"; echo $((x))'
+run_case A p2-arith-var-bad       'x=3.5; echo $((x)); echo rc=$?'
+run_case A p2-byte-strip-prefix   'v=中文ab; echo ${#v} "${v:0:1}" "${v#?}"'
+run_case A p2-scalar-at           'a=1; echo "${a[@]}" "${#a[@]}"'
+run_case A p2-printf-n            'printf "a%n" v; echo "[$v]"'
+run_case A p2-printf-n-repeat     'printf "a%n" v x; echo "[$v] [$x]"'
+run_case A p2-jobs-invalid-opt    'jobs -z; echo rc=$?'
+run_case A p2-jobs-bare-word      'jobs foo; echo rc=$?'
+run_case A p2-wait-bad-spec       'wait abc; echo rc=$?'
+run_case A p2-bad-fd-dup          'echo hi 2>&9; echo rc=$?'
+run_case A p2-ambiguous-redir     'v="a b"; > $v; echo rc=$?'
+run_case A p2-wait-jobspec        'sleep 0.1 & wait %1; echo rc=$?'
 
 # GROUP B -- regression fence for already-fixed defects (21 cases, green today).
 # (每条用例都曾是真实缺陷，修复后留在这里作为回归栅栏：通过 run_case 同时跑

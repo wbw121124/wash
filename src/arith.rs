@@ -16,6 +16,10 @@ pub struct ArithError {
     pub message: String,
     /// The token bash appends as `(error token is "...")`; empty when none.
     pub token: String,
+    /// bash prefixes a value-recursion error with the variable's raw value
+    /// instead of the top-level expression (`x=3.5; $((x))` reports
+    /// `3.5: ...`).  `None` uses the caller's expression text.
+    pub expr_prefix: Option<String>,
 }
 
 impl ArithError {
@@ -23,6 +27,7 @@ impl ArithError {
         ArithError {
             message: msg.to_string(),
             token: String::new(),
+            expr_prefix: None,
         }
     }
 }
@@ -52,6 +57,13 @@ pub trait ArithEnv {
     fn get(&self, name: &str, may_unbound: bool) -> Option<i64>;
     /// Assign `value` to `name`.
     fn set(&mut self, name: &str, value: i64);
+    /// Raw string value of a variable, so the evaluator can recursively
+    /// expand it the way bash does (`x="1+2"; $((x))` is 3).  Envs that
+    /// cannot provide raw values return None and the plain numeric lookup
+    /// is used.
+    fn get_str(&self, _name: &str) -> Option<String> {
+        None
+    }
 }
 
 /// An environment backed by a plain map (used for `let` on the shell's
@@ -67,6 +79,9 @@ impl<'a> ArithEnv for MapEnv<'a> {
     fn set(&mut self, name: &str, value: i64) {
         self.vars.insert(name.to_string(), value.to_string());
     }
+    fn get_str(&self, name: &str) -> Option<String> {
+        self.vars.get(name).cloned()
+    }
 }
 
 /// A read-only environment: assignments are silently discarded.
@@ -79,6 +94,9 @@ impl<'a> ArithEnv for ReadOnlyEnv<'a> {
         self.vars.get(name).and_then(|v| parse_number(v).ok())
     }
     fn set(&mut self, _name: &str, _value: i64) {}
+    fn get_str(&self, name: &str) -> Option<String> {
+        self.vars.get(name).cloned()
+    }
 }
 
 /// Parse a bare integer the way bash's arithmetic evaluator does: decimal,
@@ -217,6 +235,12 @@ thread_local! {
     // itself SIGSEGVs on MSYS2 long before it prints its own recursion-limit
     // diagnostic; wash must instead fail deterministically without crashing.
     static ARITH_NEST_DEPTH: Cell<usize> = const { Cell::new(0) };
+    // Depth of recursive variable-value evaluation (`x="1+2"; $((x))`).
+    // Kept separate from ARITH_NEST_DEPTH and much smaller: every value
+    // level costs ~20 native parse frames, and wash's 1 MB main-thread
+    // stack allows roughly 50 levels (bash tolerates ~700, unreachable
+    // within the stack budget).
+    static VAR_EVAL_DEPTH: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Nesting cap for the recursive arithmetic productions (parenthesised
@@ -246,6 +270,31 @@ impl NestGuard {
 impl Drop for NestGuard {
     fn drop(&mut self) {
         ARITH_NEST_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+/// Nesting cap for recursive variable-value evaluation.
+const MAX_VAR_EVAL_DEPTH: usize = 50;
+
+/// RAII token for one level of variable-value recursion.
+struct VarEvalGuard;
+
+impl VarEvalGuard {
+    fn enter() -> Option<VarEvalGuard> {
+        VAR_EVAL_DEPTH.with(|depth| {
+            if depth.get() >= MAX_VAR_EVAL_DEPTH {
+                None
+            } else {
+                depth.set(depth.get() + 1);
+                Some(VarEvalGuard)
+            }
+        })
+    }
+}
+
+impl Drop for VarEvalGuard {
+    fn drop(&mut self) {
+        VAR_EVAL_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
     }
 }
 
@@ -292,8 +341,13 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, ArithError> {
                 i += 1;
             }
             let text: String = chars[start..i].iter().collect();
-            let v = parse_unsigned(&text)
-                .map_err(|e| ArithError::new(&e.message))?;
+            let v = parse_unsigned(&text).map_err(|e| ArithError {
+                message: e.message,
+                // bash names the whole literal (`10#ff` -> error token
+                // "10#ff").
+                token: text.clone(),
+                expr_prefix: None,
+            })?;
             toks.push(Tok::Num(v));
             continue;
         }
@@ -352,10 +406,15 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, ArithError> {
             }
         }
         if !matched {
-            return Err(ArithError::new(&format!(
-                "syntax error in expression (error token is \"{}\")",
-                c
-            )));
+            // bash's arithmetic lexer reports an unknown character as an
+            // "invalid arithmetic operator" and points at the rest of the
+            // input from that character (`1.5` -> error token ".5").
+            let rest: String = chars[i..].iter().collect();
+            return Err(ArithError {
+                message: "invalid arithmetic operator".to_string(),
+                token: rest,
+                expr_prefix: None,
+            });
         }
     }
     Ok(toks)
@@ -402,6 +461,73 @@ fn operand_expected(lex: &Lexer) -> ArithError {
     ArithError {
         message: "operand expected".to_string(),
         token: lex.error_token(),
+        expr_prefix: None,
+    }
+}
+
+/// Recursively evaluate a variable's value the way bash does: the value is
+/// itself an arithmetic expression (`x="1+2"` -> 3, `x=" 1 + 2 "` -> 3,
+/// `x="0x10"` -> 16, `x="y=5"` assigns y).  Errors carry the raw value as
+/// the expression prefix so the diagnostic matches bash
+/// (`3.5: arithmetic syntax error: invalid arithmetic operator ...`).
+fn eval_var_string(s: &str, env: &mut dyn ArithEnv) -> Result<i64, ArithError> {
+    // Fast path: a plain number (also trims whitespace and accepts 0x/base#).
+    if let Ok(v) = parse_number(s) {
+        return Ok(v);
+    }
+    // Recursion cap: bash reports `x: expression recursion level exceeded
+    // (error token is "x")` for self-referential values.
+    let _guard = match VarEvalGuard::enter() {
+        Some(g) => g,
+        None => {
+            return Err(ArithError {
+                message: "expression recursion level exceeded".to_string(),
+                token: s.trim().to_string(),
+                expr_prefix: Some(s.trim_start().to_string()),
+            });
+        }
+    };
+    let toks = match tokenize(s) {
+        Ok(t) => std::sync::Arc::new(t),
+        Err(mut e) => {
+            e.expr_prefix = Some(s.trim_start().to_string());
+            return Err(e);
+        }
+    };
+    let mut lex = Lexer::new(toks);
+    if lex.toks.is_empty() {
+        // An empty value evaluates to 0 without an error (bash: `x=`).
+        return Ok(0);
+    }
+    let v = match parse_comma(&mut lex, env) {
+        Ok(v) => v,
+        Err(mut e) => {
+            e.expr_prefix = Some(s.trim_start().to_string());
+            return Err(e);
+        }
+    };
+    if lex.pos < lex.toks.len() {
+        return Err(ArithError {
+            message: "arithmetic syntax error in expression".to_string(),
+            token: lex.error_token(),
+            expr_prefix: Some(s.trim_start().to_string()),
+        });
+    }
+    Ok(v)
+}
+
+/// Read a variable through `env`, recursively evaluating its raw value the
+/// way bash does (`x="1+2"; $((x))` is 3).  `may_unbound` passes through to
+/// the plain numeric lookup for unset names.
+fn env_read(env: &mut dyn ArithEnv, name: &str, may_unbound: bool) -> Result<i64, ArithError> {
+    match env.get_str(name) {
+        Some(raw) => {
+            if raw.trim().is_empty() {
+                return Ok(env.get(name, may_unbound).unwrap_or(0));
+            }
+            eval_var_string(&raw, env)
+        }
+        None => Ok(env.get(name, may_unbound).unwrap_or(0)),
     }
 }
 
@@ -417,6 +543,7 @@ pub fn eval(src: &str, env: &mut dyn ArithEnv) -> Result<i64, ArithError> {
         return Err(ArithError {
             message: "arithmetic syntax error in expression".to_string(),
             token: lex.error_token(),
+                expr_prefix: None,
         });
     }
     Ok(v)
@@ -452,7 +579,7 @@ fn parse_assign(lex: &mut Lexer, env: &mut dyn ArithEnv) -> Result<i64, ArithErr
         lex.pos += 2;
         let divisor_tok = lex.peek().cloned();
         let rhs = parse_assign(lex, env)?;
-        let cur = env.get(&name, aop != "=").unwrap_or(0);
+        let cur = env_read(env, &name, aop != "=")?;
         let newv = match aop {
             "=" => rhs,
             "+=" => cur.wrapping_add(rhs),
@@ -463,6 +590,7 @@ fn parse_assign(lex: &mut Lexer, env: &mut dyn ArithEnv) -> Result<i64, ArithErr
                     return Err(ArithError {
                         message: "division by 0".to_string(),
                         token: token_text(&divisor_tok),
+                            expr_prefix: None,
                     });
                 }
                 cur.wrapping_div(rhs)
@@ -472,6 +600,7 @@ fn parse_assign(lex: &mut Lexer, env: &mut dyn ArithEnv) -> Result<i64, ArithErr
                     return Err(ArithError {
                         message: "division by 0".to_string(),
                         token: token_text(&divisor_tok),
+                            expr_prefix: None,
                     });
                 }
                 cur.wrapping_rem(rhs)
@@ -509,6 +638,7 @@ fn parse_conditional(lex: &mut Lexer, env: &mut dyn ArithEnv) -> Result<i64, Ari
             return Err(ArithError {
                 message: "`:' expected for conditional expression".to_string(),
                 token: lex.error_token(),
+                    expr_prefix: None,
             });
         }
         let other = parse_assign(lex, env).map_err(expression_expected)?;
@@ -654,6 +784,7 @@ fn parse_multiplicative(lex: &mut Lexer, env: &mut dyn ArithEnv) -> Result<i64, 
                 return Err(ArithError {
                     message: "division by 0".to_string(),
                     token: token_text(&divisor_tok),
+                        expr_prefix: None,
                 });
             }
             v = v.wrapping_div(rhs);
@@ -665,6 +796,7 @@ fn parse_multiplicative(lex: &mut Lexer, env: &mut dyn ArithEnv) -> Result<i64, 
                 return Err(ArithError {
                     message: "division by 0".to_string(),
                     token: token_text(&divisor_tok),
+                        expr_prefix: None,
                 });
             }
             v = v.wrapping_rem(rhs);
@@ -715,7 +847,7 @@ fn parse_unary(lex: &mut Lexer, env: &mut dyn ArithEnv) -> Result<i64, ArithErro
             _ => return Err(operand_expected(lex)),
         };
         lex.pos += 1;
-        let cur = env.get(&name, true).unwrap_or(0);
+        let cur = env_read(env, &name, true)?;
         let newv = if op == "++" {
             cur.wrapping_add(1)
         } else {
@@ -763,6 +895,7 @@ fn parse_power(lex: &mut Lexer, env: &mut dyn ArithEnv) -> Result<i64, ArithErro
             return Err(ArithError {
                 message: "exponent less than 0".to_string(),
                 token: lex.error_token(),
+                    expr_prefix: None,
             });
         }
         return Ok(base.wrapping_pow(exp as u32));
@@ -800,7 +933,9 @@ fn parse_primary(lex: &mut Lexer, env: &mut dyn ArithEnv) -> Result<i64, ArithEr
             _ => unreachable!(),
         };
         lex.pos += 1;
-        return Ok(env.get(name, true).unwrap_or(0));
+        // bash evaluates a variable's *value* recursively as an expression
+        // (`x="1+2"; $((x))` is 3); env_read implements exactly that.
+        return env_read(env, name, true);
     }
     match lex.peek().cloned() {
         Some(Tok::Num(v)) => {

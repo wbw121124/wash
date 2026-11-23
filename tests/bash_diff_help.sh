@@ -100,14 +100,15 @@ python3 -c 'import sys; sys.exit(0 if __debug__ and sys.flags.optimize == 0 else
 DIVERGENCE_DOC="$REPO_ROOT/docs/intentional-divergences.md"
 [ -f "$DIVERGENCE_DOC" ] || { echo "FATAL: docs/intentional-divergences.md missing"; exit 1; }
 DIV_DOC_ENTRIES="$(grep -c '^| `D-0' "$DIVERGENCE_DOC")"
-[ "$DIV_DOC_ENTRIES" -eq 2 ] || {
-    echo "FATAL: divergence list must register exactly 2 entries, got $DIV_DOC_ENTRIES"; exit 1; }
+[ "$DIV_DOC_ENTRIES" -eq 3 ] || {
+    echo "FATAL: divergence list must register exactly 3 entries, got $DIV_DOC_ENTRIES"; exit 1; }
 grep -Fq 'D-001' "$DIVERGENCE_DOC" || { echo "FATAL: D-001 not registered"; exit 1; }
 grep -Fq 'D-002' "$DIVERGENCE_DOC" || { echo "FATAL: D-002 not registered"; exit 1; }
+grep -Fq 'D-003' "$DIVERGENCE_DOC" || { echo "FATAL: D-003 not registered"; exit 1; }
 grep -Fq -- 'job_spec [&]' "$DIVERGENCE_DOC" || { echo "FATAL: D-002 patterns not registered"; exit 1; }
 grep -Fq 'JOB_SPEC_DIVERGENCES' "$REPO_ROOT/src/help_pages.rs" || {
     echo "FATAL: code-side divergence table missing"; exit 1; }
-echo "hard gate: DIVERGENCE_DOC registers exactly 2 divergences (D-001, D-002)"
+echo "hard gate: DIVERGENCE_DOC registers exactly 3 divergences (D-001, D-002, D-003)"
 
 export LC_ALL=C
 export LANG=C
@@ -672,7 +673,7 @@ echo "=== 结果: 严格对拍 PASS=$PASS FAIL=$FAIL | D-002 精确偏离 PASS=$
 [ "$DIVERGE_PASS" -eq "$DIVERGE_EXPECTED" ] || {
     echo "FATAL: divergence case count drifted: expected $DIVERGE_EXPECTED got $DIVERGE_PASS"; exit 1; }
 echo "hard gate: 其余 $PASS 例仍严格 rc+stdout+stderr 逐字节相等；偏离面固定为 $DIVERGE_PASS 例"
-echo "hard gate: docs/intentional-divergences.md 恰好登记 2 条有意偏离（D-001 / D-002）"
+echo "hard gate: docs/intentional-divergences.md 恰好登记 3 条有意偏离（D-001 / D-002 / D-003）"
 [ "$FAIL" -eq 0 ] || exit 1
 [ "$DIVERGE_FAIL" -eq 0 ] || exit 1
 exit 0

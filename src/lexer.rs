@@ -389,7 +389,15 @@ fn word_is_assignment(parts: &[WordPart], pending: &str) -> bool {
     let mut in_subscript = false;
     for p in parts {
         match p {
-            WordPart::Text(s, _) => {
+            WordPart::Text(s, quoted) => {
+                // bash: quoting any character before the `=` (or the `=` in
+                // the name region) turns the word into an ordinary command
+                // word (`"x=y"` is `x=y: command not found`, not an
+                // assignment).  Quoted text inside a subscript (`m["x"]`) is
+                // still part of the name.
+                if *quoted && !in_subscript {
+                    return false;
+                }
                 if let Some(pos) = s.find('=') {
                     name.push_str(&s[..pos]);
                     found_eq = true;
@@ -486,15 +494,213 @@ fn read_dup_target(chars: &[char], i: usize) -> (Vec<WordPart>, usize) {
     (vec![WordPart::Text(text, false)], j)
 }
 
+/// True when `c` may appear inside a shell word (identifier characters plus
+/// glob metacharacters — `in*file` is ONE word, not the keyword `in`).
+fn is_word_char(c: char) -> bool {
+    c.is_ascii_alphanumeric()
+        || c == '_'
+        || c == '*'
+        || c == '?'
+        || c == '['
+        || c == ']'
+        || c == '-'
+        || c == '.'
+        || c == '/'
+}
+
+/// True when the word starting at `j` is exactly `word` (a non-word
+/// character follows it).  Only called at word starts.
+fn word_eq_at(chars: &[char], j: usize, word: &str) -> bool {
+    let wc: Vec<char> = word.chars().collect();
+    let n = wc.len();
+    if j + n > chars.len() || chars[j..j + n] != wc[..] {
+        return false;
+    }
+    match chars.get(j + n) {
+        Some(c) => !is_word_char(*c),
+        None => true,
+    }
+}
+
+/// Scan a `case ... esac` construct inside a command substitution.
+/// `j` points just past the `case` keyword.  Returns the index just past the
+/// matching `esac`, or `None` when the construct never closes.
+///
+/// Inside a case header/body a bare `)` belongs to the case grammar (the arm
+/// delimiter), not to the surrounding parenthesis nesting — that is why
+/// `$(case a in a) echo yes;; esac)` must not terminate at the arm's `)`.
+fn scan_case(chars: &[char], j: usize) -> Option<usize> {
+    #[derive(PartialEq)]
+    enum CaseSt {
+        /// between `case` and `in`
+        Header,
+        /// arm pattern list, up to the arm's `)` (or the final `esac`)
+        Patterns,
+        /// arm body, up to `;;` / `;&` / the final `esac`
+        Body,
+    }
+    let mut st = CaseSt::Header;
+    let mut pd = 0i32; // nested parens inside the body
+    let mut cmd_pos = true; // right after `case`, a keyword may follow
+    let mut k = j;
+    while k < chars.len() {
+        let c = chars[k];
+        // Quoted spans are copied verbatim and end any pending word.
+        if c == '\'' {
+            k += 1;
+            while k < chars.len() && chars[k] != '\'' {
+                k += 1;
+            }
+            if k >= chars.len() {
+                return None;
+            }
+            k += 1;
+            cmd_pos = false;
+            continue;
+        }
+        if c == '"' {
+            k += 1;
+            while k < chars.len() {
+                if chars[k] == '\\' && k + 1 < chars.len() {
+                    k += 2;
+                    continue;
+                }
+                if chars[k] == '"' {
+                    break;
+                }
+                k += 1;
+            }
+            if k >= chars.len() {
+                return None;
+            }
+            k += 1;
+            cmd_pos = false;
+            continue;
+        }
+        if c == '\\' && k + 1 < chars.len() {
+            k += 2;
+            cmd_pos = false;
+            continue;
+        }
+        // Word collection: check reserved words at word boundaries.
+        if is_word_char(c) {
+            let start = k;
+            while k < chars.len() && is_word_char(chars[k]) {
+                k += 1;
+            }
+            let word: String = chars[start..k].iter().collect();
+            match st {
+                CaseSt::Header => {
+                    if word == "in" {
+                        st = CaseSt::Patterns;
+                        cmd_pos = true;
+                    } else {
+                        cmd_pos = false;
+                    }
+                }
+                CaseSt::Patterns => {
+                    // The final `esac` after the last `;;`.  (`case x in
+                    // esac)` — esac spelled as a pattern — is itself a bash
+                    // syntax error, so this never mis-terminates valid code.)
+                    if cmd_pos && word == "esac" {
+                        return Some(k);
+                    }
+                    cmd_pos = false;
+                }
+                CaseSt::Body => {
+                    if pd == 0 && cmd_pos {
+                        if word == "esac" {
+                            return Some(k);
+                        }
+                        if word == "case" {
+                            return match scan_case(chars, k) {
+                                Some(end) => {
+                                    k = end;
+                                    cmd_pos = false;
+                                    continue;
+                                }
+                                None => None,
+                            };
+                        }
+                    }
+                    cmd_pos = false;
+                }
+            }
+            continue;
+        }
+        match st {
+            CaseSt::Header => match c {
+                ';' | '&' | '|' | '\n' => cmd_pos = true,
+                ')' => return None,
+                _ => {
+                    if !c.is_whitespace() {
+                        cmd_pos = false;
+                    }
+                }
+            },
+            CaseSt::Patterns => match c {
+                ')' => {
+                    st = CaseSt::Body;
+                    cmd_pos = true;
+                }
+                // A single leading `(` before a pattern is decoration
+                // (`case x in (a) ...`), not a subshell paren.
+                '(' => cmd_pos = false,
+                ';' | '&' | '|' | '\n' => cmd_pos = true,
+                _ => {
+                    if !c.is_whitespace() {
+                        cmd_pos = false;
+                    }
+                }
+            },
+            CaseSt::Body => match c {
+                '(' => {
+                    pd += 1;
+                    cmd_pos = true;
+                }
+                ')' => {
+                    if pd > 0 {
+                        pd -= 1;
+                    }
+                    cmd_pos = false;
+                }
+                ';' if pd == 0 => {
+                    // `;;` / `;&` / `;;&` all terminate the arm.
+                    let mut nk = k + 1;
+                    while nk < chars.len() && (chars[nk] == ';' || chars[nk] == '&') {
+                        nk += 1;
+                    }
+                    k = nk;
+                    st = CaseSt::Patterns;
+                    cmd_pos = true;
+                    continue;
+                }
+                ';' | '&' | '|' | '\n' => cmd_pos = true,
+                _ => {
+                    if !c.is_whitespace() {
+                        cmd_pos = false;
+                    }
+                }
+            },
+        }
+        k += 1;
+    }
+    None
+}
+
 /// Read the body of a `$( ... )` / `$(( ... ))` up to its matching `)`.
 /// Parentheses inside single or double quotes are literal, so `$(echo ")")`
-/// must not terminate at the quoted `)`.
+/// must not terminate at the quoted `)`.  A `case` construct inside the
+/// substitution is scanned by `scan_case`, so the arm's `)` does not close
+/// the substitution either.
 pub(crate) fn read_paren(chars: &[char], i: usize) -> Option<(String, usize)> {
     let mut depth = 1;
     let mut s = String::new();
     let mut j = i;
     let mut in_single = false;
     let mut in_double = false;
+    // Command-position tracking for reserved-word recognition (`case`).
+    let mut cmd_pos = true;
     while j < chars.len() {
         let c = chars[j];
         // Inside quotes every character is copied verbatim; only the matching
@@ -521,18 +727,39 @@ pub(crate) fn read_paren(chars: &[char], i: usize) -> Option<(String, usize)> {
             j += 1;
             continue;
         }
+        // A `case` keyword in command position opens a case construct whose
+        // arm `)` must not close the substitution.
+        if cmd_pos && word_eq_at(chars, j, "case") {
+            match scan_case(chars, j + 4) {
+                Some(end) => {
+                    s.extend(&chars[j..end]);
+                    if chars.get(end) == Some(&')') {
+                        // The `)` right after `esac` closes the substitution
+                        // itself (`$(case a in a) echo;; esac)`).
+                        return Some((s, end + 1));
+                    }
+                    j = end;
+                    cmd_pos = false;
+                    continue;
+                }
+                None => return None,
+            }
+        }
         match c {
             '\'' => {
                 in_single = true;
                 s.push(c);
+                cmd_pos = false;
             }
             '"' => {
                 in_double = true;
                 s.push(c);
+                cmd_pos = false;
             }
             '(' => {
                 depth += 1;
                 s.push('(');
+                cmd_pos = true;
             }
             ')' => {
                 depth -= 1;
@@ -540,17 +767,29 @@ pub(crate) fn read_paren(chars: &[char], i: usize) -> Option<(String, usize)> {
                     return Some((s, j + 1));
                 }
                 s.push(')');
+                cmd_pos = false;
+            }
+            ';' | '&' | '|' | '\n' => {
+                s.push(c);
+                cmd_pos = true;
             }
             '\\' => {
                 if j + 1 < chars.len() {
                     s.push('\\');
                     s.push(chars[j + 1]);
                     j += 2;
-                    continue;
+                } else {
+                    s.push('\\');
                 }
-                s.push('\\');
+                cmd_pos = false;
+                continue;
             }
-            _ => s.push(c),
+            _ => {
+                s.push(c);
+                if !c.is_whitespace() {
+                    cmd_pos = false;
+                }
+            }
         }
         j += 1;
     }

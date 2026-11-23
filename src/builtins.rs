@@ -4248,9 +4248,14 @@ fn builtin_printf(argv: &[String], sh: Option<&mut Shell>) -> i32 {
                 }
             };
             let args = argv.get(format_idx + 1..).unwrap_or(&[]);
-            let (value, conv_error) = printf_format(&format, args);
+            let (value, conv_error, assigns) = printf_format(&format, args);
             if let Some(sh) = sh {
                 sh.env.insert(var, crate::byteval::encode_raw(&value));
+                // bash（oracle 实测）：`printf -v out "a%n" v` → out="a" 且
+                // v=1 —— %n 的赋值与 -v 目标并存。
+                for (nv, nv_val) in assigns {
+                    sh.env.insert(nv, nv_val.to_string());
+                }
             }
             if conv_error {
                 1
@@ -4271,10 +4276,17 @@ fn builtin_printf(argv: &[String], sh: Option<&mut Shell>) -> i32 {
             }
             let format = &argv[format_idx];
             let args = argv.get(format_idx + 1..).unwrap_or(&[]);
-            let (bytes, conv_error) = printf_format(format, args);
+            let (bytes, conv_error, assigns) = printf_format(format, args);
             // bash 也会检测 printf 的写错误（`printf hi > /dev/full` →
             // `printf: write error: ...` rc 1）；转换错误与写错误都是 rc 1。
             let werr = write_stdout_checked(&bytes, "printf");
+            // %n 赋值：正常输出路径同样把「已打印字符数」写入指定变量
+            //（bash oracle：`printf "a%n" v` → 输出 a、v=1、rc 0）。
+            if let Some(sh) = sh {
+                for (nv, nv_val) in assigns {
+                    sh.env.insert(nv, nv_val.to_string());
+                }
+            }
             if conv_error || werr != 0 {
                 1
             } else {
@@ -4288,7 +4300,10 @@ fn builtin_printf(argv: &[String], sh: Option<&mut Shell>) -> i32 {
 /// indicating whether a numeric conversion failed (bash's "conv_error" → exit
 /// code 1). This is the shared core used by both the child (stdout) and the
 /// parent (`-v`, store to env).
-fn printf_format(format: &str, args: &[String]) -> (Vec<u8>, bool) {
+///
+/// 第三个返回值是 `%n` 产生的赋值清单 `(变量名, 已打印字符数)`（按出现
+/// 顺序）；调用方负责写入 shell 环境（`-v` 路径与普通路径都要应用）。
+fn printf_format(format: &str, args: &[String]) -> (Vec<u8>, bool, Vec<(String, u64)>) {
     // 格式串与参数可能含 byteval 编码的裸字节（read -n 截断），先解码为
     // 原始字节再做逐字节格式化，避免 PUA 编码泄漏到输出。
     let format_raw = crate::byteval::decode_raw(format);
@@ -4296,6 +4311,7 @@ fn printf_format(format: &str, args: &[String]) -> (Vec<u8>, bool) {
     let mut out: Vec<u8> = Vec::new();
     let mut conv_error = false;
     let mut ai: usize = 0;
+    let mut assigns: Vec<(String, u64)> = Vec::new();
 
     let has_conv = {
         // The scan has to skip the escaped percent signs exactly like the
@@ -4325,6 +4341,9 @@ fn printf_format(format: &str, args: &[String]) -> (Vec<u8>, bool) {
 
     loop {
         let consumed_before = ai;
+        // bash 的 %n 计数在每轮格式复用时重置（oracle 实测
+        // `printf "a%n" v x` → v=1、x=1，不是累计的 x=2）。
+        let iter_start_len = out.len();
         let mut i = 0;
         while i < bytes.len() {
             let c = bytes[i];
@@ -4334,7 +4353,7 @@ fn printf_format(format: &str, args: &[String]) -> (Vec<u8>, bool) {
                     // format character and stops.
                     conv_error = true;
                     safe_eprintln!("wash: printf: `%': missing format character");
-                    return (out, conv_error);
+                    return (out, conv_error, assigns);
                 }
                 let nxt = bytes[i + 1];
                 if nxt == b'%' {
@@ -4342,17 +4361,26 @@ fn printf_format(format: &str, args: &[String]) -> (Vec<u8>, bool) {
                     i += 2;
                     continue;
                 }
-                let (ni, stop) = parse_printf_spec(bytes, i, &mut out, args, &mut ai, &mut conv_error);
+                let (ni, stop) = parse_printf_spec(
+                    bytes,
+                    i,
+                    &mut out,
+                    args,
+                    &mut ai,
+                    &mut conv_error,
+                    &mut assigns,
+                    iter_start_len,
+                );
                 i = ni;
                 if stop {
-                    return (out, conv_error);
+                    return (out, conv_error, assigns);
                 }
             } else if c == b'\\' {
                 let (esc, ni, stop) = escape_at(bytes, i, false);
                 out.extend_from_slice(&esc);
                 i = ni;
                 if stop {
-                    return (out, conv_error);
+                    return (out, conv_error, assigns);
                 }
             } else {
                 out.push(c);
@@ -4372,7 +4400,7 @@ fn printf_format(format: &str, args: &[String]) -> (Vec<u8>, bool) {
         }
     }
 
-    (out, conv_error)
+    (out, conv_error, assigns)
 }
 
 fn parse_printf_spec(
@@ -4382,6 +4410,8 @@ fn parse_printf_spec(
     args: &[String],
     ai: &mut usize,
     conv_error: &mut bool,
+    assigns: &mut Vec<(String, u64)>,
+    iter_start_len: usize,
 ) -> (usize, bool) {
     let mut i = start + 1; // skip '%'
 
@@ -4517,6 +4547,37 @@ fn parse_printf_spec(
             let padded = apply_field(&content, minus, zero, if have_width { rwidth } else { 0 }, true);
             out.extend_from_slice(&padded);
             *ai += 1;
+        }
+        b'n' => {
+            // bash 语义（oracle 实测）：%n 不产生输出，消耗下一个参数作为
+            // 变量名，把**到此为止已打印的字符数**赋给它。
+            //   `printf "a%n" v`   → 输出 a，v=1，rc 0
+            //   `printf "%s%n" hello v` → 输出 hello，v=5
+            //   `printf "a%nb" v`  → 输出 ab，v=1（%n 之后的字面字符照常输出）
+            //   `printf "a%n" v x` → 输出 aa（格式重复，v、x 各被赋 1）
+            // 无效标识符：报 `printf: `X': not a valid identifier`、rc=1，
+            // 并**终止**格式处理（`printf "a%nZ" 1abc` 只输出 `a`）。
+            // 参数缺失：不赋值、不消耗参数（ai 未前进使格式重复循环终止）。
+            // 消除 curl 符号盲区：不让 snprintf 直接吃 %n（内存写入面）。
+            if arg_missing {
+                // nothing to consume, nothing to assign
+            } else {
+                *ai += 1;
+                if is_valid_ident(arg) {
+                    assigns.push((arg.to_string(), (out.len() - iter_start_len) as u64));
+                } else {
+                    // bash（oracle 实测 `printf "a%nZ" 1abc` → 只输出 `a`，
+                    // rc=1）：无效标识符报错后**终止**格式处理，与未知转换
+                    // 字符同型。arg_raw 是原始字节（可能含裸 0xff），按字节写。
+                    *conv_error = true;
+                    safe_eprint_bytes!(
+                        b"wash: printf: `",
+                        &arg_raw,
+                        b"': not a valid identifier\n"
+                    );
+                    return (i, true);
+                }
+            }
         }
         b'd' | b'i' | b'o' | b'u' | b'x' | b'X' => {
             let (v_ll, v_ull, valid) = if arg_missing {
@@ -6835,11 +6896,21 @@ fn builtin_ulimit(argv: &[String], _sh: &mut Shell) -> i32 {
 ///                           was killed by signal N, the status is 128+N (bash
 ///                           semantics — this is what makes `kill -TERM $p; wait
 ///                           $p` return 143).
-///   * `wait %N`          → wait for background job N (1-based, matching the
-///                           `[N] pid` listing printed at job start).
+///   * `wait JOBSPEC`     → wait for the background job identified by the
+///                           jobspec: `%N` (1-based), `%%`/`%+` (current job),
+///                           `%-` (previous job), `%?str` (substring match) and
+///                           `%str` (prefix match). Resolution goes through
+///                           `find_job` — the SAME job_table view used by
+///                           `jobs`/`fg`/`bg` — so there is no second, index
+///                           numbering to keep in sync.
 ///
-/// A pid that was never a child of this shell (or was already reaped) yields
-/// `wait: pid N is not a child of this shell` and rc 127, exactly like bash.
+/// Oracle (MSYS2 bash 5.3.20, LC_ALL=C) exact diagnostics:
+///   * unknown jobspec → stderr ``wait: <spec>: no such job`` (no backticks),
+///     rc 127;
+///   * non-pid, non-jobspec word → stderr ``wait: `abc': not a pid or valid
+///     job spec`` (backticked), rc 1;
+///   * pid that was never a child of this shell (or was already reaped) yields
+///     `wait: pid N is not a child of this shell` and rc 127.
 fn builtin_wait(argv: &[String], sh: &mut Shell) -> i32 {
     let mut last_status: i32 = 0;
     let mut any = false;
@@ -6871,21 +6942,26 @@ fn builtin_wait(argv: &[String], sh: &mut Shell) -> i32 {
     }
 
     for arg in &targets {
-        let pid = if let Some(jobno_str) = arg.strip_prefix('%') {
-            // jobspec：%N（1-based）
-            match jobno_str.parse::<usize>() {
-                Ok(n) if n >= 1 && n <= sh.jobs.len() => sh.jobs[n - 1],
-                _ => {
-                    safe_eprintln!("wash: wait: `{}': no such job", arg);
-                    return 1;
+        let pid = if let Some(_spec) = arg.strip_prefix('%') {
+            // jobspec：%N / %% / %+ / %- / %?str / %str —— 与 jobs/fg/bg 共用
+            // 同一个 find_job / job_table 视角（review #28：不再用 sh.jobs
+            // 下标造第二套编号）。报错文案对齐 oracle：
+            //   ``wait: %1: no such job``（无反引号）+ rc 127。
+            match find_job(sh, Some(arg.as_str()), "wait") {
+                Ok(i) => sh.job_table[i].pid,
+                Err(text) => {
+                    safe_eprintln!("wash: wait: {}: no such job", text);
+                    return 127;
                 }
             }
         } else {
             match arg.parse::<i32>() {
                 Ok(p) => p,
                 Err(_) => {
-                    safe_eprintln!("wash: wait: {}: not a pid or jobspec", arg);
-                    return 127;
+                    // oracle：``wait: `abc': not a pid or valid job spec``
+                    //（带反引号）+ rc 1。
+                    safe_eprintln!("wash: wait: `{}': not a pid or valid job spec", arg);
+                    return 1;
                 }
             }
         };
@@ -6927,22 +7003,46 @@ fn job_control_on(sh: &Shell) -> bool {
 /// `%-`（前一个作业）、`%?str`（命令含 str）、`%str`（命令以 str 开头）。
 /// `None` 表示省略 jobspec，按当前作业处理。失败时 `Err` 携带用于报错的
 /// spec 文本（省略时用 bash 的 "current"）。
-fn find_job(sh: &Shell, spec: Option<&str>) -> Result<usize, String> {
+///
+/// 裸词（不以 `%` 开头）：bash（oracle 实测）先打印
+/// `{builtin}: warning: <词>: job specification requires leading `%'`，
+/// 然后**仍按 `%<词>` 解释**——`jobs sleep`（有 sleep 作业）告警后照样
+/// 列出该作业，`jobs foo` 告警后报 `foo: no such job` rc=1。`bname` 用于
+/// 告警行的内建名前缀（jobs / fg / bg / disown）。
+fn find_job(sh: &Shell, spec: Option<&str>, bname: &str) -> Result<usize, String> {
     let n = sh.job_table.len();
-    let raw = spec.unwrap_or("current");
+    let (raw, key) = match spec {
+        None => ("current".to_string(), "current".to_string()),
+        Some(s) => {
+            if s.starts_with('%') {
+                (s.to_string(), s.to_string())
+            } else {
+                safe_eprintln!(
+                    "{}: warning: {}: job specification requires leading `%'",
+                    bname, s
+                );
+                (s.to_string(), format!("%{}", s))
+            }
+        }
+    };
     if n == 0 {
-        return Err(raw.to_string());
+        return Err(raw);
     }
-    let found = match raw {
+    let found = match key.as_str() {
         "current" | "%%" | "%+" => Some(n - 1),
-        "%-" => n.checked_sub(2),
+        // `%-`：oracle 实测 = 前一个作业（倒数第二个）；**只有一个作业时
+        // bash 回退到当前作业**（`sleep 5 & jobs %-` / `disown %-` 均命中
+        // 作业 [1]，get_job_spec 共用此语义）。
+        "%-" => Some(n.saturating_sub(2).max(0)),
         s if s.starts_with('%') => {
             let rest = &s[1..];
             if let Ok(num) = rest.parse::<usize>() {
-                if num >= 1 && num <= n {
-                    Some(num - 1)
-                } else {
+                // bash 作业号持久：%N 按注册时分配的 jobno 定位，不能按
+                // 当前表下标（中间作业被 disown/wait 移除后表会重排）。
+                if num == 0 {
                     None
+                } else {
+                    sh.job_table.iter().position(|j| j.jobno == num)
                 }
             } else if let Some(needle) = rest.strip_prefix('?') {
                 sh.job_table.iter().position(|j| j.command.contains(needle))
@@ -6950,9 +7050,10 @@ fn find_job(sh: &Shell, spec: Option<&str>) -> Result<usize, String> {
                 sh.job_table.iter().position(|j| j.command.starts_with(rest))
             }
         }
-        _ => sh.job_table.iter().position(|j| j.command.starts_with(raw)),
+        // key 只可能是 "current" 或以 `%` 开头（裸词已在上面补 `%`）。
+        _ => None,
     };
-    found.ok_or_else(|| raw.to_string())
+    found.ok_or_else(|| raw)
 }
 
 /// 用 `kill(pid, 0)` 非破坏性地刷新作业存活状态。
@@ -6967,12 +7068,55 @@ fn refresh_job_states(sh: &mut Shell) {
     }
 }
 
-/// 作业状态文本（bash 的 jobs 列表用 Running / Done）。
-fn job_state(j: &JobInfo) -> &'static str {
-    if j.done {
-        "Done"
-    } else {
-        "Running"
+/// 作业状态文本（bash 的 jobs 列表）：
+///   Running（未结束）/ Done（status=0 或 kill 探测路径无状态）/
+///   Exit N（非零普通退出）/ 信号名（status=128+sig，如 Terminated）。
+/// 信号名取自 oracle（MSYS2 bash 5.3.20 `kill -l` + 各信号 `jobs %1` 实测），
+/// 与 Cygwin strsignal 文案一致。
+fn job_state(j: &JobInfo) -> String {
+    if !j.done {
+        return "Running".to_string();
+    }
+    match j.status {
+        None | Some(0) => "Done".to_string(),
+        Some(n) if n < 128 => format!("Exit {}", n),
+        Some(n) => {
+            let sig = n - 128;
+            let name = match sig {
+                1 => "Hangup",
+                2 => "Interrupt",
+                3 => "Quit",
+                4 => "Illegal instruction",
+                5 | 6 => "Trace/breakpoint trap",
+                7 => "Bus error",
+                8 => "Floating point exception",
+                9 => "Killed",
+                10 => "User defined signal 1",
+                11 => "Segmentation fault",
+                12 => "User defined signal 2",
+                13 => "Broken pipe",
+                14 => "Alarm clock",
+                15 => "Terminated",
+                16 => "Stack fault",
+                17 => "Child exited",
+                18 => "Continued",
+                19 => "Stopped (signal)",
+                20 => "Stopped",
+                21 => "Stopped (tty input)",
+                22 => "Stopped (tty output)",
+                23 => "Urgent I/O condition",
+                24 => "CPU time limit exceeded",
+                25 => "File size limit exceeded",
+                26 => "Virtual timer expired",
+                27 => "Profiling timer expired",
+                28 => "Window changed",
+                29 => "I/O possible",
+                30 => "Power failure",
+                31 => "Bad system call",
+                _ => return format!("Signal {}", sig),
+            };
+            name.to_string()
+        }
     }
 }
 
@@ -6984,47 +7128,72 @@ fn drop_job(sh: &mut Shell, pid: i32) {
 
 /// `jobs [-lnprs] [jobspec ...]`：列出真实后台作业。
 ///
-/// `-l` 带 pid、`-p` 只输出 pid、`-r` 仅未结束、`-s` 仅已结束；其余选项
-/// 与 `-x` 本轮忽略。列宽对齐 bash 5.3：状态字段固定 27 宽。
+/// `-l` 带 pid、`-p` 只输出 pid、`-r` 仅未结束、`-s` 仅已结束。已知但未实现
+/// 语义的 `-x`（jobspec→pid 替换执行）接受该字母、暂按无操作处理。其余字母
+/// 对齐 oracle（MSYS2 bash 5.3.20，LC_ALL=C 实测）：
+///   stderr 两行
+///     `jobs: -z: invalid option`
+///     `jobs: usage: jobs [-lnprs] [jobspec ...] or jobs -x command [args]`
+///   rc=2。
+/// 选项扫描遵循 bash `internal_getopt` 语义：`--` 终止选项，首个非选项实参
+/// 之后的 `-z` 等一律按 jobspec 处理（oracle 实测 `jobs foo -z` 把 `-z` 当
+/// jobspec 而不是选项）。
 fn builtin_jobs(argv: &[String], sh: &mut Shell) -> i32 {
     let mut long = false;
     let mut pid_only = false;
     let mut running_only = false;
     let mut done_only = false;
     let mut specs: Vec<&str> = Vec::new();
+    let mut opts_done = false;
     for a in argv.iter().skip(1) {
-        if a.starts_with('-') && a.len() > 1 {
+        if !opts_done && a == "--" {
+            opts_done = true;
+        } else if !opts_done && a.starts_with('-') && a.len() > 1 {
             for c in a[1..].chars() {
                 match c {
                     'l' => long = true,
                     'p' => pid_only = true,
                     'r' => running_only = true,
                     's' => done_only = true,
-                    _ => {}
+                    // bash 认识 `-x`（带参数执行命令）；wash 暂未实现其
+                    // 执行语义，接受该字母以不与 `-z` 之类的未知选项混淆。
+                    'x' => {}
+                    _ => {
+                        safe_eprintln!("wash: jobs: -{}: invalid option", c);
+                        safe_eprintln!(
+                            "jobs: usage: jobs [-lnprs] [jobspec ...] or jobs -x command [args]"
+                        );
+                        return 2;
+                    }
                 }
             }
         } else {
+            // 首个非选项实参之后不再做选项解析（bash internal_getopt）。
+            opts_done = true;
             specs.push(a.as_str());
         }
     }
 
     refresh_job_states(sh);
 
-    // 显式 jobspec 过滤；无 jobspec 时列出全部。
-    let wanted: Option<Vec<usize>> = if specs.is_empty() {
-        None
+    // 显式 jobspec 过滤；无 jobspec 时列出全部。bash（oracle 实测）对
+    // 失败的 jobspec **逐个**报告且不中断：`jobs foo %1` 照样列出作业 [1]
+    // 并报 foo 两次诊断，rc=1；`jobs foo bar` 报两对诊断 rc=1。
+    let (wanted, spec_rc): (Option<Vec<usize>>, i32) = if specs.is_empty() {
+        (None, 0)
     } else {
         let mut v = Vec::new();
+        let mut rc = 0;
         for s in &specs {
-            match find_job(sh, Some(s)) {
+            match find_job(sh, Some(s), "jobs") {
                 Ok(i) => v.push(i),
                 Err(text) => {
                     safe_eprintln!("wash: jobs: {}: no such job", text);
-                    return 1;
+                    rc = 1;
                 }
             }
         }
-        Some(v)
+        (Some(v), rc)
     };
 
     let n = sh.job_table.len();
@@ -7051,13 +7220,19 @@ fn builtin_jobs(argv: &[String], sh: &mut Shell) -> i32 {
             ' '
         };
         let state = job_state(j);
+        // bash（oracle 实测）：已结束的作业行**不带尾部 ` &`**——
+        //   Running：`[1]+  Running                    sleep 5 &`
+        //   Done：  `[1]+  Done                       true`（无 &，无多余空格）
+        // 状态列由 JobInfo.status 驱动（0→Done、1..127→Exit N、128+sig→信号名）；
+        // 作业号用持久 jobno（中间作业被 disown/wait 移除后不重排）。
+        let amp = if j.done { "" } else { " &" };
         if long {
-            println!("[{}]{} {:>5} {:<27}{} &", i + 1, marker, j.pid, state, j.command);
+            println!("[{}]{} {:>5} {:<27}{}{}", j.jobno, marker, j.pid, state, j.command, amp);
         } else {
-            println!("[{}]{}  {:<27}{} &", i + 1, marker, state, j.command);
+            println!("[{}]{}  {:<27}{}{}", j.jobno, marker, state, j.command, amp);
         }
     }
-    0
+    spec_rc
 }
 
 /// `fg [jobspec]`：把后台作业带回前台。
@@ -7071,7 +7246,7 @@ fn builtin_fg(argv: &[String], sh: &mut Shell) -> i32 {
         safe_eprintln!("wash: fg: no job control");
         return 1;
     }
-    let idx = match find_job(sh, argv.get(1).map(|s| s.as_str())) {
+    let idx = match find_job(sh, argv.get(1).map(|s| s.as_str()), "fg") {
         Ok(i) => i,
         Err(text) => {
             safe_eprintln!("wash: fg: {}: no such job", text);
@@ -7116,14 +7291,14 @@ fn builtin_bg(argv: &[String], sh: &mut Shell) -> i32 {
 
     refresh_job_states(sh);
     for spec in specs {
-        let idx = match find_job(sh, spec) {
+        let idx = match find_job(sh, spec, "bg") {
             Ok(i) => i,
             Err(text) => {
                 safe_eprintln!("wash: bg: {}: no such job", text);
                 return 1;
             }
         };
-        let jobno = idx + 1;
+        let jobno = sh.job_table[idx].jobno;
         if !sh.job_table[idx].done {
             safe_eprintln!("wash: bg: job {} already in background", jobno);
             continue;
@@ -7143,23 +7318,39 @@ fn builtin_bg(argv: &[String], sh: &mut Shell) -> i32 {
 ///
 /// 不检查作业控制（bash 的 disown 在 `-c` 下也能对空表给出
 /// "current: no such job"）。`-a` 全部、`-r` 仅未结束、`-h` 保留在表中
-/// 仅标记不发送 SIGHUP（wash 暂无 SIGHUP 转发，故为近似）。
+/// 仅标记不发送 SIGHUP（wash 暂无 SIGHUP 转发，故为近似）。未知选项字母
+/// 对齐 oracle（MSYS2 bash 5.3.20，LC_ALL=C 实测）：
+///   stderr 两行
+///     `disown: -z: invalid option`
+///     `disown: usage: disown [-h] [-ar] [jobspec ... | pid ...]`
+///   rc=2（`--foo` 报 `disown: --: invalid option`，即 `-` + 首个非法字符）。
+/// 选项扫描与 `jobs` 相同：`--` 终止选项，首个非选项实参之后全部按
+/// jobspec 处理。
 fn builtin_disown(argv: &[String], sh: &mut Shell) -> i32 {
     let mut all = false;
     let mut running_only = false;
     let mut keep = false;
     let mut specs: Vec<&str> = Vec::new();
+    let mut opts_done = false;
     for a in argv.iter().skip(1) {
-        if a.starts_with('-') && a.len() > 1 {
+        if !opts_done && a == "--" {
+            opts_done = true;
+        } else if !opts_done && a.starts_with('-') && a.len() > 1 {
             for c in a[1..].chars() {
                 match c {
                     'a' => all = true,
                     'r' => running_only = true,
                     'h' => keep = true,
-                    _ => {}
+                    _ => {
+                        safe_eprintln!("wash: disown: -{}: invalid option", c);
+                        safe_eprintln!("disown: usage: disown [-h] [-ar] [jobspec ... | pid ...]");
+                        return 2;
+                    }
                 }
             }
         } else {
+            // 首个非选项实参之后不再做选项解析（bash internal_getopt）。
+            opts_done = true;
             specs.push(a.as_str());
         }
     }
@@ -7179,18 +7370,25 @@ fn builtin_disown(argv: &[String], sh: &mut Shell) -> i32 {
             specs.iter().map(|s| Some(*s)).collect()
         };
         let mut v = Vec::new();
+        let mut failed = false;
         for s in list {
-            match find_job(sh, s) {
+            match find_job(sh, s, "disown") {
                 Ok(i) => {
                     if !running_only || !sh.job_table[i].done {
                         v.push(sh.job_table[i].pid);
                     }
                 }
                 Err(text) => {
+                    // bash（oracle 实测）：disown 对失败的 jobspec 逐个报错并
+                    // 继续，但只要有任一 spec 失败 rc 就为 1——即使其余 spec
+                    // 全部成功（`disown %1 %nosuch` rc=1，与顺序无关）。
                     safe_eprintln!("wash: disown: {}: no such job", text);
-                    return 1;
+                    failed = true;
                 }
             }
+        }
+        if failed {
+            return 1;
         }
         v
     };

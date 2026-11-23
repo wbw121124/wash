@@ -243,7 +243,10 @@ static PAGES_ZH_CN: OnceLock<Vec<Page>> = OnceLock::new();
 pub fn all() -> &'static [Page] {
     if is_zh() {
         PAGES_ZH_CN
-            .get_or_init(|| parse(DATA_ZH_CN, Some(all_en())))
+            .get_or_init(|| {
+                parse(DATA_ZH_CN, Some(all_en()))
+                    .unwrap_or_else(|e| panic!("help page data invalid: {e}"))
+            })
             .as_slice()
     } else {
         all_en()
@@ -253,7 +256,12 @@ pub fn all() -> &'static [Page] {
 fn all_en() -> &'static [Page] {
     PAGES_EN
         .get_or_init(|| {
-            let pages = parse(DATA_EN, None);
+            let pages = parse(DATA_EN, None).unwrap_or_else(|e| {
+                // 数据漂移时在首次初始化处快速失败：错误消息带 1-based
+                // 行号与具体原因（review #24），绝不静默回退、也绝不产生
+                // "byte index N is not a char boundary" 这类不可读 panic。
+                panic!("help page data invalid: {e}")
+            });
             // One-time structural gate: the 77 displayed synopses and the 77
             // parsed page names must be the SAME ordered 77-key set.  A failure
             // here is a hard panic on the first `help` call, never a fallback.
@@ -263,34 +271,78 @@ fn all_en() -> &'static [Page] {
         .as_slice()
 }
 
-fn parse(data: &'static str, en: Option<&'static [Page]>) -> Vec<Page> {
+fn parse(data: &'static str, en: Option<&'static [Page]>) -> Result<Vec<Page>, String> {
     let mut src = data;
-    while src.starts_with('#') {
-        let eol = src.find('\n').expect("help_pages comment line");
-        src = &src[eol + 1..];
+    let mut line = 1usize;
+    while let Some(rest) = src.strip_prefix('#') {
+        match rest.find('\n') {
+            Some(eol) => {
+                src = &rest[eol + 1..];
+                line += 1;
+            }
+            None => {
+                return Err(format!(
+                    "help page data line {line}: comment line has no newline"
+                ))
+            }
+        }
     }
-    let mut pages = Vec::with_capacity(77);
-    while src.starts_with("@@@ ") {
+    let mut pages: Vec<Page> = Vec::with_capacity(77);
+    while !src.is_empty() {
+        if !src.starts_with("@@@ ") {
+            let head = src.split('\n').next().unwrap_or("");
+            return Err(format!(
+                "help page data line {line}: expected `@@@ NAME @@@' topic marker, found {head:?}"
+            ));
+        }
+        // 前缀 `@@@ ` 是 ASCII，长度 4 处必为字符边界。
         let after = &src[4..];
-        let eol = after.find('\n').expect("help_pages marker line");
-        let name = after[..eol]
+        let eol = after.find('\n').ok_or_else(|| {
+            format!("help page data line {line}: topic marker line has no newline")
+        })?;
+        let marker = &after[..eol];
+        let name = marker
             .strip_suffix(" @@@")
-            .expect("help_pages marker suffix");
+            .ok_or_else(|| format!("help page data line {line}: topic marker must end with ` @@@'"))?;
+        if name.is_empty() {
+            return Err(format!("help page data line {line}: empty topic name"));
+        }
         let tail = &after[eol + 1..];
+        line += 1;
         let (body, next) = match tail.find("\n@@@ ") {
             Some(p) => (&tail[..p + 1], &tail[p + 1..]),
             None => (tail, ""),
         };
-        let first_end = body.find('\n').expect("help_pages synopsis line");
+        let first_end = body.find('\n').ok_or_else(|| {
+            format!("help page data line {line}: topic `{name}' has no synopsis line")
+        })?;
         let first = &body[..first_end];
         let rest = &body[first_end + 1..];
-        let usage = &first[name.len() + 2..];
+        // usage：synopsis 必须形如 `<name>: <usage>`。用 strip_prefix 定位，
+        // 不再按 `name.len() + 2` 做裸字节偏移（多字节名称下会切在非字符
+        // 边界上 panic，见 review #24）。
+        let usage = first
+            .strip_prefix(name)
+            .and_then(|r| r.strip_prefix(": "))
+            .ok_or_else(|| {
+                format!(
+                    "help page data line {line}: synopsis of topic `{name}' must start with `{name}: '"
+                )
+            })?;
         let desc_line = rest.split('\n').next().unwrap_or("");
         let desc = desc_line.strip_prefix("    ").unwrap_or(desc_line);
         let desc_en = match en {
             Some(english) => {
-                let counterpart = &english[pages.len()];
-                assert_eq!(counterpart.name, name, "catalog topic order differs");
+                let counterpart = english.get(pages.len()).ok_or_else(|| {
+                    format!("help page data line {line}: more topics than the English catalog")
+                })?;
+                if counterpart.name != name {
+                    return Err(format!(
+                        "help page data line {line}: catalog topic order differs: \
+                         expected `{}', found `{name}'",
+                        counterpart.name
+                    ));
+                }
                 counterpart.desc
             }
             None => desc,
@@ -303,10 +355,17 @@ fn parse(data: &'static str, en: Option<&'static [Page]>) -> Vec<Page> {
             body,
             rest,
         });
+        // 推进行号计数：body 内的换行数即这段数据占用的行数。
+        line += body.matches('\n').count();
         src = next;
     }
-    assert_eq!(pages.len(), 77, "help_pages data must hold 77 topics");
-    pages
+    if pages.len() != 77 {
+        return Err(format!(
+            "help page data must hold 77 topics, found {}",
+            pages.len()
+        ));
+    }
+    Ok(pages)
 }
 
 /// bash accepts these short spellings in addition to the canonical topic name.
@@ -528,4 +587,70 @@ fn class_matches(p: &[u8], start: usize, c: u8) -> Option<(bool, usize)> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// review #25：77↔77 静态锁必须在 `cargo test` 时**立即**执行，
+    /// 而不是推迟到运行时第一次 `help` 调用（那会让漂移穿过所有普通
+    /// 测试、只在交互式使用时炸出来）。
+    #[test]
+    fn list_binding_holds_at_test_time() {
+        let pages = all_en();
+        assert_eq!(pages.len(), 77);
+        verify_list_binding(pages);
+    }
+
+    /// zh_CN 目录必须与英文目录绑定同一组 77 个规范名（顺序一致）。
+    #[test]
+    fn zh_catalog_binds_the_same_77_names() {
+        let en = all_en();
+        let zh = all();
+        assert_eq!(zh.len(), 77);
+        for (i, p) in zh.iter().enumerate() {
+            assert_eq!(
+                p.name, en[i].name,
+                "zh_CN catalog name/order drift at index {i}"
+            );
+        }
+    }
+
+    /// 别名表与 D-002 偏离表的目标页必须真实存在，否则偏离通道的
+    /// `expect` 会在运行时炸出（这里把它变成测试期失败）。
+    #[test]
+    fn alias_and_divergence_targets_resolve() {
+        let pages = all_en();
+        for (alias, target) in ALIASES {
+            assert!(
+                pages.iter().any(|p| p.name == *target),
+                "alias `{alias}' targets missing page `{target}'"
+            );
+        }
+        for (pattern, target) in JOB_SPEC_DIVERGENCES {
+            assert!(
+                pages.iter().any(|p| p.name == *target),
+                "divergence `{pattern}' targets missing page `{target}'"
+            );
+        }
+    }
+
+    /// review #24：数据漂移必须得到**带行号的确定性错误**，而不是
+    /// `expect` panic 或非字符边界切片 panic。
+    #[test]
+    fn parse_errors_are_located_and_deterministic() {
+        // `Page` 没有 Debug，这里不能用 unwrap_err，用 match 显式拆。
+        let expect_err = |r: Result<Vec<Page>, String>| match r {
+            Err(e) => e,
+            Ok(_) => panic!("expected a located parse error, got Ok"),
+        };
+        let e = expect_err(parse("@@@ broken\nbody\n", None));
+        assert!(e.contains("line 1"), "error must carry a line number: {e}");
+        let e = expect_err(parse("#comment\n@@@ x\nbody without suffix\n", None));
+        assert!(e.contains("line 2"), "error must carry a line number: {e}");
+        // 多字节数据漂移不得触发 char-boundary panic。
+        let e = expect_err(parse("@@@ 中文 @@@\n中文-缺少冒号\nbody\n", None));
+        assert!(e.contains("`中文'"), "error must name the topic: {e}");
+    }
 }

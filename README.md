@@ -42,7 +42,7 @@ MSYSTEM=MSYS "/d/msys2/usr/bin/bash.exe" -lc 'cd <repo> && cargo build'
 wash 处于**进行中**：核心执行与展开系统已对齐，但仍有已知缺口。当前登记的重点：
 
 - 计划内特性已全部实现：`select`、`shopt -s nullglob` 均已与 bash 5.3 逐字节对齐。`[[ ]]`、`declare -A` 关联数组、`getopts`、`trap -l`、`declare -f`/`-F`、`(( ))` 算术命令、C 风格 `for ((...))` 循环、brace group 作循环 body、`continue N` 跨层传播同样对齐（含畸形语法诊断、1024 桶哈希遍历顺序与函数定义版式）。窄边界：`shopt` 全表仅列 wash 实现的 3 项、`select` ≥10 项的多列菜单布局依赖终端宽度，详见[兼容性矩阵](docs/compatibility.md)。
-- 有意偏离 bash 仅 2 项（见 [兼容性矩阵](docs/compatibility.md)）。
+- 有意偏离 bash 仅 3 项（见 [兼容性矩阵](docs/compatibility.md)）。
 
 内建逐项状态、实测依据、已知缺陷一律以 [兼容性矩阵](docs/compatibility.md) 为准——那是
 实测结论，不是设计意图。

@@ -112,6 +112,11 @@ pub fn translate(msgid: &str) -> String {
 /// gettext 的译文用 printf 风格的占位符；Rust 的 `format!` 要求格式串必须是
 /// 编译期的字面量，而译文是运行期才知道的，所以这里自己做替换（占位符按出现
 /// 顺序依次对应 `args`）。
+///
+/// 占位符规则（对齐 printf / gettext 约定，review #26）：
+///   * `%%` → 字面 `%`，**不消耗**参数；
+///   * `%s` / `%d` → 依次取 `args`（参数不足时原样保留占位符）；
+///   * 其它孤立的 `%` → 原样保留。
 pub fn format_msg(msgid: &str, args: &[String]) -> String {
     let msg = translate(msgid);
     let mut out = String::with_capacity(msg.len());
@@ -119,6 +124,13 @@ pub fn format_msg(msgid: &str, args: &[String]) -> String {
     let mut next = 0usize;
     while let Some(pos) = rest.find('%') {
         let tail = &rest[pos..];
+        // gettext 约定：`%%` 是转义的字面 `%`（译文含 `100%%` 等场景）。
+        if tail.starts_with("%%") {
+            out.push_str(&rest[..pos]);
+            out.push('%');
+            rest = &tail[2..];
+            continue;
+        }
         let len = if tail.starts_with("%s") || tail.starts_with("%d") {
             2
         } else {
@@ -232,11 +244,16 @@ fn parse_po(src: &str) -> HashMap<String, String> {
 }
 
 /// 把一个条目写进表里（空 msgid 是文件头，空 msgstr 表示没有译文）。
+///
+/// gettext 语义（review #27）：**重复 msgid 时首条生效**——msgfmt 只对
+/// 重复项告警并保留第一份译文，这里对齐为 `entry().or_insert_with()`，
+/// 后条不再覆盖前条。
 fn store_entry(map: &mut HashMap<String, String>, msgid: &str, msgstr: &str) {
     if msgid.is_empty() || msgstr.is_empty() {
         return;
     }
-    map.insert(msgid.to_string(), msgstr.to_string());
+    map.entry(msgid.to_string())
+        .or_insert_with(|| msgstr.to_string());
 }
 
 /// 解析一个 .po 里的双引号字符串（去掉引号并还原转义）。
@@ -292,7 +309,14 @@ mod tests {
                    msgid \"multi\"\n\"line one\\n\"\n\"line two\"\nmsgstr \"多行\"\n";
         let map = parse_po(src);
         assert_eq!(map.get("Hello").map(String::as_str), Some("你好"));
-        assert_eq!(map.get("multi").map(String::as_str), Some("多行"));
+        // POSIX .po 语义：msgid 的续行（后续带引号的行）**拼接进 msgid 本身**，
+        // 所以这个条目的键是拼接后的完整字符串，而不是首行 "multi"。
+        // （旧断言 `map.get("multi")` 违反 .po 续行语义，属测试自身错误，
+        // 顺带修正——parse_po 的行为一直是正确的。）
+        assert_eq!(
+            map.get("multiline one\nline two").map(String::as_str),
+            Some("多行")
+        );
         // 文件头（空 msgid）不进入表。
         assert_eq!(map.len(), 2);
     }
@@ -300,5 +324,33 @@ mod tests {
     #[test]
     fn unknown_msgid_falls_back() {
         assert_eq!(translate("__no_such_msgid__"), "__no_such_msgid__");
+    }
+
+    /// review #27：重复 msgid 首条生效（对齐 gettext / msgfmt）。
+    #[test]
+    fn duplicate_msgid_first_entry_wins() {
+        let src = "msgid \"a\"\nmsgstr \"first\"\n\nmsgid \"a\"\nmsgstr \"second\"\n";
+        let map = parse_po(src);
+        assert_eq!(map.get("a").map(String::as_str), Some("first"));
+        assert_eq!(map.len(), 1);
+    }
+
+    /// review #26：`%%` 是字面 `%` 且不消耗参数；孤立 `%` 原样保留。
+    /// 中文译文若含 `%%` 走的是同一替换逻辑（translate 之后统一处理）。
+    #[test]
+    fn format_msg_percent_escape() {
+        assert_eq!(
+            format_msg("100%% done: %s", &["x".to_string()]),
+            "100% done: x"
+        );
+        assert_eq!(format_msg("a%%b", &[]), "a%b");
+        assert_eq!(format_msg("100% done", &[]), "100% done");
+        // `%%` 不消耗参数：后面的 %s 仍取到第一个参数。
+        assert_eq!(
+            format_msg("%%%s!", &["hi".to_string()]),
+            "%hi!"
+        );
+        // 不足的参数原样保留占位符。
+        assert_eq!(format_msg("%s and %s", &["one".to_string()]), "one and %s");
     }
 }

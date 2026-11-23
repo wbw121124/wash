@@ -325,8 +325,25 @@ fn parent_of(p: &str) -> &str {
     }
 }
 
-/// 校验并归一化插件路径，返回 realpath（MSYS 风格绝对路径）。
-fn validate_path(path: &str, sh: &Shell) -> Result<String, String> {
+/// 校验并归一化插件路径，返回 `(realpath, 校验时目标文件的 (dev, ino))`。
+///
+/// # 威胁模型与偏离说明（review #22 / #23）
+///
+/// * **#22（显式路径白名单）**：oracle（MSYS2 bash 5.3.20）实测
+///   `enable -f <任意路径>` 一律 rc=2 报
+///   ``enable: dynamic loading not available``——oracle 构建根本没有启用
+///   动态加载，所以「显式路径是否受 BASH_LOADABLES_PATH 约束」在本平台
+///   上没有可对齐的 oracle 行为。wash 的插件系统是自带扩展能力，显式
+///   路径白名单因此是一项**未登记的安全加固（待主理人裁决：保留并登记
+///   为有意偏离，或放开对齐上游 bash 源码行为）**；在裁决落地前行为保持
+///   不变，此处留档防止再次静默偏离。
+/// * **#23（TOCTOU）**：lstat 拒 symlink 与 `dl_open` 之间存在窗口。防护
+///   分两层：(1) 这里把校验时目标文件的 `(dev, ino)` 一并返回；(2)
+///   `load_plugin` 在 `dl_open` 成功后重新 `stat` 比对 inode，窗口内文件
+///   被替换即拒绝。前提威胁模型：对白名单目录**有写权限**的攻击者本就
+///   能直接决定被加载的内容（校验前替换不在防护目标内），本防护只封
+///   「校验通过后、加载完成前」的替换窗口。
+fn validate_path(path: &str, sh: &Shell) -> Result<(String, i64, i64), String> {
     let wl = resolve_whitelist(sh);
     if wl.is_empty() {
         return Err("BASH_LOADABLES_PATH has no usable absolute directory".to_string());
@@ -376,7 +393,12 @@ fn validate_path(path: &str, sh: &Shell) -> Result<String, String> {
     if !ok {
         return Err(format!("{}: outside BASH_LOADABLES_PATH whitelist", path));
     }
-    Ok(real)
+
+    // 记录最终目标文件的 (dev, ino)，供 load_plugin 在 dl_open 之后复核
+    //（review #23：封死校验 → 加载之间的 TOCTOU 窗口）。
+    let st = posix::stat_path(&real, true)
+        .ok_or_else(|| format!("{}: cannot stat", path))?;
+    Ok((real, st.dev, st.ino))
 }
 
 /// 立即拷贝一个 C 字符串成 Rust String（NULL -> None）。
@@ -395,13 +417,25 @@ unsafe fn cstr_copy(p: *const c_char) -> Option<String> {
 /// 加载插件。NAME 参数仅为 bash 语法兼容：wash ABI 由插件自带 builtins 列表
 /// 自描述，一次 `-f` 注册插件声明的**全部** count 个内建。
 pub fn load_plugin(path: &str, _names: &[String], sh: &mut Shell) -> Result<(), String> {
-    let real = validate_path(path, sh)?;
+    let (real, dev0, ino0) = validate_path(path, sh)?;
 
     // 重复路径复用句柄。
     let (handle, is_new) = match sh.plugins.handles.get(&real) {
         Some(&h) => (h, false),
         None => (posix::dl_open(&real)?, true),
     };
+
+    // review #23：dl_open 成功后复核 inode。若校验通过后、加载完成前文件
+    // 被替换（换成另一个 inode），拒绝加载并立即关闭刚取得的句柄。
+    if is_new {
+        match posix::stat_path(&real, true) {
+            Some(st) if st.dev == dev0 && st.ino == ino0 => {}
+            _ => {
+                let _ = posix::dl_close(handle);
+                return Err(format!("{}: plugin file changed while loading", path));
+            }
+        }
+    }
 
     let init_addr = match posix::dl_sym(handle, "wash_plugin_init") {
         Ok(a) if a != 0 => a,

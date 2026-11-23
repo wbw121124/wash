@@ -101,12 +101,13 @@ bash 对 `$'\uHHHH'`/`$'\UHHHHHHHH'` 的解释取决于 `MB_CUR_MAX`（字符分
 ## 有意偏离（唯一真源）
 
 非交互 `-c` 输出默认**逐字节一致**，全部有意例外的单一清单是
-[`docs/intentional-divergences.md`](intentional-divergences.md)，当前恰好 2 条：
+[`docs/intentional-divergences.md`](intentional-divergences.md)，当前恰好 3 条：
 
 | ID | 例外 | 裁决 |
 | ---- | ---- | ---- |
 | D-001 | `help -m` 的 IMPLEMENTATION 段用 wash 身份而非 GNU bash 版权段 | 项目自始既有行为；`tests/help_footer.py` 严格替换 + 可逆性校验 |
 | D-002 | `help job_spec` / `help 'job_spec [&]'`（单 pattern 精确）命中 `%` 页，rc=0 | 用户裁决：要、全局生效（含非交互 `-c`）、允许破坏脚本兼容 |
+| D-003 | `enable -f` 显式路径受 `BASH_LOADABLES_PATH` 白名单约束（oracle 构建未启用动态加载，无可对齐语义） | 2026-11-21 主理人裁决：安全设计优先（白名单 + dlopen 后 dev/ino 复核封 TOCTOU） |
 
 D-002 刻意不进通用别名表：只有"选项解析后恰好 1 个 pattern 且字符串精确命中"才生效，
 glob / 多 pattern / 空 pattern / 其余清单显示值 / 别名路径全部仍与 oracle 严格逐字节对拍。
@@ -196,5 +197,32 @@ yacc `near` 行只取最后一个空白之后的部分；被转义的 `=` 是字
 其余已对齐：if/for/while/until/case、函数、eval、mapfile、local、`>|`、
 `exec 3>&-`、`declare -A`、`getopts`、`trap -l`、`(( ))`、数组下标赋值、
 `${!pre*}`、`$(( ))`、heredoc/herestring、未闭合 `$(`、重定向逐行部分执行等。
+
+
+## P2 修复轮遗留 backlog（2026-11-23，oracle 实测确认，未伪装对齐）
+
+本轮 `.workbuddy/review.md` P2 清单 32 条已逐条对拍处理（18/20 早已修复，
+其余按文件域分三批落地）。以下为**如实登记的残留**，不属已对齐行为：
+
+- `cmdsub` 内部的语法错误（`echo $(a | | b)`、`x=$(for)`）：bash 在顶层解析期
+  即报 `-c: line 1: syntax error near unexpected token ...` rc=127；wash 的
+  `parse_cmdsub_cached` 吞掉解析错误，rc=0 空展开。修法需把嵌套解析错误
+  上抛到顶层诊断链，涉及 heredoc/未闭合 `$(` 行号既有机制，留待后续单独排期。
+- `case` 的 `;&`（落空到下一段）语法未实现：bash `case a in a) echo yes ;& b)
+  echo no;; esac` 输出 yes/no，wash 输出 yes 且尝试执行 `b` 命令。
+- `2>&x` 非数字重定向目标的回显词：rc=1 与 `x: ambiguous redirect` 形态已对齐，
+  但 lexer `read_dup_target` 对非 `-`/`$var`/数字目标静默丢弃原始文本，极端
+  情形下词文本为空（bash 回显原词）。
+- `cmdsub` 输出内嵌 NUL：bash 丢弃并告警 `command substitution: ignored null
+  byte in input`，wash 经 byteval 保留裸字节（与项目原始字节保真契约一致，
+  告警缺失）。
+- `${PIPESTATUS[@]:-none}` / `${arr[@]:-x}`：`@` 列表不应用 `:-` 默认值。
+- `$HOME` 缺省回退：bash 用 passwd 项，wash 用 Windows 用户目录（MSYS2
+  平台边界）。
+- 算术变量值递归链深度：wash 50 层护栏（防栈溢出）以内与 bash 对齐，
+  51–700 层 bash 仍可求值而 wash 报 recursion exceeded。
+- 后台作业 `command` 文本取自渲染后的 AST，丢失原始引号（`sh -c "exit 5" &`
+  的 jobs 行显示 `sh -c exit 5`）；持久作业号 jobno 与状态码已对齐。
+- `jobs -x`（jobspec→pid 替换执行）wash 接受该选项但无执行语义。
 
 详细根因存档见 `AGENTS.md`「内建兼容性矩阵 → 已修复缺陷的根因存档」。

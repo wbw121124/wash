@@ -288,6 +288,16 @@ pub struct JobInfo {
     pub command: String,
     /// 已被非阻塞探测判定为结束（进程已消失），不再计入 Running。
     pub done: bool,
+    /// 退出状态（shell 风格：exit code，或 128+信号号；oracle 实测
+    /// bash 对 `wait $p` 同样返回 143）。None = 仍在运行。由收割点
+    /// （executor::reap_finished_jobs）填充；显示端据此区分 bash 的
+    /// `Done`（0）/ `Exit N`（非零）/ `Terminated` 等（128+sig → 信号名）。
+    pub status: Option<i32>,
+    /// 持久作业号（bash 语义）：注册时由 Shell::next_jobno 单调分配，
+    /// 中间作业被 disown / wait 移除后编号**不回收不重排**（oracle 实测：
+    /// `sleep 5 & sleep 5 & disown %2; jobs` 显示 `[1]` `[3]`，
+    /// `… disown %1; sleep 5 &; jobs` 新作业为 `[3]`）。
+    pub jobno: usize,
 }
 
 /// bash names the input source in parse-error prefixes: `-c` for a command
@@ -435,10 +445,13 @@ pub struct Shell {
     pub bg_pid: i32,
     /// Background job pids this shell has started and not yet reaped (`wait`).
     pub jobs: Vec<i32>,
-    /// 与 `jobs` 平行的真实作业表：保存 pid、命令文本与状态，供
-    /// `jobs` / `fg` / `bg` / `disown` 定位与展示。`wait` 只操作 `jobs`，
+    /// 与 `jobs` 平行的真实作业表：保存 pid、命令文本、持久作业号与状态，
+    /// 供 `jobs` / `fg` / `bg` / `disown` 定位与展示。`wait` 只操作 `jobs`，
     /// 回收时会同步清理这里的对应条目。
     pub job_table: Vec<JobInfo>,
+    /// 下一个待分配的持久作业号（bash 语义：单调递增，不随作业删除回收）。
+    /// `execute_background` 注册作业时取用并自增。
+    pub next_jobno: usize,
     /// Array variables (`ARR=(a b)`). Each maps a name to an ordered list of
     /// elements (bash arrays).
     pub arrays: HashMap<String, Vec<String>>,
@@ -608,6 +621,7 @@ impl Shell {
             bg_pid: 0,
             jobs: Vec::new(),
             job_table: Vec::new(),
+            next_jobno: 1,
             arrays: HashMap::new(),
             array_set_indices: HashMap::new(),
             getopts_offset: (0, 0),

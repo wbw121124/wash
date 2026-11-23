@@ -108,6 +108,10 @@ pub const W_OK: c_int = 2;
 pub const R_OK: c_int = 4;
 /// `errno` values used by the shell diagnostics.
 pub const EEXIST: i32 = 17;
+/// Interrupted system call: blocking shim calls (read/waitpid) interrupted
+/// by a signal must be retried instead of being mistaken for EOF (silent
+/// output truncation) or a finished child (a fake status 0 + leaked zombie).
+pub const EINTR: i32 = 4;
 
 /// The file types `test` distinguishes (mirrors the `WASH_FT_*` constants of
 /// the C shim).
@@ -145,9 +149,23 @@ pub const S_ISUID: i32 = 0o4000;
 pub const S_ISGID: i32 = 0o2000;
 pub const S_ISVTX: i32 = 0o1000;
 
+/// 构造 C 字符串：内嵌 NUL 字节按 bash 的 ingress 语义剥除（#13）。
+///
+/// bash 的变量与 argv 永不内嵌 NUL（命令替换收到 NUL 时丢弃该字节并
+/// 告警；argv/execve 边界同样无法携带 NUL）。wash 的 byteval 编码可以
+/// 让含 NUL 的值（如二进制命令替换输出）流入这里；原先
+/// `CString::new(..).unwrap_or_default()` 遇内嵌 NUL 会把整串静默截为
+/// **空串**（`chdir("a\0b")` 退化成 `chdir("")`）。剥除 NUL 字节与 bash
+/// 对同类输入的可观测行为一致，且消除了所有 FFI 调用点的静默截断。
+pub(crate) fn cstr_strip_nul(mut bytes: Vec<u8>) -> CString {
+    bytes.retain(|&b| b != 0);
+    // 剥除后不再含 NUL，CString::new 不会失败。
+    CString::new(bytes).unwrap_or_default()
+}
+
 /// 把 shell 层的路径字符串转成 C 字符串；byteval 编码的裸字节在此还原。
 pub(crate) fn path_cstr(path: &str) -> CString {
-    CString::new(crate::byteval::decode_raw(path)).unwrap_or_default()
+    cstr_strip_nul(crate::byteval::decode_raw(path))
 }
 
 /// The metadata of `path`.
@@ -364,7 +382,7 @@ pub fn realpath(path: &str) -> String {
 
 /// Map a signal name ("INT", "SIGINT", "TERM", ...) to its number, or -1.
 pub fn signal_number(name: &str) -> i32 {
-    let c = CString::new(name).unwrap_or_default();
+    let c = cstr_strip_nul(name.as_bytes().to_vec());
     unsafe { wash_signal_number(c.as_ptr()) }
 }
 
@@ -478,19 +496,79 @@ pub fn kill(pid: i32, sig: i32) -> i32 {
 /// Wait for a specific pid and decode the exit status into a shell-style code.
 pub fn wait_pid(pid: i32) -> i32 {
     let mut status: RawCInt = 0;
-    unsafe {
-        wash_waitpid(pid, &mut status, 0);
+    loop {
+        let r = unsafe { wash_waitpid(pid, &mut status, 0) };
+        // EINTR 不是「子进程已结束」：必须重试，否则返回假 0 并泄漏
+        // 僵尸进程（#15）。
+        if r < 0 && unsafe { wash_errno() } == EINTR {
+            continue;
+        }
+        break;
     }
     decode_status(status)
 }
 
 pub fn wait_pid_nohang(pid: i32) -> Option<i32> {
     let mut status: RawCInt = 0;
-    let r = unsafe { wash_waitpid(pid, &mut status, WNOHANG) };
+    let r = loop {
+        let r = unsafe { wash_waitpid(pid, &mut status, WNOHANG) };
+        if r < 0 && unsafe { wash_errno() } == EINTR {
+            continue;
+        }
+        break r;
+    };
     if r == 0 {
         None
     } else {
         Some(decode_status(status))
+    }
+}
+
+// 自动收割（`executor::reap_finished_jobs`）记下的退出状态。
+//
+// `waitpid(-1, WNOHANG)` 回收后台作业后，进程已消失；`wait` 内建随后
+// 调用 `wait_pid_check` 会得到 ECHILD。bash 的语义是保留已结束作业的
+// 状态直到被通知，所以收割时把状态记入本表，`wait_pid_check` 优先查它
+// （取走即清除）。fork 的子进程经内存拷贝继承本表，与 bash 在子 shell
+// 中等待继承作业的行为一致。
+thread_local! {
+    static REAPED_STATUS: std::cell::RefCell<std::collections::HashMap<i32, i32>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Record the shell-style status of a reaped pid for later `wait` queries.
+fn cache_reaped_status(pid: i32, status: i32) {
+    REAPED_STATUS.with(|c| {
+        let mut map = c.borrow_mut();
+        // 防御上限：从未被 wait 查询的陈旧条目不无限累积。
+        if map.len() >= 1024 {
+            map.clear();
+        }
+        map.insert(pid, status);
+    });
+}
+
+fn take_reaped_status(pid: i32) -> Option<i32> {
+    REAPED_STATUS.with(|c| c.borrow_mut().remove(&pid))
+}
+
+/// 非阻塞收割任意一个已结束的子进程（`waitpid(-1, WNOHANG)`），返回
+/// `(pid, shell 风格退出状态)`；没有可回收的子进程（包括完全没有子
+/// 进程的 ECHILD）时返回 `None`。供 executor 的后台作业自动收割点轮询。
+pub fn wait_any_nohang() -> Option<(i32, i32)> {
+    loop {
+        let mut status: RawCInt = 0;
+        let r = unsafe { wash_waitpid(-1, &mut status, WNOHANG) };
+        if r < 0 && unsafe { wash_errno() } == EINTR {
+            continue;
+        }
+        if r <= 0 {
+            // r == 0：还有子进程但都未结束；r < 0：ECHILD（无子进程）。
+            return None;
+        }
+        let st = decode_status(status);
+        cache_reaped_status(r, st);
+        return Some((r, st));
     }
 }
 
@@ -499,8 +577,18 @@ pub fn wait_pid_nohang(pid: i32) -> Option<i32> {
 /// child of this shell → `ECHILD`). This lets the `wait` builtin tell
 /// "no such child" apart from a genuine exit status of 0.
 pub fn wait_pid_check(pid: i32) -> Option<i32> {
+    // 该 pid 若已被自动收割，waitpid 必然 ECHILD；先查收割状态表。
+    if let Some(code) = take_reaped_status(pid) {
+        return Some(code);
+    }
     let mut status: RawCInt = 0;
-    let r = unsafe { wash_waitpid(pid, &mut status, 0) };
+    let r = loop {
+        let r = unsafe { wash_waitpid(pid, &mut status, 0) };
+        if r < 0 && unsafe { wash_errno() } == EINTR {
+            continue;
+        }
+        break r;
+    };
     if r < 0 {
         None
     } else {
@@ -521,7 +609,7 @@ fn decode_status(status: RawCInt) -> i32 {
 }
 
 pub fn to_cstr(s: &str) -> CString {
-    CString::new(s).unwrap_or_default()
+    cstr_strip_nul(s.as_bytes().to_vec())
 }
 
 // --- bash-compatible numeric parsing / formatting -------------------------
@@ -531,7 +619,7 @@ pub fn to_cstr(s: &str) -> CString {
 /// the string has trailing garbage or no digits (→ bash's conv_error). On
 /// overflow the value is clamped (LLONG_MAX/MIN) and `overflow` is set.
 pub fn parse_long_long(s: &str) -> (i64, bool, bool) {
-    let c = CString::new(s).unwrap_or_default();
+    let c = cstr_strip_nul(s.as_bytes().to_vec());
     let mut fully: c_int = 0;
     let mut overflow: c_int = 0;
     let v = unsafe { wash_parse_ll(c.as_ptr(), &mut fully, &mut overflow) };
@@ -541,7 +629,7 @@ pub fn parse_long_long(s: &str) -> (i64, bool, bool) {
 /// Parse `s` as a base-0 unsigned integer (bash `%u` semantics). Same contract
 /// as `parse_long_long` but uses `strtoull` (so `-1` wraps to 2^64-1).
 pub fn parse_unsigned_long_long(s: &str) -> (u64, bool, bool) {
-    let c = CString::new(s).unwrap_or_default();
+    let c = cstr_strip_nul(s.as_bytes().to_vec());
     let mut fully: c_int = 0;
     let mut overflow: c_int = 0;
     let v = unsafe { wash_parse_ull(c.as_ptr(), &mut fully, &mut overflow) };
@@ -552,8 +640,8 @@ pub fn parse_unsigned_long_long(s: &str) -> (u64, bool, bool) {
 /// `L` length modifier before the conversion letter, e.g. `%10.5Lf`). Returns
 /// the rendered bytes and whether the argument was fully/validly parsed.
 pub fn printf_long_double(fmt: &str, arg: &str) -> (Vec<u8>, bool) {
-    let cf = CString::new(fmt).unwrap_or_default();
-    let ca = CString::new(arg).unwrap_or_default();
+    let cf = cstr_strip_nul(fmt.as_bytes().to_vec());
+    let ca = cstr_strip_nul(arg.as_bytes().to_vec());
     let mut valid: c_int = 0;
     // Initial buffer; grow if snprintf reports it was too small.
     let mut buf: Vec<u8> = vec![0u8; 4096];
@@ -583,7 +671,7 @@ pub fn printf_long_double(fmt: &str, arg: &str) -> (Vec<u8>, bool) {
 /// Format a signed `long long` with `fmt` (must contain `ll` length modifier,
 /// e.g. `%lld`/`%lli`).
 pub fn snprintf_ll_d(fmt: &str, v: i64) -> Vec<u8> {
-    let cf = CString::new(fmt).unwrap_or_default();
+    let cf = cstr_strip_nul(fmt.as_bytes().to_vec());
     let mut buf: Vec<u8> = vec![0u8; 4096];
     loop {
         let n = unsafe {
@@ -604,7 +692,7 @@ pub fn snprintf_ll_d(fmt: &str, v: i64) -> Vec<u8> {
 
 /// Format an unsigned `long long` with `fmt` (must contain `ll`, e.g. `%llu`).
 pub fn snprintf_ll_u(fmt: &str, v: u64) -> Vec<u8> {
-    let cf = CString::new(fmt).unwrap_or_default();
+    let cf = cstr_strip_nul(fmt.as_bytes().to_vec());
     let mut buf: Vec<u8> = vec![0u8; 4096];
     loop {
         let n = unsafe {
@@ -627,7 +715,13 @@ pub fn snprintf_ll_u(fmt: &str, v: u64) -> Vec<u8> {
 /// Read one byte from `fd`.  Returns `None` at the end of the file.
 pub fn read_byte_from(fd: i32) -> Option<u8> {
     let mut buf = [0u8; 1];
-    let n = unsafe { wash_read(fd, buf.as_mut_ptr(), 1) };
+    let n = loop {
+        let n = unsafe { wash_read(fd, buf.as_mut_ptr(), 1) };
+        if n < 0 && unsafe { wash_errno() } == EINTR {
+            continue;
+        }
+        break n;
+    };
     if n == 1 {
         Some(buf[0])
     } else {
@@ -646,7 +740,15 @@ pub fn read_all(fd: i32) -> String {
     let mut out = Vec::new();
     loop {
         let n = unsafe { wash_read(fd, buf.as_mut_ptr(), buf.len()) };
-        if n <= 0 {
+        if n < 0 {
+            // EINTR 不是 EOF：被信号打断的 read 必须重试，否则命令替换
+            // 的输出会被静默截断（#15）。
+            if unsafe { wash_errno() } == EINTR {
+                continue;
+            }
+            break;
+        }
+        if n == 0 {
             break;
         }
         out.extend_from_slice(&buf[..n as usize]);
@@ -679,7 +781,13 @@ pub fn poll_readable(fd: i32, ms: i32) -> bool {
 /// Blocking read of a single byte from stdin. Returns `None` on EOF.
 pub fn read_byte() -> Option<u8> {
     let mut buf = [0u8; 1];
-    let n = unsafe { wash_read(0, buf.as_mut_ptr(), 1) };
+    let n = loop {
+        let n = unsafe { wash_read(0, buf.as_mut_ptr(), 1) };
+        if n < 0 && unsafe { wash_errno() } == EINTR {
+            continue;
+        }
+        break n;
+    };
     if n == 1 {
         Some(buf[0])
     } else {
@@ -742,7 +850,7 @@ pub fn getpgrp() -> i32 {
 
 /// 按 strftime 格式取本地时间字符串（供 PS1 转义使用）。
 pub fn strftime_local(fmt: &str) -> String {
-    let c = CString::new(fmt).unwrap_or_default();
+    let c = cstr_strip_nul(fmt.as_bytes().to_vec());
     let mut buf = [0u8; 128];
     let r = unsafe { wash_strftime(buf.as_mut_ptr() as *mut c_char, buf.len(), c.as_ptr()) };
     if r != 0 {
@@ -777,7 +885,7 @@ pub fn dl_close(slot: i32) -> Result<(), String> {
 
 /// 查符号地址，返回可 transmute 成函数指针的 `usize`（对应 C `uintptr_t`）。
 pub fn dl_sym(slot: i32, name: &str) -> Result<usize, String> {
-    let c = CString::new(name).unwrap_or_default();
+    let c = cstr_strip_nul(name.as_bytes().to_vec());
     let mut addr: usize = 0;
     let r = unsafe { wash_dlsym(slot, c.as_ptr(), &mut addr) };
     if r != 0 {
@@ -831,7 +939,7 @@ pub fn regex_match(text: &str, pattern: &str, icase: bool) -> RegexMatch {
     if handle.is_null() {
         return RegexMatch::Error;
     }
-    let cpat = CString::new(pattern).unwrap_or_default();
+    let cpat = cstr_strip_nul(pattern.as_bytes().to_vec());
     let mut cflags = REG_EXTENDED;
     if icase {
         cflags |= REG_ICASE;
@@ -851,7 +959,7 @@ pub fn regex_match(text: &str, pattern: &str, icase: bool) -> RegexMatch {
     let cap = unsafe { wash_regex_nsub(handle) } + 1;
     let mut starts = vec![0 as c_long; cap];
     let mut ends = vec![0 as c_long; cap];
-    let ctext = CString::new(text).unwrap_or_default();
+    let ctext = cstr_strip_nul(text.as_bytes().to_vec());
     let rc = unsafe {
         wash_regex_exec(
             handle,

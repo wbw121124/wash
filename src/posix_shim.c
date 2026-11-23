@@ -628,6 +628,36 @@ unsigned long long wash_parse_ull(const char *s, int *fully, int *overflow) {
 // an `L` length modifier before the conversion letter). Sets *valid (1 iff the
 // whole string was consumed and at least one digit was parsed). This keeps the
 // `long double` value inside C so we never cross the long-double ABI to Rust.
+// 白名单校验即将直通 snprintf 的格式串（review #14）。
+//
+// 调用方（builtins.rs 的 printf 内建）会把用户格式串解析后**重组**成只含
+// 一个转换的规范形式，但纵深防御要求 C 侧自身把关：格式串必须形如
+//   '%' flags(- + 空格 # 0) width(数字) [.prec(数字)] <长度修饰 lhjztqL> CONV
+// 且 CONV 只能取 `convs` 白名单内的字母。任何指针/参数型转换（%n %s %p
+// %c）与 `*` 宽度一律拒绝：glibc 的 %n 会按 varargs 里的位模式写内存，
+// `*` 则会消耗不属于它的 vararg —— 两者都可能把受控输入变成内存写入面。
+static int wash_fmt_safe(const char *fmt, const char *convs) {
+    const char *p = fmt;
+    int conversions = 0;
+    while (*p) {
+        if (*p != '%') { p++; continue; }
+        p++;
+        if (*p == '%') { p++; continue; }
+        while (*p && strchr("-+ #0", *p)) p++;
+        while (isdigit((unsigned char)*p)) p++;
+        if (*p == '.') {
+            p++;
+            while (isdigit((unsigned char)*p)) p++;
+        }
+        while (*p && strchr("lhjztqL", *p)) p++;
+        if (*p == '\0' || strchr(convs, *p) == NULL) return 0;
+        p++;
+        conversions++;
+        if (conversions > 1) return 0;  /* 调用方只传一个转换 */
+    }
+    return conversions == 1;
+}
+
 int wash_printf_ld(char *buf, size_t n, const char *fmt, const char *arg, int *valid) {
     const char *p = arg;
     while (*p && isspace((unsigned char)*p)) p++;
@@ -637,14 +667,26 @@ int wash_printf_ld(char *buf, size_t n, const char *fmt, const char *arg, int *v
     char *end;
     long double v = strtold(arg, &end);
     *valid = parsed_digit && (*end == '\0');
+    if (!wash_fmt_safe(fmt, "aAeEfFgG")) {
+        errno = EINVAL;
+        return -1;
+    }
     return snprintf(buf, n, fmt, v);
 }
 
 int wash_snprintf_ll_d(char *buf, size_t n, const char *fmt, long long v) {
+    if (!wash_fmt_safe(fmt, "diouxX")) {
+        errno = EINVAL;
+        return -1;
+    }
     return snprintf(buf, n, fmt, v);
 }
 
 int wash_snprintf_ll_u(char *buf, size_t n, const char *fmt, unsigned long long v) {
+    if (!wash_fmt_safe(fmt, "diouxX")) {
+        errno = EINVAL;
+        return -1;
+    }
     return snprintf(buf, n, fmt, v);
 }
 

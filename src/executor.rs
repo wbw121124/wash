@@ -44,7 +44,8 @@ impl ArgVec {
         let mut ptrs = Vec::with_capacity(args.len() + 1);
         for a in args {
             // 变量值中的 byteval 编码字节在此还原为原始 argv 字节。
-            let c = CString::new(crate::byteval::decode_raw(a)).unwrap_or_default();
+            // 内嵌 NUL 按 bash 的 ingress 语义剥除（见 posix::cstr_strip_nul）。
+            let c = posix::cstr_strip_nul(crate::byteval::decode_raw(a));
             ptrs.push(c.as_ptr());
             cstrings.push(c);
         }
@@ -61,7 +62,7 @@ fn env_entry(k: &str, v: &str) -> CString {
     let mut kv = crate::byteval::decode_raw(k);
     kv.push(b'=');
     kv.extend_from_slice(&crate::byteval::decode_raw(v));
-    CString::new(kv).unwrap_or_default()
+    posix::cstr_strip_nul(kv)
 }
 
 /// Build the null-terminated `envp` vector for an environment map.
@@ -195,8 +196,8 @@ fn exec_classified(
                 // 解释器不存在/不可执行时按其实际 errno 报
                 // `bad interpreter: <strerror>`（rc 126，无行号前缀）。
                 // interp 是 byteval 编码串，execve 前必须 decode_raw 还原字节。
-                let ic = CString::new(crate::byteval::decode_raw(&interp)).unwrap_or_default();
-                let script_c = CString::new(display).unwrap_or_default();
+                let ic = posix::cstr_strip_nul(crate::byteval::decode_raw(&interp));
+                let script_c = posix::cstr_strip_nul(display.as_bytes().to_vec());
                 let mut ptrs: Vec<*const c_char> =
                     vec![ic.as_ptr(), script_c.as_ptr()];
                 for p in argv.iter().skip(1) {
@@ -488,28 +489,112 @@ enum ExpRedir {
     Out(i32, String, bool, bool),
     /// file, append (`&>>`).
     Both(String, bool),
-    Dup(i32, String), // `N>&M` / `N<&M` / `>&-`
+    /// fd, expanded target, raw source word (`N>&M` / `N<&M` / `>&-`)。
+    /// raw 用于 `M` 不是数字时按 bash 语义回显原始词（`2>&x` →
+    /// `x: ambiguous redirect`，实测）。
+    Dup(i32, String, String),
     /// fd, text: a here-document body or here-string after expansion.  Both
     /// are fed to the descriptor the same way (bash spools them to a temp
     /// file too).
     HereDoc(i32, String),
+    /// fd, raw source word: the redirection word expanded to several fields
+    /// (or zero fields) — bash reports `<raw word>: ambiguous redirect`
+    /// with the ORIGINAL word text (MSYS2 bash 5.3 实测：`> $v`、`> ${v}`、
+    /// `> $(echo "$v")`、`> "pre"$v` 都原样回显源词，含引号)。
+    Ambiguous(i32, String),
 }
 
-fn expand_file(file: &[WordPart], ctx: &ExpandCtx) -> String {
+/// Reconstruct the RAW source text of a redirection word for bash's
+/// `<word>: ambiguous redirect` diagnostic.  The AST carries no original
+/// text, so the word is rebuilt from its parts: quoted literal fragments are
+/// re-wrapped in double quotes (bash 回显的是源词原文；单引号与转义细节
+/// 无法从 AST 还原，登记为极端情形下的已知偏差).
+fn raw_word_text(word: &[WordPart]) -> String {
+    let mut s = String::new();
+    for p in word {
+        match p {
+            WordPart::Text(t, quoted) => {
+                if *quoted {
+                    s.push('"');
+                    s.push_str(t);
+                    s.push('"');
+                } else {
+                    s.push_str(t);
+                }
+            }
+            WordPart::Var(n, _) => {
+                s.push('$');
+                s.push_str(n);
+            }
+            WordPart::Braced(b, _) => {
+                s.push_str("${");
+                s.push_str(b);
+                s.push('}');
+            }
+            WordPart::CmdSub(b, _) => {
+                s.push_str("$(");
+                s.push_str(b);
+                s.push(')');
+            }
+            WordPart::Backtick(b, _) => {
+                s.push('`');
+                s.push_str(b);
+                s.push('`');
+            }
+            WordPart::Arith(b, _) => {
+                s.push_str("$((");
+                s.push_str(b);
+                s.push_str("))");
+            }
+            WordPart::Tilde => s.push('~'),
+            WordPart::Brace(alts) => {
+                s.push('{');
+                for (i, a) in alts.iter().enumerate() {
+                    if i > 0 {
+                        s.push(',');
+                    }
+                    s.push_str(a);
+                }
+                s.push('}');
+            }
+        }
+    }
+    s
+}
+
+/// Expand one redirection word.  Returns `Err(raw)` — the RAW source word —
+/// when the expansion does not yield exactly one field: zero fields (an
+/// empty variable, nullglob with no matches) or several fields (word
+/// splitting) both make bash report `<raw word>: ambiguous redirect`.
+fn expand_redir_file(file: &[WordPart], ctx: &ExpandCtx) -> Result<String, String> {
     let words = expand_word(file, ctx);
-    words.into_iter().next().unwrap_or_default()
+    if words.len() == 1 {
+        Ok(words.into_iter().next().unwrap_or_default())
+    } else {
+        Err(raw_word_text(file))
+    }
 }
 
 fn expand_redirs(redirs: &[Redir], ctx: &ExpandCtx) -> Vec<ExpRedir> {
     redirs
         .iter()
         .map(|r| match r {
-            Redir::In { fd, file } => ExpRedir::In(*fd, expand_file(file, ctx)),
-            Redir::Out { fd, file, append, clobber } => {
-                ExpRedir::Out(*fd, expand_file(file, ctx), *append, *clobber)
-            }
-            Redir::Both { file, append } => ExpRedir::Both(expand_file(file, ctx), *append),
-            Redir::Dup { fd, file } => ExpRedir::Dup(*fd, expand_file(file, ctx)),
+            Redir::In { fd, file } => match expand_redir_file(file, ctx) {
+                Ok(f) => ExpRedir::In(*fd, f),
+                Err(raw) => ExpRedir::Ambiguous(*fd, raw),
+            },
+            Redir::Out { fd, file, append, clobber } => match expand_redir_file(file, ctx) {
+                Ok(f) => ExpRedir::Out(*fd, f, *append, *clobber),
+                Err(raw) => ExpRedir::Ambiguous(*fd, raw),
+            },
+            Redir::Both { file, append } => match expand_redir_file(file, ctx) {
+                Ok(f) => ExpRedir::Both(f, *append),
+                Err(raw) => ExpRedir::Ambiguous(2, raw),
+            },
+            Redir::Dup { fd, file } => match expand_redir_file(file, ctx) {
+                Ok(t) => ExpRedir::Dup(*fd, t, raw_word_text(file)),
+                Err(raw) => ExpRedir::Ambiguous(*fd, raw),
+            },
             Redir::HereDoc { fd, body, expand } => ExpRedir::HereDoc(
                 *fd,
                 if *expand {
@@ -558,7 +643,10 @@ fn apply_exp_redirs(redirs: &[ExpRedir], noclobber: bool) {
                 if f < 0 {
                     redir_failed(file);
                 }
-                posix::dup2(f, *fd);
+                if posix::dup2(f, *fd) < 0 {
+                    posix::close(f);
+                    redir_failed(file);
+                }
                 posix::close(f);
             }
             ExpRedir::Out(fd, file, append, clobber) => {
@@ -566,7 +654,10 @@ fn apply_exp_redirs(redirs: &[ExpRedir], noclobber: bool) {
                 if f < 0 {
                     redir_failed(file);
                 }
-                posix::dup2(f, *fd);
+                if posix::dup2(f, *fd) < 0 {
+                    posix::close(f);
+                    redir_failed(file);
+                }
                 posix::close(f);
             }
             ExpRedir::Both(file, append) => {
@@ -574,17 +665,26 @@ fn apply_exp_redirs(redirs: &[ExpRedir], noclobber: bool) {
                 if f < 0 {
                     redir_failed(file);
                 }
-                posix::dup2(f, 1);
-                posix::dup2(f, 2);
+                if posix::dup2(f, 1) < 0 || posix::dup2(f, 2) < 0 {
+                    posix::close(f);
+                    redir_failed(file);
+                }
                 posix::close(f);
             }
-            ExpRedir::Dup(fd, target) => {
+            ExpRedir::Dup(fd, target, raw) => {
                 // `N>&M` makes N refer to whatever M currently refers to;
-                // `>&-` closes the descriptor.
+                // `>&-` closes the descriptor.  目标 fd 无效时 bash 报
+                // `<M>: Bad file descriptor` 且 rc=1（MSYS2 bash 5.3 实测：
+                // `echo hi 2>&9` → `bash: line 1: 9: Bad file descriptor`）。
                 if target == "-" {
                     posix::close(*fd);
                 } else if let Ok(src) = target.parse::<i32>() {
-                    posix::dup2(src, *fd);
+                    if posix::dup2(src, *fd) < 0 {
+                        dup_bad_fd_exit(target);
+                    }
+                } else {
+                    // `2>&x`：目标不是数字，bash 报 ambiguous redirect。
+                    dup_ambiguous_exit(raw);
                 }
             }
             ExpRedir::HereDoc(fd, text) => {
@@ -592,11 +692,40 @@ fn apply_exp_redirs(redirs: &[ExpRedir], noclobber: bool) {
                 if f < 0 {
                     redir_failed("here-document");
                 }
-                posix::dup2(f, *fd);
+                if posix::dup2(f, *fd) < 0 {
+                    // dup2 失败必须关闭已 spool 的临时描述符，不再泄漏。
+                    posix::close(f);
+                    redir_failed("here-document");
+                }
                 posix::close(f);
+            }
+            ExpRedir::Ambiguous(_fd, raw) => {
+                // bash 对展开为多字段（或零字段）的重定向词以**原始词文本**
+                // 报错并使命令失败（rc 1）：`echo hi > $v`（v="a b"）→
+                // `bash: line 1: $v: ambiguous redirect`。
+                safe_eprintln!("wash: {}: ambiguous redirect", raw);
+                let _ = std::io::stdout().flush();
+                posix::exit(1);
             }
         }
     }
+}
+
+/// 子进程里 dup 失效目标（`N>&M` 的 M 不是数字且不是 `-`）：bash 报
+/// `<原始词>: ambiguous redirect` 并以 rc 1 终止本命令。
+fn dup_ambiguous_exit(raw: &str) -> ! {
+    safe_eprintln!("wash: {}: ambiguous redirect", raw);
+    let _ = std::io::stdout().flush();
+    posix::exit(1);
+}
+
+/// 子进程里 dup2 到无效源 fd（`N>&M` 的 M 未打开）：bash 报
+/// `<M>: Bad file descriptor` 并以 rc 1 终止本命令。
+fn dup_bad_fd_exit(target: &str) -> ! {
+    let e = posix::errno();
+    safe_eprintln!("wash: {}: {}", target, posix::errno_message(e));
+    let _ = std::io::stdout().flush();
+    posix::exit(1);
 }
 
 /// Apply the redirections to the *current* shell, saving the previous
@@ -625,7 +754,12 @@ fn apply_redirs_in_parent(
                 }
                 let backup = posix::dup(*fd);
                 saved.push((*fd, backup));
-                posix::dup2(f, *fd);
+                if posix::dup2(f, *fd) < 0 {
+                    let e = posix::errno();
+                    posix::close(f);
+                    restore_fds(&saved);
+                    return Err(format!("wash: {}: {}", file, posix::errno_message(e)));
+                }
                 posix::close(f);
             }
             ExpRedir::Out(fd, file, append, clobber) => {
@@ -640,7 +774,12 @@ fn apply_redirs_in_parent(
                 }
                 let backup = posix::dup(*fd);
                 saved.push((*fd, backup));
-                posix::dup2(f, *fd);
+                if posix::dup2(f, *fd) < 0 {
+                    let e = posix::errno();
+                    posix::close(f);
+                    restore_fds(&saved);
+                    return Err(format!("wash: {}: {}", file, posix::errno_message(e)));
+                }
                 posix::close(f);
             }
             ExpRedir::Both(file, append) => {
@@ -657,18 +796,32 @@ fn apply_redirs_in_parent(
                 }
                 posix::close(f);
             }
-            ExpRedir::Dup(fd, target) => {
+            ExpRedir::Dup(fd, target, raw) => {
                 // Builtins run in the parent, so the descriptor must be saved
-                // for restore_fds() afterwards.
-                let backup = posix::dup(*fd);
-                saved.push((*fd, backup));
+                // for restore_fds() afterwards.  先校验目标合法性再保存备份
+                // （#17：旧实现先 dup 后校验，ambiguous 失败时把 -1 压入
+                // saved，restore 时 dup2(-1, fd) 静默无效）。
                 if target == "-" {
+                    let backup = posix::dup(*fd);
+                    saved.push((*fd, backup));
                     posix::close(*fd);
                 } else if let Ok(src) = target.parse::<i32>() {
-                    posix::dup2(src, *fd);
+                    let backup = posix::dup(*fd);
+                    // backup == -1：原 fd 本就不存在（如 `9>&1` 在 fd 9 上
+                    // 新建描述符）；restore_fds 会按「关闭」恢复。
+                    saved.push((*fd, backup));
+                    if posix::dup2(src, *fd) < 0 {
+                        // bash 实测：`echo hi 2>&9`（echo 为父 shell 内建）
+                        // → `bash: line 1: 9: Bad file descriptor`，rc=1。
+                        let e = posix::errno();
+                        restore_fds(&saved);
+                        return Err(format!("wash: {}: {}", target, posix::errno_message(e)));
+                    }
                 } else {
+                    // `2>&x`：目标不是数字，bash 报 ambiguous redirect
+                    // （回显原始词）。
                     restore_fds(&saved);
-                    return Err(format!("wash: {}: ambiguous redirect", target));
+                    return Err(format!("wash: {}: ambiguous redirect", raw));
                 }
             }
             ExpRedir::HereDoc(fd, text) => {
@@ -682,8 +835,19 @@ fn apply_redirs_in_parent(
                 }
                 let backup = posix::dup(*fd);
                 saved.push((*fd, backup));
-                posix::dup2(f, *fd);
+                if posix::dup2(f, *fd) < 0 {
+                    let e = posix::errno();
+                    posix::close(f);
+                    restore_fds(&saved);
+                    return Err(format!("wash: here-document: {}", posix::errno_message(e)));
+                }
                 posix::close(f);
+            }
+            ExpRedir::Ambiguous(_fd, raw) => {
+                // bash 对展开为多字段（或零字段）的重定向词以**原始词文本**
+                // 报错（rc 1）；已应用的重定向按 bash 语义恢复原状。
+                restore_fds(&saved);
+                return Err(format!("wash: {}: ambiguous redirect", raw));
             }
         }
     }
@@ -691,10 +855,18 @@ fn apply_redirs_in_parent(
 }
 
 /// Restore the descriptors saved by `apply_redirs_in_parent`.
+///
+/// `(fd, -1)` 表示保存时原 fd 本就不存在（dup 失败，例如 `9>&1` 在 fd 9
+/// 上新建描述符）：恢复动作是**关闭**该 fd，而不是把 -1 喂给 dup2
+/// （#17：旧实现静默 dup2(-1, fd)，无效且泄漏新建的 fd）。
 fn restore_fds(saved: &[(i32, i32)]) {
     for (fd, backup) in saved.iter().rev() {
-        posix::dup2(*backup, *fd);
-        posix::close(*backup);
+        if *backup >= 0 {
+            posix::dup2(*backup, *fd);
+            posix::close(*backup);
+        } else {
+            posix::close(*fd);
+        }
     }
 }
 
@@ -2984,16 +3156,21 @@ fn execute_background(p: &Pipeline, sh: &mut Shell, path: Option<&str>) -> i32 {
     // 不会执行到这里；且子进程持有独立的 Shell 副本，其内部若再起后台作业
     // 也只改自己的副本，不会污染父 shell 的作业表。
     sh.jobs.push(pid);
+    // 持久作业号（bash 语义）：单调分配，作业删除后不回收不重排。
+    let jobno = sh.next_jobno;
+    sh.next_jobno += 1;
     sh.job_table.push(crate::shell::JobInfo {
         pid,
         // 命令文本取自流水线渲染（不含结尾的 `&`），是真实输入，非伪造。
         command: crate::builtins::render_pipeline(p),
         done: false,
+        status: None,
+        jobno,
     });
     sh.bg_pid = pid;
-    let jobno = sh.jobs.len();
     // bash 只在交互式 shell（且打开了作业控制）里通报后台作业的启动；
     // 非交互的 `bash -c 'sleep 1 &'` 什么都不打印。通报信息走 stderr。
+    // 通报用持久作业号，与 jobs 内建显示的 `[N]` 同源。
     if sh.interactive {
         safe_eprintln!("[{}] {}", jobno, pid);
     }
@@ -3055,10 +3232,37 @@ fn execute_andor(andor: &AndOr, sh: &mut Shell, path: Option<&str>, last: &mut i
     false
 }
 
+/// 自动收割已结束的后台作业（review #21）。
+///
+/// 以前除 `wait` 内建之外没有任何 waitpid 收割点，交互 shell 里大量
+/// `sleep &` 后僵尸进程无限累积、`jobs` 永远显示 Running。这里用
+/// `waitpid(-1, WNOHANG)` 轮询收割：收割到的 pid 在作业表中标记
+/// `done = true`（`jobs` 内建据此显示 bash 的 `Done`），其退出状态由
+/// `posix::wait_any_nohang` 记入 REAPED_STATUS 表，`wait` 内建随后仍能
+/// 取到真实状态（bash 保留已结束作业状态直到被通知的语义）。
+///
+/// 只碰**自己的**子进程（waitpid(-1) 的语义边界），不会干扰任何调用方
+/// 正在按 pid 等待的子进程：所有按 pid 的同步等待（命令替换、子 shell、
+/// 管道阶段）从 fork 到 wait 之间都不会重入 execute()。
+fn reap_finished_jobs(sh: &mut Shell) {
+    while let Some((pid, status)) = posix::wait_any_nohang() {
+        if let Some(j) = sh.job_table.iter_mut().find(|j| j.pid == pid) {
+            j.done = true;
+            // 退出状态（shell 风格：exit code 或 128+sig）随收割一并记录，
+            // 供显示端区分 bash 的 Done / Exit N / Terminated 等；与
+            // REAPED_STATUS 表同源，`wait` 内建取走缓存不会丢这里的状态。
+            j.status = Some(status);
+        }
+    }
+}
+
 pub fn execute(list: &CommandList, sh: &mut Shell) -> i32 {
     // Make every function defined anywhere in this list (including nested
     // ones) callable before any command runs.
     register_functions(list, sh);
+
+    // 自动收割点（#21）：每条命令列表执行前轮询回收已结束的后台作业。
+    reap_finished_jobs(sh);
 
     // `PATH` 未设置（键不存在）与设置为空串要区分开：未设置 → 裸名直接
     // execve（bash 报 `No such file or directory`），设置为空 → 只搜
@@ -3081,6 +3285,10 @@ pub fn execute(list: &CommandList, sh: &mut Shell) -> i32 {
     };
     for andor in &expanded.andors {
         let aborted = execute_andor(andor, sh, path, &mut last);
+        // 自动收割点（#21）：AND-OR 列表之间也收割，保证
+        // `sleep 0.1 & sleep 0.3; jobs` 在 jobs 运行前把作业标记为 Done
+        // （bash 实测输出：`[1]+  Done   sleep 0.1`，rc=0）。
+        reap_finished_jobs(sh);
         // A fatal expansion error aborts every enclosing command list,
         // including `if` / loop / function bodies that called us.
         if crate::expand::arith_failed() || crate::expand::expansion_abort_code().is_some() {

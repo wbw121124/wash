@@ -354,12 +354,17 @@ struct Candidate {
     /// 最终为空时应被整体丢弃（bash: `$empty`、空的 `"$@"` → 0 个词）。
     /// 显式空串 `""`、带引号的 `$var`、或已拼接字面量的字段永不 droppable。
     droppable: bool,
+    /// 该候选含有来自「未加引号」部分的通配符，因而在整词展开结束后要参与
+    /// glob（bash 先展开整词、再对每个字段 glob）。带引号的 `*` 是字面量，
+    /// 不会置位此标志。
+    globbable: bool,
 }
 
 /// Append literal text to every still-open candidate.  Closed fields are
 /// already complete words and stay untouched.  Quoted text (even an empty
 /// `""`) makes the field explicit and therefore non-droppable.
 fn append_literal(candidates: Vec<Candidate>, text: &str, quoted: bool) -> Vec<Candidate> {
+    let magic = !quoted && has_glob(text);
     candidates
         .into_iter()
         .map(|c| {
@@ -368,6 +373,7 @@ fn append_literal(candidates: Vec<Candidate>, text: &str, quoted: bool) -> Vec<C
                     text: format!("{}{}", c.text, text),
                     open: true,
                     droppable: if quoted { false } else { c.droppable },
+                    globbable: c.globbable || magic,
                 }
             } else {
                 c
@@ -379,37 +385,18 @@ fn append_literal(candidates: Vec<Candidate>, text: &str, quoted: bool) -> Vec<C
 /// Expand a single word into 0+ resulting words (splitting + globbing for
 /// unquoted expansions).
 pub fn expand_word(parts: &[WordPart], ctx: &ExpandCtx) -> Vec<String> {
-    let mut candidates: Vec<Candidate> = vec![Candidate { text: String::new(), open: true, droppable: false }];
+    let mut candidates: Vec<Candidate> = vec![Candidate {
+        text: String::new(),
+        open: true,
+        droppable: false,
+        globbable: false,
+    }];
     for part in parts {
         match part {
             WordPart::Text(s, quoted) => {
-                let mut next = append_literal(candidates, s, *quoted);
-                if !*quoted && !ctx.noglob {
-                    // Unquoted literal text is still subject to globbing.  A
-                    // glob that yields several matches turns all but the last
-                    // into complete fields.
-                    let mut globbed = Vec::new();
-                    for c in next.drain(..) {
-                        if !c.open || !has_glob(&c.text) {
-                            // On a wildcard-free field `glob()` would just
-                            // return `[text.clone()]` and keep `open`
-                            // unchanged.  Skip that Vec + String allocation:
-                            // the hot path (ordinary words) now allocates
-                            // nothing for globbing.  `has_glob` is exactly
-                            // the guard `glob()` itself uses, so behaviour is
-                            // byte-identical for every field.
-                            globbed.push(c);
-                            continue;
-                        }
-                        let matches = glob(&c.text, ctx.nullglob);
-                        let n = matches.len();
-                        for (k, m) in matches.into_iter().enumerate() {
-                            globbed.push(Candidate { text: m, open: k + 1 == n, droppable: false });
-                        }
-                    }
-                    next = globbed;
-                }
-                candidates = next;
+                // bash globs only the FULLY expanded field, so no globbing
+                // happens here; the word-end pass below handles it.
+                candidates = append_literal(candidates, s, *quoted);
             }
             WordPart::Tilde => {
                 let home = ctx.env.get("HOME").cloned().unwrap_or_else(|| "/".to_string());
@@ -421,6 +408,7 @@ pub fn expand_word(parts: &[WordPart], ctx: &ExpandCtx) -> Vec<String> {
                                 text: if c.text.is_empty() { home.clone() } else { format!("{}~", c.text) },
                                 open: true,
                                 droppable: false,
+                                globbable: c.globbable,
                             }
                         } else {
                             c
@@ -481,20 +469,44 @@ pub fn expand_word(parts: &[WordPart], ctx: &ExpandCtx) -> Vec<String> {
                         continue;
                     }
                     for a in alts {
-                        next.push(Candidate { text: format!("{}{}", c.text, a), open: true, droppable: false });
+                        next.push(Candidate {
+                            text: format!("{}{}", c.text, a),
+                            open: true,
+                            droppable: false,
+                            globbable: c.globbable,
+                        });
                     }
                 }
                 candidates = next;
             }
         }
     }
-    candidates
-        .into_iter()
+    // Globbing runs once, on the fully expanded fields (bash expands the
+    // whole word first, then globs each field).  Only fields that received a
+    // wildcard from an UNQUOTED part participate; a quoted `*` is literal.
+    let mut results: Vec<String> = Vec::new();
+    for c in candidates {
         // bash: 未加引号的空展开 / 空 "$@" 产生 0 个词；显式 ""、带引号的
         // $var、已拼接字面量的字段（droppable=false）必须保留为 1 个词。
-        .filter(|c| !(c.droppable && c.text.is_empty()))
-        .map(|c| c.text)
-        .collect()
+        if c.droppable && c.text.is_empty() {
+            continue;
+        }
+        if !ctx.noglob && c.globbable && has_glob(&c.text) {
+            let matches = glob(&c.text, ctx.nullglob);
+            if matches.is_empty() {
+                // nullglob: a pattern matching nothing contributes zero words;
+                // otherwise the pattern stays literal.
+                if !ctx.nullglob {
+                    results.push(c.text);
+                }
+            } else {
+                results.extend(matches);
+            }
+        } else {
+            results.push(c.text);
+        }
+    }
+    results
 }
 
 /// The value of `$IFS` for word splitting.  An *unset* IFS behaves like the
@@ -600,11 +612,9 @@ fn expansion_fields(exp: Expansion, quoted: bool, ctx: &ExpandCtx) -> (Vec<Strin
             fields.extend(split_ifs(&joined, &ifs));
         }
     }
-    let mut out = Vec::new();
-    for f in &fields {
-        out.extend(glob_fields("", f, ctx.noglob, ctx.nullglob));
-    }
-    (out, true)
+    // Fields are returned un-globbed: globbing happens once per fully
+    // expanded field at the end of `expand_word` (bash's expansion order).
+    (fields, true)
 }
 
 /// Append `exp` to each open candidate.  When it yields several fields, only
@@ -623,7 +633,12 @@ fn apply_value(candidates: Vec<Candidate>, exp: Expansion, quoted: bool, ctx: &E
             // 尚无字面内容时，标记为 droppable（末尾统一删除）。带引号的
             // ""、已有前缀的 `a$empty` 等必须原样保留。
             if empty_droppable && c.text.is_empty() {
-                next.push(Candidate { text: String::new(), open: true, droppable: true });
+                next.push(Candidate {
+                    text: String::new(),
+                    open: true,
+                    droppable: true,
+                    globbable: c.globbable,
+                });
             } else {
                 next.push(c);
             }
@@ -631,17 +646,22 @@ fn apply_value(candidates: Vec<Candidate>, exp: Expansion, quoted: bool, ctx: &E
         }
         let n = fields.len();
         for (k, f) in fields.iter().enumerate() {
+            // 未加引号的展开结果同样参与末尾的 glob（bash: `$x` 值含通配符
+            // 时按 bash 语义展开）。
+            let g = !quoted && has_glob(f);
             if k == 0 {
                 next.push(Candidate {
                     text: format!("{}{}", c.text, f),
                     open: n == 1,
                     droppable: false,
+                    globbable: c.globbable || g,
                 });
             } else {
                 next.push(Candidate {
                     text: f.clone(),
                     open: k + 1 == n,
                     droppable: false,
+                    globbable: g,
                 });
             }
         }
@@ -802,7 +822,13 @@ fn eval_braced(body: &str, ctx: &ExpandCtx) -> Expansion {
             "@" | "*" => {
                 let n = match ctx.array_set_indices.get(arr) {
                     Some(indices) => indices.len(),
-                    None => elems.map(|e| e.len()).unwrap_or(0),
+                    None => match elems {
+                        Some(e) => e.len(),
+                        // A scalar set via `a=1` is a one-element array for
+                        // bash (`${#a[@]}` is 1).
+                        None if expand_env_contains(ctx, arr) => 1,
+                        None => 0,
+                    },
                 };
                 Expansion::Scalar(n.to_string())
             }
@@ -1007,7 +1033,14 @@ fn eval_braced(body: &str, ctx: &ExpandCtx) -> Expansion {
                 }
             };
         }
-        let elems = ctx.arrays.get(name).cloned().unwrap_or_default();
+        // A scalar set via `a=1` is a one-element array for `${a[@]}` /
+        // `${a[*]}` (bash returns the scalar's value, not the empty list).
+        let mut elems = ctx.arrays.get(name).cloned().unwrap_or_default();
+        if elems.is_empty() && !ctx.array_set_indices.contains_key(name) {
+            if let Some(v) = expand_env_get(ctx, name) {
+                elems = vec![v];
+            }
+        }
         match subscript {
             "@" | "*" => {
                 let elems = if let Some(indices) = ctx.array_set_indices.get(name) {
@@ -1444,48 +1477,52 @@ fn strip_prefix(value: &str, pat: &str, longest: bool) -> String {
     if pat.is_empty() {
         return value.to_string();
     }
-    let chars: Vec<char> = value.chars().collect();
-    let patc: Vec<char> = pat.chars().collect();
+    // LC_ALL=C 下 bash 按裸字节匹配：`?` / 字符类可以命中多字节字符的中间
+    // 字节。值与模式都先解码成裸字节再映射为 char 跑 glob_match，结果编码
+    // 回 byteval，保证字节级语义与 bash 一致。
+    let chars = bytes_as_chars(value);
+    let patc = bytes_as_chars(pat);
     if longest {
         // remove the LONGEST matching prefix: largest k where chars[..k] matches
         for k in (0..=chars.len()).rev() {
             if glob_match(&chars[..k], &patc) {
-                return chars[k..].iter().collect();
+                return crate::byteval::encode_raw(&chars_as_bytes(&chars[k..]));
             }
         }
     } else {
         // remove the SHORTEST matching prefix: smallest k (first match scanning up)
         for k in 0..=chars.len() {
             if glob_match(&chars[..k], &patc) {
-                return chars[k..].iter().collect();
+                return crate::byteval::encode_raw(&chars_as_bytes(&chars[k..]));
             }
         }
     }
-    value.to_string()
+    crate::byteval::encode_raw(&chars_as_bytes(&chars))
 }
 
 fn strip_suffix(value: &str, pat: &str, longest: bool) -> String {
     if pat.is_empty() {
         return value.to_string();
     }
-    let chars: Vec<char> = value.chars().collect();
-    let patc: Vec<char> = pat.chars().collect();
+    // 同 strip_prefix：字节级语义（见上）。
+    let chars = bytes_as_chars(value);
+    let patc = bytes_as_chars(pat);
     if longest {
         // remove the LONGEST matching suffix: smallest k where chars[k..] matches
         for k in 0..=chars.len() {
             if glob_match(&chars[k..], &patc) {
-                return chars[..k].iter().collect();
+                return crate::byteval::encode_raw(&chars_as_bytes(&chars[..k]));
             }
         }
     } else {
         // remove the SHORTEST matching suffix: largest k (first match scanning down)
         for k in (0..=chars.len()).rev() {
             if glob_match(&chars[k..], &patc) {
-                return chars[..k].iter().collect();
+                return crate::byteval::encode_raw(&chars_as_bytes(&chars[..k]));
             }
         }
     }
-    value.to_string()
+    crate::byteval::encode_raw(&chars_as_bytes(&chars))
 }
 
 /// Split the `pattern/replacement` argument of `${v/pat/rep}`.  A `/` escaped
@@ -1646,29 +1683,125 @@ fn has_glob(p: &str) -> bool {
     p.contains('*') || p.contains('?') || (p.contains('[') && p.contains(']'))
 }
 
-/// Expand one unquoted field into **one word per glob match**.  Joining all
-/// matches with a space (the old `glob_one`) collapsed them into a single
-/// argument, breaking `x=dir/*.txt; printf "[%s]" $x`, `for f in $x`, etc.
-fn glob_fields(prefix: &str, field: &str, noglob: bool, nullglob: bool) -> Vec<String> {
-    if noglob || !has_glob(field) {
-        // `glob()` on a wildcard-free field returns exactly one element
-        // (the field itself); build that result directly instead of
-        // allocating an intermediate Vec + String first.
-        return vec![format!("{}{}", prefix, field)];
+/// Join one pattern component onto an accumulated msys-spelling prefix.
+fn join_component(pfx: &str, comp: &str, absolute: bool, first: bool) -> String {
+    if first && absolute {
+        format!("/{}", comp)
+    } else if pfx.is_empty() {
+        comp.to_string()
+    } else {
+        format!("{}/{}", pfx, comp)
     }
-    let matches = glob(field, nullglob);
-    if matches.is_empty() {
-        // nullglob: a pattern matching nothing contributes zero fields.
+}
+
+/// Native path for `read_dir` at a walk prefix: msys drive paths (`/d`,
+/// `/d/tmp`) must be translated to Windows form; a relative empty prefix
+/// means the current directory.
+fn native_dir(pfx: &str) -> String {
+    if pfx.is_empty() {
+        return ".".to_string();
+    }
+    if let Some(win) = translate_msys_path(pfx) {
+        return win;
+    }
+    // A bare drive root reached while walking `/d/*/...`.
+    let b = pfx.as_bytes();
+    if b.len() == 2 && b[0] == b'/' && (b[1] as char).is_ascii_alphabetic() {
+        return format!("{}:/", (b[1] as char).to_ascii_uppercase());
+    }
+    pfx.to_string()
+}
+
+/// Expand a filename pattern to matching paths.  With `nullglob` off (bash's
+/// default) a pattern matching nothing stays literal; with it on the pattern
+/// expands to zero fields.
+///
+/// bash walks a pattern one path component at a time: every component is
+/// matched against the corresponding directory level, so `src/*/main.rs`
+/// globs the middle component too.  A literal final component must still
+/// exist for the whole path to match (`src/*/nope` stays literal even when
+/// `src/*/` matches directories).  A trailing `/` restricts matches to
+/// directories and keeps the slash in the output (`src/*/`).
+pub fn glob(pattern: &str, nullglob: bool) -> Vec<String> {
+    if !has_glob(pattern) {
+        return vec![pattern.to_string()];
+    }
+    let absolute = pattern.starts_with('/');
+    let dir_only = pattern.ends_with('/') && pattern.contains('/');
+    let comps: Vec<&str> = pattern.split('/').filter(|c| !c.is_empty()).collect();
+    if comps.is_empty() {
+        return vec![pattern.to_string()];
+    }
+    // Each state is the msys-spelling prefix accumulated so far; the native
+    // form is derived on demand for `read_dir`.
+    let mut states: Vec<String> = vec![String::new()];
+    let last = comps.len() - 1;
+    for (ci, comp) in comps.iter().enumerate() {
+        let is_last = ci == last;
+        let magic = has_glob(comp);
+        let hidden_ok = comp.starts_with('.');
+        let patc: Vec<char> = comp.chars().collect();
+        let mut next: Vec<String> = Vec::new();
+        for pfx in &states {
+            if !magic {
+                next.push(join_component(pfx, comp, absolute, ci == 0));
+                continue;
+            }
+            // The msys root has no native equivalent, so a magic first
+            // component of an absolute pattern cannot enumerate anything
+            // (same as before: the pattern stays literal).
+            if absolute && pfx.is_empty() {
+                continue;
+            }
+            let dir_native = native_dir(pfx);
+            if let Ok(entries) = std::fs::read_dir(&dir_native) {
+                for e in entries.flatten() {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    // Skip dotfiles unless the component explicitly asks.
+                    if name.starts_with('.') && !hidden_ok {
+                        continue;
+                    }
+                    if dir_only && is_last {
+                        // A trailing `/` matches directories only (through
+                        // symlinks, like bash's stat-based check).
+                        match e.metadata() {
+                            Ok(m) if m.is_dir() => {}
+                            _ => continue,
+                        }
+                    }
+                    let nc: Vec<char> = name.chars().collect();
+                    if glob_match(&nc, &patc) {
+                        let out_name = if dir_only && is_last {
+                            format!("{}/", name)
+                        } else {
+                            name
+                        };
+                        next.push(join_component(pfx, &out_name, absolute, ci == 0));
+                    }
+                }
+            }
+        }
+        states = next;
+        if states.is_empty() {
+            break;
+        }
+    }
+    // A literal final component must exist (bash's glob verifies the whole
+    // path: `src/*/nope` matches nothing even though `src/*/` matches).
+    if !has_glob(comps[last]) {
+        states.retain(|p| std::fs::symlink_metadata(&native_dir(p)).is_ok());
+    }
+    if states.is_empty() {
         if nullglob {
             return Vec::new();
         }
-        vec![format!("{}{}", prefix, field)]
-    } else {
-        matches
-            .iter()
-            .map(|m| format!("{}{}", prefix, m))
-            .collect()
+        // bash default (nullglob off): a pattern with glob metacharacters
+        // that matches nothing yields the literal pattern, not an empty
+        // result.
+        return vec![pattern.to_string()];
     }
+    states.sort();
+    states
 }
 
 /// Translate an msys-style drive path (`/d/foo/bar`) to a native Windows path
@@ -1682,71 +1815,6 @@ fn translate_msys_path(p: &str) -> Option<String> {
         return Some(format!("{}:\\{}", drive, rest.replace('/', "\\")));
     }
     None
-}
-
-/// Expand a filename pattern to matching paths.  With `nullglob` off (bash's
-/// default) a pattern matching nothing stays literal; with it on the pattern
-/// expands to zero fields.
-pub fn glob(pattern: &str, nullglob: bool) -> Vec<String> {
-    if !has_glob(pattern) {
-        return vec![pattern.to_string()];
-    }
-    let (mut dir, base) = split_dir(pattern);
-    // A pattern without a directory component refers to the current directory;
-    // `read_dir("")` fails, so normalise the empty directory to ".".
-    if dir.is_empty() {
-        dir = ".".to_string();
-    }
-    // Resolve the directory: msys drive paths must become native Windows paths
-    // for `std::fs::read_dir`, but we keep the msys form for the output.
-    let (dir_for_read, dir_for_out) = match translate_msys_path(&dir) {
-        Some(win) => (win, dir.clone()),
-        None => (dir.clone(), dir.clone()),
-    };
-    let out_prefix = if dir_for_out.is_empty() || dir_for_out == "." {
-        String::new()
-    } else {
-        format!("{}/", dir_for_out)
-    };
-    let patc: Vec<char> = base.chars().collect();
-    // A leading dot in the pattern opts into matching hidden files.
-    let hidden_ok = base.starts_with('.');
-    let mut out = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&dir_for_read) {
-        for e in entries.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            // Skip dotfiles unless the pattern explicitly asks for them.
-            if name.starts_with('.') && !hidden_ok {
-                continue;
-            }
-            let nc: Vec<char> = name.chars().collect();
-            if glob_match(&nc, &patc) {
-                out.push(if out_prefix.is_empty() {
-                    name
-                } else {
-                    format!("{}{}", out_prefix, name)
-                });
-            }
-        }
-    }
-    out.sort();
-    // bash default (nullglob off): a pattern with glob metacharacters that
-    // matches nothing yields the literal pattern, not an empty result.
-    // With nullglob on it contributes nothing at all.
-    if out.is_empty() {
-        if nullglob {
-            return Vec::new();
-        }
-        return vec![pattern.to_string()];
-    }
-    out
-}
-
-fn split_dir(pattern: &str) -> (String, String) {
-    match pattern.rfind('/') {
-        Some(i) => (pattern[..i].to_string(), pattern[i + 1..].to_string()),
-        None => ("".to_string(), pattern.to_string()),
-    }
 }
 
 /// Glob matcher supporting `*`, `?` and `[...]` character classes (with `!`/`^`
@@ -1873,6 +1941,27 @@ impl<'a> crate::arith::ArithEnv for ArithCtx<'a> {
         }
         val
     }
+    /// Raw string value, so `arith::eval` can recursively expand a
+    /// variable's value the way bash does (`x="1+2"; $((x))` is 3).
+    fn get_str(&self, name: &str) -> Option<String> {
+        if let Some(v) = self.assigned.borrow().get(name) {
+            return Some(v.to_string());
+        }
+        if let Ok(n) = name.parse::<usize>() {
+            if n == 0 {
+                return Some(self.ctx.dollar_zero.to_string());
+            }
+            return self.ctx.positional.get(n - 1).cloned();
+        }
+        match name {
+            "@" | "*" => return None,
+            "#" => return Some(self.ctx.positional.len().to_string()),
+            "?" => return Some(self.ctx.last_status.to_string()),
+            "0" => return Some(self.ctx.dollar_zero.to_string()),
+            _ => {}
+        }
+        expand_env_get(self.ctx, name)
+    }
     fn set(&mut self, name: &str, value: i64) {
         self.assigned.borrow_mut().insert(name.to_string(), value);
         // bash applies arithmetic assignments immediately: a later `$x` on
@@ -1918,16 +2007,25 @@ pub fn eval_arith(body: &str, ctx: &ExpandCtx) -> String {
         Err(e) => {
             // bash prefixes the expression itself, and labels parser-level
             // failures as "arithmetic syntax error".
-            let msg = if e.message == "operand expected" {
+            let msg = if e.message == "operand expected"
+                || e.message == "invalid arithmetic operator"
+            {
                 format!("arithmetic syntax error: {}", e.message)
             } else {
                 e.message.clone()
             };
+            // A value-recursion error is reported against the variable's raw
+            // value, not the top-level expression (`x=3.5; $((x))` reports
+            // `3.5: arithmetic syntax error: ...`).
+            let prefix_src = e
+                .expr_prefix
+                .clone()
+                .unwrap_or_else(|| body.to_string());
             flag_arith_failure(&format!(
                 "{}: {} (error token is \"{}\")",
-                body.trim_start(),
+                prefix_src.trim_start(),
                 msg,
-                bash_error_token(body, &e.token)
+                bash_error_token(&prefix_src, &e.token)
             ));
             String::new()
         }
