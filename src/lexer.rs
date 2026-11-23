@@ -19,6 +19,85 @@ thread_local! {
     /// bodies).  Parse-time here-document warnings belong to the OUTER
     /// command line: a nested parse must not emit a second copy.
     static NESTED_DEPTH: Cell<u32> = const { Cell::new(0) };
+    /// First syntax error found inside a `$(...)` body during a TOP-LEVEL
+    /// tokenize.  bash's yacc parses command substitutions while reading the
+    /// outer command line, so a nested syntax error aborts the whole `-c`
+    /// script with rc=127 before any command runs.  `(line, message)`.
+    static CMDSUB_SYNTAX_ERROR: std::cell::RefCell<Option<(usize, String)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Take (and clear) a pending top-level command-substitution syntax error.
+pub fn take_cmdsub_syntax_error() -> Option<(usize, String)> {
+    CMDSUB_SYNTAX_ERROR.with(|c| c.borrow_mut().take())
+}
+
+/// Validate a `$(...)` body at top-level lex time.  Nested tokenize calls
+/// (the validation itself, speculative prefix parses) skip this to avoid
+/// recursion and duplicate reports.  bash appends " while looking for
+/// matching `)'" when the yacc error token is not `)` itself (the `)` case
+/// means the body ended prematurely, e.g. `$(for)`).
+fn validate_cmdsub_body(body: &str, line: usize) {
+    // NOTE: bare `;;` validation lives in the parser's flat command-list
+    // loop (see parse_command_list, SemicolonKind::DoubleLead arm).  It must
+    // NOT be done by a raw token scan here: `;;` is legal between case arms
+    // (`$(case a in a) x;; esac)`) and a scan cannot distinguish the two.
+    // An unterminated compound at the very end of a `$(...)` body is what
+    // bash reports as the closing `)` being unexpected (`$(case x in)`).
+    // `tokenize_nested` defers that diagnostic to its EOF path, so detect it
+    // here from the raw body text.
+    let trimmed = body.trim();
+    let unterminated_compound = matches!(trimmed, "case" | "if" | "for" | "while" | "until" | "select")
+        || (trimmed.starts_with("case ") && !trimmed.contains("esac"))
+        || (trimmed.starts_with("if ") && !trimmed.contains("fi"))
+        || (trimmed.starts_with("for ") && !trimmed.contains("do"));
+
+    let err: Option<String> = if unterminated_compound {
+        Some("syntax error near unexpected token `)'".to_string())
+    } else {
+        match tokenize_nested(body) {
+            Ok(toks) => match crate::parser::parse_command_list(&toks) {
+                Ok(_) => None,
+                Err(e) => Some(e.message),
+            },
+            Err(e) => Some(e.message),
+        }
+    };
+    if let Some(raw) = err {
+        // bash's `$(...)` reader (parse_matched_pair) names the offending
+        // token itself.  When the body ends prematurely (`for`, `if`, `case x
+        // in`, `a |`) the yacc error is an EOF-family message but bash still
+        // reports the closing `)` as the unexpected token, with no suffix.
+        // A real interior token (`|`, `;;`) keeps its name and gets the
+        // "while looking for matching `)'" clause.
+        let eof_family = unterminated_compound
+            || raw.contains("unexpected end of file")
+            || raw.contains("expected a loop variable")
+            || raw.contains("expected `do'")
+            || raw.contains("expected a case word")
+            || raw.contains("expected `in'")
+            || raw.contains("from `if' command")
+            || raw.contains("from `while' command")
+            || raw.contains("from `for' command")
+            || raw.contains("from `case' command")
+            || raw.contains("unexpected token (expected")
+            || !raw.contains("unexpected token `");
+        let msg = if eof_family {
+            "syntax error near unexpected token `)'".to_string()
+        } else {
+            let mut m = raw.clone();
+            m.push_str(" while looking for matching `)'");
+            m
+        };
+        CMDSUB_SYNTAX_ERROR.with(|c| {
+            let mut slot = c.borrow_mut();
+            if slot.is_none() {
+                // Use the caller's outer line (the `$(` line) for nested
+                // bodies; bash reports the whole `-c` line anyway.
+                *slot = Some((line, msg));
+            }
+        });
+    }
 }
 
 /// Tokenize a nested command string without emitting parse-time heredoc
@@ -113,6 +192,12 @@ pub enum SemicolonKind {
     DoubleLead,
     /// A newline standing in for `;`.
     Newline,
+    /// The `;&` case terminator: fall through to the next arm's body without
+    /// re-testing its patterns (bash's `case ... ;& ...`).
+    CaseFall,
+    /// The `;;&` case terminator: fall through to the next arm and re-test its
+    /// patterns (bash's `case ... ;;& ...`).
+    CaseFallTest,
 }
 
 /// A separator's kind together with its 1-based physical source line, so a
@@ -1437,6 +1522,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                             continue;
                         }
                         if let Some((body, ni)) = read_paren(&chars, i + 1) {
+                            validate_cmdsub_body(&body, line_no);
                             register_shadow_heredocs(&body, &chars, i + 1, line_no, &mut pending_heredocs);
                             parts.push(WordPart::CmdSub(body, true));
                             i = ni;
@@ -1685,14 +1771,37 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                 // A `;;` pair is tokenized as two semicolons (the case parser
                 // still sees both), but the first one is marked so an empty
                 // loop body can report bash's `;;` instead of `;`.
-                let kind = if i + 1 < n && chars[i + 1] == ';' {
-                    SemicolonKind::DoubleLead
+                //
+                // bash's case-only terminators `;&` and `;;&` are recognized
+                // here as a *single* token so the parser can tell them apart
+                // from `;;` (two semicolons) and from a typed `;` followed by
+                // a background `&` (which bash rejects).  The `&` is consumed
+                // together with the semicolon(s), so no stray `Background`
+                // token reaches the case parser.
+                if i + 1 < n && chars[i + 1] == '&' {
+                    tokens.push(Token::Semicolon(SemicolonOrigin {
+                        kind: SemicolonKind::CaseFall,
+                        line: line_no,
+                    }));
+                    at_command_start = true;
+                    i += 2;
+                } else if i + 2 < n && chars[i + 1] == ';' && chars[i + 2] == '&' {
+                    tokens.push(Token::Semicolon(SemicolonOrigin {
+                        kind: SemicolonKind::CaseFallTest,
+                        line: line_no,
+                    }));
+                    at_command_start = true;
+                    i += 3;
                 } else {
-                    SemicolonKind::Literal
-                };
-                tokens.push(Token::Semicolon(SemicolonOrigin { kind, line: line_no }));
-                at_command_start = true;
-                i += 1;
+                    let kind = if i + 1 < n && chars[i + 1] == ';' {
+                        SemicolonKind::DoubleLead
+                    } else {
+                        SemicolonKind::Literal
+                    };
+                    tokens.push(Token::Semicolon(SemicolonOrigin { kind, line: line_no }));
+                    at_command_start = true;
+                    i += 1;
+                }
             }
             '<' => {
                 if cond_depth > 0 {
@@ -1881,6 +1990,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                         continue;
                     }
                     if let Some((body, ni)) = read_paren(&chars, i + 1) {
+                        validate_cmdsub_body(&body, line_no);
                         register_shadow_heredocs(&body, &chars, i + 1, line_no, &mut pending_heredocs);
                         parts.push(WordPart::CmdSub(body, false));
                         i = ni;

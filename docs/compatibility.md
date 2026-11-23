@@ -118,7 +118,8 @@ glob / 多 pattern / 空 pattern / 其余清单显示值 / 别名路径全部仍
 
 | 内建 | 延后原因 | 计划 Phase |
 | ---- | ---- | ---- |
-| `jobs` / `fg` / `bg` / `wait` / `disown` | 需要完整作业控制（后台进程组、`SIGTSTP`/`SIGCONT`、`$!` 与 jobs 表）；当前执行模型是每条命令 fork/exec | Phase 2 |
+| `jobs` / `fg` / `bg` / `wait` | 作业表、jobspec（`kill %N` / `jobs -x`）、stopped 状态、后台独立进程组与 `fg` 前台交接已实现；非交互 `-c` 部分逐字节对齐 | Phase 2 已完成 |
+| `disown` | 需要作业表脱离语义；bash `-c` 下与交互模式行为不同，尚未实现 | Phase 2 之后 |
 | `mapfile` / `readarray` / `coproc` | 需要协进程双向管道与文件→数组读取 | Phase 4 |
 | 数组 `-a` / `-A`（下标展开） | 赋值 `ARR=(a b)`、下标赋值 `a[i]=v`、`declare -A` 关联数组（FNV 桶序遍历）已落地 | Phase 4 已完成 |
 | `compgen` / `complete` / `bind` | 补全与键绑定属交互层；Phase 6 已有自研 Tab 补全但未暴露成 bash 风格内建 | Phase 4 之后 |
@@ -186,30 +187,46 @@ yacc `near` 行只取最后一个空白之后的部分；被转义的 `=` 是字
 - **readonly 循环变量**：`for`/`select` 的目标变量为 readonly 时，bash
   在赋值处报 `X: readonly variable`、跳过 body、循环状态 1（select 保留
   菜单/PS3/REPLY 副作用），wash 逐字节一致。
-- **三处仍如实登记的窄边界**：① `shopt` 全表仅含 wash 实现的 3 个选项
-  （`expand_aliases` / `nullglob` / `sourcepath`），与 bash 60+ 项全表输出
-  不同；② `select` 单列菜单 ≤9 项逐字节一致，但 10 项时 bash 把编号
-  右对齐为 ` 1) …`（wash 左对齐 `1) …`），≥11 项 bash 用制表符分列
-  （`1) 1\t 3) 3\t…`，列数随 COLUMNS=80 变化）而 wash 用空格补齐——
-  均为纯显示布局差异，不影响选择语义；③ 关联数组多字符键哈希冲突时
-  的遍历顺序、同一命令内 `$((x++))` 与后续 `$x` 的展开时序（历史窄边界）。
+- **`shopt` 60 项全表**：本轮补齐到 MSYS2 bash 5.3 的全部 60 项（默认
+  13 ON / 47 OFF），列宽 `%-20s\t%s`、表项顺序（含
+  `completion_strip_exe` 在 `complete_fullquote` 之前）、`shopt -p`、
+  具名查询 rc、`-s`/`-u`（含 bundled / 冲突 / `-o`）、`BASHOPTS`
+  冒号串均与 oracle 逐字节一致；`login_shell` / `restricted_shell`
+  是只读伪选项（设置 rc=0 但状态不变）。**语义边界（如实登记）**：
+  60 项中仅 3 项有真实语义（`expand_aliases` / `nullglob` /
+  `sourcepath`），其余 57 项仅做状态存取与显示，不改变 shell 行为
+  （经用户 2026-11-23 裁决：全表显示/状态对齐优先，语义未实现不伪装）。
+- **`select` ≥10 项多列菜单**：本轮补齐 `ls -C` 式列数重算
+  （`maxcols = COLUMNS / cellw`、`nrows = ceil(n/maxcols)`、
+  `ncols = ceil(n/nrows)`、退化单列），编号按列主序、首列宽度按
+  `digits(nrows)`、列间贪心 tab（tabstop 8）+ 空格补齐；`COLUMNS`
+  为只读 shell 变量，缺省/0/非法按 80。10～30 项 × 多列宽度的
+  130 项矩阵与 oracle 逐字节一致。此前 ≤9 项单列行为不变。
 
 其余已对齐：if/for/while/until/case、函数、eval、mapfile、local、`>|`、
 `exec 3>&-`、`declare -A`、`getopts`、`trap -l`、`(( ))`、数组下标赋值、
 `${!pre*}`、`$(( ))`、heredoc/herestring、未闭合 `$(`、重定向逐行部分执行等。
 
 
-## P2 修复轮遗留 backlog（2026-11-23，oracle 实测确认，未伪装对齐）
+## backlog 残留（oracle 实测确认，未伪装对齐）
 
-本轮 `.workbuddy/review.md` P2 清单 32 条已逐条对拍处理（18/20 早已修复，
-其余按文件域分三批落地）。以下为**如实登记的残留**，不属已对齐行为：
+### 本轮已修复并纳入门禁（2026-11-23）
 
-- `cmdsub` 内部的语法错误（`echo $(a | | b)`、`x=$(for)`）：bash 在顶层解析期
-  即报 `-c: line 1: syntax error near unexpected token ...` rc=127；wash 的
-  `parse_cmdsub_cached` 吞掉解析错误，rc=0 空展开。修法需把嵌套解析错误
-  上抛到顶层诊断链，涉及 heredoc/未闭合 `$(` 行号既有机制，留待后续单独排期。
-- `case` 的 `;&`（落空到下一段）语法未实现：bash `case a in a) echo yes ;& b)
-  echo no;; esac` 输出 yes/no，wash 输出 yes 且尝试执行 `b` 命令。
+以下三项原 P2 backlog 已在本轮修复，均有 GROUP A 栅栏、逐字节对齐 oracle：
+
+- **`cmdsub` 内部语法错误上抛**：`src/lexer.rs::validate_cmdsub_body` 在顶层
+  lex 期递归验证 `$(...)` body，错误经 `take_cmdsub_syntax_error` 上抛到
+  `run_str`：rc=127、两行诊断、内部 token 后缀 ` while looking for matching
+  \`)'`、EOF 形态归一为 near `)'`；错误行之前的完整命令行仍执行。
+- **`case ;&` / `;;&` fallthrough**：lexer 最长匹配专用分号 token、
+  parser `CaseTerminator` 记录每段终止符、executor 状态机执行
+  （`;&` 跳过 pattern 匹配直接跑下一段 body、`;;&` 重新匹配、rc 取最后 body）。
+  顶层非法 `;&` / `;;&` 报 near-token。
+- **`jobs -x`（jobspec→pid 替换执行）**：`run_job_x_command` 把 `%N` 解析为
+  job pid 后 exec；未知 jobspec 复刻 bash 诊断。
+
+### 仍未修复（如实登记）
+
 - `2>&x` 非数字重定向目标的回显词：rc=1 与 `x: ambiguous redirect` 形态已对齐，
   但 lexer `read_dup_target` 对非 `-`/`$var`/数字目标静默丢弃原始文本，极端
   情形下词文本为空（bash 回显原词）。
@@ -223,6 +240,9 @@ yacc `near` 行只取最后一个空白之后的部分；被转义的 `=` 是字
   51–700 层 bash 仍可求值而 wash 报 recursion exceeded。
 - 后台作业 `command` 文本取自渲染后的 AST，丢失原始引号（`sh -c "exit 5" &`
   的 jobs 行显示 `sh -c exit 5`）；持久作业号 jobno 与状态码已对齐。
-- `jobs -x`（jobspec→pid 替换执行）wash 接受该选项但无执行语义。
+- **Phase 2 作业控制的 PTY-only 边界**：非交互 `-c` 下 bash 不跟踪 stopped
+  状态，wash 已按 oracle 对齐；stopped 状态、后台独立进程组、`fg` 的
+  `tcsetpgrp` 前台交接仅在 PTY 下可观测，以 `tests/e2e/` PTY 套件验证，
+  不做 `-c` 逐字节断言。
 
 详细根因存档见 `AGENTS.md`「内建兼容性矩阵 → 已修复缺陷的根因存档」。

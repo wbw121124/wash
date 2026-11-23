@@ -587,6 +587,12 @@ int wash_wif_exited(int status) { return WIFEXITED(status); }
 int wash_wexitstatus(int status) { return WEXITSTATUS(status); }
 int wash_wif_signaled(int status) { return WIFSIGNALED(status); }
 int wash_wtermsig(int status) { return WTERMSIG(status); }
+// Job control (Phase 2): waitpid(WUNTRACED|WCONTINUED) reports a stopped or
+// continued child through these macros.  Cygwin's values match POSIX here;
+// they are queried at runtime rather than hardcoded in Rust.
+int wash_wif_stopped(int status) { return WIFSTOPPED(status); }
+int wash_wstopsig(int status) { return WSTOPSIG(status); }
+int wash_wif_continued(int status) { return WIFCONTINUED(status); }
 
 // --- bash-compatible printf / number parsing helpers -----------------------
 //

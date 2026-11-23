@@ -249,31 +249,232 @@ impl Shell {
     }
 }
 
-/// The `shopt` options wash understands, in bash's display order
-/// (alphabetical).  These are the shell options that are NOT reachable
-/// through `set -o`.
-pub const SHOPT_ORDER: &[&str] = &["expand_aliases", "nullglob", "sourcepath"];
+/// One entry of bash 5.3's `shopt` table, in bash's own display order.
+///
+/// `default_on` is the state a fresh non-interactive `-c` shell reports (the
+/// oracle on this MSYS2 host).  `read_only` marks bash's two pseudo-options
+/// (`login_shell` / `restricted_shell`): `shopt -s/-u` accepts them with rc=0
+/// but never changes their state.  Only three entries have real semantics in
+/// wash (`expand_aliases`, `nullglob`, `sourcepath`); the remaining entries
+/// are state-only so the display / query / `-p` / `BASHOPTS` surface matches
+/// bash byte-for-byte, and are registered as semantics-not-implemented in
+/// `docs/compatibility.md`.
+pub struct ShoptSpec {
+    pub name: &'static str,
+    pub default_on: bool,
+    pub read_only: bool,
+}
+
+macro_rules! shopt_specs {
+    ($( $name:literal : $on:literal $ro:literal ),* $(,)?) => {
+        pub const SHOPT_SPECS: &[ShoptSpec] = &[
+            $(ShoptSpec { name: $name, default_on: $on, read_only: $ro }),*
+        ];
+    };
+}
+
+// Order is exactly the oracle's `shopt` output order (not lexicographic:
+// e.g. `completion_strip_exe` precedes `complete_fullquote`).
+shopt_specs! {
+    "array_expand_once": false false,
+    "assoc_expand_once": false false,
+    "autocd": false false,
+    "bash_source_fullpath": false false,
+    "cdable_vars": false false,
+    "cdspell": false false,
+    "checkhash": false false,
+    "checkjobs": false false,
+    "checkwinsize": true false,
+    "cmdhist": true false,
+    "compat31": false false,
+    "compat32": false false,
+    "compat40": false false,
+    "compat41": false false,
+    "compat42": false false,
+    "compat43": false false,
+    "compat44": false false,
+    "completion_strip_exe": false false,
+    "complete_fullquote": true false,
+    "direxpand": false false,
+    "dirspell": false false,
+    "dotglob": false false,
+    "execfail": false false,
+    "expand_aliases": false false,
+    "extdebug": false false,
+    "extglob": false false,
+    "extquote": true false,
+    "failglob": false false,
+    "force_fignore": true false,
+    "globasciiranges": true false,
+    "globskipdots": true false,
+    "globstar": false false,
+    "gnu_errfmt": false false,
+    "histappend": false false,
+    "histreedit": false false,
+    "histverify": false false,
+    "hostcomplete": true false,
+    "huponexit": false false,
+    "inherit_errexit": false false,
+    "interactive_comments": true false,
+    "lastpipe": false false,
+    "lithist": false false,
+    "localvar_inherit": false false,
+    "localvar_unset": false false,
+    "login_shell": false true,
+    "mailwarn": false false,
+    "no_empty_cmd_completion": false false,
+    "nocaseglob": false false,
+    "nocasematch": false false,
+    "noexpand_translation": false false,
+    "nullglob": false false,
+    "patsub_replacement": true false,
+    "progcomp": true false,
+    "progcomp_alias": false false,
+    "promptvars": true false,
+    "restricted_shell": false true,
+    "shift_verbose": false false,
+    "sourcepath": true false,
+    "varredir_close": false false,
+    "xpg_echo": false false,
+}
+
+/// Option names in `shopt` display order, derived from [`SHOPT_SPECS`].
+pub const SHOPT_ORDER: &[&str] = &[
+    "array_expand_once",
+    "assoc_expand_once",
+    "autocd",
+    "bash_source_fullpath",
+    "cdable_vars",
+    "cdspell",
+    "checkhash",
+    "checkjobs",
+    "checkwinsize",
+    "cmdhist",
+    "compat31",
+    "compat32",
+    "compat40",
+    "compat41",
+    "compat42",
+    "compat43",
+    "compat44",
+    "completion_strip_exe",
+    "complete_fullquote",
+    "direxpand",
+    "dirspell",
+    "dotglob",
+    "execfail",
+    "expand_aliases",
+    "extdebug",
+    "extglob",
+    "extquote",
+    "failglob",
+    "force_fignore",
+    "globasciiranges",
+    "globskipdots",
+    "globstar",
+    "gnu_errfmt",
+    "histappend",
+    "histreedit",
+    "histverify",
+    "hostcomplete",
+    "huponexit",
+    "inherit_errexit",
+    "interactive_comments",
+    "lastpipe",
+    "lithist",
+    "localvar_inherit",
+    "localvar_unset",
+    "login_shell",
+    "mailwarn",
+    "no_empty_cmd_completion",
+    "nocaseglob",
+    "nocasematch",
+    "noexpand_translation",
+    "nullglob",
+    "patsub_replacement",
+    "progcomp",
+    "progcomp_alias",
+    "promptvars",
+    "restricted_shell",
+    "shift_verbose",
+    "sourcepath",
+    "varredir_close",
+    "xpg_echo",
+];
+
+/// Hard invariant: the two tables must stay in lock-step.  A mismatch would
+/// silently produce a wrong `shopt` listing or a missing `BASHOPTS` entry.
+const _: () = {
+    // Const-evaluated by rustc; a mismatch is a compile error.
+    const fn same() -> bool {
+        let mut i = 0;
+        while i < SHOPT_SPECS.len() {
+            let a = SHOPT_SPECS[i].name.as_bytes();
+            let b = SHOPT_ORDER[i].as_bytes();
+            if a.len() != b.len() {
+                return false;
+            }
+            let mut j = 0;
+            while j < a.len() {
+                if a[j] != b[j] {
+                    return false;
+                }
+                j += 1;
+            }
+            i += 1;
+        }
+        SHOPT_SPECS.len() == SHOPT_ORDER.len()
+    }
+    assert!(same());
+};
 
 impl Shell {
-    /// Look up a `shopt` option by its name.
+    /// Look up a `shopt` option by its name.  Every name in [`SHOPT_ORDER`]
+    /// resolves; unknown names still return `None`.
     pub fn shopt_get(&self, name: &str) -> Option<bool> {
-        Some(match name {
-            "expand_aliases" => self.expand_aliases,
-            "nullglob" => self.nullglob,
-            "sourcepath" => self.sourcepath,
-            _ => return None,
-        })
+        match name {
+            "expand_aliases" => Some(self.expand_aliases),
+            "nullglob" => Some(self.nullglob),
+            "sourcepath" => Some(self.sourcepath),
+            _ => SHOPT_SPECS
+                .iter()
+                .find(|s| s.name == name)
+                .map(|s| *self.shopt_state.get(name).unwrap_or(&s.default_on)),
+        }
     }
 
     /// Set a `shopt` option by its name.  Returns false for unknown names.
+    /// Read-only pseudo-options report success without changing state, as
+    /// bash does for `login_shell` / `restricted_shell`.
     pub fn shopt_set(&mut self, name: &str, value: bool) -> bool {
         match name {
             "expand_aliases" => self.expand_aliases = value,
             "nullglob" => self.nullglob = value,
             "sourcepath" => self.sourcepath = value,
-            _ => return false,
+            _ => {
+                let spec = match SHOPT_SPECS.iter().find(|s| s.name == name) {
+                    Some(s) => s,
+                    None => return false,
+                };
+                if !spec.read_only {
+                    self.shopt_state.insert(name.to_string(), value);
+                }
+            }
         }
+        self.refresh_bashopts();
         true
+    }
+
+    /// Rebuild `BASHOPTS` from the current option states in display order.
+    /// bash exposes only the options that are currently on, colon-separated.
+    pub fn refresh_bashopts(&mut self) {
+        let mut on: Vec<&str> = Vec::new();
+        for name in SHOPT_ORDER {
+            if self.shopt_get(name).unwrap_or(false) {
+                on.push(name);
+            }
+        }
+        self.env.insert("BASHOPTS".to_string(), on.join(":"));
     }
 }
 
@@ -298,6 +499,14 @@ pub struct JobInfo {
     /// `sleep 5 & sleep 5 & disown %2; jobs` 显示 `[1]` `[3]`，
     /// `… disown %1; sleep 5 &; jobs` 新作业为 `[3]`）。
     pub jobno: usize,
+    /// Phase 2: the signal that stopped this job (`WSTOPSIG`), or `None` when
+    /// it is running / finished.  A stopped job is still waitable and must
+    /// not be marked `done`; `jobs` renders it as `Stopped` / `Stopped (SIG)`.
+    pub stopped_signal: Option<i32>,
+    /// Phase 2: the job's process group id when job control is active (the
+    /// background child calls `setpgid(0, 0)`), or `0` when it shares the
+    /// shell's group.  `fg` hands the terminal foreground group to this pgid.
+    pub pgid: i32,
 }
 
 /// bash names the input source in parse-error prefixes: `-c` for a command
@@ -415,6 +624,11 @@ pub struct Shell {
     /// `$PATH` FIRST and in the current directory afterwards.  With
     /// `shopt -u sourcepath` the current directory comes first.
     pub sourcepath: bool,
+
+    /// State overrides for the `shopt` entries without a dedicated field.
+    /// Only three options have real semantics in wash; the others are stored
+    /// here so `shopt` / `shopt -q` / `shopt -p` / `BASHOPTS` match bash.
+    pub shopt_state: HashMap<String, bool>,
 
     /// Set by `return` so the enclosing `source`/function can stop.
     pub return_requested: Option<i32>,
@@ -610,6 +824,7 @@ impl Shell {
             expand_aliases: false,
             nullglob: false,
             sourcepath: true,
+            shopt_state: HashMap::new(),
             return_requested: None,
             break_requested: None,
             continue_requested: None,
@@ -689,7 +904,7 @@ impl Shell {
             concat!("wash ", env!("WASH_VERSION")).to_string(),
         );
         sh.env.insert("BASH".to_string(), sh.dollar_zero.clone());
-        sh.env.insert("BASHOPTS".to_string(), String::new());
+        sh.refresh_bashopts();
         sh.env.insert("SHELLOPTS".to_string(), String::new());
         sh.env.insert("HOSTTYPE".to_string(), "x86_64".to_string());
         sh.env
@@ -996,20 +1211,66 @@ impl Shell {
         crate::expand::clear_arith_failed();
         crate::expand::clear_expansion_abort();
         let code = match lexer::tokenize(s) {
-            Ok(tokens) => match parser::parse_command_list(&tokens) {
-                Ok(list) => {
-                    let c = executor::execute(&list, self);
-                    self.last_status = c;
-                    c
+            Ok(tokens) => {
+                // bash's yacc parses `$(...)` bodies while reading the outer
+                // command line.  A nested syntax error therefore aborts the
+                // whole `-c` script with rc=127 and a two-line diagnostic,
+                // before any command runs.  The lexer records the first such
+                // error during tokenize; report it here.
+                if let Some((line, msg)) = lexer::take_cmdsub_syntax_error() {
+                    // bash reads the whole `-c` string but still executes the
+                    // complete command lines BEFORE the one holding the bad
+                    // substitution (`echo ok\necho $(a | | b)` prints `ok`).
+                    if line > 1 {
+                        self.execute_completed_prefix(s, line - 1);
+                    }
+                    // Report directly (not via report_command_error): that
+                    // path would re-run its own `largest_parseable_prefix`,
+                    // which includes the error line and any blank lines.
+                    self.report_parse_error(
+                        &msg,
+                        line,
+                        Some(s.lines().nth(line - 1).unwrap_or("")),
+                        None,
+                    );
+                    127
+                } else {
+                    match parser::parse_command_list(&tokens) {
+                        Ok(list) => {
+                            let c = executor::execute(&list, self);
+                            self.last_status = c;
+                            c
+                        }
+                        Err(e) => {
+                            self.report_command_error(s, Some(&tokens), &e);
+                            2
+                        }
+                    }
                 }
-                Err(e) => {
-                    self.report_command_error(s, Some(&tokens), &e);
+            }
+            Err(e) => {
+                // A lex error outranks a nested cmdsub error; clear the
+                // pending slot so it cannot leak into a later command.
+                let _ = lexer::take_cmdsub_syntax_error();
+                // An unterminated `case` inside `$( ... )` makes read_paren
+                // treat the `$(` as unclosed, but bash's yacc names the `)`
+                // that ends the substitution as the unexpected token
+                // (`echo $(case x in)` -> rc=127, near `)').
+                if e.family == DiagnosticFamily::CmdsubEof
+                    && (s.contains("$(case ") || s.contains("$( case "))
+                {
+                    let line = s.lines().count().max(1);
+                    self.report_parse_error(
+                        "syntax error near unexpected token `)'",
+                        line,
+                        Some(s.lines().last().unwrap_or("")),
+                        None,
+                    );
+                    127
+                } else {
+                    self.report_command_error(s, None, &e);
                     2
                 }
-            },
-            Err(e) => {
-                self.report_command_error(s, None, &e);
-                2
             }
         };
         // A fatal parameter expansion terminates a non-interactive shell with

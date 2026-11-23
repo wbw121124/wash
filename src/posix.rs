@@ -40,6 +40,9 @@ extern "C" {
     fn wash_wexitstatus(status: c_int) -> c_int;
     fn wash_wif_signaled(status: c_int) -> c_int;
     fn wash_wtermsig(status: c_int) -> c_int;
+    fn wash_wif_stopped(status: c_int) -> c_int;
+    fn wash_wstopsig(status: c_int) -> c_int;
+    fn wash_wif_continued(status: c_int) -> c_int;
     fn wash_errno() -> c_int;
     fn wash_strerror(code: c_int) -> *const c_char;
     fn wash_read_file(path: *const c_char, buf: *mut c_char, n: usize) -> isize;
@@ -102,6 +105,8 @@ extern "C" {
 
 pub const X_OK: c_int = 1;
 pub const WNOHANG: c_int = 1;
+pub const WUNTRACED: c_int = 2;
+pub const WCONTINUED: c_int = 8;
 /// `access(2)` modes.
 pub const F_OK: c_int = 0;
 pub const W_OK: c_int = 2;
@@ -569,6 +574,49 @@ pub fn wait_any_nohang() -> Option<(i32, i32)> {
         let st = decode_status(status);
         cache_reaped_status(r, st);
         return Some((r, st));
+    }
+}
+
+/// A child state change reported by `waitpid` with `WUNTRACED|WCONTINUED`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobWaitState {
+    /// Child exited; value is the shell-style code (128+N for a signal).
+    Exited(i32),
+    /// Child was stopped by signal N (`WIFSTOPPED`).
+    Stopped(i32),
+    /// A previously stopped child was continued (`WIFCONTINUED`).
+    Continued,
+}
+
+/// Non-blocking `waitpid(-1, WNOHANG|WUNTRACED|WCONTINUED)` for the job table.
+/// Unlike [`wait_any_nohang`] this does NOT reap a stopped child (waitpid only
+/// reaps on exit), so a `Stopped` result leaves the child waitable for a later
+/// `fg`/`bg` and for the eventual exit notification.
+pub fn wait_any_nohang_jobs() -> Option<(i32, JobWaitState)> {
+    loop {
+        let mut status: RawCInt = 0;
+        let r = unsafe {
+            wash_waitpid(-1, &mut status, WNOHANG | WUNTRACED | WCONTINUED)
+        };
+        if r < 0 && unsafe { wash_errno() } == EINTR {
+            continue;
+        }
+        if r <= 0 {
+            return None;
+        }
+        let state = unsafe {
+            if wash_wif_stopped(status) != 0 {
+                JobWaitState::Stopped(wash_wstopsig(status))
+            } else if wash_wif_continued(status) != 0 {
+                JobWaitState::Continued
+            } else {
+                JobWaitState::Exited(decode_status(status))
+            }
+        };
+        if let JobWaitState::Exited(code) = state {
+            cache_reaped_status(r, code);
+        }
+        return Some((r, state));
     }
 }
 

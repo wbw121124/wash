@@ -30,6 +30,42 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   仍 rc=1」+「wash 2×2×4 组合精确偏离」+「`ALIASES`=3 且偏离表恰好 2 项」，
   原有全部结构断言保留。
 
+### Added（2026-11-23：backlog 最高价值项 + Phase 2 作业控制）
+
+- **`cmdsub` 语法错误上抛**：顶层 lex 期递归校验 `$(...)` body，内部语法错
+  现在 rc=127 并输出 bash 形态的两行诊断（含 ` while looking for matching
+  \`)'` 后缀与 EOF 归一），错误行之前的完整命令行照常执行。新增 12 条
+  GROUP A 栅栏。
+- **`case ;&` / `;;&` fallthrough**：`;&` 跳过 pattern 直接执行下一段 body，
+  `;;&` 重新匹配；rc 取最后执行 body 的状态；顶层非法终止符报 near-token。
+  新增 12 条 GROUP A 栅栏。
+- **`shopt` 60 项全表**：从 3 项扩到 MSYS2 bash 5.3 全部 60 项，列宽/顺序/
+  `-p`/`BASHOPTS`/只读伪选项逐字节对齐；57 项仅状态存取、无真实语义
+  （用户裁决：显示对齐优先，语义未实现如实登记）。新增 6 条栅栏。
+- **`select` ≥10 项多列布局**：`ls -C` 式列数重算、列主序编号、tab+空格
+  补齐，10～30 项 × 多列宽度 130 项矩阵逐字节一致。新增 8 条栅栏。
+- **Phase 2 作业控制补齐**：jobspec（`kill %N` / `jobs -x`）、stopped 状态
+  跟踪（`waitpid` WUNTRACED/WCONTINUED）、后台独立进程组、`fg` 的
+  `tcsetpgrp` 前台交接、无参 `wait` 返回 0 语义。非交互 `-c` 部分 9 条
+  GROUP A 栅栏；stopped/交接的 PTY 行为由 `tests/e2e/` 观测。
+
+GROUP A 833 → 880（+47），全量对拍见 `tests/bash_diff_builtins.sh`。
+
+### Fixed（全量门禁暴露的回归）
+
+- **`jobs -x` 未解析 jobspec**：oracle 实测 `jobs -x echo %99` 输出 `%99`
+  rc=0（无法解析的 `%xxx` 保留原词照常执行，`jobs %99` 才报 `no such
+  job`）；此前误用了后者的报错语义。
+- **`$(case ... ;; esac)` 误判**：`cmdsub` 裸 `;;` 校验从 lexer 的粗糙
+  token 扫描移到 parser 的顶层命令列表（case arm 的 `;;` 已被 case
+  解析器从 body 切片中排除）；`$(case a in a) echo yes;; esac)` 不再被
+  误报 rc=127。
+- **stdout broken-pipe panic**：`trap -l | head -1` 时 `print!` 写失败会
+  panic 并向 stderr 打 `failed printing to stdout: Broken pipe`（rc 虽为
+  0 但 stderr 不逐字节）。新增 `safe_print!` / `safe_println!` 宏（对齐
+  `safe_eprintln!` 的"写失败静默忽略"契约），信号表输出率先迁移；
+  40 次压力测试零 stderr。
+
 ## [0.2.1] - 2026-11-09
 
 ### Added

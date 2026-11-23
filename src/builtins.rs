@@ -22,6 +22,8 @@ use std::io::Write;
 use crate::arith;
 use crate::safe_eprint_bytes;
 use crate::safe_eprintln;
+use crate::safe_print;
+use crate::safe_println;
 use crate::posix;
 use crate::shell::{Shell, JobInfo, SET_O_ORDER, SHOPT_ORDER};
 // fish 风格的翻译宏 `tr!("...")`，参见 `src/i18n.rs`。
@@ -2032,10 +2034,16 @@ fn render_compound(c: &crate::parser::Compound) -> String {
                     .map(|p| render_word(p))
                     .collect::<Vec<_>>()
                     .join(" | ");
+                let term = match arm.terminator {
+                    crate::parser::CaseTerminator::Fall => ";&",
+                    crate::parser::CaseTerminator::FallTest => ";;&",
+                    _ => ";;",
+                };
                 s.push_str(&format!(
-                    "    {})\n{}\n    ;;\n",
+                    "    {})\n{}\n    {}\n",
                     pats,
-                    render_command_list(&arm.body, 2)
+                    render_command_list(&arm.body, 2),
+                    term
                 ));
             }
             s.push_str("esac");
@@ -2283,7 +2291,12 @@ fn bash_fmt_compound(c: &crate::parser::Compound, indent: usize) -> Vec<String> 
                     .join(" | ");
                 out.push(format!("{}    {})", pad, pats));
                 out.extend(bash_fmt_list(&arm.body, indent + 2, false));
-                out.push(format!("{}    ;;", pad));
+                let term = match arm.terminator {
+                    crate::parser::CaseTerminator::Fall => ";&",
+                    crate::parser::CaseTerminator::FallTest => ";;&",
+                    _ => ";;",
+                };
+                out.push(format!("{}    {}", pad, term));
             }
             out.push(format!("{}esac", pad));
             out
@@ -6082,6 +6095,39 @@ fn builtin_kill(argv: &[String], sh: &mut Shell) -> i32 {
         } else {
             (false, pidstr.as_str())
         };
+        // bash accepts a jobspec (`%N`, `%%`, `%+`, `%-`, `%?str`, `%str`) as
+        // a kill operand and resolves it to the job's real pid.  A leading
+        // `-` before a jobspec is NOT a process-group id (`kill -%1` is not
+        // a bash spelling), so only numeric operands take that path.
+        let resolved: Option<i32> = if !negate && pidstr.starts_with('%') {
+            match find_job(sh, Some(pidstr), "kill") {
+                Ok(idx) => Some(sh.job_table[idx].pid),
+                Err(_) => {
+                    safe_eprintln!("wash: kill: {}: no such job", pidstr);
+                    status = 1;
+                    Some(-1) // sentinel: already diagnosed, skip numeric path
+                }
+            }
+        } else {
+            None
+        };
+        if resolved == Some(-1) {
+            continue;
+        }
+        if let Some(p) = resolved {
+            let target = p;
+            let r = posix::kill(target, sig);
+            if r != 0 {
+                let e = posix::errno();
+                safe_eprintln!(
+                    "wash: kill: ({}) - {}",
+                    target,
+                    posix::errno_message(e)
+                );
+                status = 1;
+            }
+            continue;
+        }
         // bash 接受任意 `int` 范围内的 pid；非数字或超出范围都报
         // ``kill: `ARG': not a pid or valid job spec``（注意反引号包裹，
         // 实测 `kill -0 10000000000` 与 `kill abc` 同文案，rc 1）。
@@ -6200,20 +6246,20 @@ fn print_signal_table() {
                 break;
             }
             if col > 0 {
-                print!("\t");
+                safe_print!("\t");
             }
             let num = n + 1;
             let name = signal_name(num).unwrap_or_default();
-            print!("{:>2}) SIG{}", num, name);
+            safe_print!("{:>2}) SIG{}", num, name);
             n += 1;
             last_col = col as i32;
         }
         // bash 在最后一行（不满 5 列）行末额外输出一个分隔 tab，
         // 而完整行行末只有换行。逐字节对齐需据此区分。
         if last_col >= 0 && (last_col as usize) < COLS - 1 {
-            print!("\t");
+            safe_print!("\t");
         }
-        println!();
+        safe_println!();
     }
 }
 
@@ -6925,12 +6971,13 @@ fn builtin_wait(argv: &[String], sh: &mut Shell) -> i32 {
         .cloned()
         .collect();
 
-    // 没有参数 → 等待全部后台作业。
+    // 没有参数 → 等待全部后台作业。bash（oracle 实测）的无参 `wait` 总是
+    // 返回 0，即便等待的作业被信号终止（`sleep 2 & kill %1; wait` -> rc=0）；
+    // 只有显式 `wait %N` / `wait $pid` 才报告 128+sig（`wait %1` -> 143）。
     if targets.is_empty() {
         let pids: Vec<i32> = sh.jobs.clone();
         for pid in pids {
-            if let Some(code) = posix::wait_pid_check(pid) {
-                last_status = code;
+            if posix::wait_pid_check(pid).is_some() {
                 any = true;
                 sh.jobs.retain(|&p| p != pid);
                 // 两表同步：wait 回收后作业也从真实作业表移除，保证
@@ -6938,7 +6985,8 @@ fn builtin_wait(argv: &[String], sh: &mut Shell) -> i32 {
                 sh.job_table.retain(|j| j.pid != pid);
             }
         }
-        return if any { last_status } else { 0 };
+        let _ = (last_status, any);
+        return 0;
     }
 
     for arg in &targets {
@@ -7074,6 +7122,27 @@ fn refresh_job_states(sh: &mut Shell) {
 /// 信号名取自 oracle（MSYS2 bash 5.3.20 `kill -l` + 各信号 `jobs %1` 实测），
 /// 与 Cygwin strsignal 文案一致。
 fn job_state(j: &JobInfo) -> String {
+    if let Some(sig) = j.stopped_signal {
+        // bash renders a stopped job by its signal: SIGTSTP(20) -> `Stopped`,
+        // SIGTTIN(21) -> `Stopped (tty input)`, SIGTTOU(22) -> `Stopped (tty
+        // output)`, and any other signal -> `Stopped (signal)`/`Stopped (SIG)`.
+        // Signal numbers are MSYS2/Cygwin values, queried at runtime so the
+        // mapping cannot drift: SIGSTOP=17, SIGTSTP=18, SIGTTIN=21, SIGTTOU=22.
+        let stop = posix::signal_number("STOP");
+        let tstp = posix::signal_number("TSTP");
+        let ttin = posix::signal_number("TTIN");
+        let ttou = posix::signal_number("TTOU");
+        if sig == stop || sig == tstp {
+            return "Stopped".to_string();
+        }
+        if sig == ttin {
+            return "Stopped (tty input)".to_string();
+        }
+        if sig == ttou {
+            return "Stopped (tty output)".to_string();
+        }
+        return "Stopped (signal)".to_string();
+    }
     if !j.done {
         return "Running".to_string();
     }
@@ -7128,8 +7197,9 @@ fn drop_job(sh: &mut Shell, pid: i32) {
 
 /// `jobs [-lnprs] [jobspec ...]`：列出真实后台作业。
 ///
-/// `-l` 带 pid、`-p` 只输出 pid、`-r` 仅未结束、`-s` 仅已结束。已知但未实现
-/// 语义的 `-x`（jobspec→pid 替换执行）接受该字母、暂按无操作处理。其余字母
+/// `-l` 带 pid、`-p` 只输出 pid、`-r` 仅运行、`-s` 仅停止（bash 语义；此前
+/// 误把 `-s` 当 done-only，Phase 2 引入 stopped 状态后更正）。`-x` 把
+/// jobspec 参数替换为 pid 后执行命令。其余字母
 /// 对齐 oracle（MSYS2 bash 5.3.20，LC_ALL=C 实测）：
 ///   stderr 两行
 ///     `jobs: -z: invalid option`
@@ -7145,7 +7215,8 @@ fn builtin_jobs(argv: &[String], sh: &mut Shell) -> i32 {
     let mut done_only = false;
     let mut specs: Vec<&str> = Vec::new();
     let mut opts_done = false;
-    for a in argv.iter().skip(1) {
+    let mut exec_command: Option<usize> = None;
+    for (idx, a) in argv.iter().enumerate().skip(1) {
         if !opts_done && a == "--" {
             opts_done = true;
         } else if !opts_done && a.starts_with('-') && a.len() > 1 {
@@ -7155,9 +7226,9 @@ fn builtin_jobs(argv: &[String], sh: &mut Shell) -> i32 {
                     'p' => pid_only = true,
                     'r' => running_only = true,
                     's' => done_only = true,
-                    // bash 认识 `-x`（带参数执行命令）；wash 暂未实现其
-                    // 执行语义，接受该字母以不与 `-z` 之类的未知选项混淆。
-                    'x' => {}
+                    // `-x COMMAND [ARGS]`: replace every jobspec argument
+                    // with the job's pid and execute COMMAND directly.
+                    'x' => exec_command = Some(idx + 1),
                     _ => {
                         safe_eprintln!("wash: jobs: -{}: invalid option", c);
                         safe_eprintln!(
@@ -7175,6 +7246,31 @@ fn builtin_jobs(argv: &[String], sh: &mut Shell) -> i32 {
     }
 
     refresh_job_states(sh);
+
+    // `jobs -x command [args]`: bash substitutes each RESOLVABLE `%N`-style
+    // jobspec in the argument list with the corresponding job's pid, then
+    // executes the command directly (no job listing).  An UNRESOLVABLE
+    // spec is left literally in argv (oracle: `jobs -x echo %99` prints
+    // `%99`, rc=0) -- unlike `jobs %99`, which reports `no such job`.
+    if let Some(cmd_idx) = exec_command {
+        if cmd_idx >= argv.len() {
+            safe_eprintln!("wash: jobs: -x: option requires an argument");
+            return 2;
+        }
+        let mut args: Vec<String> = Vec::new();
+        for a in &argv[cmd_idx..] {
+            if a.starts_with('%') {
+                match find_job(sh, Some(a), "jobs") {
+                    Ok(i) => args.push(sh.job_table[i].pid.to_string()),
+                    // Unresolvable spec: keep the literal word, no error.
+                    Err(_) => args.push(a.clone()),
+                }
+            } else {
+                args.push(a.clone());
+            }
+        }
+        return crate::executor::run_job_x_command(&args, sh);
+    }
 
     // 显式 jobspec 过滤；无 jobspec 时列出全部。bash（oracle 实测）对
     // 失败的 jobspec **逐个**报告且不中断：`jobs foo %1` 照样列出作业 [1]
@@ -7203,8 +7299,9 @@ fn builtin_jobs(argv: &[String], sh: &mut Shell) -> i32 {
                 continue;
             }
         }
-        let running = !j.done;
-        if (running_only && !running) || (done_only && running) {
+        let stopped = j.stopped_signal.is_some();
+        let running = !j.done && !stopped;
+        if (running_only && !running) || (done_only && !stopped) {
             continue;
         }
         if pid_only {
@@ -7225,7 +7322,12 @@ fn builtin_jobs(argv: &[String], sh: &mut Shell) -> i32 {
         //   Done：  `[1]+  Done                       true`（无 &，无多余空格）
         // 状态列由 JobInfo.status 驱动（0→Done、1..127→Exit N、128+sig→信号名）；
         // 作业号用持久 jobno（中间作业被 disown/wait 移除后不重排）。
-        let amp = if j.done { "" } else { " &" };
+        // bash omits the trailing ` &` for both finished AND stopped jobs.
+        let amp = if j.done || j.stopped_signal.is_some() {
+            ""
+        } else {
+            " &"
+        };
         if long {
             println!("[{}]{} {:>5} {:<27}{}{}", j.jobno, marker, j.pid, state, j.command, amp);
         } else {
@@ -7254,17 +7356,30 @@ fn builtin_fg(argv: &[String], sh: &mut Shell) -> i32 {
         }
     };
     let pid = sh.job_table[idx].pid;
+    let pgid = sh.job_table[idx].pgid;
     let command = sh.job_table[idx].command.clone();
 
     // bash 把作业命令回显到 stdout（不带 `&`）。
     println!("{}", command);
     std::io::stdout().flush().ok();
 
+    // Phase 2: before resuming, hand the terminal's foreground process group
+    // to the job so terminal signals reach it and not the shell.  `fg` is only
+    // reachable with job control on, so pgid is valid here.
+    let shell_pgrp = posix::getpgrp();
+    if pgid > 0 {
+        posix::tcsetpgrp(0, pgid);
+    }
     let cont = posix::signal_number("CONT");
     if cont > 0 {
         posix::kill(pid, cont);
     }
     let code = posix::wait_pid(pid);
+    // Always restore the shell as terminal foreground group, even when the
+    // job exits by signal (a stopped job that is later killed).
+    if pgid > 0 {
+        posix::tcsetpgrp(0, shell_pgrp);
+    }
     drop_job(sh, pid);
     code
 }
@@ -7299,7 +7414,10 @@ fn builtin_bg(argv: &[String], sh: &mut Shell) -> i32 {
             }
         };
         let jobno = sh.job_table[idx].jobno;
-        if !sh.job_table[idx].done {
+        // bash only resumes a *stopped* job; a running background job gets
+        // "already in background".  With Phase 2 stopped tracking this is now
+        // a real state check rather than the old `done` approximation.
+        if sh.job_table[idx].stopped_signal.is_none() && !sh.job_table[idx].done {
             safe_eprintln!("wash: bg: job {} already in background", jobno);
             continue;
         }
@@ -7309,6 +7427,7 @@ fn builtin_bg(argv: &[String], sh: &mut Shell) -> i32 {
             posix::kill(pid, cont);
         }
         sh.job_table[idx].done = false;
+        sh.job_table[idx].stopped_signal = None;
         println!("[{}]+ {} &", jobno, sh.job_table[idx].command);
     }
     0

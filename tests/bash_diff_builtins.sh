@@ -26,7 +26,7 @@
 #       'cd <WASH_REPO> && bash tests/bash_diff_builtins.sh'
 #
 # Optional: ONLY_GROUP=A|K|B|C|D runs a single group.
-#   A = core semantics + finished builtins (833 cases: 340 + 33 brace-range
+#   A = core semantics + finished builtins (880 cases: 340 + 33 brace-range
 #       + 24 brace word-boundary + 15 brace nest/escape/quote-removal
 #       + 1 brace deep-nesting stack guard + 37 heredoc / herestring
 #       + 11 unclosed `$(` syntax-error fence
@@ -2466,6 +2466,69 @@ run_case D shlvl-increment   'echo "SHLVL=$SHLVL"'
 # attribute; wash never updates it and keeps it exported.
 run_case D underscore-update  'X=1; echo "[$_]"'
 run_case D underscore-export-status 'X=1; export -p | grep -c "^declare -x _="'
+
+# --- 2026-11-23 backlog 终轮栅栏 (47 条) ------------------------------------
+# cmdsub 语法错误上抛 (12): bash 在顶层解析期递归解析 $(...) body, 语法错误
+# rc=127 + 两行诊断(含 while looking for matching `)' 后缀规则); 多行场景只
+# 执行错误行之前的完整命令行. backtick 走不同的软告警路径, 不在本组.
+run_case A cmdsyn-pipe         'echo $(a | | b)'
+run_case A cmdsyn-for          'x=$(for)'
+run_case A cmdsyn-if           'echo $(if)'
+run_case A cmdsyn-dblsemi      'echo $(a;;)'
+run_case A cmdsyn-case-in      'echo $(case x in)'
+run_case A cmdsyn-multi-sub    'echo $(echo ok) $(a | | b)'
+run_case A cmdsyn-quoted       'echo "$(a | | b)"'
+run_case A cmdsyn-nested       'echo $(echo $(b | | c))'
+run_case A cmdsyn-eof-pipe     'echo $(a |)'
+run_case A cmdsyn-leading-pipe 'echo $(| a)'
+run_case A cmdsyn-clean        'echo $(echo hi); echo after'
+run_case A cmdsyn-multiline    $'echo ok\necho $(a | | b)\necho after'
+
+# case ;& / ;;& fallthrough (12): ;& 无条件执行下一段 body, ;;& 继续匹配下一段
+# pattern; 与 ;; 组合的状态机、rc 传播、case 外的 near-token 诊断。
+run_case A case-fall-basic     'case a in a) echo yes ;& b) echo no;; esac'
+run_case A case-fall-nomatch   'case b in a) echo yes ;& b) echo no;; esac'
+run_case A case-test-basic     'case a in a) echo yes ;;& a) echo no;; esac'
+run_case A case-test-nomatch   'case a in a) echo yes ;;& b) echo no;; esac'
+run_case A case-fall-chain     'case a in a) echo yes ;& b) echo no ;& c) echo third;; esac'
+run_case A case-fall-esac      'case a in a) echo yes ;& esac'
+run_case A case-fall-status    'case a in a) false ;& esac; echo rc=$?'
+run_case A case-mix-fall-test  'case a in a) echo yes ;& b) echo no ;;& c) echo third;; esac'
+run_case A case-mix-test-fall  'case b in a) echo A ;;& b) echo B ;& c) echo C;; esac'
+run_case A case-fall-multi     'case a in a) echo 1; echo 2 ;& b) echo 3;; esac; echo rc=$?'
+run_case A case-outside-fall   'echo hi ;& echo bye'
+run_case A case-outside-test   'echo hi ;;& echo bye'
+
+# shopt 全表 + BASHOPTS (6): 60 项表格/-p/BASHOPTS 逐字节; 57 项仅状态对齐,
+# 语义未实现已在 docs/compatibility.md 登记.
+run_case A shopt-full-table    'shopt'
+run_case A shopt-full-p        'shopt -p'
+run_case A shopt-bashopts      'echo $BASHOPTS'
+run_case A shopt-bashopts-mod  'shopt -s extglob; echo $BASHOPTS; shopt extglob; echo rc=$?'
+run_case A shopt-readonly      'shopt -s login_shell; echo "rc=$? q=$(shopt -q login_shell; echo $?)"'
+run_case A shopt-wide-name     'shopt -s no_empty_cmd_completion; shopt no_empty_cmd_completion; echo rc=$?'
+
+# select 多列布局 (8): ls -C 列数重算 + tab 贪心填充 + 首列窄宽度/右对齐.
+run_case_in A select-10        '1\n'  'printf "1\n" | (select x in $(seq 1 10); do break; done)'
+run_case_in A select-11        '1\n'  'printf "1\n" | (select x in $(seq 1 11); do break; done)'
+run_case_in A select-12        '1\n'  'printf "1\n" | (select x in $(seq 1 12); do break; done)'
+run_case_in A select-20        '1\n'  'printf "1\n" | (select x in $(seq 1 20); do break; done)'
+run_case_in A select-30        '1\n'  'printf "1\n" | (select x in $(seq 1 30); do break; done)'
+run_case_in A select-cols20    '1\n'  'COLUMNS=20; printf "1\n" | (select x in $(seq 1 20); do break; done)'
+run_case_in A select-cols40    '1\n'  'COLUMNS=40; printf "1\n" | (select x in $(seq 1 20); do break; done)'
+run_case_in A select-cols120   '1\n'  'COLUMNS=120; printf "1\n" | (select x in $(seq 1 30); do break; done)'
+
+# jobs / wait / kill jobspec (9): Phase 2 的 -c 可逐字节验证部分.
+# PID 绑定输出(jobs -l/-p/$!)不可逐字节, 用不变量组(K)之外的形态规避.
+run_case A jobs-kill-spec      'sleep 0.2 & kill %1; wait; echo rc=$?'
+run_case A jobs-kill-stop      'sleep 0.2 & kill -STOP %1; jobs; kill -CONT %1; wait; echo rc=$?'
+run_case A jobs-kill-badspec   'kill %99; echo rc=$?'
+run_case A jobs-x-expand       'sleep 5 & jobs -x test %1 -gt 0; echo rc=$?'
+run_case A jobs-x-bad          'sleep 5 & jobs -x echo %99; echo rc=$?'
+run_case A jobs-wait-none      'sleep 0.2 & kill %1; wait; echo rc=$?'
+run_case A jobs-wait-pid       'sleep 0.2 & p=$!; kill $p; wait $p; echo rc=$?'
+run_case A jobs-bg-running     'sleep 0.2 & bg; echo rc=$?'
+run_case A jobs-fg-nocontrol   'sleep 0.2 & fg; echo rc=$?'
 
 ###############################################################################
 # Summary

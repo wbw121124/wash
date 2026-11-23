@@ -127,11 +127,26 @@ pub enum Compound {
     },
 }
 
+/// How one `case` arm ends, and therefore what the next arm does.
+///
+/// bash's three terminators differ in whether the following arm's patterns
+/// are re-tested: `;;` stops the case entirely, `;&` runs the next arm's body
+/// unconditionally, and `;;&` continues pattern matching with the next arm.
+/// The final arm (ending at `esac`) uses `Esac`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaseTerminator {
+    DoubleSemi,
+    Fall,
+    FallTest,
+    Esac,
+}
+
 /// One arm of a `case` command: a set of patterns and the body to run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaseArm {
     pub patterns: Vec<Vec<WordPart>>,
     pub body: CommandList,
+    pub terminator: CaseTerminator,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1308,10 +1323,13 @@ fn parse_case_compound(tokens: &[Token], start: usize) -> Result<(Compound, usiz
                 }
             }
         }
-        // The body runs until a top-level `;;` (two semicolons) or `esac`.
+        // The body runs until a top-level `;;` (two semicolons), `;&`, `;;&`
+        // or `esac`.  The terminator kind is carried into the AST so the
+        // executor can implement bash's fall-through semantics.
         let body_start = i;
         let mut body_end = i;
         let mut depth = 0i32;
+        let mut terminator = CaseTerminator::Esac;
         while body_end < tokens.len() {
             match &tokens[body_end] {
                 Token::Reserved(r, _) if matches!(r.as_str(), "if" | "for" | "while" | "until" | "case") => {
@@ -1322,11 +1340,20 @@ fn parse_case_compound(tokens: &[Token], start: usize) -> Result<(Compound, usiz
                 {
                     depth -= 1;
                 }
+                Token::Semicolon(o) if depth == 0 && o.kind == SemicolonKind::CaseFall => {
+                    terminator = CaseTerminator::Fall;
+                    break;
+                }
+                Token::Semicolon(o) if depth == 0 && o.kind == SemicolonKind::CaseFallTest => {
+                    terminator = CaseTerminator::FallTest;
+                    break;
+                }
                 Token::Semicolon(_)
                     if depth == 0
                         && body_end + 1 < tokens.len()
                         && matches!(tokens.get(body_end + 1), Some(Token::Semicolon(_))) =>
                 {
+                    terminator = CaseTerminator::DoubleSemi;
                     break;
                 }
                 Token::Reserved(r, _) if r == "esac" && depth == 0 => break,
@@ -1335,18 +1362,18 @@ fn parse_case_compound(tokens: &[Token], start: usize) -> Result<(Compound, usiz
             body_end += 1;
         }
         let body = parse_command_list(&tokens[body_start..body_end])?;
-        arms.push(CaseArm { patterns, body });
+        arms.push(CaseArm {
+            patterns,
+            body,
+            terminator,
+        });
 
-        // Advance past the `;;` terminator if present.
-        if body_end < tokens.len()
-            && matches!(tokens.get(body_end), Some(Token::Semicolon(_)))
-            && body_end + 1 < tokens.len()
-            && matches!(tokens.get(body_end + 1), Some(Token::Semicolon(_)))
-        {
-            i = body_end + 2;
-        } else {
-            i = body_end;
-        }
+        // Advance past the terminator if present.
+        i = match terminator {
+            CaseTerminator::Fall | CaseTerminator::FallTest => body_end + 1,
+            CaseTerminator::DoubleSemi => body_end + 2,
+            CaseTerminator::Esac => body_end,
+        };
     }
 
     let end = find_matching_closer(tokens, start)?; // just after `esac`
@@ -1750,6 +1777,33 @@ pub fn parse_command_list(tokens: &[Token]) -> Result<CommandList> {
                 after_pipe = false;
                 last_was_funcdef = false;
             }
+            Token::Semicolon(o)
+                if matches!(o.kind, SemicolonKind::CaseFall | SemicolonKind::CaseFallTest) =>
+            {
+                // `;&` / `;;&` are only legal as case-arm terminators.  At
+                // command-list level bash rejects them as near-token errors.
+                return Err(WashError::syntax_unclosed(
+                    DiagnosticFamily::NearToken,
+                    o.line,
+                    format!(
+                        "syntax error near unexpected token `{}'",
+                        token_near_text(t)
+                    ),
+                ));
+            }
+            // A bare `;;` (DoubleLead) is legal ONLY between case arms; the
+            // case parser slices each arm body up to (not including) it, so
+            // any DoubleLead reaching this flat command-list level is a real
+            // syntax error.  Checked here rather than by a raw token scan in
+            // the cmdsub validator, which cannot tell `$(case a in a) x;;
+            // esac)` (legal `;;`) from `$(a;;)` (illegal).
+            Token::Semicolon(o) if o.kind == SemicolonKind::DoubleLead => {
+                return Err(WashError::syntax_unclosed(
+                    DiagnosticFamily::NearToken,
+                    o.line,
+                    "syntax error near unexpected token `;;'".to_string(),
+                ));
+            }
             Token::Semicolon(_) => {
                 if after_pipe && stage.is_empty() {
                     return Err(WashError::syntax(
@@ -2128,7 +2182,11 @@ fn token_near_text(tok: &Token) -> String {
     match tok {
         Token::Reserved(name, _) => name.clone(),
         Token::Word(parts) => plain_text(parts),
-        Token::Semicolon(_) => ";".to_string(),
+        Token::Semicolon(o) => match o.kind {
+            SemicolonKind::CaseFall => ";&".to_string(),
+            SemicolonKind::CaseFallTest => ";;&".to_string(),
+            _ => ";".to_string(),
+        },
         Token::Pipe => "|".to_string(),
         Token::AndAnd => "&&".to_string(),
         Token::OrOr => "||".to_string(),

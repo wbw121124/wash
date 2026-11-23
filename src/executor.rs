@@ -1083,6 +1083,14 @@ pub fn exec_external(argv: &[String], sh: &Shell) -> i32 {
     posix::wait_pid(pid)
 }
 
+/// Execute the command built by `jobs -x` after jobspec→pid substitution.
+/// bash runs it as an ordinary external command in the foreground; the
+/// builtins that `jobs -x` may name are not special-cased here (oracle 实测
+/// `jobs -x echo %1` 输出 pid).
+pub fn run_job_x_command(args: &[String], sh: &Shell) -> i32 {
+    exec_external(args, sh)
+}
+
 // ---------------------------------------------------------------------------
 // Compound commands
 // ---------------------------------------------------------------------------
@@ -1288,38 +1296,78 @@ fn execute_for(var: &str, words: &[Vec<WordPart>], body: &CommandList, sh: &mut 
     code
 }
 
-/// Print bash's numbered `select` menu.  bash lays the choices out in
-/// columns like `ls -C`: each cell is `N) ITEM`, cells are padded to the
-/// widest cell plus two, and COLUMNS (default 80) decides how many columns
-/// fit.  Items fill column-major then print row-major.  Widths are in BYTES
-/// (LC_ALL=C).  Output goes to stderr.
+/// Print bash 5.3's numbered `select` menu on stderr.
+///
+/// bash's `print_select_menu` (execute_cmd.c) uses the same column math as
+/// `ls -C`, then emits one physical line per row with a literal TAB between
+/// cells.  For a single-column menu the item numbers are right-aligned to the
+/// widest number (` 1) …` when there are 10+ choices); for multi-column menus
+/// the same padded cell is used but the line's leading padding is dropped, so
+/// the first cell starts flush at column 0 while later cells keep their pad.
+/// Widths are in BYTES (LC_ALL=C); COLUMNS is read from the shell variable and
+/// defaults to 80 when unset / zero / non-numeric.
 fn print_select_menu(fields: &[String], sh: &Shell) {
     if fields.is_empty() { return; }
+    let n = fields.len();
+    let number_width = n.to_string().len();
+    // A cell is the item number right-aligned to `number_width`, `") "`, and
+    // the item's raw bytes.  The widest cell fixes the column pitch.
     let cells: Vec<Vec<u8>> = fields.iter().enumerate().map(|(i, f)| {
-        let mut c = format!("{}) ", i + 1).into_bytes();
+        let mut c = format!("{:>w$}) ", i + 1, w = number_width).into_bytes();
         c.extend(crate::byteval::decode_raw(f));
         c
     }).collect();
-    let widest = cells.iter().map(|c| c.len()).max().unwrap_or(0);
-    let cellw = widest + 2;
+    let cellw = cells.iter().map(|c| c.len()).max().unwrap_or(0) + 2;
     let columns: usize = sh.env.get("COLUMNS")
         .and_then(|v| v.trim().parse().ok())
-        .filter(|&n| n > 0)
+        .filter(|&v| v > 0)
         .unwrap_or(80);
-    let mut ncols = std::cmp::max(1, columns / cellw);
-    // bash falls back to a single column whenever all choices would fit
-    // in one row (that is, ncols >= number of items).
-    if ncols >= cells.len() { ncols = 1; }
-    let nrows = (cells.len() + ncols - 1) / ncols;
+
+    // `ls -C` layout: cap the columns that fit, derive the row count, then
+    // recompute the real column count from it.  Everything fitting on one
+    // row falls back to a single column.
+    let maxcols = std::cmp::max(1, columns / cellw);
+    let mut nrows = (n + maxcols - 1) / maxcols;
+    let mut ncols = (n + nrows - 1) / nrows;
+    if ncols >= n {
+        ncols = 1;
+        nrows = n;
+    }
+    // The first column holds numbers 1..nrows, so bash right-aligns it to
+    // that narrower width; later columns use the global width.  This is why
+    // `11` items in one row print `1) 1` but ` 3) 3`.
+    let first_width = nrows.to_string().len();
+
     let mut out: Vec<u8> = Vec::new();
     for r in 0..nrows {
-        let row_idxs: Vec<usize> = (0..ncols).map(|c| r + c * nrows).filter(|&i| i < cells.len()).collect();
-        for (k, &i) in row_idxs.iter().enumerate() {
-            out.extend_from_slice(&cells[i]);
-            if k + 1 < row_idxs.len() {
-                for _ in 0..(cellw - cells[i].len()) { out.push(b' '); }
+        let mut line: Vec<u8> = Vec::new();
+        let mut cur: usize = 0; // expanded display column, 8-wide tabstops
+        for c in 0..ncols {
+            let idx = c * nrows + r;
+            if idx >= n { break; }
+            let has_next = c + 1 < ncols && (c + 1) * nrows + r < n;
+            let mut cell: Vec<u8> = Vec::new();
+            let w = if c == 0 { first_width } else { number_width };
+            cell.extend_from_slice(format!("{:>w$}", idx + 1, w = w).as_bytes());
+            cell.extend_from_slice(b") ");
+            cell.extend(crate::byteval::decode_raw(&fields[idx]));
+            line.extend_from_slice(&cell);
+            cur += cell.len();
+            if has_next {
+                // Greedy tabs while the next tabstop does not overshoot the
+                // next cell's logical start, then spaces for the remainder.
+                let target = (c + 1) * cellw;
+                while (cur / 8 + 1) * 8 <= target {
+                    line.push(b'\t');
+                    cur = (cur / 8 + 1) * 8;
+                }
+                for _ in cur..target {
+                    line.push(b' ');
+                }
+                cur = target;
             }
         }
+        out.extend_from_slice(&line);
         out.push(b'\n');
     }
     safe_eprint_bytes!(out);
@@ -1681,42 +1729,86 @@ fn execute_loop_body(body: &CommandList, sh: &mut Shell) -> i32 {
 /// glob semantics: `*`/`?`/`[...]`, `|`-separated alternatives) runs its body
 /// and the construct returns its status.  With no match the status is 0.
 fn execute_case(word: &[WordPart], arms: &[crate::parser::CaseArm], sh: &mut Shell) -> i32 {
-    let attrs = sh.attr_refs();
-    let ctx = ExpandCtx {
-        env: &sh.env,
-        positional: &sh.positional,
-        last_status: sh.last_status,
-        self_pid: sh.self_pid,
-        noglob: sh.options.noglob,
-        nullglob: sh.nullglob,
-        nounset: sh.options.nounset,
-        shell_flags: sh.dash_flags(),
-        set_options: &sh.options,
-        bg_pid: sh.bg_pid,
-        dollar_zero: &sh.dollar_zero,
-        attrs: &attrs,
-        functions: &sh.functions,
-        arrays: &sh.arrays,
-        assoc_arrays: &sh.assoc_arrays,
+    // bash expands the case word exactly once, before any arm runs.
+    let value = {
+        let attrs = sh.attr_refs();
+        let ctx = ExpandCtx {
+            env: &sh.env,
+            positional: &sh.positional,
+            last_status: sh.last_status,
+            self_pid: sh.self_pid,
+            noglob: sh.options.noglob,
+            nullglob: sh.nullglob,
+            nounset: sh.options.nounset,
+            shell_flags: sh.dash_flags(),
+            set_options: &sh.options,
+            bg_pid: sh.bg_pid,
+            dollar_zero: &sh.dollar_zero,
+            attrs: &attrs,
+            functions: &sh.functions,
+            arrays: &sh.arrays,
+            assoc_arrays: &sh.assoc_arrays,
             array_set_indices: &sh.array_set_indices,
-        pending_assign: None,
-        arith_overlay: None,
+            pending_assign: None,
+            arith_overlay: None,
+        };
+        expand_scalar(word, &ctx)
     };
-    let value = expand_scalar(word, &ctx);
+    // bash's case terminators form a small state machine:
+    //   `;;`   stop after this body;
+    //   `;&`   execute the next arm's body unconditionally (no pattern test);
+    //   `;;&`  continue pattern matching with the next arm.
+    // `skip_patterns` is set by `;&`; once set, the next arm runs its body
+    // regardless of its patterns, and its own terminator decides what follows.
+    let mut status = 0;
+    let mut skip_patterns = false;
     for arm in arms {
-        let mut matched = false;
-        for pat in &arm.patterns {
-            let p = expand_scalar(pat, &ctx);
-            if glob_match(&value, &p) {
-                matched = true;
-                break;
+        let mut matched = skip_patterns;
+        skip_patterns = false;
+        if !matched {
+            // A fresh short-lived ctx per arm: `;;&` re-tests patterns after
+            // earlier bodies ran, so they must be expanded at that point.
+            let attrs = sh.attr_refs();
+            let ctx = ExpandCtx {
+                env: &sh.env,
+                positional: &sh.positional,
+                last_status: sh.last_status,
+                self_pid: sh.self_pid,
+                noglob: sh.options.noglob,
+                nullglob: sh.nullglob,
+                nounset: sh.options.nounset,
+                shell_flags: sh.dash_flags(),
+                set_options: &sh.options,
+                bg_pid: sh.bg_pid,
+                dollar_zero: &sh.dollar_zero,
+                attrs: &attrs,
+                functions: &sh.functions,
+                arrays: &sh.arrays,
+                assoc_arrays: &sh.assoc_arrays,
+                array_set_indices: &sh.array_set_indices,
+                pending_assign: None,
+                arith_overlay: None,
+            };
+            for pat in &arm.patterns {
+                let p = expand_scalar(pat, &ctx);
+                if glob_match(&value, &p) {
+                    matched = true;
+                    break;
+                }
             }
         }
-        if matched {
-            return execute(&arm.body, sh);
+        if !matched {
+            continue;
+        }
+        status = execute(&arm.body, sh);
+        match arm.terminator {
+            crate::parser::CaseTerminator::DoubleSemi
+            | crate::parser::CaseTerminator::Esac => return status,
+            crate::parser::CaseTerminator::Fall => skip_patterns = true,
+            crate::parser::CaseTerminator::FallTest => {}
         }
     }
-    0
+    status
 }
 
 /// A bash-style glob match (no FNM_PATHNAME, so `*` matches `/` as well).
@@ -3141,7 +3233,16 @@ fn execute_background(p: &Pipeline, sh: &mut Shell, path: Option<&str>) -> i32 {
             return 1;
         }
     };
+    let job_ctl = job_control_active(sh);
     if pid == 0 {
+        // Phase 2: with job control active the background job gets its own
+        // process group, so terminal-generated signals (Ctrl-C / Ctrl-Z) go
+        // to the job and never to the shell.  `fg` later hands the terminal
+        // foreground group to this pgid.  Both parent and child call setpgid
+        // to avoid the fork/exec race where the parent runs first.
+        if job_ctl {
+            posix::setpgid(0, 0);
+        }
         // 后台作业的子进程沿用父 Shell（interactive 仍为 true），但它不该
         // 接管终端前台进程组；置位后其内部的 execute_pipeline 会跳过接线。
         SUPPRESS_JOB_CONTROL.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -3151,6 +3252,10 @@ fn execute_background(p: &Pipeline, sh: &mut Shell, path: Option<&str>) -> i32 {
         p2.background = false;
         let code = execute_pipeline(&p2, sh, path);
         posix::exit(code);
+    }
+    // 父进程同样 setpgid（竞态防护）；pgid 就是子进程 pid。
+    if job_ctl {
+        posix::setpgid(pid, pid);
     }
     // 父进程：登记真实作业条目。子进程 fork 后走 pid==0 分支并 posix::exit，
     // 不会执行到这里；且子进程持有独立的 Shell 副本，其内部若再起后台作业
@@ -3166,6 +3271,8 @@ fn execute_background(p: &Pipeline, sh: &mut Shell, path: Option<&str>) -> i32 {
         done: false,
         status: None,
         jobno,
+        stopped_signal: None,
+        pgid: if job_ctl { pid } else { 0 },
     });
     sh.bg_pid = pid;
     // bash 只在交互式 shell（且打开了作业控制）里通报后台作业的启动；
@@ -3245,13 +3352,27 @@ fn execute_andor(andor: &AndOr, sh: &mut Shell, path: Option<&str>, last: &mut i
 /// 正在按 pid 等待的子进程：所有按 pid 的同步等待（命令替换、子 shell、
 /// 管道阶段）从 fork 到 wait 之间都不会重入 execute()。
 fn reap_finished_jobs(sh: &mut Shell) {
-    while let Some((pid, status)) = posix::wait_any_nohang() {
+    while let Some((pid, state)) = posix::wait_any_nohang_jobs() {
         if let Some(j) = sh.job_table.iter_mut().find(|j| j.pid == pid) {
-            j.done = true;
-            // 退出状态（shell 风格：exit code 或 128+sig）随收割一并记录，
-            // 供显示端区分 bash 的 Done / Exit N / Terminated 等；与
-            // REAPED_STATUS 表同源，`wait` 内建取走缓存不会丢这里的状态。
-            j.status = Some(status);
+            match state {
+                posix::JobWaitState::Exited(status) => {
+                    j.done = true;
+                    j.stopped_signal = None;
+                    // 退出状态（shell 风格：exit code 或 128+sig）随收割一并记录，
+                    // 供显示端区分 bash 的 Done / Exit N / Terminated 等；与
+                    // REAPED_STATUS 表同源，`wait` 内建取走缓存不会丢状态。
+                    j.status = Some(status);
+                }
+                posix::JobWaitState::Stopped(sig) => {
+                    // 子进程仍在（waitpid 只在退出时回收），不可标 done。
+                    j.done = false;
+                    j.stopped_signal = Some(sig);
+                }
+                posix::JobWaitState::Continued => {
+                    j.done = false;
+                    j.stopped_signal = None;
+                }
+            }
         }
     }
 }

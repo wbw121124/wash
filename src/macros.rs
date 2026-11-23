@@ -13,6 +13,30 @@ macro_rules! safe_eprintln {
     }};
 }
 
+/// 非 panic 的 stdout 写宏（写失败一律忽略，绝不 panic）。
+///
+/// Rust 标准库的 `print!` / `println!` 在 stdout 写失败（例如输出被
+/// `| head -1` 提前关闭读端，产生 Broken pipe / EPIPE）时直接 panic，
+/// 把 `failed printing to stdout: Broken pipe` 打到 stderr。bash 对这类
+/// 写失败是静默放弃、不产生任何诊断（oracle 实测
+/// `trap -l | head -1` rc=0、stderr 空）。凡是输出可接到提前关闭的
+/// 管道的统计/列表型内建，都应改用本宏而不是 `print!` / `println!`。
+#[macro_export]
+macro_rules! safe_print {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = write!(std::io::stdout(), $($arg)*);
+    }};
+}
+
+#[macro_export]
+macro_rules! safe_println {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stdout(), $($arg)*);
+    }};
+}
+
 /// 按裸字节写 stderr（写失败忽略，绝不 panic）。
 ///
 /// bash 的部分内建（`source` / `type` 等）把参数按 `%s` 原样写诊断，
