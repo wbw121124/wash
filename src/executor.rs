@@ -1031,7 +1031,11 @@ pub fn capture_command(
         posix::exit(code);
     }
     posix::close(w);
-    let s = posix::read_all(r);
+    let mut s = posix::read_all(r);
+    if s.contains('\0') {
+        s.retain(|c| c != '\0');
+        safe_eprintln!("wash: warning: command substitution: ignored null byte in input");
+    }
     posix::close(r);
     let status = posix::wait_pid(pid);
     // Record the substitution's exit status so a standalone assignment can
