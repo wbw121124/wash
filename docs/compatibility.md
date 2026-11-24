@@ -210,9 +210,9 @@ yacc `near` 行只取最后一个空白之后的部分；被转义的 `=` 是字
 
 ## backlog 残留（oracle 实测确认，未伪装对齐）
 
-### 本轮已修复并纳入门禁（2026-11-23）
+### 本轮已修复（2026-11-23 / 11-24）
 
-以下三项原 P2 backlog 已在本轮修复，均有 GROUP A 栅栏、逐字节对齐 oracle：
+以下项已修复并逐字节对齐 oracle（除另有说明者，均已纳入门禁）：
 
 - **`cmdsub` 内部语法错误上抛**：`src/lexer.rs::validate_cmdsub_body` 在顶层
   lex 期递归验证 `$(...)` body，错误经 `take_cmdsub_syntax_error` 上抛到
@@ -222,27 +222,59 @@ yacc `near` 行只取最后一个空白之后的部分；被转义的 `=` 是字
   parser `CaseTerminator` 记录每段终止符、executor 状态机执行
   （`;&` 跳过 pattern 匹配直接跑下一段 body、`;;&` 重新匹配、rc 取最后 body）。
   顶层非法 `;&` / `;;&` 报 near-token。
-- **`jobs -x`（jobspec→pid 替换执行）**：`run_job_x_command` 把 `%N` 解析为
-  job pid 后 exec；未知 jobspec 复刻 bash 诊断。
+- **`jobs -x`（jobspec→pid 替换执行）**：`run_job_x_command` 把可解析的 `%N`
+  替换为对应 job pid 后 exec；**  无法解析的 `%xxx` 保留原词照常执行、rc=0**
+  （oracle 实测 `jobs -x echo %99` 输出 `%99` rc=0——这与 `jobs %99` 报
+  `no such job` 是两套不同语义，切勿混用）。
+- **`cmdsub` 输出内嵌 NUL**（11-24，commit `11985a9`）：`capture_command`
+  收集出口丢弃 NUL 并告警，每个 substitution 只告警一次；不经过 cmdsub 的
+  裸字节路径（`printf 'a\0b' | od`）仍保留 NUL，与 byteval 保真契约不冲突。
+- **`${arr[@]:-x}` / `${@:+x}` 整表判定**（11-24，commit `96ea521`）：
+  `src/expand.rs::array_word_op` 对数组 `@`/`*` 的 `-`/`:-`/`+`/`:+` 按整体
+  判定——无冒号形式看元素数、带冒号形式看 IFS 连接后的值是否为空；生效时
+  替代词作为单个字段产出（加引号 1 词、未加引号按 IFS 分词）。故 `a=("")`
+  套 `:-` 默认值而 `a=("" "")` 不套。索引数组与关联数组两处分支均已覆盖。
+- **`2>&x` 重定向目标整词**（11-24，commit `329f647`）：lexer `read_dup_target`
+  改为读取完整 shell 词（引号 / `$var` / `${}` / `$()` / 算术 / glob / `{x}`），
+  不再只吞数字前缀——`2>&1x` 现在整词歧义报错而非拆成 fd 1 + 参数；
+  非数字目标回显展开后的单字段（`x=abc; 2>&$x` → `abc: ambiguous redirect`）；
+  `2>&` 到 EOF 报两行 `syntax error near unexpected token`；`N>&""` / 变量空值
+  分别按 Bad file descriptor / ambiguous redirect 对齐。18 条 GROUP A 栅栏。
 
 ### 仍未修复（如实登记）
 
-- `2>&x` 非数字重定向目标的回显词：rc=1 与 `x: ambiguous redirect` 形态已对齐，
-  但 lexer `read_dup_target` 对非 `-`/`$var`/数字目标静默丢弃原始文本，极端
-  情形下词文本为空（bash 回显原词）。
-- `cmdsub` 输出内嵌 NUL：bash 丢弃并告警 `command substitution: ignored null
-  byte in input`，wash 经 byteval 保留裸字节（与项目原始字节保真契约一致，
-  告警缺失）。
-- `${PIPESTATUS[@]:-none}` / `${arr[@]:-x}`：`@` 列表不应用 `:-` 默认值。
-- `$HOME` 缺省回退：bash 用 passwd 项，wash 用 Windows 用户目录（MSYS2
-  平台边界）。
+- `2>&x` 的残余窄边界（在 23 条 GROUP A 栅栏之外）：fd==1 的空目标回显
+  保留原始引号种类——`1>&''` bash 报 `''`、wash 报 `""`；`1>&"$x"`（x 空）
+  bash 报 `"$x"`、wash 报 `$x`。`raw_word_text` 的 AST 不保留单双引号形态，
+  改动面超出本轮收益，如实登记。源词含引号/变量/算术但展开为数字
+  （`2>&"9"` / `x=9; 2>&$x` 等）在后续修复中已对齐（回显 fd 号）。
+- `${PIPESTATUS[@]:-none}`：`@` 列表的默认值已在上面对齐，但 `PIPESTATUS`
+  数组本身未实现（见下）。
+- `$HOME` 缺省回退（MSYS2 平台边界）：判据必须从 MSYS2 bash 内部调
+  `env -u HOME`（从 Git Bash 调会造出"bash HOME 为空"的跨运行时假象）。
+  原生口径实测：unset HOME 时 bash 回退 passwd 项 `/home/wbw`、wash 为空；
+  空 HOME 值时 bash 保持空、wash 被 MSYS2 runtime 转成 `/c/Users/wbw`。
+  两者都属进程环境/runtime 行为，不通过 getpwuid 回填伪装对齐。
 - 算术变量值递归链深度：wash 50 层护栏（防栈溢出）以内与 bash 对齐，
-  51–700 层 bash 仍可求值而 wash 报 recursion exceeded。
+  51 层以上 bash 仍可求值而 wash 报 recursion exceeded。MSYS2 bash 5.3 的
+  算术**嵌套**在 1022 层成功、1023 层确定性报错（不 SIGSEGV），wash 的
+  200 层嵌套护栏同样低于该阈值；两者都是"防栈溢出的保守上限"，不是
+  bash 兼容阈值，勿据注释声称对齐。
 - 后台作业 `command` 文本取自渲染后的 AST，丢失原始引号（`sh -c "exit 5" &`
   的 jobs 行显示 `sh -c exit 5`）；持久作业号 jobno 与状态码已对齐。
 - **Phase 2 作业控制的 PTY-only 边界**：非交互 `-c` 下 bash 不跟踪 stopped
   状态，wash 已按 oracle 对齐；stopped 状态、后台独立进程组、`fg` 的
   `tcsetpgrp` 前台交接仅在 PTY 下可观测，以 `tests/e2e/` PTY 套件验证，
   不做 `-c` 逐字节断言。
+- **`PIPESTATUS` 数组本身未实现**（全源码零命中）：bash 在每条管道后把各段
+  退出码写入 `PIPESTATUS`（`true | false` → `0 1`），wash 该变量完全不存在，
+  `${PIPESTATUS[@]}` 恒为空。属独立缺口，非 `:-` 默认值一项可覆盖。
+- **默认值/替代词内的二次展开**：`${v:-$x}` 在 bash 下把 `$x` 展开后再作
+  默认值（x=VAL → `VAL`），wash 的标量 `apply_scalar_op` 与数组
+  `array_word_op` 都直接回显参数原文（→ `$x`）；命令替换 / 算术替换
+  同理不展开。为保持标量与数组路径一致，本轮未改。
+- **复合赋值中的稀疏下标**：`a=([0]=x [3]=y)` bash 产出 `x y`，wash 把
+  `[0]=x` / `[3]=y` 当字面元素（且下标记为 0/1）；`declare -p` 也随之
+  不同。属 `a[i]=v` 单独赋值路径之外的复合赋值解析缺口，本轮未改。
 
 详细根因存档见 `AGENTS.md`「内建兼容性矩阵 → 已修复缺陷的根因存档」。

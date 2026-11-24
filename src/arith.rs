@@ -231,15 +231,18 @@ const ARITH_TOK_CACHE_MAX: usize = 512;
 thread_local! {
     static TOK_CACHE: RefCell<HashMap<String, Arc<Vec<Tok>>>> =
         RefCell::new(HashMap::new());
-    // Guard against stack exhaustion from deeply nested arithmetic.  bash
-    // itself SIGSEGVs on MSYS2 long before it prints its own recursion-limit
-    // diagnostic; wash must instead fail deterministically without crashing.
+    // Guard against stack exhaustion from deeply nested arithmetic.  MSYS2
+    // bash 5.3 does NOT SIGSEGV here: it accepts ~1022 levels and then
+    // deterministically fails with "expression recursion level exceeded"
+    // at 1023.  wash keeps a much smaller cap so adversarial input returns
+    // a deterministic error instead of overflowing its native stack.
     static ARITH_NEST_DEPTH: Cell<usize> = const { Cell::new(0) };
     // Depth of recursive variable-value evaluation (`x="1+2"; $((x))`).
     // Kept separate from ARITH_NEST_DEPTH and much smaller: every value
     // level costs ~20 native parse frames, and wash's 1 MB main-thread
-    // stack allows roughly 50 levels (bash tolerates ~700, unreachable
-    // within the stack budget).
+    // stack allows roughly 50 levels.  bash tolerates far more (~700 on
+    // MSYS2 bash 5.3) — this threshold is a documented deviation, not a
+    // bash-compatible number; do not claim parity at this boundary.
     static VAR_EVAL_DEPTH: Cell<usize> = const { Cell::new(0) };
 }
 

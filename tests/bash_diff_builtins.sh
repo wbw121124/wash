@@ -26,7 +26,7 @@
 #       'cd <WASH_REPO> && bash tests/bash_diff_builtins.sh'
 #
 # Optional: ONLY_GROUP=A|K|B|C|D runs a single group.
-#   A = core semantics + finished builtins (880 cases: 340 + 33 brace-range
+#   A = core semantics + finished builtins (922 cases: 340 + 33 brace-range
 #       + 24 brace word-boundary + 15 brace nest/escape/quote-removal
 #       + 1 brace deep-nesting stack guard + 37 heredoc / herestring
 #       + 11 unclosed `$(` syntax-error fence
@@ -96,7 +96,13 @@
 #          $((x)) arithmetic string eval, byte-prefix strip, scalar [@],
 #          printf %n (incl. format-repeat counter reset), jobs invalid option
 #          / bare-word warning, bad jobspec, bad fd dup, ambiguous redirect,
-#          wait %N).  -> MUST stay green (regressions)
+#          wait %N)
+#       + 42 backlog-cleanup fence (23 dup-redir target: non-numeric word
+#          echo, 1x whole-word ambiguity, EOF two-line syntax error, empty
+#          target, numeric-after-expansion reports fd number; 7 cmdsub-NUL: drop+single warning, with raw-byte pipe/
+#          ANSI-C anchors that must keep the NUL; 12 array @/* -/:-/+/:+
+#          whole-array operators, incl. a=("") vs a=("" "")).
+#          -> MUST stay green (regressions)
 #   K = KNOWN-DIFF: cannot be byte-equal by design (documented, not fixed)
 #   B = regression fence for already-fixed defects (GROUP B, 21 cases, green today)
 #   C = third-priority builtins (may not be implemented yet)
@@ -1797,6 +1803,58 @@ run_case A p2-wait-bad-spec       'wait abc; echo rc=$?'
 run_case A p2-bad-fd-dup          'echo hi 2>&9; echo rc=$?'
 run_case A p2-ambiguous-redir     'v="a b"; > $v; echo rc=$?'
 run_case A p2-wait-jobspec        'sleep 0.1 & wait %1; echo rc=$?'
+
+# backlog 清理轮栅栏：2>&x 重定向目标（21 条）+ cmdsub NUL（7 条）+
+# 数组 @/* 默认值整表判定（12 条）。dup 用例覆盖非数字目标原词回显、
+# 1x 整词歧义、EOF 两行语法错误、空引号/变量展开的空目标诊断。
+# NUL 用例中 pipe/ANSI-C 两条是不经 cmdsub 的裸字节锚点，必须保留 NUL；
+# 其余经 command substitution，NUL 被丢弃且只告警一次。
+run_case A dup-amb-x         'echo hi 2>&x'
+run_case A dup-amb-foo       'echo hi 2>&foo'
+run_case A dup-amb-1x        'echo hi 2>&1x'
+run_case A dup-amb-1x-more   'echo hi 2>&1x more'
+run_case A dup-amb-dq        'echo hi 2>&"x"'
+run_case A dup-amb-sq        "echo hi 2>&'x'"
+run_case A dup-amb-space     'echo hi 2>&"a b"'
+run_case A dup-amb-brace     'echo hi 2>&{x}'
+run_case A dup-amb-star      'echo hi 2>&*'
+run_case A dup-amb-at        'echo hi 2>&$@'
+run_case A dup-amb-dstar     'echo hi 2>&$*'
+run_case A dup-amb-var       'echo hi 2>&$x'
+run_case A dup-close         'echo hi 2>&-'
+run_case A dup-num01         'echo hi 2>&01'
+run_case A dup-badfd9        'echo hi 2>&9'
+run_case A dup-badfd-empty   'echo hi 2>&""'
+run_case A dup-eof           'echo hi 2>&'
+run_case A dup-var-empty     'x=""; echo hi 2>&$x'
+run_case A dup-num-quoted    'echo hi 2>&"9"'
+run_case A dup-num-arith     'echo hi 2>&$((3+1))'
+run_case A dup-num-var       'x=9; echo hi 2>&$x'
+run_case A dup-num-var-fd1   'x=9; echo hi 1>&$x'
+run_case A dup-num-leadzero  'echo hi 2>&09'
+# 未对齐边界（不进 GROUP A，如实登记 docs）：fd==1 的空目标回显保留原始
+# 引号种类（1>&'' bash 报 ''、wash 报 ""；1>&"$x" 同类），raw_word_text
+# 的 AST 不保留单双引号形态。
+run_case A nul-var-q          'x=$(printf "a\0b"); printf "%q" "$x"'
+run_case A nul-echo           'echo $(printf "a\0b")'
+run_case A nul-inline         'printf "%q" "$(printf "a\0b")"'
+run_case A nul-two-nuls       'x=$(printf "a\0\0b"); printf "%q" "$x"'
+run_case A nul-two-subs       'x=$(printf "a\0b"); y=$(printf "c\0d"); printf "%s%s" "$x" "$y"'
+run_case A nul-pipe-anchor    'printf "a\0b" | od -An -tx1'
+run_case A nul-ansi-anchor    'x=$'"'"'a\0b'"'"'; printf "%q" "$x"'
+
+run_case A arr-at-def-empty   'a=(); echo "${a[@]:-x}"'
+run_case A arr-at-def-unset   'unset a; echo "${a[@]:-x}"'
+run_case A arr-at-def-full    'a=(1 2); echo "${a[@]:-x}"'
+run_case A arr-at-def-null    'a=(1 "" 3); echo "${a[@]:-x}"'
+run_case A arr-at-def-blanks  'a=("" ""); echo "${a[@]:-x}"'
+run_case A arr-mix-def        'a=(); echo "[${a[@]:-x}][${a[*]:-y}]"'
+run_case A arr-bare-def       'a=(); echo "${a[@]-x}"'
+run_case A arr-at-alt-full    'a=(1 2); echo "${a[@]:+x}"'
+run_case A arr-at-alt-empty   'a=(); echo "${a[@]:+x}"'
+run_case A arr-star-alt-full  'a=(1 2); echo "${a[*]:+x}"'
+run_case A arr-def-space      'a=(); echo "[${a[@]:-x y}]"'
+run_case A arr-def-space-unq  'a=(); echo ${a[@]:-x y}'
 
 # GROUP B -- regression fence for already-fixed defects (21 cases, green today).
 # (每条用例都曾是真实缺陷，修复后留在这里作为回归栅栏：通过 run_case 同时跑

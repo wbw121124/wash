@@ -691,7 +691,7 @@ fn apply_exp_redirs(redirs: &[ExpRedir], noclobber: bool) {
                     dup_empty_target_exit(&name);
                 } else if let Ok(src) = target.parse::<i32>() {
                     if posix::dup2(src, *fd) < 0 {
-                        dup_bad_fd_exit(target);
+                        dup_bad_fd_exit(&dup_bad_fd_name(raw, target, *fd, src));
                     }
                 } else {
                     // `2>&x`：目标展开后不是数字，bash 以**展开后的单字段
@@ -730,6 +730,31 @@ fn dup_ambiguous_exit(raw: &str) -> ! {
     safe_eprintln!("wash: {}: ambiguous redirect", raw);
     let _ = std::io::stdout().flush();
     posix::exit(1);
+}
+
+/// 目标 fd 是否是"源词里的字面十进制数"（如 `2>&9`、`2>&09`）。bash 只对
+/// 这种形态在 dup2 失败时回显**规范化后的数字**（`09` → `9`）；带引号、
+/// 变量、算术/命令替换等产生的数字一律回显目标 fd 号（fd 为默认的 1 时
+/// 回显原始词），oracle 实测：
+///   `2>&9`        → `9: Bad file descriptor`
+///   `2>&09`       → `9: Bad file descriptor`
+///   `2>&"9"`      → `2: Bad file descriptor`
+///   `x=9; 2>&$x`  → `2: Bad file descriptor`
+///   `x=9; 1>&$x`  → `$x: Bad file descriptor`
+fn is_literal_dup_number(raw: &str, target: &str) -> bool {
+    raw == target && !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// dup2 失败时 bash 回显的名字：`M` 是字面数字则回显规范化数字，否则回显
+/// 目标 fd（fd 是默认输出描述符 1 时回显原始词）。
+fn dup_bad_fd_name(raw: &str, target: &str, fd: i32, parsed: i32) -> String {
+    if is_literal_dup_number(raw, target) {
+        parsed.to_string()
+    } else if fd == 1 {
+        raw.to_string()
+    } else {
+        fd.to_string()
+    }
 }
 
 /// 子进程里 dup 目标展开为空串（`N>&""`）：bash 报
@@ -847,7 +872,8 @@ fn apply_redirs_in_parent(
                         // → `bash: line 1: 9: Bad file descriptor`，rc=1。
                         let e = posix::errno();
                         restore_fds(&saved);
-                        return Err(format!("wash: {}: {}", target, posix::errno_message(e)));
+                        let name = dup_bad_fd_name(raw, target, *fd, src);
+                        return Err(format!("wash: {}: {}", name, posix::errno_message(e)));
                     }
                 } else {
                     // `2>&x`：目标展开后不是数字，bash 以展开后的单字段文本
