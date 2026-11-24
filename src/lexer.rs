@@ -554,29 +554,250 @@ fn take_digit_prefix(word: &mut String) -> Option<i32> {
     }
 }
 
-/// Read the target of a descriptor-duplication redirection (`>&N`, `<&N`,
-/// `>&-`, `>&$fd`).  Returns the target as a word (so a variable target still
-/// goes through the normal expander) and the index just past it.
-fn read_dup_target(chars: &[char], i: usize) -> (Vec<WordPart>, usize) {
-    let mut j = i;
-    if j < chars.len() && chars[j] == '-' {
-        return (vec![WordPart::Text("-".to_string(), false)], j + 1);
-    }
-    if j < chars.len() && chars[j] == '$' {
-        j += 1;
-        let start = j;
-        while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
-            j += 1;
+/// Read the complete target word of a descriptor-duplication redirection
+/// (`>&WORD`, `<&WORD`).  Returns the word (so the normal expander handles
+/// variables, command/arithmetic substitutions, globs and quote removal) and
+/// the index just past it.  An empty `Vec` means there was no target at all
+/// (a separator or end of input right after the operator) — the caller then
+/// leaves the redirection targetless so the parser emits bash's
+/// `syntax error near unexpected token` diagnostic.
+///
+/// bash treats the dup target as an ordinary shell word, not just a number:
+/// `2>&1x` is ONE word (`1x: ambiguous redirect`), `2>&"x"` is the quoted word
+/// `x`, and `2>&$@` keeps the special parameter intact.  This mirrors the
+/// word-reading state machine in `tokenize` without consuming the surrounding
+/// redirection operators.  Word separators (blank, newline, `; & | ( ) < >`)
+/// end the word; quotes kept it open.
+fn read_dup_target(chars: &[char], mut i: usize) -> (Vec<WordPart>, usize) {
+    fn flush(pending: &mut String, parts: &mut Vec<WordPart>, quoted: bool) {
+        if !pending.is_empty() {
+            parts.push(WordPart::Text(std::mem::take(pending), quoted));
         }
-        let name: String = chars[start..j].iter().collect();
-        return (vec![WordPart::Var(name, false)], j);
     }
-    let start = j;
-    while j < chars.len() && chars[j].is_ascii_digit() {
-        j += 1;
+
+    let n = chars.len();
+    let mut parts: Vec<WordPart> = Vec::new();
+    let mut pending = String::new();
+    let mut pending_quoted = false;
+    let mut in_single = false;
+    let mut in_double = false;
+
+    while i < n {
+        let c = chars[i];
+
+        if in_single {
+            if c == '\'' {
+                flush(&mut pending, &mut parts, pending_quoted);
+                pending_quoted = false;
+                in_single = false;
+                if parts.is_empty() {
+                    parts.push(WordPart::Text(String::new(), true));
+                }
+                i += 1;
+            } else {
+                pending.push(c);
+                i += 1;
+            }
+            continue;
+        }
+        if in_double {
+            match c {
+                '"' => {
+                    flush(&mut pending, &mut parts, pending_quoted);
+                    pending_quoted = false;
+                    in_double = false;
+                    if parts.is_empty() {
+                        parts.push(WordPart::Text(String::new(), true));
+                    }
+                    i += 1;
+                }
+                '$' => {
+                    flush(&mut pending, &mut parts, pending_quoted);
+                    i += 1;
+                    if i < n && chars[i] == '(' {
+                        if i + 1 < n && chars[i + 1] == '(' {
+                            if let Some((body, ni)) = read_paren(&chars, i + 2) {
+                                if ni < n && chars[ni] == ')' {
+                                    parts.push(WordPart::Arith(body, true));
+                                    i = ni + 1;
+                                    continue;
+                                }
+                            }
+                            parts.push(WordPart::Text("$(".to_string(), true));
+                            i += 1;
+                            continue;
+                        }
+                        if let Some((body, ni)) = read_paren(&chars, i + 1) {
+                            parts.push(WordPart::CmdSub(body, true));
+                            i = ni;
+                            continue;
+                        }
+                        parts.push(WordPart::Text("$(".to_string(), true));
+                        i += 1;
+                        continue;
+                    } else if i < n && chars[i] == '{' {
+                        if let Some((body, ni)) = read_brace(&chars, i + 1) {
+                            parts.push(WordPart::Braced(body, true));
+                            i = ni;
+                            continue;
+                        }
+                        parts.push(WordPart::Text("${".to_string(), true));
+                        i += 1;
+                        continue;
+                    } else if i < n && is_expansion_start(chars[i]) {
+                        let name = read_var_name(&chars, i);
+                        i += name.chars().count();
+                        parts.push(WordPart::Var(name, true));
+                        continue;
+                    } else {
+                        pending.push('$');
+                        continue;
+                    }
+                }
+                '`' => {
+                    flush(&mut pending, &mut parts, pending_quoted);
+                    let mut body = String::new();
+                    i += 1;
+                    let mut closed = false;
+                    while i < n && chars[i] != '`' {
+                        body.push(chars[i]);
+                        i += 1;
+                    }
+                    if i < n && chars[i] == '`' {
+                        closed = true;
+                    }
+                    i += 1;
+                    if closed {
+                        parts.push(WordPart::Backtick(body, true));
+                    }
+                    continue;
+                }
+                '\\' => {
+                    if i + 1 < n {
+                        let nxt = chars[i + 1];
+                        if matches!(nxt, '"' | '`' | '$' | '\\') {
+                            pending.push(nxt);
+                        } else if nxt != '\n' {
+                            pending.push('\\');
+                            pending.push(nxt);
+                        }
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                _ => {
+                    pending.push(c);
+                    i += 1;
+                }
+            }
+            continue;
+        }
+
+        // Unquoted context: a word separator ends the target word.
+        if is_word_separator(c) {
+            break;
+        }
+        match c {
+            '\'' => {
+                flush(&mut pending, &mut parts, pending_quoted);
+                pending_quoted = true;
+                in_single = true;
+                i += 1;
+            }
+            '"' => {
+                flush(&mut pending, &mut parts, pending_quoted);
+                pending_quoted = true;
+                in_double = true;
+                i += 1;
+            }
+            '\\' => {
+                if i + 1 < n {
+                    if chars[i + 1] != '\n' {
+                        pending.push(chars[i + 1]);
+                    }
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            '`' => {
+                flush(&mut pending, &mut parts, pending_quoted);
+                let mut body = String::new();
+                i += 1;
+                let mut closed = false;
+                while i < n && chars[i] != '`' {
+                    body.push(chars[i]);
+                    i += 1;
+                }
+                if i < n && chars[i] == '`' {
+                    closed = true;
+                }
+                i += 1;
+                if closed {
+                    parts.push(WordPart::Backtick(body, false));
+                }
+                continue;
+            }
+            '$' => {
+                flush(&mut pending, &mut parts, pending_quoted);
+                i += 1;
+                if i < n && chars[i] == '(' {
+                    if i + 1 < n && chars[i + 1] == '(' {
+                        if let Some((body, ni)) = read_paren(&chars, i + 2) {
+                            if ni < n && chars[ni] == ')' {
+                                parts.push(WordPart::Arith(body, false));
+                                i = ni + 1;
+                                continue;
+                            }
+                        }
+                        parts.push(WordPart::Text("$(".to_string(), false));
+                        i += 1;
+                        continue;
+                    }
+                    if let Some((body, ni)) = read_paren(&chars, i + 1) {
+                        parts.push(WordPart::CmdSub(body, false));
+                        i = ni;
+                        continue;
+                    }
+                    parts.push(WordPart::Text("$(".to_string(), false));
+                    i += 1;
+                    continue;
+                } else if i < n && chars[i] == '{' {
+                    if let Some((body, ni)) = read_brace(&chars, i + 1) {
+                        parts.push(WordPart::Braced(body, false));
+                        i = ni;
+                        continue;
+                    }
+                    parts.push(WordPart::Text("${".to_string(), false));
+                    i += 1;
+                    continue;
+                } else if i < n && chars[i] == '\'' {
+                    if let Some((text, ni)) = read_ansi_c(&chars, i - 1) {
+                        parts.push(WordPart::Text(text, true));
+                        i = ni;
+                        continue;
+                    }
+                    pending.push('$');
+                    continue;
+                } else if i < n && is_expansion_start(chars[i]) {
+                    let name = read_var_name(&chars, i);
+                    i += name.chars().count();
+                    parts.push(WordPart::Var(name, false));
+                    continue;
+                } else {
+                    pending.push('$');
+                    continue;
+                }
+            }
+            _ => {
+                pending.push(c);
+                i += 1;
+            }
+        }
     }
-    let text: String = chars[start..j].iter().collect();
-    (vec![WordPart::Text(text, false)], j)
+    flush(&mut pending, &mut parts, pending_quoted);
+    (parts, i)
 }
 
 /// True when `c` may appear inside a shell word (identifier characters plus
@@ -1837,7 +2058,12 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                         fd: Some(fd.unwrap_or(0)),
                         heredoc: None,
                     });
-                    tokens.push(Token::Word(target));
+                    // No target right after `<&`: leave the redirection
+                    // targetless so the parser reports bash's
+                    // `syntax error near unexpected token`.
+                    if !target.is_empty() {
+                        tokens.push(Token::Word(target));
+                    }
                     redirect_target = false;
                     i = ni;
                 } else if i + 2 < n && chars[i + 1] == '<' && chars[i + 2] == '<' {
@@ -1917,7 +2143,12 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                         fd: Some(fd.unwrap_or(1)),
                         heredoc: None,
                     });
-                    tokens.push(Token::Word(target));
+                    // No target right after `>&` (EOF or a separator): leave
+                    // the redirection targetless so the parser reports bash's
+                    // two-line `syntax error near unexpected token`.
+                    if !target.is_empty() {
+                        tokens.push(Token::Word(target));
+                    }
                     redirect_target = false;
                     i = ni;
                 } else {

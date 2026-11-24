@@ -490,8 +490,9 @@ enum ExpRedir {
     /// file, append (`&>>`).
     Both(String, bool),
     /// fd, expanded target, raw source word (`N>&M` / `N<&M` / `>&-`)。
-    /// raw 用于 `M` 不是数字时按 bash 语义回显原始词（`2>&x` →
-    /// `x: ambiguous redirect`，实测）。
+    /// `M` 展开后非数字时回显**展开后的单字段**（`x=abc; 2>&$x` →
+    /// `abc: ambiguous redirect`）；raw 仅用于 `M` 展开为空串且 fd 为默认
+    /// 输出描述符时的诊断（`1>&""` → `"": Bad file descriptor`）。
     Dup(i32, String, String),
     /// fd, text: a here-document body or here-string after expansion.  Both
     /// are fed to the descriptor the same way (bash spools them to a temp
@@ -678,13 +679,25 @@ fn apply_exp_redirs(redirs: &[ExpRedir], noclobber: bool) {
                 // `echo hi 2>&9` → `bash: line 1: 9: Bad file descriptor`）。
                 if target == "-" {
                     posix::close(*fd);
+                } else if target.is_empty() {
+                    // `N>&""` 展开为空串：bash 报 `<fd>: Bad file
+                    // descriptor`，但当 N 是 `>` 操作的默认 fd（1）时回显
+                    // 原始词（`1>&""` → `"": Bad file descriptor`，oracle 实测）。
+                    let name = if *fd == 1 {
+                        raw.clone()
+                    } else {
+                        fd.to_string()
+                    };
+                    dup_empty_target_exit(&name);
                 } else if let Ok(src) = target.parse::<i32>() {
                     if posix::dup2(src, *fd) < 0 {
                         dup_bad_fd_exit(target);
                     }
                 } else {
-                    // `2>&x`：目标不是数字，bash 报 ambiguous redirect。
-                    dup_ambiguous_exit(raw);
+                    // `2>&x`：目标展开后不是数字，bash 以**展开后的单字段
+                    // 文本**回显 ambiguous redirect（`x=abc; 2>&$x` →
+                    // `abc: ambiguous redirect`，oracle 实测）。
+                    dup_ambiguous_exit(target);
                 }
             }
             ExpRedir::HereDoc(fd, text) => {
@@ -711,10 +724,19 @@ fn apply_exp_redirs(redirs: &[ExpRedir], noclobber: bool) {
     }
 }
 
-/// 子进程里 dup 失效目标（`N>&M` 的 M 不是数字且不是 `-`）：bash 报
-/// `<原始词>: ambiguous redirect` 并以 rc 1 终止本命令。
+/// 子进程里 dup 失效目标（`N>&M` 的 M 展开后不是数字且不是 `-`）：bash 报
+/// `<展开后的单字段>: ambiguous redirect` 并以 rc 1 终止本命令。
 fn dup_ambiguous_exit(raw: &str) -> ! {
     safe_eprintln!("wash: {}: ambiguous redirect", raw);
+    let _ = std::io::stdout().flush();
+    posix::exit(1);
+}
+
+/// 子进程里 dup 目标展开为空串（`N>&""`）：bash 报
+/// `<name>: Bad file descriptor` 并以 rc 1 终止本命令。此处不经过 dup2，
+/// errno 不一定反映 EBADF，所以直接给出 bash 的固定文案。
+fn dup_empty_target_exit(name: &str) -> ! {
+    safe_eprintln!("wash: {}: Bad file descriptor", name);
     let _ = std::io::stdout().flush();
     posix::exit(1);
 }
@@ -805,6 +827,16 @@ fn apply_redirs_in_parent(
                     let backup = posix::dup(*fd);
                     saved.push((*fd, backup));
                     posix::close(*fd);
+                } else if target.is_empty() {
+                    // `N>&""`：bash 报 `<fd>: Bad file descriptor`，默认 fd 1
+                    // 时回显原始词（`1>&""` → `"": ...`，oracle 实测）。
+                    let name = if *fd == 1 {
+                        raw.clone()
+                    } else {
+                        fd.to_string()
+                    };
+                    restore_fds(&saved);
+                    return Err(format!("wash: {}: Bad file descriptor", name));
                 } else if let Ok(src) = target.parse::<i32>() {
                     let backup = posix::dup(*fd);
                     // backup == -1：原 fd 本就不存在（如 `9>&1` 在 fd 9 上
@@ -818,10 +850,11 @@ fn apply_redirs_in_parent(
                         return Err(format!("wash: {}: {}", target, posix::errno_message(e)));
                     }
                 } else {
-                    // `2>&x`：目标不是数字，bash 报 ambiguous redirect
-                    // （回显原始词）。
+                    // `2>&x`：目标展开后不是数字，bash 以展开后的单字段文本
+                    // 回显 ambiguous redirect（`x=abc; 2>&$x` → `abc: ...`）。
+                    // `ExpRedir::Ambiguous`（零/多字段）路径仍回显原始词。
                     restore_fds(&saved);
-                    return Err(format!("wash: {}: ambiguous redirect", raw));
+                    return Err(format!("wash: {}: ambiguous redirect", target));
                 }
             }
             ExpRedir::HereDoc(fd, text) => {
