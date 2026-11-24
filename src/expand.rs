@@ -1014,6 +1014,9 @@ fn eval_braced(body: &str, ctx: &ExpandCtx) -> Expansion {
             };
             return match subscript {
                 "@" | "*" => {
+                    if let Some(exp) = array_word_op(op, &fields, subscript, arg, ctx) {
+                        return exp;
+                    }
                     let fields = if op == ":" {
                         slice_fields(fields, arg, ctx)
                     } else {
@@ -1059,6 +1062,9 @@ fn eval_braced(body: &str, ctx: &ExpandCtx) -> Expansion {
                 } else {
                     elems
                 };
+                if let Some(exp) = array_word_op(op, &elems, subscript, arg, ctx) {
+                    return exp;
+                }
                 let fields = if op == ":" {
                     slice_fields(elems, arg, ctx)
                 } else {
@@ -1221,6 +1227,41 @@ fn slice_fields(fields: Vec<String>, arg: &str, ctx: &ExpandCtx) -> Vec<String> 
         return Vec::new();
     }
     fields[start..].iter().take(len as usize).cloned().collect()
+}
+
+/// Whole-array default/alternate operators for `${arr[@]...}` / `${arr[*]...}`.
+///
+/// bash 5.2+ tests these operators against the array as a whole, not per
+/// element.  The bare forms (`-`, `+`) only look at whether the array holds
+/// any elements; the colon forms (`:-`, `:+`) look at the array's joined
+/// value.  `@` joins with a literal space, `*` with the first character of
+/// `$IFS`.  When the operator fires, its word replaces the *whole* array
+/// expansion as a single field (it is word-split later if unquoted); when it
+/// does not fire, the caller falls back to the ordinary `@` / `*` expansion.
+fn array_word_op(
+    op: &str,
+    elems: &[String],
+    subscript: &str,
+    arg: &str,
+    ctx: &ExpandCtx,
+) -> Option<Expansion> {
+    let joined = if subscript == "@" {
+        elems.join(" ")
+    } else {
+        elems.join(&ifs_join_sep(ctx))
+    };
+    let fires = match op {
+        "-" => elems.is_empty(),
+        ":-" => joined.is_empty(),
+        "+" => !elems.is_empty(),
+        ":+" => !joined.is_empty(),
+        _ => false,
+    };
+    if fires {
+        Some(Expansion::Scalar(arg.to_string()))
+    } else {
+        None
+    }
 }
 
 /// Apply a (possibly empty) braced-operator to a scalar `val`, returning the
