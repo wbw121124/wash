@@ -5,6 +5,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed（2026-11-24 backlog 收尾，逐字节对齐 MSYS2 bash 5.3.20）
+
+- **`2>&x` 重定向目标整词**（`329f647`/`5894174`）：lexer `read_dup_target`
+  读取完整 shell 词，`2>&1x` 不再被拆成 fd 1 + 参数；非数字目标回显展开后的
+  单字段；`2>&` EOF 报两行语法错误；空目标 / 展开为数字的目标按 oracle 区分
+  fd 号与原始词。18 条 GROUP A 栅栏。残余边界（fd==1 空目标引号形态）如实登记。
+- **`${arr[@]:-x}` / `${@:+x}` 整表判定**（`96ea521`）：`array_word_op` 对数组
+  `@`/`*` 的 `-`/`:-`/`+`/`:+` 按整体判定，替代词作为单字段产出。12 条栅栏。
+- **cmdsub 内嵌 NUL**（`11985a9`）：`capture_command` 丢弃 NUL 并单次告警；
+  裸字节路径仍保真。7 条栅栏。
+- 全量门禁 debug + release **1168/0** 双绿（GROUP A 922），版本闸全匹配，
+  perf TOTAL 0.80x / startup 0.42x / VmRSS 0.68x 全 PASS。
+
 ### Changed（有意偏离，用户 2026-11-10 裁决）
 
 - **新增单一「有意偏离清单」** `docs/intentional-divergences.md`，登记 wash 相对
