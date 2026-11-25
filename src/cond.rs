@@ -468,7 +468,7 @@ fn raw_token(tok: &Token) -> String {
         Token::AndAnd => "&&".to_string(),
         Token::OrOr => "||".to_string(),
         Token::Pipe => "|".to_string(),
-        Token::Background => "&".to_string(),
+        Token::Background(_) => "&".to_string(),
         Token::Reserved(name, _) => name.clone(),
         Token::CondStart(_) => "[[".to_string(),
         Token::ArithCmd(body, _) => format!("(( {} ))", body),

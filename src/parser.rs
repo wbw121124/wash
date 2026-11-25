@@ -171,6 +171,12 @@ pub struct Pipeline {
     pub commands: Vec<SimpleCommand>,
     /// True when the pipeline was suffixed with `&` (run in the background).
     pub background: bool,
+    /// Raw source text of the command fragment this pipeline stands for, as
+    /// carried by its `&` token (quotes, escapes and redirection spacing
+    /// intact, without the `&` itself).  Set only for backgrounded pipelines:
+    /// `jobs` shows it (normalized) instead of re-rendering the AST, which
+    /// would drop the original quoting (`sh -c "exit 5"` loses the quotes).
+    pub raw: Option<String>,
 }
 
 /// The operator that joins two pipelines of an AND-OR list.
@@ -339,7 +345,7 @@ fn parse_compounds(tokens: &[Token]) -> Result<(Vec<Token>, Vec<FuncDef>)> {
 fn at_command_position(out: &[Token]) -> bool {
     match out.last() {
         None => true,
-        Some(Token::Semicolon(_) | Token::Pipe | Token::AndAnd | Token::OrOr | Token::Background) => {
+        Some(Token::Semicolon(_) | Token::Pipe | Token::AndAnd | Token::OrOr | Token::Background(_)) => {
             true
         }
         Some(Token::Reserved(..)) => true,
@@ -361,7 +367,7 @@ fn group_may_close(tokens: &[Token], start: usize, close: usize) -> bool {
     }
     matches!(
         tokens.get(close - 1),
-        Some(Token::Semicolon(_) | Token::Background)
+        Some(Token::Semicolon(_) | Token::Background(_))
     )
 }
 
@@ -1460,6 +1466,7 @@ fn compound_body_list(c: Compound) -> CommandList {
                 compound: Some(c),
             }],
             background: false,
+            raw: None,
         })],
         func_defs: Vec::new(),
     }
@@ -1768,6 +1775,7 @@ pub fn parse_command_list(tokens: &[Token]) -> Result<CommandList> {
                     pipelines.push(Pipeline {
                         commands: std::mem::take(&mut current_cmds),
                         background: false,
+                        raw: None,
                     });
                 }
                 ops.push(match t {
@@ -1823,13 +1831,14 @@ pub fn parse_command_list(tokens: &[Token]) -> Result<CommandList> {
                     pipelines.push(Pipeline {
                         commands: std::mem::take(&mut current_cmds),
                         background: false,
+                        raw: None,
                     });
                 }
                 flush_andor(&mut andors, &mut pipelines, &mut ops)?;
                 after_pipe = false;
                 last_was_funcdef = false;
             }
-            Token::Background => {
+            Token::Background(raw) => {
                 if after_pipe && stage.is_empty() {
                     return Err(WashError::syntax(
                         "syntax error near unexpected token `&'",
@@ -1848,6 +1857,7 @@ pub fn parse_command_list(tokens: &[Token]) -> Result<CommandList> {
                     pipelines.push(Pipeline {
                         commands: std::mem::take(&mut current_cmds),
                         background: true,
+                        raw: Some(raw.clone()),
                     });
                 }
                 flush_andor(&mut andors, &mut pipelines, &mut ops)?;
@@ -1866,6 +1876,7 @@ pub fn parse_command_list(tokens: &[Token]) -> Result<CommandList> {
                     pipelines.push(Pipeline {
                         commands: std::mem::take(&mut current_cmds),
                         background: false,
+                        raw: None,
                     });
                 }
                 flush_andor(&mut andors, &mut pipelines, &mut ops)?;
@@ -1895,6 +1906,7 @@ pub fn parse_command_list(tokens: &[Token]) -> Result<CommandList> {
         pipelines.push(Pipeline {
             commands: current_cmds,
             background: false,
+            raw: None,
         });
     }
     flush_andor(&mut andors, &mut pipelines, &mut ops)?;
@@ -2122,7 +2134,7 @@ fn literalize_array_reserved(tokens: &[Token]) -> Vec<Token> {
             | Token::Pipe
             | Token::AndAnd
             | Token::OrOr
-            | Token::Background
+            | Token::Background(_)
             | Token::Reserved(..)
             | Token::Redirect { .. } => cmd_start = true,
             _ => cmd_start = false,
@@ -2190,7 +2202,7 @@ fn token_near_text(tok: &Token) -> String {
         Token::Pipe => "|".to_string(),
         Token::AndAnd => "&&".to_string(),
         Token::OrOr => "||".to_string(),
-        Token::Background => "&".to_string(),
+        Token::Background(_) => "&".to_string(),
         Token::ArithCmd(_, _) => "(( ))".to_string(),
         Token::Redirect { kind, .. } => match kind {
             RedirKind::In => "<".to_string(),
@@ -2368,7 +2380,7 @@ fn parse_simple(tokens: &[Token]) -> Result<SimpleCommand> {
                 i += 2;
                 continue;
             }
-            Token::Pipe | Token::Semicolon(_) | Token::Background | Token::AndAnd | Token::OrOr => {
+            Token::Pipe | Token::Semicolon(_) | Token::Background(_) | Token::AndAnd | Token::OrOr => {
                 return Err(WashError::syntax("syntax error: unexpected token in command"));
             }
             Token::FunctionDef(_) => {

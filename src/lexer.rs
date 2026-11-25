@@ -266,7 +266,12 @@ pub enum Token {
     /// failed.
     OrOr,
     Semicolon(SemicolonOrigin),
-    Background,
+    /// A background `&`.  Carries the raw source text of the command fragment
+    /// it backgrounds (everything since the last depth-0 `;` / newline, not
+    /// including the `&` itself), so `jobs` can display the command with its
+    /// original quoting (`sh -c "exit 5"` keeps the quotes) instead of a
+    /// re-rendered AST.
+    Background(String),
     Redirect {
         kind: RedirKind,
         fd: Option<i32>,
@@ -530,7 +535,7 @@ fn word_is_assignment(parts: &[WordPart], pending: &str) -> bool {
 fn in_assignment_prefix(tokens: &[Token]) -> bool {
     for t in tokens.iter().rev() {
         match t {
-            Token::Semicolon(_) | Token::Background | Token::Pipe
+            Token::Semicolon(_) | Token::Background(_) | Token::Pipe
             | Token::AndAnd | Token::OrOr => return true,
             Token::Word(parts) => {
                 if !word_is_assignment(parts, "") {
@@ -1674,6 +1679,13 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
     // True while lexing the word after an unquoted `=~` inside `[[ ]]`: bash's
     // COND_REGEXP state keeps `|`, `(` and `)` inside that word.
     let mut cond_regex_rhs = false;
+    // Start offset of the current command's raw source text, captured by the
+    // next `Background` token so `jobs` can show the original quoting.  It is
+    // reset at every depth-0 `;` / newline; `{`/`(` open a group that hides
+    // the separators inside a compound command from the reset.
+    let mut cmd_raw_start: usize = 0;
+    // Depth of `{` / `(` command groups currently open (see `cmd_raw_start`).
+    let mut raw_group_depth: usize = 0;
 
     // Flush the current `pending` literal buffer into a `Text` part. `quoted`
     // must reflect whether the buffered characters came from a quoted context
@@ -1924,6 +1936,11 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                     }));
                     at_command_start = true;
                 }
+                // A newline at group depth 0 starts a new raw command
+                // fragment (see `cmd_raw_start`).
+                if raw_group_depth == 0 {
+                    cmd_raw_start = i;
+                }
                 i = next_i;
             }
             '|' if cond_depth > 0 && cond_regex_rhs => {
@@ -2022,6 +2039,12 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                     tokens.push(Token::Semicolon(SemicolonOrigin { kind, line: line_no }));
                     at_command_start = true;
                     i += 1;
+                }
+                // A `;` at group depth 0 starts a new raw command fragment
+                // (see `cmd_raw_start`); inside `{ ...; }` or `( ...; )` the
+                // separators belong to the enclosing compound command.
+                if raw_group_depth == 0 {
+                    cmd_raw_start = i;
                 }
             }
             '<' => {
@@ -2198,7 +2221,9 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                     redirect_target = true;
                     i += if is_append { 3 } else { 2 };
                 } else {
-                    tokens.push(Token::Background);
+                    let raw: String = chars[cmd_raw_start..i].iter().collect();
+                    tokens.push(Token::Background(raw));
+                    cmd_raw_start = i + 1;
                     i += 1;
                 }
                 at_command_start = true;
@@ -2327,6 +2352,9 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                 if complete_token && pending.is_empty() && parts.is_empty() {
                     tokens.push(Token::Word(vec![WordPart::Text("{".to_string(), false)]));
                     at_command_start = true;
+                    // An opening command group hides the `;` / newline inside
+                    // it from the raw `Background` fragment reset.
+                    raw_group_depth += 1;
                     i += 1;
                 } else {
                     // Literal `{`: keep it in the current word (`a{` -> `a{`,
@@ -2434,6 +2462,13 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                 // Inside a conditional expression `(` / `)` group operands;
                 // they never introduce a subshell.
                 at_command_start = cond_depth == 0;
+                // Track subshell groups so the raw `Background` fragment keeps
+                // the separators inside a compound command.
+                if c == '(' {
+                    raw_group_depth += 1;
+                } else {
+                    raw_group_depth = raw_group_depth.saturating_sub(1);
+                }
                 i += 1;
             }
             '}' => {
@@ -2448,6 +2483,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                 if complete_token && pending.is_empty() && parts.is_empty() {
                     tokens.push(Token::Word(vec![WordPart::Text("}".to_string(), false)]));
                     at_command_start = true;
+                    raw_group_depth = raw_group_depth.saturating_sub(1);
                     i += 1;
                 } else {
                     pending.push('}');

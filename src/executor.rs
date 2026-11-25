@@ -3298,6 +3298,247 @@ fn execute_pipeline(p: &Pipeline, sh: &mut Shell, path: Option<&str>) -> i32 {
     code
 }
 
+/// Normalize a raw background-command fragment for the `jobs` display.
+///
+/// bash rebuilds the job's command text from its source words: runs of
+/// unquoted whitespace collapse to a single separator, both ends are trimmed,
+/// quotes / escapes / variables stay literal (nothing is re-expanded), the
+/// whitespace inside a `$(`-substitution is kept verbatim, and every
+/// redirection operator is separated from its target word by exactly one
+/// space — except descriptor duplication (`2>&1`, `<&-`), which bash renders
+/// without any space (and with an implicit `1` / `0` fd when the source had
+/// none, e.g. `>&1` becomes `1>&1`).
+fn normalize_job_text(raw: &str) -> String {
+    let chars: Vec<char> = raw.chars().collect();
+    let n = chars.len();
+    let mut out = String::new();
+    let mut i = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    // Depth of `$(` / `$((` substitutions: their inner whitespace is part of
+    // the displayed text and must not be collapsed.
+    let mut subst_depth = 0usize;
+    // Set by an unquoted run of whitespace at group depth 0; flushed as a
+    // single space before the next non-space fragment.
+    let mut pending_space = false;
+
+    while i < n {
+        let c = chars[i];
+        if in_single {
+            out.push(c);
+            if c == '\'' {
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_double {
+            // Quoted whitespace stays verbatim, exactly like in bash.
+            if c == '"' {
+                in_double = false;
+                out.push('"');
+            } else if c == '\\' && i + 1 < n {
+                out.push('\\');
+                out.push(chars[i + 1]);
+                i += 2;
+                continue;
+            } else {
+                out.push(c);
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '\'' => {
+                if pending_space {
+                    out.push(' ');
+                    pending_space = false;
+                }
+                in_single = true;
+                out.push('\'');
+                i += 1;
+            }
+            '"' => {
+                if pending_space {
+                    out.push(' ');
+                    pending_space = false;
+                }
+                in_double = true;
+                out.push('"');
+                i += 1;
+            }
+            '\\' => {
+                if pending_space {
+                    out.push(' ');
+                    pending_space = false;
+                }
+                out.push('\\');
+                if i + 1 < n {
+                    out.push(chars[i + 1]);
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            '$' if i + 1 < n && chars[i + 1] == '(' => {
+                if pending_space {
+                    out.push(' ');
+                    pending_space = false;
+                }
+                out.push('$');
+                out.push('(');
+                i += 2;
+                subst_depth += 1;
+            }
+            ' ' | '\t' | '\n' => {
+                if subst_depth > 0 {
+                    out.push(c);
+                } else {
+                    pending_space = true;
+                }
+                i += 1;
+            }
+            '(' if subst_depth > 0 => {
+                out.push('(');
+                subst_depth += 1;
+                i += 1;
+            }
+            ')' if subst_depth > 0 => {
+                out.push(')');
+                subst_depth -= 1;
+                i += 1;
+            }
+            '<' | '>' if subst_depth == 0 => {
+                if pending_space {
+                    out.push(' ');
+                    pending_space = false;
+                }
+                // Descriptor duplication (`>&N` / `<&N` / `>&-`): bash keeps
+                // operator and target glued.  An implicit `1` / `0` fd is
+                // printed only when the target is itself a valid fd spec
+                // (`>&1`, `>&12`, `>&-`); an ambiguous word target (`>&1x`)
+                // keeps the raw source form.
+                let is_dup = i + 1 < n && chars[i + 1] == '&';
+                if is_dup && is_valid_dup_target(&chars, i + 2)
+                    && !ends_with_bare_fd(&out)
+                {
+                    if !out.ends_with(' ') && !out.is_empty() {
+                        out.push(' ');
+                    }
+                    out.push(if c == '>' { '1' } else { '0' });
+                }
+                out.push(c);
+                i += 1;
+                // Operator suffixes: `>>`, `<<`, `<<<`, `<>`, `<<-`.
+                let mut heredoc = false;
+                if i < n && (chars[i] == '<' || chars[i] == '>') {
+                    let second = chars[i];
+                    out.push(second);
+                    i += 1;
+                    if second == '<' {
+                        if i < n && chars[i] == '<' {
+                            // `<<<` here-string: bash separates it from its
+                            // word (`<<< xyz`).
+                            out.push('<');
+                            i += 1;
+                        } else {
+                            // `<<` / `<<-` heredocs: bash keeps the
+                            // delimiter glued (`cat <<EOF`).
+                            heredoc = true;
+                            if i < n && chars[i] == '-' {
+                                out.push('-');
+                                i += 1;
+                            }
+                        }
+                    }
+                }
+                if is_dup {
+                    out.push('&');
+                    i += 1;
+                } else if !heredoc
+                    && i < n
+                    && chars[i] != ' '
+                    && chars[i] != '\t'
+                    && chars[i] != '\n'
+                {
+                    // Every other redirection takes one space before its
+                    // target (`>/dev/null` displays as `> /dev/null`).
+                    out.push(' ');
+                }
+            }
+            '&' if subst_depth == 0 => {
+                if pending_space {
+                    out.push(' ');
+                    pending_space = false;
+                }
+                out.push('&');
+                i += 1;
+                if i < n && chars[i] == '>' {
+                    // `&>` / `&>>`: one space before the target, like bash.
+                    out.push('>');
+                    i += 1;
+                    if i < n && chars[i] == '>' {
+                        out.push('>');
+                        i += 1;
+                    }
+                    if i < n
+                        && chars[i] != ' '
+                        && chars[i] != '\t'
+                        && chars[i] != '\n'
+                    {
+                        out.push(' ');
+                    }
+                }
+            }
+            _ => {
+                if subst_depth == 0 && pending_space {
+                    out.push(' ');
+                    pending_space = false;
+                }
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out.trim().to_string()
+}
+
+/// True when the word at `start` is a valid descriptor-duplication target:
+/// either all digits (an fd number) or a lone `-` (close the descriptor).
+/// Anything else (`1x`) is an ambiguous word target, which bash displays
+/// verbatim without an implicit fd.
+fn is_valid_dup_target(chars: &[char], start: usize) -> bool {
+    if start >= chars.len() {
+        return false;
+    }
+    if chars[start] == '-' {
+        return start + 1 == chars.len()
+            || !(chars[start + 1].is_ascii_alphanumeric() || chars[start + 1] == '_');
+    }
+    let mut end = start;
+    while end < chars.len() && chars[end].is_ascii_digit() {
+        end += 1;
+    }
+    end > start
+        && (end == chars.len()
+            || !(chars[end].is_ascii_alphanumeric() || chars[end] == '_'))
+}
+
+/// True when `out` ends with a bare fd number: a digit run directly after a
+/// separator (or at the very start).  A digit glued to a word (`hi2>&1`) is
+/// part of that word, not a descriptor prefix.
+fn ends_with_bare_fd(out: &str) -> bool {
+    let b: Vec<char> = out.chars().collect();
+    if b.is_empty() || !b[b.len() - 1].is_ascii_digit() {
+        return false;
+    }
+    if b.len() == 1 {
+        return true;
+    }
+    let prev = b[b.len() - 2];
+    !(prev.is_ascii_alphanumeric() || prev == '_')
+}
+
 /// Run the pipeline in the background (`cmd &`).
 ///
 /// We fork once; the child runs the whole pipeline normally (with the
@@ -3348,8 +3589,14 @@ fn execute_background(p: &Pipeline, sh: &mut Shell, path: Option<&str>) -> i32 {
     sh.next_jobno += 1;
     sh.job_table.push(crate::shell::JobInfo {
         pid,
-        // 命令文本取自流水线渲染（不含结尾的 `&`），是真实输入，非伪造。
-        command: crate::builtins::render_pipeline(p),
+        // 命令文本优先取 `&` 携带的原始输入片段（保留引号/转义/重定向空格，
+        // 经 normalize_job_text 按 bash 语义规整），仅在没有原始文本时才退回
+        // AST 渲染；两者都不含结尾的 `&`，是真实输入，非伪造。
+        command: p
+            .raw
+            .clone()
+            .map(|s| normalize_job_text(&s))
+            .unwrap_or_else(|| crate::builtins::render_pipeline(p)),
         done: false,
         status: None,
         jobno,
