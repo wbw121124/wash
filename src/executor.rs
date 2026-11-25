@@ -3148,7 +3148,7 @@ fn execute_pipeline(p: &Pipeline, sh: &mut Shell, path: Option<&str>) -> i32 {
         if crate::expand::arith_failed() {
             return 1;
         }
-        return run_standalone_exp(
+        let code = run_standalone_exp(
             &pr.argv,
             &pr.redirs,
             &pr.assigns,
@@ -3158,6 +3158,14 @@ fn execute_pipeline(p: &Pipeline, sh: &mut Shell, path: Option<&str>) -> i32 {
             sh,
             path,
         );
+        // PIPESTATUS is rewritten by every completed command.  A single
+        // command stores its own status as a one-element array.  The write is
+        // placed after run_standalone_exp so an inner pipeline (inside a
+        // function or compound command) is overridden by the enclosing
+        // command's status, matching bash's "last command wins" semantics.
+        sh.arrays
+            .insert("PIPESTATUS".to_string(), vec![code.to_string()]);
+        return code;
     }
 
     let mut prev_read: Option<i32> = None;
@@ -3253,8 +3261,12 @@ fn execute_pipeline(p: &Pipeline, sh: &mut Shell, path: Option<&str>) -> i32 {
 
     let mut last = 0;
     let mut failure = 0;
+    // PIPESTATUS holds every stage's raw exit status.  It is NOT affected by
+    // `set -o pipefail`, which only adjusts the pipeline's own `$?`.
+    let mut statuses: Vec<String> = Vec::with_capacity(n);
     for pid in pids {
         let status = posix::wait_pid(pid);
+        statuses.push(status.to_string());
         last = status;
         if status != 0 {
             failure = status;
@@ -3268,15 +3280,22 @@ fn execute_pipeline(p: &Pipeline, sh: &mut Shell, path: Option<&str>) -> i32 {
     // the stages that did run (bash semantics).  The stages already forked
     // were reaped above and the terminal foreground group was restored.
     if fork_failed {
+        // A fork failure fails the whole pipeline with status 1.  Its exact
+        // PIPESTATUS oracle value is not stably reproducible; record [1].
+        sh.arrays
+            .insert("PIPESTATUS".to_string(), vec!["1".to_string()]);
         return 1;
     }
     // With `set -o pipefail` the pipeline fails when any stage failed; the
-    // status is then the one of the rightmost failing stage.
-    if pipefail && failure != 0 {
+    // status is then the one of the rightmost failing stage.  PIPESTATUS keeps
+    // the raw per-stage statuses regardless of pipefail.
+    let code = if pipefail && failure != 0 {
         failure
     } else {
         last
-    }
+    };
+    sh.arrays.insert("PIPESTATUS".to_string(), statuses);
+    code
 }
 
 /// Run the pipeline in the background (`cmd &`).
