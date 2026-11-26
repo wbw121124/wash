@@ -1869,7 +1869,9 @@ run_case A arr-def-space-unq  'a=(); echo ${a[@]:-x y}'
 # wait 写 [rc]、复合命令内部管道、手工赋值被覆盖、declare -p 形态。
 # jobs 覆盖：引号种类保留、赋值前缀、字面变量不展开、反斜杠转义、
 # 词间空白归一、重定向补空格（>/dev/null → > /dev/null）、fd-dup 不补、
-# AND-OR 片段。exclude（登记 docs，不入栅栏）：复合命令括号规范化、
+# AND-OR 片段。全部用 sleep 5 慢作业 + kill %1 收尾：echo 类快作业的
+# 后台输出与 jobs 行的交错顺序、以及 kill 时作业已结束的 rc，两侧都是
+# 时序竞争，不可栅栏（oracle 实测快作业形态本身显示文本一致）。exclude（登记 docs，不入栅栏）：复合命令括号规范化、
 # heredoc body 嵌入、ANSI-C 解码、$() 内层空白压缩、foo&&bar& 执行语义、
 # 管道取反 !、${arr[@]/pat/repl}、首命令 declare -p 未定义变量。
 run_case A ps-pipe-basic      'true | false; echo "[${PIPESTATUS[@]}]"'
@@ -1898,11 +1900,11 @@ run_case A jobs-cmd-squote    "sleep '5' & jobs; kill %1 2>/dev/null"
 run_case A jobs-cmd-assign    'FOO=bar sleep 5 & jobs; kill %1 2>/dev/null'
 run_case A jobs-cmd-pipe      'sleep 5 | cat & jobs; kill %1 2>/dev/null'
 run_case A jobs-cmd-shc       'sh -c "exit 5" & jobs; kill %1 2>/dev/null'
-run_case A jobs-cmd-var-lit   'v=abc; echo "$v" & jobs; kill %1 2>/dev/null'
-run_case A jobs-cmd-escape    'echo a\ b & jobs; kill %1 2>/dev/null'
+run_case A jobs-cmd-var-lit   'v=5; sleep "$v" & jobs; kill %1 2>/dev/null'
+run_case A jobs-cmd-escape    '{ sleep 5; echo a\ b; } & jobs; kill %1 2>/dev/null'
 run_case A jobs-cmd-multispace 'sleep   5   & jobs; kill %1 2>/dev/null'
-run_case A jobs-cmd-redir-space 'echo hi > /dev/null & jobs; kill %1 2>/dev/null'
-run_case A jobs-cmd-redir-nospace 'echo hi >/dev/null & jobs; kill %1 2>/dev/null'
+run_case A jobs-cmd-redir-space 'sleep 5 > /dev/null & jobs; kill %1 2>/dev/null'
+run_case A jobs-cmd-redir-nospace 'sleep 5 >/dev/null & jobs; kill %1 2>/dev/null'
 run_case A jobs-cmd-fddup     'sleep 5 2>&1 & jobs; kill %1 2>/dev/null'
 run_case A jobs-cmd-andor     'true && sleep 5 & jobs; kill %1 2>/dev/null'
 run_case A jobs-cmd-brace     '{ sleep 5; } & jobs; kill %1 2>/dev/null'
