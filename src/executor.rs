@@ -3681,6 +3681,13 @@ fn execute_andor(andor: &AndOr, sh: &mut Shell, path: Option<&str>, last: &mut i
 /// 正在按 pid 等待的子进程：所有按 pid 的同步等待（命令替换、子 shell、
 /// 管道阶段）从 fork 到 wait 之间都不会重入 execute()。
 fn reap_finished_jobs(sh: &mut Shell) {
+    // bash 非交互 `-c`（job control off）从不把作业标为 Stopped：oracle 实测
+    // `sleep 5 & kill -STOP %1; sleep 0.05; jobs` 仍显示 `Running`（10/10 稳定，
+    // STOP 已递送 50ms 也不例外），且 `wait %N` 对 stopped 作业阻塞到其真正
+    // 退出。只有交互 PTY（job control on）下 bash 才跟踪并显示 Stopped。
+    // 因此 stopped 观测必须以 job_control_active 为前提，否则 release 下 fork
+    // 更快、STOP 在 `jobs` 打印前递送，会显示出 bash 永远不会显示的 Stopped。
+    let track_stopped = job_control_active(sh);
     while let Some((pid, state)) = posix::wait_any_nohang_jobs() {
         if let Some(j) = sh.job_table.iter_mut().find(|j| j.pid == pid) {
             match state {
@@ -3694,8 +3701,12 @@ fn reap_finished_jobs(sh: &mut Shell) {
                 }
                 posix::JobWaitState::Stopped(sig) => {
                     // 子进程仍在（waitpid 只在退出时回收），不可标 done。
-                    j.done = false;
-                    j.stopped_signal = Some(sig);
+                    // 非交互下不记录：jobs 保持 Running、显式 wait 继续阻塞，
+                    // 与 bash 的"非交互不跟踪 stopped"一致（见函数头注释）。
+                    if track_stopped {
+                        j.done = false;
+                        j.stopped_signal = Some(sig);
+                    }
                 }
                 posix::JobWaitState::Continued => {
                     j.done = false;
