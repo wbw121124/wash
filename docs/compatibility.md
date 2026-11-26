@@ -240,6 +240,13 @@ yacc `near` 行只取最后一个空白之后的部分；被转义的 `=` 是字
   非数字目标回显展开后的单字段（`x=abc; 2>&$x` → `abc: ambiguous redirect`）；
   `2>&` 到 EOF 报两行 `syntax error near unexpected token`；`N>&""` / 变量空值
   分别按 Bad file descriptor / ambiguous redirect 对齐。18 条 GROUP A 栅栏。
+- **`PIPESTATUS` 特殊数组**（11-25，commit `10daf6b`）：`execute_pipeline`
+  在每次命令/管道完成后写 `sh.arrays["PIPESTATUS"]`——单命令单元素 `[rc]`、
+  多段管道各段原始码（不受 pipefail 调整）；`&` 不写数组、`wait` 写
+  `[wait rc]`；fork 时子 Shell `arrays.clone()` 天然满足 cmdsub/子 shell/管道段
+  "继承快照、不回传父"语义；不在启动时预置（首命令前 `declare -p` 报
+  not found，与 oracle 一致）。`${PIPESTATUS[@]}`/`[*]`/`[i]`/`${#…[@]}`/
+  切片/`declare -p`/`unset` 全部由现有数组机制自动生效。24 条 GROUP A 栅栏。
 
 ### 仍未修复（如实登记）
 
@@ -248,8 +255,7 @@ yacc `near` 行只取最后一个空白之后的部分；被转义的 `=` 是字
   bash 报 `"$x"`、wash 报 `$x`。`raw_word_text` 的 AST 不保留单双引号形态，
   改动面超出本轮收益，如实登记。源词含引号/变量/算术但展开为数字
   （`2>&"9"` / `x=9; 2>&$x` 等）在后续修复中已对齐（回显 fd 号）。
-- `${PIPESTATUS[@]:-none}`：`@` 列表的默认值已在上面对齐，但 `PIPESTATUS`
-  数组本身未实现（见下）。
+- `${PIPESTATUS[@]:-none}`：已随 `PIPESTATUS` 实现对齐（见上）。
 - `$HOME` 缺省回退（MSYS2 平台边界）：判据必须从 MSYS2 bash 内部调
   `env -u HOME`（从 Git Bash 调会造出"bash HOME 为空"的跨运行时假象）。
   原生口径实测：unset HOME 时 bash 回退 passwd 项 `/home/wbw`、wash 为空；
@@ -260,8 +266,12 @@ yacc `near` 行只取最后一个空白之后的部分；被转义的 `=` 是字
   算术**嵌套**在 1022 层成功、1023 层确定性报错（不 SIGSEGV），wash 的
   200 层嵌套护栏同样低于该阈值；两者都是"防栈溢出的保守上限"，不是
   bash 兼容阈值，勿据注释声称对齐。
-- 后台作业 `command` 文本取自渲染后的 AST，丢失原始引号（`sh -c "exit 5" &`
-  的 jobs 行显示 `sh -c exit 5`）；持久作业号 jobno 与状态码已对齐。
+- 后台作业 `command` 文本：Phase 1（raw span @ `&` + normalizer）已覆盖
+  简单 pipeline 的引号/赋值前缀/重定向空格/字面变量；残余窄边界——复合命令
+  括号规范化（bash `( sleep 5 )`）、if/for/while 多行 pretty-print、
+  ANSI-C `$'...'` 剥 `$` 并解码、`$( )` 内层空白压缩、`foo && bar &`
+  bash 后台化整个 AND-OR 而 wash 只后台化最后一段 pipeline（执行语义
+  独立缺口）——均如实登记。持久作业号 jobno 与状态码已对齐。
 - **Phase 2 作业控制的 PTY-only 边界**：非交互 `-c` 下 bash 不跟踪 stopped
   状态，wash 已按 oracle 对齐；stopped 状态、后台独立进程组、`fg` 的
   `tcsetpgrp` 前台交接仅在 PTY 下可观测，以 `tests/e2e/` PTY 套件验证，
@@ -276,5 +286,15 @@ yacc `near` 行只取最后一个空白之后的部分；被转义的 `=` 是字
 - **复合赋值中的稀疏下标**：`a=([0]=x [3]=y)` bash 产出 `x y`，wash 把
   `[0]=x` / `[3]=y` 当字面元素（且下标记为 0/1）；`declare -p` 也随之
   不同。属 `a[i]=v` 单独赋值路径之外的复合赋值解析缺口，本轮未改。
+- **数组模式替换 `${arr[@]/pat/repl}`**：bash 对数组逐元素替换
+  （`false|true|false; echo "${PIPESTATUS[@]/1/9}"` → `9 0 9`），wash
+  完全不替换（普通数组 `arr=(1 0)` 同样不替换）；属通用数组模式替换
+  缺口，非 PIPESTATUS 特有，本轮未改。
+- **管道取反 `! pipeline`**：bash `!` 只取反 `$?`、PIPESTATUS 保留各段
+  原始码；wash Parser::Pipeline 无 negate 字段，`!` 被当外部命令
+  （`!: command not found`）。属解析层独立缺口，本轮未改。
+- **`declare -p` 未定义变量**：bash 报 `declare: X: not found` rc=1，
+  wash 输出 `declare -- X` rc=0（`declare -p TOTALLY_UNDEFINED` 同样
+  复现，通用行为非 PIPESTATUS 特有），本轮未改。
 
 详细根因存档见 `AGENTS.md`「内建兼容性矩阵 → 已修复缺陷的根因存档」。

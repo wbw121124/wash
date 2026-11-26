@@ -26,7 +26,7 @@
 #       'cd <WASH_REPO> && bash tests/bash_diff_builtins.sh'
 #
 # Optional: ONLY_GROUP=A|K|B|C|D runs a single group.
-#   A = core semantics + finished builtins (922 cases: 340 + 33 brace-range
+#   A = core semantics + finished builtins (955 cases: 340 + 33 brace-range
 #       + 24 brace word-boundary + 15 brace nest/escape/quote-removal
 #       + 1 brace deep-nesting stack guard + 37 heredoc / herestring
 #       + 11 unclosed `$(` syntax-error fence
@@ -102,6 +102,13 @@
 #          target, numeric-after-expansion reports fd number; 7 cmdsub-NUL: drop+single warning, with raw-byte pipe/
 #          ANSI-C anchors that must keep the NUL; 12 array @/* -/:-/+/:+
 #          whole-array operators, incl. a=("") vs a=("" "")).
+#       + 35 boundary-cleanup fence (21 PIPESTATUS special array: per-stage
+#          raw codes, reset-to-singleton after every command, pipefail only
+#          touches $?, cmdsub/subshell/function snapshot isolation, `&` writes
+#          nothing, wait writes [rc]; 14 jobs command original quoting phase 1:
+#          quote kinds kept, assignment prefix, literal variables, backslash
+#          escapes, whitespace normalization, redirection space but not fd-dup,
+#          brace-group fragments with quoted inner whitespace).
 #          -> MUST stay green (regressions)
 #   K = KNOWN-DIFF: cannot be byte-equal by design (documented, not fixed)
 #   B = regression fence for already-fixed defects (GROUP B, 21 cases, green today)
@@ -1855,6 +1862,51 @@ run_case A arr-at-alt-empty   'a=(); echo "${a[@]:+x}"'
 run_case A arr-star-alt-full  'a=(1 2); echo "${a[*]:+x}"'
 run_case A arr-def-space      'a=(); echo "[${a[@]:-x y}]"'
 run_case A arr-def-space-unq  'a=(); echo ${a[@]:-x y}'
+
+# 边界清理轮栅栏：PIPESTATUS 特殊数组（21 条）+ jobs command 原始引号
+# Phase 1（12 条）。PIPESTATUS 覆盖：管道各段原始码、每条命令重置为单元素、
+# pipefail 只改 $? 不改数组、子 shell/函数/cmdsub 继承快照不回传、& 不写、
+# wait 写 [rc]、复合命令内部管道、手工赋值被覆盖、declare -p 形态。
+# jobs 覆盖：引号种类保留、赋值前缀、字面变量不展开、反斜杠转义、
+# 词间空白归一、重定向补空格（>/dev/null → > /dev/null）、fd-dup 不补、
+# AND-OR 片段。exclude（登记 docs，不入栅栏）：复合命令括号规范化、
+# heredoc body 嵌入、ANSI-C 解码、$() 内层空白压缩、foo&&bar& 执行语义、
+# 管道取反 !、${arr[@]/pat/repl}、首命令 declare -p 未定义变量。
+run_case A ps-pipe-basic      'true | false; echo "[${PIPESTATUS[@]}]"'
+run_case A ps-three           'false | true | false; printf "[%s]" "${PIPESTATUS[@]}"; echo'
+run_case A ps-single          'false; echo "[${PIPESTATUS[@]}] q=$?"'
+run_case A ps-twice           'false | true; echo "[${PIPESTATUS[@]}]"; echo "[${PIPESTATUS[@]}]"'
+run_case A ps-qmark           'false | true; echo "q=$? p=${PIPESTATUS[0]},${PIPESTATUS[1]}"'
+run_case A ps-pipefail        'set -o pipefail; false | true; echo "q=$? p=${PIPESTATUS[*]}"'
+run_case A ps-subshell        '(false | true); echo "[${PIPESTATUS[@]}]"'
+run_case A ps-func            'f(){ false | true; echo "in=[${PIPESTATUS[@]}]"; }; f; echo "out=[${PIPESTATUS[@]}]"'
+run_case A ps-cmdsub          'x=$(false | true; echo "${PIPESTATUS[@]}"); echo "x=$x out=[${PIPESTATUS[@]}]"'
+run_case A ps-cmdsub-inherit  'false | true; x=$(echo "in=${PIPESTATUS[@]}"); echo "x=$x"'
+run_case A ps-bg-wait         'false | true & wait; echo "w=$? p=${PIPESTATUS[@]}"'
+run_case A ps-cond            'false | true; [[ 1 == 1 ]]; echo "[${PIPESTATUS[@]}]"'
+run_case A ps-arith-cmd       'false | true; (( 1+1 )); echo "[${PIPESTATUS[@]}]"'
+run_case A ps-declare         'false | true; declare -p PIPESTATUS'
+run_case A ps-in-if           'if false | true; then echo "[${PIPESTATUS[@]}]"; fi'
+run_case A ps-read            'true | read x; echo "n=${#PIPESTATUS[@]} [${PIPESTATUS[@]}]"'
+run_case A ps-unset           'unset PIPESTATUS; echo "[${PIPESTATUS[@]}]"'
+run_case A ps-shortcircuit-and 'true; false && false | true; echo "[${PIPESTATUS[@]}]"'
+run_case A ps-shortcircuit-or 'true || false | true; echo "[${PIPESTATUS[@]}]"'
+run_case A ps-replace         'false | true; echo "${PIPESTATUS[@]}"; true; echo "${PIPESTATUS[@]}"'
+run_case A ps-manual-assign   'PIPESTATUS=(9 9); false | true; echo "[${PIPESTATUS[@]}]"'
+run_case A jobs-cmd-dquote    'sleep "5" & jobs; kill %1 2>/dev/null'
+run_case A jobs-cmd-squote    "sleep '5' & jobs; kill %1 2>/dev/null"
+run_case A jobs-cmd-assign    'FOO=bar sleep 5 & jobs; kill %1 2>/dev/null'
+run_case A jobs-cmd-pipe      'sleep 5 | cat & jobs; kill %1 2>/dev/null'
+run_case A jobs-cmd-shc       'sh -c "exit 5" & jobs; kill %1 2>/dev/null'
+run_case A jobs-cmd-var-lit   'v=abc; echo "$v" & jobs; kill %1 2>/dev/null'
+run_case A jobs-cmd-escape    'echo a\ b & jobs; kill %1 2>/dev/null'
+run_case A jobs-cmd-multispace 'sleep   5   & jobs; kill %1 2>/dev/null'
+run_case A jobs-cmd-redir-space 'echo hi > /dev/null & jobs; kill %1 2>/dev/null'
+run_case A jobs-cmd-redir-nospace 'echo hi >/dev/null & jobs; kill %1 2>/dev/null'
+run_case A jobs-cmd-fddup     'sleep 5 2>&1 & jobs; kill %1 2>/dev/null'
+run_case A jobs-cmd-andor     'true && sleep 5 & jobs; kill %1 2>/dev/null'
+run_case A jobs-cmd-brace     '{ sleep 5; } & jobs; kill %1 2>/dev/null'
+run_case A jobs-cmd-brace-quote '{ sleep "a   b"; } & jobs; kill %1 2>/dev/null'
 
 # GROUP B -- regression fence for already-fixed defects (21 cases, green today).
 # (每条用例都曾是真实缺陷，修复后留在这里作为回归栅栏：通过 run_case 同时跑

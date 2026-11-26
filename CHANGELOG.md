@@ -5,6 +5,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added（2026-11-25 边界清理轮，逐字节对齐 MSYS2 bash 5.3.20）
+
+- **`PIPESTATUS` 特殊数组**（`10daf6b`）：`execute_pipeline` 在每条命令/管道
+  完成后写入——单命令 `[rc]`、多段管道各段原始码（不受 pipefail 调整）；
+  `&` 不写、`wait` 写 `[rc]`；cmdsub/子 shell/管道段经 fork 继承快照且不
+  回传父；不预置（首命令前 `declare -p` 报 not found，与 oracle 一致）。
+  `${PIPESTATUS[@]}`/`[*]`/`[i]`/`${#…[@]}`/切片/`declare -p`/`unset` 由现有
+  数组机制自动生效。21 条 GROUP A 栅栏。
+- **jobs command 原始引号 Phase 1**（`0cb96f1`）：`Token::Background(String)`
+  在 `&` 处携带 raw span，`normalize_job_text` 按词重建显示文本（词间空白
+  归一、引号种类与引号内空白原样、赋值前缀、字面变量不展开、重定向补空格
+  但 fd-dup 不补且隐式 fd 规则对齐 `>&1`→`1>&1`）。14 条 GROUP A 栅栏。
+  窄边界（复合命令括号规范化、heredoc body 嵌入、ANSI-C 解码、
+  `foo && bar &` 执行语义）如实登记。
+
 ### Fixed（2026-11-24 backlog 收尾，逐字节对齐 MSYS2 bash 5.3.20）
 
 - **`2>&x` 重定向目标整词**（`329f647`/`5894174`）：lexer `read_dup_target`
