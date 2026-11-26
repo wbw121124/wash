@@ -5,6 +5,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed（2026-11-25/26 边界清理轮）
+
+- **非交互下作业不再显示 Stopped**（`8ec80a4`）：oracle 实测 bash 非交互
+  `-c` 从不跟踪 stopped（STOP 递送 50ms 后 `jobs` 仍 `Running`、`wait %N`
+  阻塞到退出），wash 原先无条件记录 `Stopped(sig)`，release 下 fork 更快
+  导致 `jobs-kill-stop` 稳定 DIFF。`reap_finished_jobs` 现以 job control on
+  为前提记录 stopped；交互 PTY 行为不变。
+
 ### Added（2026-11-25 边界清理轮，逐字节对齐 MSYS2 bash 5.3.20）
 
 - **`PIPESTATUS` 特殊数组**（`10daf6b`）：`execute_pipeline` 在每条命令/管道

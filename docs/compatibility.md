@@ -273,7 +273,10 @@ yacc `near` 行只取最后一个空白之后的部分；被转义的 `=` 是字
   bash 后台化整个 AND-OR 而 wash 只后台化最后一段 pipeline（执行语义
   独立缺口）——均如实登记。持久作业号 jobno 与状态码已对齐。
 - **Phase 2 作业控制的 PTY-only 边界**：非交互 `-c` 下 bash 不跟踪 stopped
-  状态，wash 已按 oracle 对齐；stopped 状态、后台独立进程组、`fg` 的
+  状态，wash 已按 oracle 对齐（commit `8ec80a4`：`reap_finished_jobs` 仅在
+  job control on 时记录 `Stopped(sig)`——oracle 实测非交互下 STOP 递送 50ms
+  后 `jobs` 仍显示 `Running` 且 `wait %N` 阻塞到作业退出，只有交互 PTY 才
+  显示 Stopped）；stopped 状态、后台独立进程组、`fg` 的
   `tcsetpgrp` 前台交接仅在 PTY 下可观测，以 `tests/e2e/` PTY 套件验证，
   不做 `-c` 逐字节断言。
 - **`PIPESTATUS` 数组本身未实现**（全源码零命中）：bash 在每条管道后把各段
