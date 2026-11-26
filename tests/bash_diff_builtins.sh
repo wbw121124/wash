@@ -1908,7 +1908,7 @@ run_case A jobs-cmd-redir-nospace 'sleep 5 >/dev/null & jobs; kill %1 2>/dev/nul
 run_case A jobs-cmd-fddup     'sleep 5 2>&1 & jobs; kill %1 2>/dev/null'
 run_case A jobs-cmd-andor     'true && sleep 5 & jobs; kill %1 2>/dev/null'
 run_case A jobs-cmd-brace     '{ sleep 5; } & jobs; kill %1 2>/dev/null'
-run_case A jobs-cmd-brace-quote '{ sleep "a   b"; } & jobs; kill %1 2>/dev/null'
+run_case A jobs-cmd-brace-quote '{ sleep 5; echo "a   b"; } & jobs; kill %1 2>/dev/null'
 
 # GROUP B -- regression fence for already-fixed defects (21 cases, green today).
 # (每条用例都曾是真实缺陷，修复后留在这里作为回归栅栏：通过 run_case 同时跑
