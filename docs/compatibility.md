@@ -248,30 +248,94 @@ yacc `near` 行只取最后一个空白之后的部分；被转义的 `=` 是字
   not found，与 oracle 一致）。`${PIPESTATUS[@]}`/`[*]`/`[i]`/`${#…[@]}`/
   切片/`declare -p`/`unset` 全部由现有数组机制自动生效。24 条 GROUP A 栅栏。
 
+### 本轮已修复（2026-11-26）
+
+以下窄边界已按 MSYS2 bash 5.3 逐字节对拍（stdout/stderr 归一化/rc）：
+
+- **`PIPESTATUS` 两项归档**：`${PIPESTATUS[@]:-none}` 随 `PIPESTATUS` 数组
+  机制自动对齐；此前登记的「数组本身未实现」已由 11-25 的
+  `execute_pipeline` 写入逻辑修复（单命令 `[rc]`、多段各段原始码、不受
+  pipefail 影响、`wait`/后台/fork 子进程快照语义），本轮再次对拍确认。
+- **管道取反 `! pipeline`**：`Pipeline` 新增 `negate` 字段，parser 在流水线
+  首段剥离未加引号的 `!`（多枚按奇偶翻转；非首段报 near-token 语法错误），
+  executor 在写完 `PIPESTATUS` 之后才翻转 `$?`；lexer 让前缀 `!` 后的词
+  仍处于命令位置，故 `! ( ... )` / `! if ...` / `! for ...` 复合命令也按
+  bash 解析。因此 `! true` rc=1、
+  `! false` rc=0、`! true | false` rc=0 且 `${PIPESTATUS[@]}` 仍是 `0 1`；
+  `echo !` 与 `'!'` 保持字面量。
+- **参数运算词二次展开**：`eval_braced` 把 op 的 word 先按 shell 词法扫成
+  `WordPart`（剥引号、保留 `$x` / `$(cmd)` / `$((expr))` 节点），再用标量
+  展开器求值一次，标量与数组路径共享；`${v:-$x}`、`${v:-"a b"}`、命令/
+  算术替换、`:=` 赋值、`?` 消息以及 `#`/`%`/`/` 模式参数均按 bash 展开。
+  模式类 op（`/` `//` `#` `##` `%` `%%`）的 word 分流处理：反斜杠保留给
+  `unescape_pattern` / `expand_replacement`，不会被词法扫描当引号转义剥掉；
+  第一个未转义 `/` 用内部哨兵标记，故 `$x` 展开出的 `/` 不会被误当分隔符。
+- **数组逐元素模式替换**：`array_word_op` 对 `/` / `//` 逐元素复用标量的
+  `replace_pattern`，`@` 保持每元素一字段、`*` 按 IFS 连接；
+  `a=(1 0); ${a[@]/1/9}` 得到 `9` / `0` 两行，模式与替换词也先二次展开。
+- **复合赋值稀疏下标**：`name=([i]=v)` 在 parser 保留下标词、executor 按
+  展开后的算术下标写入 `sh.arrays` 并在 `sh.array_set_indices` 登记真实
+  下标（空位用空串占位但不计入 `${#a[@]}` / `${!a[@]}` / `${a[@]}`）；
+  `a=([0]=x [3]=y)` 的 `declare -p` 输出 `([0]="x" [3]="y")`。
+- **`declare -p` 未定义名**：命名查询逐个检查是否定义，未定义打印
+  `declare: NAME: not found` 到 stderr 并 rc=1，已定义变量输出保持不变
+  （多个名字时 bash 对每个未定义名各报一行，已对齐）。
+- **`2>&x` 引号形态**：lexer 为 `N>&WORD` / `N<&WORD` 额外携带 WORD 的原始
+  源码 span，`Redir::Dup` 透传到 Bad file descriptor 诊断；
+  `1>&''` 回显 `''`、`1>&"$x"`（空值）回显 `"$x"`，数字字面量与
+  ambiguous redirect 的既有行为不变。
+- **算术递归护栏对齐**：MSYS2 bash 5.3 的变量值递归链 1022 层成功、
+  1023 层确定性报 `a0: expression recursion level exceeded (error token is
+  "a0")` rc=1。`MAX_VAR_EVAL_DEPTH` 设为 1022（每层变量值恰好进入一次
+  guard），`MAX_ARITH_NEST` 提高到 3500 覆盖字面 `(` 嵌套；整个 shell 跑在
+  64 MB 栈的专用线程上（默认 1 MB 主线程在约千层时 SIGSEGV，实测证据：
+  rc=139 + `thread has overflowed its stack`），并保留最内层失败变量作为
+  诊断前缀（此前会被外层变量覆盖）。1022/1023 与 `1023` 层字面括号均
+  逐字节对齐；3500 层内不崩，超过时返回确定性错误而非 SIGSEGV。
+- **后台作业文本与 AND-OR 后台化**：`normalize_job_text` 剥 `$'...'` 的 `$`
+  并按 C 转义解码（`$'a\nb'` 显示为含实际换行的 `'a<newline>b'`）；命令替换
+  `$( )` 内未加引号的空白折叠为单空格并裁掉括号两侧，引号内与 `$(( ))`
+  算术空白保持原样；复合命令（`( )` / `if` / `for` / `while` / `case`）的
+  `&` raw span 会被内部 `;` 截断，改由 AST 的 bash 风格多行渲染产出；
+  brace group `{ ...; }` 例外，bash 在 `jobs` 中显示**单行**且保留原始引号/
+  转义，故 group-only 优先用 raw span，无 raw 时用单行 AST 渲染（`{ ...; }`）；
+  `a && b &` 现在由 `AndOr` 级的 `background`/`raw` 一次性后台化整个列表，
+  `false && sleep 5 &` 立即登记一个作业（此前只后台化最后一段，前缀短路后
+  根本没有作业）。`wait %1` 状态码与 `$?` 同步对齐。
+
+### Round 2 根因复修（QA Round 1 门禁回归 / 候选缺陷）
+
+以下四组按 QA A/B 归因定位的源码根因精确修复，未削弱既有语义，均通过
+MSYS2 bash 5.3 逐字节对拍（stdout/stderr 归一化/rc）：
+
+- **根因 A — patsub 模式词反斜杠**：`expand_op_arg` 现按 op 分流，模式类 op
+  保留反斜杠原样进入 `replace_pattern`（引号词仍照常展开 `$x`/`$( )`/
+  `$(( ))`）；`${v/\//-}`、`${v//\//-}`、`${v/\*/X}`、`${v/\?/X}`、
+  `${v/\[/X}`、`${v/b/\&}` 全部对齐。另用哨兵区分 syntactically 的 `/`
+  与 `$x` 展开出的 `/`，`x=/; ${v//$x/-}` 得到 `a-b-c`（此前不替换）。
+- **根因 B — brace group 作业文本单行**：`execute_background` /
+  `execute_background_andor` 对 group-only 复合命令优先用 raw span 保真，
+  无 raw 时以 `render_group_single_line` 输出 `{ ...; }`；`if`/`for`/`while`/
+  `case` 仍走多行 AST 渲染。`{ sleep 5; echo a\ b; } &` 与
+  `{ sleep 5; echo "a   b"; } &` 的 `jobs` 文本保留转义/引号且单行。
+- **根因 C — `${v:=word}` 同行写回**：`ExpandCtx` 新增 `assign_overlay`，
+  `assign_default` 除推入 `pending_assign`（命令结束后持久化）外立即写
+  overlay，`expand_env_get`/`expand_env_contains` 优先读之，故同一命令行
+  后续词可见新值：`v=; echo "${v:=VAL}:$v"` 得 `VAL:VAL`（`$x`/`$( )`/
+  `$(( ))` 三种 word 形态同样对齐）。
+- **根因 D — 变量下标读取**：新增 `resolve_array_index` 统一元素读取与长度
+  两条路径的下标解析（先 `parse::<i64>`、失败走 `eval_arith(subscript, ctx)`
+  的 `ArithCtx`，支持 `$i`/`i`/`i+1`，未设值的 `$i` 视为 0）；`split_braced`
+  现跳过 `[...]` 内的运算符，`${a[i+1]}` 不再被误拆成 `+` 运算。
+  `${a[$i]}` 在普通与稀疏数组上均对齐（`a=(p q r s); i=3` → `s`）。
+
 ### 仍未修复（如实登记）
 
-- `2>&x` 的残余窄边界（在 23 条 GROUP A 栅栏之外）：fd==1 的空目标回显
-  保留原始引号种类——`1>&''` bash 报 `''`、wash 报 `""`；`1>&"$x"`（x 空）
-  bash 报 `"$x"`、wash 报 `$x`。`raw_word_text` 的 AST 不保留单双引号形态，
-  改动面超出本轮收益，如实登记。源词含引号/变量/算术但展开为数字
-  （`2>&"9"` / `x=9; 2>&$x` 等）在后续修复中已对齐（回显 fd 号）。
-- `${PIPESTATUS[@]:-none}`：已随 `PIPESTATUS` 实现对齐（见上）。
 - `$HOME` 缺省回退（MSYS2 平台边界）：判据必须从 MSYS2 bash 内部调
   `env -u HOME`（从 Git Bash 调会造出"bash HOME 为空"的跨运行时假象）。
   原生口径实测：unset HOME 时 bash 回退 passwd 项 `/home/wbw`、wash 为空；
   空 HOME 值时 bash 保持空、wash 被 MSYS2 runtime 转成 `/c/Users/wbw`。
   两者都属进程环境/runtime 行为，不通过 getpwuid 回填伪装对齐。
-- 算术变量值递归链深度：wash 50 层护栏（防栈溢出）以内与 bash 对齐，
-  51 层以上 bash 仍可求值而 wash 报 recursion exceeded。MSYS2 bash 5.3 的
-  算术**嵌套**在 1022 层成功、1023 层确定性报错（不 SIGSEGV），wash 的
-  200 层嵌套护栏同样低于该阈值；两者都是"防栈溢出的保守上限"，不是
-  bash 兼容阈值，勿据注释声称对齐。
-- 后台作业 `command` 文本：Phase 1（raw span @ `&` + normalizer）已覆盖
-  简单 pipeline 的引号/赋值前缀/重定向空格/字面变量；残余窄边界——复合命令
-  括号规范化（bash `( sleep 5 )`）、if/for/while 多行 pretty-print、
-  ANSI-C `$'...'` 剥 `$` 并解码、`$( )` 内层空白压缩、`foo && bar &`
-  bash 后台化整个 AND-OR 而 wash 只后台化最后一段 pipeline（执行语义
-  独立缺口）——均如实登记。持久作业号 jobno 与状态码已对齐。
 - **Phase 2 作业控制的 PTY-only 边界**：非交互 `-c` 下 bash 不跟踪 stopped
   状态，wash 已按 oracle 对齐（commit `8ec80a4`：`reap_finished_jobs` 仅在
   job control on 时记录 `Stopped(sig)`——oracle 实测非交互下 STOP 递送 50ms
@@ -279,25 +343,5 @@ yacc `near` 行只取最后一个空白之后的部分；被转义的 `=` 是字
   显示 Stopped）；stopped 状态、后台独立进程组、`fg` 的
   `tcsetpgrp` 前台交接仅在 PTY 下可观测，以 `tests/e2e/` PTY 套件验证，
   不做 `-c` 逐字节断言。
-- **`PIPESTATUS` 数组本身未实现**（全源码零命中）：bash 在每条管道后把各段
-  退出码写入 `PIPESTATUS`（`true | false` → `0 1`），wash 该变量完全不存在，
-  `${PIPESTATUS[@]}` 恒为空。属独立缺口，非 `:-` 默认值一项可覆盖。
-- **默认值/替代词内的二次展开**：`${v:-$x}` 在 bash 下把 `$x` 展开后再作
-  默认值（x=VAL → `VAL`），wash 的标量 `apply_scalar_op` 与数组
-  `array_word_op` 都直接回显参数原文（→ `$x`）；命令替换 / 算术替换
-  同理不展开。为保持标量与数组路径一致，本轮未改。
-- **复合赋值中的稀疏下标**：`a=([0]=x [3]=y)` bash 产出 `x y`，wash 把
-  `[0]=x` / `[3]=y` 当字面元素（且下标记为 0/1）；`declare -p` 也随之
-  不同。属 `a[i]=v` 单独赋值路径之外的复合赋值解析缺口，本轮未改。
-- **数组模式替换 `${arr[@]/pat/repl}`**：bash 对数组逐元素替换
-  （`false|true|false; echo "${PIPESTATUS[@]/1/9}"` → `9 0 9`），wash
-  完全不替换（普通数组 `arr=(1 0)` 同样不替换）；属通用数组模式替换
-  缺口，非 PIPESTATUS 特有，本轮未改。
-- **管道取反 `! pipeline`**：bash `!` 只取反 `$?`、PIPESTATUS 保留各段
-  原始码；wash Parser::Pipeline 无 negate 字段，`!` 被当外部命令
-  （`!: command not found`）。属解析层独立缺口，本轮未改。
-- **`declare -p` 未定义变量**：bash 报 `declare: X: not found` rc=1，
-  wash 输出 `declare -- X` rc=0（`declare -p TOTALLY_UNDEFINED` 同样
-  复现，通用行为非 PIPESTATUS 特有），本轮未改。
 
 详细根因存档见 `AGENTS.md`「内建兼容性矩阵 → 已修复缺陷的根因存档」。

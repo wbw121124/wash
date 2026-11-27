@@ -17,6 +17,7 @@
 // executor therefore calls `run_builtin` before forking; the forked child
 // only uses it for the stateless output builtins.
 
+use std::collections::HashSet;
 use std::io::Write;
 
 use crate::arith;
@@ -872,6 +873,40 @@ fn format_array(elems: &[String]) -> String {
     }
     out.push(')');
     out
+}
+
+/// Format an array for `declare -p`, preserving sparse subscripts.  `sh.arrays`
+/// stores a dense `Vec` with empty placeholders in the gaps and keeps the set
+/// of actually assigned indices in `sh.array_set_indices`; bash prints only
+/// the assigned ones (`a=([0]=x [3]=y)` -> `([0]="x" [3]="y")`).
+fn format_array_sparse(elems: &[String], indices: Option<&HashSet<i64>>) -> String {
+    if elems.is_empty() {
+        return "()".to_string();
+    }
+    let assigned: Vec<(i64, &String)> = match indices {
+        Some(set) if !set.is_empty() => {
+            let mut sorted: Vec<i64> = set
+                .iter()
+                .copied()
+                .filter(|i| *i >= 0 && (*i as usize) < elems.len())
+                .collect();
+            sorted.sort_unstable();
+            sorted
+                .into_iter()
+                .map(|i| (i, &elems[i as usize]))
+                .collect()
+        }
+        _ => elems.iter().enumerate().map(|(i, e)| (i as i64, e)).collect(),
+    };
+    if assigned.is_empty() {
+        return "()".to_string();
+    }
+    let body = assigned
+        .iter()
+        .map(|(i, e)| format!("[{}]={}", i, quote_value_for_audit(e)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("({})", body)
 }
 
 // ---------------------------------------------------------------------------
@@ -1892,7 +1927,7 @@ fn render_redir(r: &crate::parser::Redir) -> String {
         ),
         // Dup's execution is direction-independent (dup2(src, fd)); the fd
         // value is only used to pick the `<&` / `>&` spelling for display.
-        crate::parser::Redir::Dup { fd, file } => format!(
+        crate::parser::Redir::Dup { fd, file, .. } => format!(
             "{}{}&{}",
             if *fd == 0 || *fd == 1 {
                 String::new()
@@ -1919,7 +1954,56 @@ pub(crate) fn render_pipeline(p: &crate::parser::Pipeline) -> String {
     p.commands.iter().map(render_simple).collect::<Vec<_>>().join(" | ")
 }
 
-fn render_andor(a: &crate::parser::AndOr) -> String {
+/// Bash-style multi-line rendering of a pipeline, including compound
+/// commands.  Used for `jobs` when the raw `&` span is unreliable (a
+/// semicolon inside `if` / `for` / `while` restarts the span in the lexer).
+pub(crate) fn render_pipeline_bash(p: &crate::parser::Pipeline) -> String {
+    let mut clone = p.clone();
+    clone.background = false; // `jobs` prints the trailing ` &` itself.
+    bash_fmt_pipeline(&clone, 0).join("\n")
+}
+
+/// Single-line fallback for a brace group whose raw `&` span is unavailable.
+/// bash keeps `{ ...; }` on one line in `jobs` (unlike if/for/while/case).
+pub(crate) fn render_group_single_line(c: &crate::parser::Compound) -> String {
+    match c {
+        crate::parser::Compound::Group { body } => {
+            let inner = render_command_list(body, 0).replace('\n', "; ");
+            if inner.is_empty() {
+                "{ }".to_string()
+            } else {
+                format!("{{ {}; }}", inner)
+            }
+        }
+        _ => render_pipeline_bash(&crate::parser::Pipeline {
+            commands: vec![crate::parser::SimpleCommand {
+                argv: Vec::new(),
+                redirs: Vec::new(),
+                assignments: Vec::new(),
+                array_assignments: Vec::new(),
+                compound: Some(c.clone()),
+            }],
+            negate: false,
+            background: false,
+            raw: None,
+        }),
+    }
+}
+
+/// Bash-style rendering of a whole AND-OR list for a background job.
+pub(crate) fn render_andor_bash(a: &crate::parser::AndOr) -> String {
+    let mut out = render_pipeline_bash(&a.pipelines[0]);
+    for (op, p) in a.ops.iter().zip(a.pipelines[1..].iter()) {
+        let sep = match op {
+            crate::parser::AndOrOp::And => "&&",
+            crate::parser::AndOrOp::Or => "||",
+        };
+        out.push_str(&format!(" {} {}", sep, render_pipeline_bash(p)));
+    }
+    out
+}
+
+pub(crate) fn render_andor(a: &crate::parser::AndOr) -> String {
     let mut s = render_pipeline(&a.pipelines[0]);
     for (op, p) in a.ops.iter().zip(a.pipelines[1..].iter()) {
         let sep = match op {
@@ -2104,7 +2188,10 @@ fn bash_fmt_simple(c: &crate::parser::SimpleCommand, indent: usize) -> Vec<Strin
     for (name, values, append) in &c.array_assignments {
         let elems = values
             .iter()
-            .map(|w| render_word(w))
+            .map(|(index, w)| match index {
+                Some(i) => format!("[{}]={}", render_word(i), render_word(w)),
+                None => render_word(w),
+            })
             .collect::<Vec<_>>()
             .join(" ");
         parts.push(format!("{}{}=({})", name, if *append { "+" } else { "" }, elems));
@@ -5616,20 +5703,18 @@ fn builtin_declare(argv: &[String], sh: &mut Shell, _is_typeset: bool) -> i32 {
     // `declare -p [NAME...]`: print attributes of the named variable(s).
     if print {
         let names: Vec<String> = argv[i..].to_vec();
-        if names.is_empty() {
+        return if names.is_empty() {
             // Print every variable (KNOWN-DIFF: bash prints all; we print the
             // ones that carry interesting attributes).
-            print_declared(sh, &all_declared_names(sh));
+            print_declared(sh, &all_declared_names(sh))
         } else {
-            print_declared(sh, &names);
-        }
-        return 0;
+            print_declared(sh, &names)
+        };
     }
 
     if i >= argv.len() {
         // `declare` with no arguments: list all variables (KNOWN-DIFF).
-        print_declared(sh, &all_declared_names(sh));
-        return 0;
+        return print_declared(sh, &all_declared_names(sh));
     }
 
     let mut status = 0;
@@ -5877,11 +5962,34 @@ fn all_declared_names(sh: &Shell) -> Vec<String> {
     names
 }
 
+/// True when `name` currently denotes a shell variable (scalar, indexed or
+/// associative array, or a declared attribute).  Used by `declare -p NAME` to
+/// reproduce bash's `NAME: not found` diagnostic for unknown names.
+fn variable_is_defined(sh: &Shell, name: &str) -> bool {
+    sh.env.contains_key(name)
+        || sh.arrays.contains_key(name)
+        || sh.assoc_arrays.contains_key(name)
+        || sh.assoc_declared.contains(name)
+        || sh.array_assigned.contains(name)
+        || sh.integer_vars.contains(name)
+        || sh.readonly.contains(name)
+        || sh.exported.contains(name)
+        || sh.null_exported.contains(name)
+}
+
 /// Print `declare -x NAME=...` lines for the given names, in sorted order.
-fn print_declared(sh: &Shell, names: &[String]) {
+/// Returns 1 when any requested name was not found (bash keeps printing the
+/// names that do exist and still exits 1).
+fn print_declared(sh: &Shell, names: &[String]) -> i32 {
     let mut sorted = names.to_vec();
     sorted.sort();
+    let mut status = 0;
     for name in &sorted {
+        if !variable_is_defined(sh, name) {
+            safe_eprintln!("wash: declare: {}: not found", name);
+            status = 1;
+            continue;
+        }
         // Array variables are printed with the `-a` attribute and the
         // `([0]="a" [1]="b")` body, exactly like bash does.  A bare
         // `declare -a NAME` (declared but never assigned) prints without a
@@ -5917,7 +6025,11 @@ fn print_declared(sh: &Shell, names: &[String]) {
                     println!("declare -a {}", name);
                 }
             } else {
-                println!("declare -a {}={}", name, format_array(elems));
+                println!(
+                    "declare -a {}={}",
+                    name,
+                    format_array_sparse(elems, sh.array_set_indices.get(name))
+                );
             }
             continue;
         }
@@ -5940,6 +6052,7 @@ fn print_declared(sh: &Shell, names: &[String]) {
             }
         }
     }
+    status
 }
 
 /// The attribute letters bash prints before a `declare -p` name (`-irx...`).

@@ -279,6 +279,12 @@ pub enum Token {
         /// `HereDocBody`).  `None` for every other redirection kind, and
         /// until `collect_heredocs` has filled it in.
         heredoc: Option<HereDocBody>,
+        /// `N>&WORD` / `N<&WORD` only: the raw source text of WORD, including
+        /// its original quote characters.  Parameter expansions inside WORD
+        /// are recorded as `WordPart`s in the following `Token::Word`, but
+        /// bash's `Bad file descriptor` diagnostic echoes the SOURCE spelling
+        /// (`1>&''` -> `''`, `1>&"$x"` -> `"$x"`), which the AST cannot rebuild.
+        dup_raw: Option<String>,
     },
 }
 
@@ -414,6 +420,14 @@ fn push_word(
         *cond_depth = 1;
         // The word after `[[` is an operand, not a command word.
         *at_command_start = false;
+        return;
+    }
+    // `!` is a pipeline prefix, not the command word: the following token is
+    // still in command position, so `! if ...`, `! for ...` and `! ( ... )`
+    // keep their reserved-word / compound recognition.  The parser rewrites
+    // this word into a bang marker and strips it before execution.
+    if plain == Some("!") && *at_command_start {
+        tokens.push(Token::Word(parts));
         return;
     }
     let reserved = match parts.as_slice() {
@@ -573,7 +587,11 @@ fn take_digit_prefix(word: &mut String) -> Option<i32> {
 /// word-reading state machine in `tokenize` without consuming the surrounding
 /// redirection operators.  Word separators (blank, newline, `; & | ( ) < >`)
 /// end the word; quotes kept it open.
-fn read_dup_target(chars: &[char], mut i: usize) -> (Vec<WordPart>, usize) {
+fn read_dup_target(
+    chars: &[char],
+    mut i: usize,
+    stop_at_separator: bool,
+) -> (Vec<WordPart>, usize) {
     fn flush(pending: &mut String, parts: &mut Vec<WordPart>, quoted: bool) {
         if !pending.is_empty() {
             parts.push(WordPart::Text(std::mem::take(pending), quoted));
@@ -699,8 +717,10 @@ fn read_dup_target(chars: &[char], mut i: usize) -> (Vec<WordPart>, usize) {
             continue;
         }
 
-        // Unquoted context: a word separator ends the target word.
-        if is_word_separator(c) {
+        // Unquoted context: a word separator ends the target word.  Parameter
+        // operator words (`${v:-word}`) scan the whole string instead, so
+        // separators there stay literal.
+        if stop_at_separator && is_word_separator(c) {
             break;
         }
         match c {
@@ -803,6 +823,15 @@ fn read_dup_target(chars: &[char], mut i: usize) -> (Vec<WordPart>, usize) {
     }
     flush(&mut pending, &mut parts, pending_quoted);
     (parts, i)
+}
+
+/// Parse the *word* of a parameter operator (`${v:-word}`, `${a[@]/pat/repl}`,
+/// ...) into `WordPart`s, removing quotes while preserving expansion nodes.
+/// Unlike a redirection target, the whole string belongs to the word: shell
+/// separators are literal here.  The expander re-expands these parts once so
+/// `$x`, `$(cmd)` and `$((expr))` inside the word behave like bash.
+pub fn read_parameter_word(chars: &[char]) -> Vec<WordPart> {
+    read_dup_target(chars, 0, false).0
 }
 
 /// True when `c` may appear inside a shell word (identifier characters plus
@@ -2075,11 +2104,13 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                 }
                 if i + 1 < n && chars[i + 1] == '&' {
                     // `<&N` / `<&-`: duplicate or close an input descriptor.
-                    let (target, ni) = read_dup_target(&chars, i + 2);
+                    let (target, ni) = read_dup_target(&chars, i + 2, true);
+                    let raw: String = chars[i + 2..ni].iter().collect();
                     tokens.push(Token::Redirect {
                         kind: RedirKind::Dup,
                         fd: Some(fd.unwrap_or(0)),
                         heredoc: None,
+                        dup_raw: Some(raw),
                     });
                     // No target right after `<&`: leave the redirection
                     // targetless so the parser reports bash's
@@ -2098,6 +2129,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                         kind: RedirKind::HereString,
                         fd,
                         heredoc: None,
+                        dup_raw: None,
                     });
                     redirect_target = true;
                     i += 3;
@@ -2115,6 +2147,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                         },
                         fd,
                         heredoc: None,
+                        dup_raw: None,
                     });
                     pending_heredocs.push(PendingHeredoc {
                         token_index: tokens.len() - 1,
@@ -2131,6 +2164,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                         kind: RedirKind::In,
                         fd,
                         heredoc: None,
+                        dup_raw: None,
                     });
                     redirect_target = true;
                     i += 1;
@@ -2160,11 +2194,13 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                 }
                 if i + 1 < n && chars[i + 1] == '&' {
                     // `>&N` / `>&-`: duplicate or close an output descriptor.
-                    let (target, ni) = read_dup_target(&chars, i + 2);
+                    let (target, ni) = read_dup_target(&chars, i + 2, true);
+                    let raw: String = chars[i + 2..ni].iter().collect();
                     tokens.push(Token::Redirect {
                         kind: RedirKind::Dup,
                         fd: Some(fd.unwrap_or(1)),
                         heredoc: None,
+                        dup_raw: Some(raw),
                     });
                     // No target right after `>&` (EOF or a separator): leave
                     // the redirection targetless so the parser reports bash's
@@ -2184,7 +2220,12 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                     } else {
                         RedirKind::Out
                     };
-                    tokens.push(Token::Redirect { kind, fd, heredoc: None });
+                    tokens.push(Token::Redirect {
+                        kind,
+                        fd,
+                        heredoc: None,
+                        dup_raw: None,
+                    });
                     redirect_target = true;
                     i += if is_append || is_clobber { 2 } else { 1 };
                 }
@@ -2217,6 +2258,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
                         },
                         fd: None,
                         heredoc: None,
+                        dup_raw: None,
                     });
                     redirect_target = true;
                     i += if is_append { 3 } else { 2 };
@@ -2919,6 +2961,10 @@ fn collect_heredocs(
 /// Decode a bash ANSI-C quoted string (`$'...'`). `chars[i]` must be the `$`
 /// and `chars[i + 1]` the opening quote. Returns the decoded text and the
 /// index just after the closing quote.
+pub fn decode_ansi_c(chars: &[char], i: usize) -> Option<(String, usize)> {
+    read_ansi_c(chars, i)
+}
+
 fn read_ansi_c(chars: &[char], i: usize) -> Option<(String, usize)> {
     let mut out = String::new();
     let mut j = i + 2;

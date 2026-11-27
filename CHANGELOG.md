@@ -5,6 +5,41 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed（2026-11-26/27 窄边界清零轮）
+
+- **`! pipeline` 取反**：`Pipeline` 新增 `negate` 字段，parser 在流水线首段
+  剥离未加引号的 `!`（多枚奇偶翻转、非首段报 near-token），executor 在写完
+  `PIPESTATUS` 之后才翻转 `$?`——`! true | false` rc=0 且 `PIPESTATUS` 仍是
+  `0 1`。`! ( ... )` / `! if ...` / `! for ...` 复合命令同样按 bash 解析。
+- **参数运算词二次展开**：`${v:-$x}` / `$(cmd)` / `$((expr))` 现在先按 shell
+  词法扫成 `WordPart` 再展开一次（标量与数组路径共享）；模式类 op（`/ //`
+  `# ## % %%`）保留反斜杠转义供 pattern matcher 处理，并用内部哨兵按首个
+  未转义 `/` 切分，故 `\/` 不作分隔符、`$x` 展开出的 `/` 也不误切。
+- **数组逐元素模式替换**：`${a[@]/pat/repl}` 逐元素复用标量替换，`@` 保持
+  每元素一字段、`*` 按 IFS 连接。
+- **复合赋值稀疏下标**：`a=([0]=x [3]=y)` 按展开后的算术下标写入并在
+  `array_set_indices` 登记真实下标；`${#a[@]}` / `${!a[@]}` / `declare -p`
+  均对齐；变量下标 `${a[$i]}`（含 `i+1` 算术形态）由 `resolve_array_index`
+  统一先字面后算术解析。
+- **`${v:=word}` 同行写回**：`assign_overlay` 令默认值赋值立即可见，同一
+  命令行后续 `$v` 读到新值（`v=; echo "${v:=VAL}:$v"` → `VAL:VAL`）。
+- **`declare -p` 未定义名**：命名查询逐个检查，未定义打印
+  `declare: NAME: not found` 并 rc=1，已定义变量输出不变。
+- **`2>&x` 引号形态**：`N>&WORD` 携带 WORD 原始源码 span，Bad file
+  descriptor 诊断保留 `''` / `"$x"` 等引号种类。
+- **算术递归护栏对齐**：变量值递归 1022 层成功、1023 层报
+  `a0: expression recursion level exceeded` rc=1；shell 主体跑在 64 MB 栈的
+  具名线程上（默认主线程在约千层 SIGSEGV），并保留最内层失败变量作为诊断
+  前缀。字面 `(` 嵌套在护栏内不崩、超限时确定性报错而非 SIGSEGV。
+- **后台作业文本与 AND-OR 后台化**：`$'...'` 剥 `$` 并按 C 转义解码；
+  `$( )` 内未加引号空白折叠；复合命令（brace group 单行保真、
+  `if/for/while/case` 多行 AST 渲染）均对齐；`a && b &` 由 `AndOr` 级后台化
+  整条列表（`false && sleep 5 &` 立即登记作业）。
+- 累计新增 **54 条 GROUP A 栅栏**；全量 1257/0（debug+release 双绿），
+  版本闸全匹配，perf 有效窗 TOTAL 0.79x / startup 0.36x / VmRSS 0.68x PASS。
+  此前如实登记的 10 项窄边界清零，仅余 HOME 平台边界与 PTY-only 两项
+  （符合铁律第 9 条两类例外）。
+
 ### Fixed（2026-11-25/26 边界清理轮）
 
 - **非交互下作业不再显示 Stopped**（`8ec80a4`）：oracle 实测 bash 非交互

@@ -26,11 +26,27 @@ mod shell;
 
 use std::process::exit;
 
+/// bash 5.3 的算术变量值递归链可到 1022 层，每层递归要消耗若干解析栈帧；
+/// 主线程默认 1 MB 栈在约 1000 层就会 SIGSEGV。整个 shell 跑在一个显式配置
+/// 大栈的线程里，既能覆盖 bash 的边界，又保留递归超限时的确定性诊断。
+const SHELL_STACK_SIZE: usize = 64 * 1024 * 1024;
+
 fn main() {
     // 本地化必须在任何输出之前初始化：`help` 等内建命令的说明文本要按
     // 当前 locale 翻译（`LC_ALL=C` 下是英文，`zh_CN.UTF-8` 下是中文）。
     i18n::init();
 
+    let worker = std::thread::Builder::new()
+        .name("wash-shell".to_string())
+        .stack_size(SHELL_STACK_SIZE)
+        .spawn(run_shell)
+        .expect("wash: cannot start shell thread");
+    if worker.join().is_err() {
+        exit(1);
+    }
+}
+
+fn run_shell() {
     let args: Vec<String> = std::env::args().collect();
     let mut sh = shell::Shell::new();
     // `$0` 就是 shell 被调用时用的路径，与 bash 一致。

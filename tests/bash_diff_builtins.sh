@@ -26,7 +26,7 @@
 #       'cd <WASH_REPO> && bash tests/bash_diff_builtins.sh'
 #
 # Optional: ONLY_GROUP=A|K|B|C|D runs a single group.
-#   A = core semantics + finished builtins (955 cases: 340 + 33 brace-range
+#   A = core semantics + finished builtins (1011 cases: 340 + 33 brace-range
 #       + 24 brace word-boundary + 15 brace nest/escape/quote-removal
 #       + 1 brace deep-nesting stack guard + 37 heredoc / herestring
 #       + 11 unclosed `$(` syntax-error fence
@@ -110,6 +110,32 @@
 #          escapes, whitespace normalization, redirection space but not fd-dup,
 #          brace-group fragments with quoted inner whitespace).
 #          -> MUST stay green (regressions)
+#       + 54 narrow-boundary cleanup fence (本轮新增，见 GROUP A 段末
+#          "narrow-boundary cleanup" 块；每条均先在 MSYS2 bash 5.3 下 LC_ALL=C
+#          独立实测，再与 wash 逐字节对拍确认后才固化）：
+#          9  ! pipeline（取反 rc、PIPESTATUS、字面 !、空命令、非首段语法
+#             错误、复合命令取反）
+#          8  参数运算词二次展开（默认值 / ? 消息中的 $x、$(cmd)、$((expr))、
+#             引号词与 # 模式词）
+#          5  数组逐元素模式替换（/ 与 //、替换词含变量、* 按 IFS 连接、
+#             /# 前缀锚点）
+#          6  稀疏复合赋值（计数/键列表/空位、declare -p、算术上下文变量下标、
+#             追加写入后的键序、空值下标）
+#          4  declare -p 未定义名（单名/已定义/多名逐个报错/混合，rc+stderr）
+#          5  2>&x 引号形态（'' / "$x" / "" 空目标回显，数字字面量与变量回归）
+#          5  算术递归护栏（变量链 1022 rc0 / 1023 rc1 且 stderr 逐字节、
+#             字面 ( 嵌套 1022 与 2500 层、隔离性 false; echo $?）
+#             注：3500 层字面 ( 不入栅栏——MSYS2 bash 5.3 自身在约 3000 层
+#             Segmentation fault（rc=139），oracle 无法给出可比对输出；
+#             2500 是实测两侧均 rc0 的最深对拍点，未放宽任何阈值。
+#          6  jobs 文本与 AND-OR 后台化（括号组/ANSI-C 词/命令替换参数/
+#             if 多行/false&&/true&&，全部 sleep 5 慢作业 + sleep 0.2 settle
+#             + kill %1 收尾，jobs 自身 stderr 不抑制；3 次重复均稳定）。
+#       + 6 Round-2 补强 fence（4 组根因修复后新增，仍属 narrow-boundary 块）：
+#          3  := 同行写回 + 数组变量下标读取（稠密 / 稀疏 ${a[$i]}）
+#          3  PARAM_REPL_SEP 哨兵安全性（0xff 值经 patsub 后字节流、裸 0x80
+#             注入替换词——该字节经 byteval 编码正好是 U+E000 哨兵码点、
+#             以及哨兵设计初衷的 $x 含 / 形态），确认哨兵不泄漏、不误切分。
 #   K = KNOWN-DIFF: cannot be byte-equal by design (documented, not fixed)
 #   B = regression fence for already-fixed defects (GROUP B, 21 cases, green today)
 #   C = third-priority builtins (may not be implemented yet)
@@ -174,6 +200,10 @@ printf 'echo FROM-EXECFIX\n'                    > "$SANDBOX/execfix/pdir1/nonexe
 printf '\356\204\200\356\200\200' > "$SANDBOX/execfix/forge.bin"
 printf 'printf %%s "\356\204\200\356\200\200" | od -An -tx1\n' > "$SANDBOX/execfix/forge_src.sh"
 printf '\377' > "$SANDBOX/execfix/ff.bin"
+# PARAM_REPL_SEP 哨兵冲突夹具：裸 0x80 经 byteval 编码正好是 U+E000，与
+# expand.rs 的参数替换分隔符哨兵同码。哨兵栅栏用本文件经命令替换注入真实
+# 高位字节，确认既不泄漏 PUA 编码串、也不被误当成 / 分隔符。
+printf '\200' > "$SANDBOX/execfix/80.bin"
 # from_utf8_lossy 修复夹具：源码 / printf spec / shebang 解释器 / 命令名各含
 # 裸 0xff。这些字节必须原样保真，不得变成 U+FFFD(ef bf bd) 或 U+00FF(c3 bf)。
 printf 'printf %%s "\377" | od -An -tx1\n'      > "$SANDBOX/execfix/lossy_src.sh"
@@ -2641,6 +2671,105 @@ run_case A jobs-wait-none      'sleep 0.2 & kill %1; wait; echo rc=$?'
 run_case A jobs-wait-pid       'sleep 0.2 & p=$!; kill $p; wait $p; echo rc=$?'
 run_case A jobs-bg-running     'sleep 0.2 & bg; echo rc=$?'
 run_case A jobs-fg-nocontrol   'sleep 0.2 & fg; echo rc=$?'
+
+# --- narrow-boundary cleanup 栅栏（48 条）------------------------------------
+# 本轮 8 类窄边界清零的 oracle 栅栏。每条均先在 MSYS2 bash 5.3 下以 LC_ALL=C
+# 独立实测，再与 wash 逐字节对拍（rc + stdout + normalize 后 stderr）确认后才
+# 固化。运行前须 cargo build（改源码必重建）。
+
+# 1. ! pipeline（9）：取反 rc、PIPESTATUS 在取反后仍为各段原始码、字面 !、
+# `! ;` 空命令、非首段 ! 的 near-token rc2、子 shell / if 复合命令取反。
+run_case A neg-true            '! true'
+run_case A neg-false           '! false'
+run_case A neg-pipe-rc         '! true | false'
+run_case A neg-pipe-ps         '! true | false; echo "[${PIPESTATUS[@]}]"'
+run_case A neg-literal         'echo !'
+run_case A neg-empty           '! ;'
+run_case A neg-after-pipe      'true | ! false'
+run_case A neg-subshell        '! (exit 3)'
+run_case A neg-if              '! if true; then false; fi'
+
+# 2. 参数运算词二次展开（8）：op 的 word 先扫成 WordPart 再展开一次。这里覆盖
+# 默认值 :- 中的变量 / 命令替换 / 算术替换 / 两种引号形态、? 消息的错误路径与
+# 正常路径、以及 # 模式词中的变量。
+run_case A dop-default-var     'v=; x=VAL; echo "${v:-$x}"'
+run_case A dop-default-cmdsub  'echo "${v:-$(echo hi)}"'
+run_case A dop-default-arith   'echo "${v:-$((1+2))}"'
+run_case A dop-default-quoted1 'echo "${v:-\"a b\"}"'
+run_case A dop-default-quoted2 'echo "${v:-"a b"}"'
+run_case A dop-qm-unset        'echo "${v:?boom}"'
+run_case A dop-qm-set          'v=x; echo "${v:?boom}"'
+run_case A dop-strip-var       'v=abcdef; x=abc; echo "${v#$x}"'
+
+# 3. 数组逐元素模式替换（5）：/ 与 // 的差异、替换词来自变量、* 下标按 IFS
+# 连接、/# 前缀锚点。
+run_case A arrsub-one          'a=(1 0); printf "[%s]" "${a[@]/1/9}"'
+run_case A arrsub-all          'a=(11 1); printf "[%s]" "${a[@]//1/9}"'
+run_case A arrsub-var          'a=(1 2); r=X; printf "[%s]" "${a[@]/1/$r}"'
+run_case A arrsub-star         'a=(1 2); IFS=,; echo "${a[*]/1/9}"'
+run_case A arrsub-prefix       'a=(abc abd); printf "[%s]" "${a[@]/#a/Z}"'
+
+# 4. 稀疏复合赋值（6）：name=([i]=v) 的真实下标登记、空位不计数、declare -p
+# 形态、算术上下文变量下标 ${a[i]}（无 $，避免与 ${a[$i]} 读取路径混淆）、
+# 追加写入后的键序、以及空值下标。
+run_case A sparse-count        'a=([0]=x [3]=y); echo ${#a[@]}:${!a[@]}:${a[@]}'
+run_case A sparse-hole         'a=([0]=x [3]=y); echo "[${a[1]}]"'
+run_case A sparse-declare      'a=([0]=x [3]=y); declare -p a'
+run_case A sparse-arithidx     'a=([0]=x [3]=y); i=3; echo "${a[i]}"'
+run_case A sparse-empty        'a=([3]=); echo "${#a[@]}:[${a[3]}]"'
+run_case A sparse-mixed        'a=([0]=x [3]=y); a[1]=z; echo ${#a[@]}:${!a[@]}:${a[@]}'
+
+# 5. declare -p 未定义名（4）：命名查询逐个检查，未定义名 rc=1 + stderr
+# `declare: NAME: not found`（normalize 后逐字节比），已定义名正常输出。
+run_case A declp-undef         'declare -p TOTALLY_UNDEFINED_ZZ'
+run_case A declp-def           'zz=1; declare -p zz'
+run_case A declp-multi         'declare -p AA BB CC'
+run_case A declp-mixed         'xx=1; declare -p xx YY'
+
+# 6. 2>&x 引号形态（5）：fd==1 空目标必须回显原始引号种类，数字字面量与
+# 数字变量形态作回归（既有 dup-* 栅栏不重复）。
+run_case A dup-q-sq-empty      "echo hi 1>&''"
+run_case A dup-q-dq-var        'x=; echo hi 1>&"$x"'
+run_case A dup-q-dq-empty      'echo hi 1>&""'
+run_case A dup-q-num           'echo hi 2>&"9"'
+run_case A dup-q-num-var       'x=9; echo hi 2>&$x'
+
+# 7. 算术递归护栏（5）：用 shell 变量拼接生成 1022/1023 层链，避免写出上千
+# 字符；1023 的 stderr 必须逐字节等于 `a0: expression recursion level exceeded
+# (error token is "a0")`。字面 ( 嵌套只取 oracle 可比对深度（见头部注释）。
+run_case A arith-depth-ok      'a0=1; for ((i=1;i<=1022;i++)); do eval a$i=a$((i-1)); done; echo $((a1022))'
+run_case A arith-depth-fail    'a0=1; for ((i=1;i<=1023;i++)); do eval a$i=a$((i-1)); done; echo $((a1023))'
+run_case A arith-nest-1022     'e=1; for ((i=0;i<1022;i++)); do e="($e)"; done; echo $((e))'
+run_case A arith-nest-2500     'e=1; for ((i=0;i<2500;i++)); do e="($e)"; done; echo $((e))'
+run_case A arith-guard-iso     'false; echo $?'
+
+# 8. jobs 文本与 AND-OR 后台化（6）：每条都用 sleep 5 慢作业 + sleep 0.2
+# settle + kill %1 收尾；jobs 自身 stderr 不抑制（2>/dev/null 只作用于 kill）。
+# 覆盖括号组、ANSI-C 词、命令替换参数、if 多行渲染、立即登记的 false&&/true&&。
+run_case A jobs-nb-paren       '( sleep 5 ) & sleep 0.2; jobs; kill %1 2>/dev/null'
+run_case A jobs-nb-ansi        "\$'sleep' 5 & sleep 0.2; jobs; kill %1 2>/dev/null"
+run_case A jobs-nb-cmdsub      'sleep $(echo 5) 5 & sleep 0.2; jobs; kill %1 2>/dev/null'
+run_case A jobs-nb-if          'if true; then sleep 5; fi & sleep 0.2; jobs; kill %1 2>/dev/null'
+run_case A jobs-nb-andor-no    'false && sleep 5 & sleep 0.2; jobs; kill %1 2>/dev/null'
+run_case A jobs-nb-andor-yes   'true && sleep 5 & sleep 0.2; jobs; kill %1 2>/dev/null; wait %1 2>/dev/null'
+
+# --- Round-2 补强栅栏（6 条）-------------------------------------------------
+# 4 组根因修复（PARAM_REPL_SEP 哨兵 / assign_overlay 即时写回 /
+# resolve_array_index / render_group_single_line）落地后，把 Round 1 因源码
+# Bug 暂缓的候选固化，并补哨兵安全性对拍。
+# := 的赋值必须在同一命令行内对后续 $v 可见；${a[$i]} 的变量展开下标读取
+# 稠密与稀疏数组都要命中。
+run_case A dop-assign-writeback 'v=; x=VAL; echo "${v:=$x}:$v"'
+run_case A arr-dense-varidx     'a=(p q r s); i=3; echo "${a[$i]}"'
+run_case A arr-sparse-varidx    'a=([0]=x [3]=y); i=3; echo "${a[$i]}"'
+
+# 哨兵安全性：PARAM_REPL_SEP = U+E000 与 byteval 的高位字节编码区起点同码。
+# 0xff 值经 patsub 后必须仍是裸字节流；裸 0x80（编码后正是 U+E000）经命令
+# 替换注入替换词，不得被误当分隔符、也不得泄漏 PUA 编码串；$x 自身含 / 时
+# 不得被误判为语法分隔符（哨兵的设计初衷）。
+run_case A sent-vff-patsub     'v=$(cat @SANDBOX@/execfix/ff.bin); echo "${v/a/b}" | od -An -tx1'
+run_case A sent-80-in-repl     'x=$(cat @SANDBOX@/execfix/80.bin); v=abc; echo "${v/b/$x}" | od -An -tx1'
+run_case A sent-slash-from-x   'x=/; v=a/b/c; echo "${v//$x/-}"'
 
 ###############################################################################
 # Summary

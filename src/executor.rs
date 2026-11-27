@@ -18,7 +18,7 @@
 //     like in bash).
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, CString};
 use std::io::Write;
 
@@ -592,8 +592,12 @@ fn expand_redirs(redirs: &[Redir], ctx: &ExpandCtx) -> Vec<ExpRedir> {
                 Ok(f) => ExpRedir::Both(f, *append),
                 Err(raw) => ExpRedir::Ambiguous(2, raw),
             },
-            Redir::Dup { fd, file } => match expand_redir_file(file, ctx) {
-                Ok(t) => ExpRedir::Dup(*fd, t, raw_word_text(file)),
+            Redir::Dup { fd, file, raw_word } => match expand_redir_file(file, ctx) {
+                Ok(t) => ExpRedir::Dup(
+                    *fd,
+                    t,
+                    raw_word.clone().unwrap_or_else(|| raw_word_text(file)),
+                ),
                 Err(raw) => ExpRedir::Ambiguous(*fd, raw),
             },
             Redir::HereDoc { fd, body, expand } => ExpRedir::HereDoc(
@@ -1241,6 +1245,7 @@ fn execute_compound(compound: &Compound, sh: &mut Shell) -> i32 {
                 assoc_arrays: &sh.assoc_arrays,
             array_set_indices: &sh.array_set_indices,
                 pending_assign: None,
+            assign_overlay: None,
                 arith_overlay: None,
             };
             let status = if crate::cond::eval_cond(expr, &ctx) { 0 } else { 1 };
@@ -1315,6 +1320,7 @@ fn execute_for(var: &str, words: &[Vec<WordPart>], body: &CommandList, sh: &mut 
         assoc_arrays: &sh.assoc_arrays,
             array_set_indices: &sh.array_set_indices,
         pending_assign: None,
+            assign_overlay: None,
         arith_overlay: None,
     };
     let mut fields: Vec<String> = Vec::new();
@@ -1473,6 +1479,7 @@ fn execute_select(
         assoc_arrays: &sh.assoc_arrays,
         array_set_indices: &sh.array_set_indices,
         pending_assign: None,
+            assign_overlay: None,
         arith_overlay: None,
     };
     let mut fields: Vec<String> = Vec::new();
@@ -1813,6 +1820,7 @@ fn execute_case(word: &[WordPart], arms: &[crate::parser::CaseArm], sh: &mut She
             assoc_arrays: &sh.assoc_arrays,
             array_set_indices: &sh.array_set_indices,
             pending_assign: None,
+            assign_overlay: None,
             arith_overlay: None,
         };
         expand_scalar(word, &ctx)
@@ -1850,6 +1858,7 @@ fn execute_case(word: &[WordPart], arms: &[crate::parser::CaseArm], sh: &mut She
                 assoc_arrays: &sh.assoc_arrays,
                 array_set_indices: &sh.array_set_indices,
                 pending_assign: None,
+            assign_overlay: None,
                 arith_overlay: None,
             };
             for pat in &arm.patterns {
@@ -2239,6 +2248,7 @@ fn assign_subscript_var(
             assoc_arrays: &sh.assoc_arrays,
             array_set_indices: &sh.array_set_indices,
             pending_assign: None,
+            assign_overlay: None,
             arith_overlay: None,
         };
         // `sub_src` is source text (`$k`, `${k}`), not an already-expanded
@@ -2380,16 +2390,17 @@ fn restore_command_assignments(saved: Vec<(String, Option<String>)>, sh: &mut Sh
 /// afterwards (a temporary `name=(...) cmd` assignment).  For a persistent
 /// assignment (a standalone `a=(1 2 3)`) the returned saves may be ignored.
 fn apply_array_assignments(
-    arrays: &[(String, Vec<Vec<WordPart>>, bool)],
+    arrays: &[(String, Vec<crate::parser::ArrayElementWord>, bool)],
     sh: &mut Shell,
-) -> Vec<(String, Option<Vec<String>>)> {
+) -> Vec<(String, Option<Vec<String>>, Option<HashSet<i64>>)> {
     if arrays.is_empty() {
         return Vec::new();
     }
     let attrs = sh.attr_refs();
     // Expand every element first (immutable borrow of `sh`), then mutate
-    // `sh.arrays` once the borrow is released.
-    let expanded: Vec<(String, Vec<String>, bool)> = {
+    // `sh.arrays` once the borrow is released.  A `([i]=v)` element keeps its
+    // subscript so the mutation phase can place it at the sparse index.
+    let expanded: Vec<(String, Vec<(Option<i64>, Vec<String>)>, bool)> = {
         let ctx = ExpandCtx {
             env: &sh.env,
             positional: &sh.positional,
@@ -2408,50 +2419,97 @@ fn apply_array_assignments(
             assoc_arrays: &sh.assoc_arrays,
             array_set_indices: &sh.array_set_indices,
             pending_assign: None,
+            assign_overlay: None,
             arith_overlay: None,
         };
         arrays
             .iter()
             .map(|(name, elems, append)| {
-                let mut v = Vec::new();
-                for w in elems {
-                    v.extend(expand_word(w, &ctx));
+                let mut v: Vec<(Option<i64>, Vec<String>)> = Vec::new();
+                for (index, word) in elems {
+                    let idx = index.as_ref().and_then(|iw| {
+                        let text = expand_scalar(iw, &ctx);
+                        text.parse::<i64>().ok().or_else(|| {
+                            arith::eval(&text, &mut arith::ReadOnlyEnv { vars: ctx.env }).ok()
+                        })
+                    });
+                    v.push((idx, expand_word(word, &ctx)));
                 }
                 (name.clone(), v, *append)
             })
             .collect()
     };
     let mut saved = Vec::new();
-    for (name, v, append) in expanded {
-        saved.push((name.clone(), sh.arrays.get(&name).cloned()));
-        if append {
-            // `name+=(...)` appends to the existing elements.
-            let mut all = sh.arrays.get(&name).cloned().unwrap_or_default();
-            let base = all.len() as i64;
-            all.extend(v.iter().cloned());
-            sh.arrays.insert(name.clone(), all);
-            let indices = sh.array_set_indices.entry(name).or_default();
-            for k in base..base + v.len() as i64 {
-                indices.insert(k);
-            }
+    for (name, elems, append) in expanded {
+        saved.push((
+            name.clone(),
+            sh.arrays.get(&name).cloned(),
+            sh.array_set_indices.get(&name).cloned(),
+        ));
+        let mut values = if append {
+            sh.arrays.get(&name).cloned().unwrap_or_default()
         } else {
-            sh.arrays.insert(name.clone(), v.iter().cloned().collect());
-            sh.array_set_indices
-                .insert(name, (0..v.len() as i64).collect());
+            Vec::new()
+        };
+        let mut indices = if append {
+            sh.array_set_indices.get(&name).cloned().unwrap_or_default()
+        } else {
+            HashSet::new()
+        };
+        let mut next = if append {
+            indices
+                .iter()
+                .copied()
+                .max()
+                .map(|m| m + 1)
+                .unwrap_or(0)
+                .max(values.len() as i64)
+        } else {
+            0
+        };
+        for (index, fields) in elems {
+            let start = match index {
+                Some(i) if i >= 0 => i,
+                _ => next,
+            };
+            // Even `([3]=)` (an empty value) creates the element at 3.
+            let count = fields.len().max(1);
+            let pos = start as usize;
+            if values.len() < pos + count {
+                values.resize(pos + count, String::new());
+            }
+            for k in 0..count {
+                values[pos + k] = fields.get(k).cloned().unwrap_or_default();
+                indices.insert(start + k as i64);
+            }
+            next = start + count as i64;
         }
+        sh.arrays.insert(name.clone(), values);
+        sh.array_set_indices.insert(name, indices);
     }
     saved
 }
 
 /// Undo the array assignments saved by `apply_array_assignments`.
-fn restore_array_assignments(saved: Vec<(String, Option<Vec<String>>)>, sh: &mut Shell) {
-    for (name, value) in saved {
+fn restore_array_assignments(
+    saved: Vec<(String, Option<Vec<String>>, Option<HashSet<i64>>)>,
+    sh: &mut Shell,
+) {
+    for (name, value, indices) in saved {
         match value {
             Some(v) => {
-                sh.arrays.insert(name, v);
+                sh.arrays.insert(name.clone(), v);
             }
             None => {
                 sh.arrays.remove(&name);
+            }
+        }
+        match indices {
+            Some(idx) => {
+                sh.array_set_indices.insert(name, idx);
+            }
+            None => {
+                sh.array_set_indices.remove(&name);
             }
         }
     }
@@ -2508,7 +2566,7 @@ fn run_standalone_exp(
     argv: &[String],
     redirs: &[ExpRedir],
     assigns: &[(String, Vec<WordPart>, bool)],
-    array_assigns: &[(String, Vec<Vec<WordPart>>, bool)],
+    array_assigns: &[(String, Vec<crate::parser::ArrayElementWord>, bool)],
     compound: Option<&Compound>,
     env_values: Option<&[(String, String, bool)]>,
     sh: &mut Shell,
@@ -2548,6 +2606,9 @@ fn run_standalone_exp(
             // command immediately (bash semantics); `pending` still writes them back
             // to `sh.env` once expansion of the command is complete.
             let overlay: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+            // `${v:=word}` assignments must be visible to later words on the
+            // same command line, just like arithmetic assignments above.
+            let assign_overlay: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
             // Expand all RHS values first (immutable borrow of sh.env), then
             // mutate sh.env once the borrow is released.
             let applied: Vec<(String, String, bool)> = {
@@ -2569,6 +2630,7 @@ fn run_standalone_exp(
             assoc_arrays: &sh.assoc_arrays,
             array_set_indices: &sh.array_set_indices,
                     pending_assign: Some(&pending),
+                    assign_overlay: Some(&assign_overlay),
                     arith_overlay: Some(&overlay),
                 };
                 assigns
@@ -2757,7 +2819,7 @@ struct Prepared {
     redirs: Vec<ExpRedir>,
     assigns: Vec<(String, Vec<WordPart>, bool)>,
     /// Array assignments (`name=(...)`) carried by this command.
-    array_assigns: Vec<(String, Vec<Vec<WordPart>>, bool)>,
+    array_assigns: Vec<(String, Vec<crate::parser::ArrayElementWord>, bool)>,
     /// The compound command (`if ... fi`) this command stands for.
     compound: Option<Compound>,
     /// The expanded `(name, value, append)` assignment values.  `None` when
@@ -2907,6 +2969,8 @@ fn flush_andor_list(out: &mut CommandList, pipelines: &mut Vec<Pipeline>, ops: &
     out.andors.push(AndOr {
         pipelines: std::mem::take(pipelines),
         ops: std::mem::take(ops),
+        background: false,
+        raw: None,
     });
 }
 
@@ -2970,6 +3034,8 @@ fn prepare_stage(c: &SimpleCommand, sh: &mut Shell) -> Prepared {
     // command immediately (bash semantics); `pending` still writes them back
     // to `sh.env` once expansion of the command is complete.
     let overlay: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    // Immediate `${v:=word}` write-back for later words on this command line.
+    let assign_overlay: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
 
     // `$-` is derived only from option/startup flags, never from `env`.
     // Both expansion passes below need the same snapshot, and the only
@@ -2998,6 +3064,7 @@ fn prepare_stage(c: &SimpleCommand, sh: &mut Shell) -> Prepared {
             assoc_arrays: &sh.assoc_arrays,
             array_set_indices: &sh.array_set_indices,
             pending_assign: Some(&pending),
+                    assign_overlay: Some(&assign_overlay),
             arith_overlay: Some(&overlay),
         };
         let argv = expand_argv(&c.argv, &ctx);
@@ -3039,6 +3106,7 @@ fn prepare_stage(c: &SimpleCommand, sh: &mut Shell) -> Prepared {
             assoc_arrays: &sh.assoc_arrays,
             array_set_indices: &sh.array_set_indices,
             pending_assign: Some(&pending),
+                    assign_overlay: Some(&assign_overlay),
             arith_overlay: Some(&overlay),
         };
         let values: Vec<(String, String, bool)> = c
@@ -3122,6 +3190,17 @@ fn child_prepare_and_run(c: &SimpleCommand, sh: &mut Shell, path: Option<&str>, 
     child_run_exp(&pr.argv, path, &ctx);
 }
 
+/// Apply the `!` pipeline prefix.  bash flips ONLY the pipeline's own exit
+/// status; the per-stage codes already written to `PIPESTATUS` keep their
+/// original values.  The caller must invoke this after the array write.
+fn negate_status(code: i32, negate: bool) -> i32 {
+    if negate {
+        if code == 0 { 1 } else { 0 }
+    } else {
+        code
+    }
+}
+
 fn execute_pipeline(p: &Pipeline, sh: &mut Shell, path: Option<&str>) -> i32 {
     if p.background {
         return execute_background(p, sh, path);
@@ -3165,7 +3244,7 @@ fn execute_pipeline(p: &Pipeline, sh: &mut Shell, path: Option<&str>) -> i32 {
         // command's status, matching bash's "last command wins" semantics.
         sh.arrays
             .insert("PIPESTATUS".to_string(), vec![code.to_string()]);
-        return code;
+        return negate_status(code, p.negate);
     }
 
     let mut prev_read: Option<i32> = None;
@@ -3284,7 +3363,7 @@ fn execute_pipeline(p: &Pipeline, sh: &mut Shell, path: Option<&str>) -> i32 {
         // PIPESTATUS oracle value is not stably reproducible; record [1].
         sh.arrays
             .insert("PIPESTATUS".to_string(), vec!["1".to_string()]);
-        return 1;
+        return negate_status(1, p.negate);
     }
     // With `set -o pipefail` the pipeline fails when any stage failed; the
     // status is then the one of the rightmost failing stage.  PIPESTATUS keeps
@@ -3295,16 +3374,19 @@ fn execute_pipeline(p: &Pipeline, sh: &mut Shell, path: Option<&str>) -> i32 {
         last
     };
     sh.arrays.insert("PIPESTATUS".to_string(), statuses);
-    code
+    negate_status(code, p.negate)
 }
 
 /// Normalize a raw background-command fragment for the `jobs` display.
 ///
 /// bash rebuilds the job's command text from its source words: runs of
 /// unquoted whitespace collapse to a single separator, both ends are trimmed,
-/// quotes / escapes / variables stay literal (nothing is re-expanded), the
-/// whitespace inside a `$(`-substitution is kept verbatim, and every
-/// redirection operator is separated from its target word by exactly one
+/// quotes / escapes / variables stay literal (nothing is re-expanded).
+/// `$'...'` words are shown with the `$` removed and C escapes decoded;
+/// unquoted whitespace inside a `$(...)` command substitution collapses to
+/// one space and is trimmed at the parentheses, while `$((...))` arithmetic
+/// and quoted runs keep their whitespace verbatim.  Every redirection
+/// operator is separated from its target word by exactly one
 /// space — except descriptor duplication (`2>&1`, `<&-`), which bash renders
 /// without any space (and with an implicit `1` / `0` fd when the source had
 /// none, e.g. `>&1` becomes `1>&1`).
@@ -3315,12 +3397,40 @@ fn normalize_job_text(raw: &str) -> String {
     let mut i = 0;
     let mut in_single = false;
     let mut in_double = false;
-    // Depth of `$(` / `$((` substitutions: their inner whitespace is part of
-    // the displayed text and must not be collapsed.
-    let mut subst_depth = 0usize;
+    // One entry per open `(` inside a substitution.  `true` means a command
+    // substitution (unquoted whitespace collapses), `false` means arithmetic
+    // or a plain grouping paren (whitespace stays verbatim).
+    let mut subst_modes: Vec<bool> = Vec::new();
+    // Whether the current substitution has emitted anything after its opening
+    // `(`.  Whitespace before the first fragment is trimmed, not collapsed
+    // into a leading space (bash: `$( echo x )` -> `$(echo x)`).
+    let mut subst_content: Vec<bool> = Vec::new();
+    // Set by an unquoted run of whitespace inside a collapsing substitution;
+    // flushed as ONE space before the next non-space fragment and dropped at
+    // the closing `)`.
+    let mut subst_space = false;
     // Set by an unquoted run of whitespace at group depth 0; flushed as a
     // single space before the next non-space fragment.
     let mut pending_space = false;
+
+    /// Flush a pending inside-substitution space before the next fragment.
+    macro_rules! flush_subst_space {
+        () => {
+            if subst_space {
+                out.push(' ');
+                subst_space = false;
+            }
+        };
+    }
+
+    /// Record that the innermost substitution now has visible content.
+    macro_rules! mark_subst_content {
+        () => {
+            if let Some(seen) = subst_content.last_mut() {
+                *seen = true;
+            }
+        };
+    }
 
     while i < n {
         let c = chars[i];
@@ -3354,6 +3464,8 @@ fn normalize_job_text(raw: &str) -> String {
                     out.push(' ');
                     pending_space = false;
                 }
+                flush_subst_space!();
+                mark_subst_content!();
                 in_single = true;
                 out.push('\'');
                 i += 1;
@@ -3363,6 +3475,8 @@ fn normalize_job_text(raw: &str) -> String {
                     out.push(' ');
                     pending_space = false;
                 }
+                flush_subst_space!();
+                mark_subst_content!();
                 in_double = true;
                 out.push('"');
                 i += 1;
@@ -3372,6 +3486,8 @@ fn normalize_job_text(raw: &str) -> String {
                     out.push(' ');
                     pending_space = false;
                 }
+                flush_subst_space!();
+                mark_subst_content!();
                 out.push('\\');
                 if i + 1 < n {
                     out.push(chars[i + 1]);
@@ -3380,35 +3496,88 @@ fn normalize_job_text(raw: &str) -> String {
                     i += 1;
                 }
             }
+            // `$'...'`: bash strips the `$` and prints the decoded C string
+            // still wrapped in single quotes (`$'a\nb'` -> `'a<newline>b'`).
+            '$' if i + 1 < n && chars[i + 1] == '\'' => {
+                if pending_space {
+                    out.push(' ');
+                    pending_space = false;
+                }
+                flush_subst_space!();
+                mark_subst_content!();
+                if let Some((decoded, ni)) = crate::lexer::decode_ansi_c(&chars, i) {
+                    out.push('\'');
+                    out.push_str(&decoded);
+                    out.push('\'');
+                    i = ni;
+                } else {
+                    out.push('$');
+                    i += 1;
+                }
+            }
+            // `$((` arithmetic: both parens keep their whitespace verbatim.
+            '$' if i + 2 < n && chars[i + 1] == '(' && chars[i + 2] == '(' => {
+                if pending_space {
+                    out.push(' ');
+                    pending_space = false;
+                }
+                flush_subst_space!();
+                mark_subst_content!();
+                out.push_str("$((");
+                i += 3;
+                subst_modes.push(false);
+                subst_modes.push(false);
+                subst_content.push(true);
+                subst_content.push(false);
+            }
             '$' if i + 1 < n && chars[i + 1] == '(' => {
                 if pending_space {
                     out.push(' ');
                     pending_space = false;
                 }
-                out.push('$');
-                out.push('(');
+                flush_subst_space!();
+                mark_subst_content!();
+                out.push_str("$(");
                 i += 2;
-                subst_depth += 1;
+                subst_modes.push(true);
+                subst_content.push(false);
             }
             ' ' | '\t' | '\n' => {
-                if subst_depth > 0 {
+                if subst_modes.last().copied().unwrap_or(false) {
+                    // Command substitution: collapse runs to one space, but
+                    // leading whitespace (before any content) is dropped.
+                    if subst_content.last().copied().unwrap_or(true) {
+                        subst_space = true;
+                    }
+                } else if !subst_modes.is_empty() {
+                    // Arithmetic / grouping: verbatim.
                     out.push(c);
                 } else {
                     pending_space = true;
                 }
                 i += 1;
             }
-            '(' if subst_depth > 0 => {
+            '(' if !subst_modes.is_empty() => {
+                let mode = subst_modes.last().copied().unwrap_or(false);
+                if mode {
+                    flush_subst_space!();
+                }
+                mark_subst_content!();
                 out.push('(');
-                subst_depth += 1;
+                subst_modes.push(mode);
+                subst_content.push(false);
                 i += 1;
             }
-            ')' if subst_depth > 0 => {
+            ')' if !subst_modes.is_empty() => {
+                // Whitespace right before the closer is trimmed, not shown.
+                subst_space = false;
                 out.push(')');
-                subst_depth -= 1;
+                subst_modes.pop();
+                subst_content.pop();
+                mark_subst_content!(); // the closed group is content in its parent
                 i += 1;
             }
-            '<' | '>' if subst_depth == 0 => {
+            '<' | '>' if subst_modes.is_empty() => {
                 if pending_space {
                     out.push(' ');
                     pending_space = false;
@@ -3466,7 +3635,7 @@ fn normalize_job_text(raw: &str) -> String {
                     out.push(' ');
                 }
             }
-            '&' if subst_depth == 0 => {
+            '&' if subst_modes.is_empty() => {
                 if pending_space {
                     out.push(' ');
                     pending_space = false;
@@ -3491,9 +3660,12 @@ fn normalize_job_text(raw: &str) -> String {
                 }
             }
             _ => {
-                if subst_depth == 0 && pending_space {
+                if subst_modes.is_empty() && pending_space {
                     out.push(' ');
                     pending_space = false;
+                } else {
+                    flush_subst_space!();
+                    mark_subst_content!();
                 }
                 out.push(c);
                 i += 1;
@@ -3547,6 +3719,30 @@ fn ends_with_bare_fd(out: &str) -> bool {
 /// `$!`, prints the bash-style `[job] pid` line and returns immediately, so the
 /// REPL stays responsive.  This is the scaffolding the `jobs`/`fg`/`bg`/`wait`
 /// builtins build on.
+fn pipeline_has_compound(p: &Pipeline) -> bool {
+    p.commands.iter().any(|c| c.compound.is_some())
+}
+
+/// A brace group's raw `&` span is intact (`raw_group_depth` counts `{`), and
+/// bash displays it on ONE line with the original quotes/escapes.  Use the
+/// AST renderer only for the compound kinds bash lays out over several lines.
+fn pipeline_group_only(p: &Pipeline) -> bool {
+    p.commands
+        .iter()
+        .all(|c| matches!(c.compound, Some(Compound::Group { .. })))
+        && p.commands.iter().any(|c| c.compound.is_some())
+}
+
+fn andor_has_compound(a: &AndOr) -> bool {
+    a.pipelines.iter().any(pipeline_has_compound)
+}
+
+fn andor_has_non_group_compound(a: &AndOr) -> bool {
+    a.pipelines
+        .iter()
+        .any(|p| pipeline_has_compound(p) && !pipeline_group_only(p))
+}
+
 fn execute_background(p: &Pipeline, sh: &mut Shell, path: Option<&str>) -> i32 {
     let pid = match fork_child() {
         Some(p) => p,
@@ -3592,11 +3788,32 @@ fn execute_background(p: &Pipeline, sh: &mut Shell, path: Option<&str>) -> i32 {
         // 命令文本优先取 `&` 携带的原始输入片段（保留引号/转义/重定向空格，
         // 经 normalize_job_text 按 bash 语义规整），仅在没有原始文本时才退回
         // AST 渲染；两者都不含结尾的 `&`，是真实输入，非伪造。
-        command: p
-            .raw
-            .clone()
-            .map(|s| normalize_job_text(&s))
-            .unwrap_or_else(|| crate::builtins::render_pipeline(p)),
+        command: if let Some(raw) = p.raw.as_ref() {
+            // Brace groups keep their raw span intact (`{` raises
+            // `raw_group_depth`), so prefer it: it preserves the original
+            // quotes and backslash escapes verbatim.  Non-compound pipelines
+            // do the same.  if/for/while/case spans are truncated at their
+            // internal `;`, so those are reconstructed below instead.
+            if !pipeline_has_compound(p) || pipeline_group_only(p) {
+                normalize_job_text(raw)
+            } else {
+                crate::builtins::render_pipeline_bash(p)
+            }
+        } else if pipeline_has_compound(p) {
+            if pipeline_group_only(p) {
+                p.commands
+                    .iter()
+                    .find_map(|c| c.compound.as_ref())
+                    .map(crate::builtins::render_group_single_line)
+                    .unwrap_or_else(|| crate::builtins::render_pipeline_bash(p))
+            } else {
+                // The `&` raw span restarts at `;` inside if/for/while,
+                // leaving only the closer (`fi` / `done`).
+                crate::builtins::render_pipeline_bash(p)
+            }
+        } else {
+            crate::builtins::render_pipeline(p)
+        },
         done: false,
         status: None,
         jobno,
@@ -3607,6 +3824,62 @@ fn execute_background(p: &Pipeline, sh: &mut Shell, path: Option<&str>) -> i32 {
     // bash 只在交互式 shell（且打开了作业控制）里通报后台作业的启动；
     // 非交互的 `bash -c 'sleep 1 &'` 什么都不打印。通报信息走 stderr。
     // 通报用持久作业号，与 jobs 内建显示的 `[N]` 同源。
+    if sh.interactive {
+        safe_eprintln!("[{}] {}", jobno, pid);
+    }
+    0
+}
+
+/// Background a whole AND-OR list (`a && b &`).  bash forks ONE job for the
+/// entire list; running only the final pipeline in the background would make
+/// a short-circuited prefix (`false && sleep 5 &`) produce no job at all.
+/// The child reuses `execute_andor`, so short-circuiting and per-stage status
+/// semantics are identical to the foreground path.
+fn execute_background_andor(a: &AndOr, sh: &mut Shell, path: Option<&str>) -> i32 {
+    let pid = match fork_child() {
+        Some(p) => p,
+        None => return 1,
+    };
+    let job_ctl = job_control_active(sh);
+    if pid == 0 {
+        if job_ctl {
+            posix::setpgid(0, 0);
+        }
+        SUPPRESS_JOB_CONTROL.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut child = a.clone();
+        for pipeline in &mut child.pipelines {
+            pipeline.background = false;
+        }
+        let mut last = 0;
+        execute_andor(&child, sh, path, &mut last);
+        posix::exit(last);
+    }
+    if job_ctl {
+        posix::setpgid(pid, pid);
+    }
+    sh.jobs.push(pid);
+    let jobno = sh.next_jobno;
+    sh.next_jobno += 1;
+    sh.job_table.push(crate::shell::JobInfo {
+        pid,
+        command: if let Some(raw) = a.raw.as_ref() {
+            if !andor_has_non_group_compound(a) {
+                normalize_job_text(raw)
+            } else {
+                crate::builtins::render_andor_bash(a)
+            }
+        } else if andor_has_compound(a) {
+            crate::builtins::render_andor_bash(a)
+        } else {
+            crate::builtins::render_andor(a)
+        },
+        done: false,
+        status: None,
+        jobno,
+        stopped_signal: None,
+        pgid: if job_ctl { pid } else { 0 },
+    });
+    sh.bg_pid = pid;
     if sh.interactive {
         safe_eprintln!("[{}] {}", jobno, pid);
     }
@@ -3745,7 +4018,15 @@ pub fn execute(list: &CommandList, sh: &mut Shell) -> i32 {
         list
     };
     for andor in &expanded.andors {
-        let aborted = execute_andor(andor, sh, path, &mut last);
+        let aborted = if andor.background {
+            // One background job owns the entire AND-OR list; the parent's
+            // `$?` is the backgrounding status (0), like bash.
+            last = execute_background_andor(andor, sh, path);
+            sh.last_status = last;
+            false
+        } else {
+            execute_andor(andor, sh, path, &mut last)
+        };
         // 自动收割点（#21）：AND-OR 列表之间也收割，保证
         // `sleep 0.1 & sleep 0.3; jobs` 在 jobs 运行前把作业标记为 Done
         // （bash 实测输出：`[1]+  Done   sleep 0.1`，rc=0）。

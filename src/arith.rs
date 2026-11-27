@@ -232,25 +232,23 @@ thread_local! {
     static TOK_CACHE: RefCell<HashMap<String, Arc<Vec<Tok>>>> =
         RefCell::new(HashMap::new());
     // Guard against stack exhaustion from deeply nested arithmetic.  MSYS2
-    // bash 5.3 does NOT SIGSEGV here: it accepts ~1022 levels and then
-    // deterministically fails with "expression recursion level exceeded"
-    // at 1023.  wash keeps a much smaller cap so adversarial input returns
-    // a deterministic error instead of overflowing its native stack.
+    // bash 5.3 accepts at least 1023 literal `(` levels; the cap below is
+    // high enough to cover that range while still returning a deterministic
+    // error instead of overflowing the native stack on adversarial input.
     static ARITH_NEST_DEPTH: Cell<usize> = const { Cell::new(0) };
-    // Depth of recursive variable-value evaluation (`x="1+2"; $((x))`).
-    // Kept separate from ARITH_NEST_DEPTH and much smaller: every value
-    // level costs ~20 native parse frames, and wash's 1 MB main-thread
-    // stack allows roughly 50 levels.  bash tolerates far more (~700 on
-    // MSYS2 bash 5.3) — this threshold is a documented deviation, not a
-    // bash-compatible number; do not claim parity at this boundary.
+    // Depth of recursive variable-value evaluation (`a1=a0; a0=1; $((a1))`).
+    // MSYS2 bash 5.3 accepts a chain of 1022 names and deterministically
+    // fails at 1023 with `expression recursion level exceeded`; the guard
+    // below is set to that exact boundary (N recursive values allowed).
     static VAR_EVAL_DEPTH: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Nesting cap for the recursive arithmetic productions (parenthesised
 /// sub-expressions, `**` right-hand sides and conditional branches).  Well
-/// below any native-stack limit, so the parser returns an error instead of
-/// overflowing the stack on adversarial input.
-const MAX_ARITH_NEST: usize = 200;
+/// above the bash-observable 1022/1023 value-recursion boundary, while low
+/// enough (with the 64 MB shell thread stack) to turn deeper adversarial
+/// input into a deterministic error instead of a native stack overflow.
+const MAX_ARITH_NEST: usize = 3500;
 
 /// RAII token for one level of arithmetic recursion.  Dropped on every exit
 /// path (including `?` early returns), so normal nesting is never miscounted.
@@ -276,8 +274,10 @@ impl Drop for NestGuard {
     }
 }
 
-/// Nesting cap for recursive variable-value evaluation.
-const MAX_VAR_EVAL_DEPTH: usize = 50;
+/// Nesting cap for recursive variable-value evaluation.  bash 5.3 accepts
+/// 1022 chained variable names and fails at 1023; each value level enters
+/// one `VarEvalGuard`, so allowing 1022 entries reproduces that boundary.
+const MAX_VAR_EVAL_DEPTH: usize = 1022;
 
 /// RAII token for one level of variable-value recursion.
 struct VarEvalGuard;
@@ -505,7 +505,13 @@ fn eval_var_string(s: &str, env: &mut dyn ArithEnv) -> Result<i64, ArithError> {
     let v = match parse_comma(&mut lex, env) {
         Ok(v) => v,
         Err(mut e) => {
-            e.expr_prefix = Some(s.trim_start().to_string());
+            // A nested value-recursion failure already carries the raw value
+            // that actually exceeded the limit; bash reports THAT token, not
+            // the outermost variable's value.  Only stamp this level when the
+            // child did not provide a more specific prefix.
+            if e.expr_prefix.is_none() {
+                e.expr_prefix = Some(s.trim_start().to_string());
+            }
             return Err(e);
         }
     };

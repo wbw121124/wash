@@ -27,7 +27,9 @@ pub enum Redir {
     /// `&>` / `&>>` (stdout + stderr, truncate / append).
     Both { file: Vec<WordPart>, append: bool },
     /// `N>&M` / `N<&M`: duplicate descriptor M onto N (`-` closes N).
-    Dup { fd: i32, file: Vec<WordPart> },
+    /// `raw_word` is the original source spelling of M (quotes included),
+    /// used verbatim by bash's `Bad file descriptor` diagnostic.
+    Dup { fd: i32, file: Vec<WordPart>, raw_word: Option<String> },
     /// `<<[-]DELIM` here-document.  `body` is the raw text the lexer
     /// collected (one line per source line, each terminated by `\n`; for
     /// `<<-` leading tabs are already stripped).  `expand` is false when the
@@ -149,6 +151,10 @@ pub struct CaseArm {
     pub terminator: CaseTerminator,
 }
 
+/// One element of a compound array assignment `name=(...)`.  `index` is the
+/// optional `[subscript]` word of `a=([i]=v)`; plain elements use `None`.
+pub type ArrayElementWord = (Option<Vec<WordPart>>, Vec<WordPart>);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SimpleCommand {
     pub argv: Vec<Vec<WordPart>>, // each word is a list of parts (pre-expansion)
@@ -160,7 +166,7 @@ pub struct SimpleCommand {
     /// command word.  Each value is a list of element words (each word itself a
     /// list of pre-expansion `WordPart`s); the flag marks the append (`+=`)
     /// form.
-    pub array_assignments: Vec<(String, Vec<Vec<WordPart>>, bool)>,
+    pub array_assignments: Vec<(String, Vec<ArrayElementWord>, bool)>,
     /// The compound command this simple command stands for.  When it is set
     /// the command has no words of its own.
     pub compound: Option<Compound>,
@@ -169,6 +175,10 @@ pub struct SimpleCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pipeline {
     pub commands: Vec<SimpleCommand>,
+    /// True when the pipeline was prefixed with the reserved word `!`.
+    /// bash negates only the pipeline's final exit status: the individual
+    /// stage codes stored in `PIPESTATUS` stay untouched.
+    pub negate: bool,
     /// True when the pipeline was suffixed with `&` (run in the background).
     pub background: bool,
     /// Raw source text of the command fragment this pipeline stands for, as
@@ -197,6 +207,12 @@ pub enum AndOrOp {
 pub struct AndOr {
     pub pipelines: Vec<Pipeline>,
     pub ops: Vec<AndOrOp>,
+    /// True when a trailing `&` backgrounds the WHOLE list, not just the
+    /// final pipeline (`false && sleep 5 &` creates one job for both stages).
+    pub background: bool,
+    /// Raw source text of a whole-list background job (without `&`), used by
+    /// `jobs` to keep the original quoting and operators.
+    pub raw: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -216,6 +232,8 @@ impl AndOr {
         AndOr {
             pipelines: vec![pipeline],
             ops: Vec::new(),
+            background: false,
+            raw: None,
         }
     }
 }
@@ -275,6 +293,15 @@ fn parse_compounds(tokens: &[Token]) -> Result<(Vec<Token>, Vec<FuncDef>)> {
                     funcs.push(fd.clone());
                     out.push(Token::FunctionDef(fd.name.clone()));
                     i = end;
+                }
+                // An artificially reserved `!` (see `mark_command_bangs`)
+                // is transparent to compound detection: `! ( ... )` must
+                // still be parsed as a negated subshell, not as a command
+                // called `!` followed by a literal `(`.  The stage-level
+                // bang stripper removes it before execution.
+                "!" => {
+                    out.push(tokens[i].clone());
+                    i += 1;
                 }
                 other => {
                     return Err(WashError::syntax(format!(
@@ -1465,6 +1492,7 @@ fn compound_body_list(c: Compound) -> CommandList {
                 array_assignments: Vec::new(),
                 compound: Some(c),
             }],
+            negate: false,
             background: false,
             raw: None,
         })],
@@ -1698,6 +1726,32 @@ fn ident_in_parens(text: &str) -> Option<String> {
     None
 }
 
+/// Strip leading unquoted `!` reserved words from one pipeline stage and
+/// report their parity.  bash only accepts `!` at the START of a pipeline
+/// (`! true | false` is legal, `true | ! false` is a syntax error), so a bang
+/// in any later stage is rejected here.  The removed words never reach the
+/// executor as an external command; the parity is stored on `Pipeline::negate`
+/// and applied after PIPESTATUS has been written.
+fn is_bang_token(token: &Token) -> bool {
+    match token {
+        Token::Word(parts) => is_plain_text(parts) && plain_text(parts) == "!",
+        Token::Reserved(name, _) => name == "!",
+        _ => false,
+    }
+}
+
+fn take_stage_bang(stage: &mut Vec<Token>, first_stage: bool) -> Result<bool> {
+    let mut negate = false;
+    while stage.first().map(is_bang_token).unwrap_or(false) {
+        stage.remove(0);
+        negate = !negate;
+    }
+    if negate && !first_stage {
+        return Err(WashError::syntax("syntax error near unexpected token `!'"));
+    }
+    Ok(negate)
+}
+
 /// True when `stage` is exactly the bare word `coproc` (a reserved word that
 /// requires a command to follow it; bash rejects `coproc ;` and a trailing
 /// `coproc` with a syntax error).
@@ -1709,6 +1763,33 @@ fn is_bare_coproc(stage: &[Token]) -> bool {
         Token::Word(parts) => is_plain_text(parts) && plain_text(parts) == "coproc",
         _ => false,
     }
+}
+
+/// Mark unquoted `!` words in command position as reserved tokens before
+/// compound extraction, so `! ( LIST )` / `! { LIST; }` / `! if ...` still
+/// have their opener recognised as a compound.  `at_command_position` treats
+/// a reserved token as "a command may start here", and `parse_compounds`
+/// passes the bang through untouched; the stage-level stripper later removes
+/// it and records the parity on `Pipeline::negate`.  `echo !` keeps its
+/// literal argument because it is not in command position.
+fn mark_command_bangs(tokens: &[Token]) -> Vec<Token> {
+    let mut out: Vec<Token> = Vec::with_capacity(tokens.len());
+    let mut command_start = true;
+    for token in tokens {
+        if command_start && is_bang_token(token) {
+            out.push(Token::Reserved("!".to_string(), 1));
+            command_start = true;
+            continue;
+        }
+        command_start = match token {
+            Token::Semicolon(_) | Token::Pipe | Token::AndAnd | Token::OrOr
+            | Token::Background(_) => true,
+            Token::Word(parts) if as_assignment(parts).is_some() => command_start,
+            _ => false,
+        };
+        out.push(token.clone());
+    }
+    out
 }
 
 pub fn parse_command_list(tokens: &[Token]) -> Result<CommandList> {
@@ -1723,7 +1804,11 @@ pub fn parse_command_list(tokens: &[Token]) -> Result<CommandList> {
     }
     // bash treats reserved words inside `name=( ... )` as literal array
     // elements; rewrite them before compound extraction would reject them.
-    let tokens = &literalize_array_reserved(tokens)[..];
+    // Bang marking must precede compound extraction so `! ( ... )` still
+    // parses as a negated subshell.
+    let literalized = literalize_array_reserved(tokens);
+    let marked = mark_command_bangs(&literalized);
+    let tokens = &marked[..];
     // Extract compounds + function definitions first: each becomes a single
     // token that carries the parsed branches.
     let (tokens, funcs) = parse_compounds(tokens)?;
@@ -1732,6 +1817,9 @@ pub fn parse_command_list(tokens: &[Token]) -> Result<CommandList> {
     let mut ops: Vec<AndOrOp> = Vec::new();
     let mut current_cmds: Vec<SimpleCommand> = Vec::new();
     let mut stage: Vec<Token> = Vec::new();
+    // Parity of the `!` reserved words seen at the start of this pipeline.
+    // Reset when the pipeline is emitted, so `&&` / `;` chains stay independent.
+    let mut pipeline_negate = false;
     // True directly after a `|`: bash requires a command there (`a | | b`
     // and `a | ; b` are syntax errors near the offending token).
     let mut after_pipe = false;
@@ -1753,6 +1841,8 @@ pub fn parse_command_list(tokens: &[Token]) -> Result<CommandList> {
                         ));
                     }
                 } else {
+                    let bang = take_stage_bang(&mut stage, current_cmds.is_empty())?;
+                    pipeline_negate ^= bang;
                     current_cmds.push(parse_simple(&stage)?);
                     stage.clear();
                 }
@@ -1768,12 +1858,15 @@ pub fn parse_command_list(tokens: &[Token]) -> Result<CommandList> {
                     )));
                 }
                 if !stage.is_empty() {
+                    let bang = take_stage_bang(&mut stage, current_cmds.is_empty())?;
+                    pipeline_negate ^= bang;
                     current_cmds.push(parse_simple(&stage)?);
                     stage.clear();
                 }
                 if !current_cmds.is_empty() {
                     pipelines.push(Pipeline {
                         commands: std::mem::take(&mut current_cmds),
+                        negate: std::mem::take(&mut pipeline_negate),
                         background: false,
                         raw: None,
                     });
@@ -1818,18 +1911,22 @@ pub fn parse_command_list(tokens: &[Token]) -> Result<CommandList> {
                         "syntax error near unexpected token `;'",
                     ));
                 }
+                let mut had_bang = false;
                 if !stage.is_empty() {
                     if is_bare_coproc(&stage) {
                         return Err(WashError::syntax(
                             "syntax error near unexpected token `;'",
                         ));
                     }
+                    had_bang = take_stage_bang(&mut stage, current_cmds.is_empty())?;
                     current_cmds.push(parse_simple(&stage)?);
                     stage.clear();
                 }
+                pipeline_negate ^= had_bang;
                 if !current_cmds.is_empty() {
                     pipelines.push(Pipeline {
                         commands: std::mem::take(&mut current_cmds),
+                        negate: std::mem::take(&mut pipeline_negate),
                         background: false,
                         raw: None,
                     });
@@ -1844,23 +1941,38 @@ pub fn parse_command_list(tokens: &[Token]) -> Result<CommandList> {
                         "syntax error near unexpected token `&'",
                     ));
                 }
+                let mut had_bang = false;
                 if !stage.is_empty() {
                     if is_bare_coproc(&stage) {
                         return Err(WashError::syntax(
                             "syntax error near unexpected token `&'",
                         ));
                     }
+                    had_bang = take_stage_bang(&mut stage, current_cmds.is_empty())?;
                     current_cmds.push(parse_simple(&stage)?);
                     stage.clear();
                 }
+                pipeline_negate ^= had_bang;
+                // A trailing `&` after an AND-OR list backgrounds the WHOLE
+                // list (`false && sleep 5 &` is one job), not only its final
+                // pipeline.  A lone pipeline keeps the existing per-pipeline
+                // background path so its job bookkeeping is unchanged.
+                let whole_andor = !pipelines.is_empty();
                 if !current_cmds.is_empty() {
                     pipelines.push(Pipeline {
                         commands: std::mem::take(&mut current_cmds),
-                        background: true,
-                        raw: Some(raw.clone()),
+                        negate: std::mem::take(&mut pipeline_negate),
+                        background: !whole_andor,
+                        raw: if whole_andor { None } else { Some(raw.clone()) },
                     });
                 }
                 flush_andor(&mut andors, &mut pipelines, &mut ops)?;
+                if whole_andor {
+                    if let Some(andor) = andors.last_mut() {
+                        andor.background = true;
+                        andor.raw = Some(raw.clone());
+                    }
+                }
                 after_pipe = false;
                 last_was_funcdef = false;
             }
@@ -1868,13 +1980,17 @@ pub fn parse_command_list(tokens: &[Token]) -> Result<CommandList> {
             // it produces no executable, so it is skipped here.
             Token::FunctionDef(_) => {
                 last_was_funcdef = true;
+                let mut had_bang = false;
                 if !stage.is_empty() {
+                    had_bang = take_stage_bang(&mut stage, current_cmds.is_empty())?;
                     current_cmds.push(parse_simple(&stage)?);
                     stage.clear();
                 }
+                pipeline_negate ^= had_bang;
                 if !current_cmds.is_empty() {
                     pipelines.push(Pipeline {
                         commands: std::mem::take(&mut current_cmds),
+                        negate: std::mem::take(&mut pipeline_negate),
                         background: false,
                         raw: None,
                     });
@@ -1894,17 +2010,21 @@ pub fn parse_command_list(tokens: &[Token]) -> Result<CommandList> {
         return Err(WashError::syntax("syntax error near unexpected token `newline'"));
     }
 
+    let mut had_bang = false;
     if !stage.is_empty() {
         if is_bare_coproc(&stage) {
             return Err(WashError::syntax(
                 "syntax error near unexpected token `newline'",
             ));
         }
+        had_bang = take_stage_bang(&mut stage, current_cmds.is_empty())?;
         current_cmds.push(parse_simple(&stage)?);
     }
+    pipeline_negate ^= had_bang;
     if !current_cmds.is_empty() {
         pipelines.push(Pipeline {
             commands: current_cmds,
+            negate: pipeline_negate,
             background: false,
             raw: None,
         });
@@ -1950,6 +2070,8 @@ fn flush_andor(
     andors.push(AndOr {
         pipelines: std::mem::take(pipelines),
         ops: std::mem::take(ops),
+        background: false,
+        raw: None,
     });
     Ok(())
 }
@@ -2066,6 +2188,63 @@ fn is_array_assignment_head(parts: &[WordPart], tokens: &[Token], i: usize) -> b
     false
 }
 
+/// Split one element word of `name=( ... )` into an optional `[subscript]`
+/// word and the value word.  bash only treats a leading unquoted `[k]=` as an
+/// index; every other word (including `a[b]=c` embedded mid-word) is a plain
+/// element.  The subscript is kept as `WordPart`s so `$i` / arithmetic
+/// subscripts can still be expanded at execution time.
+fn parse_array_element(parts: &[WordPart]) -> ArrayElementWord {
+    let starts_index = matches!(
+        parts.first(),
+        Some(WordPart::Text(t, false)) if t.starts_with('[')
+    );
+    if !starts_index {
+        return (None, parts.to_vec());
+    }
+    let mut acc: Vec<WordPart> = Vec::new();
+    for (i, part) in parts.iter().enumerate() {
+        let text = match part {
+            WordPart::Text(t, false) => t,
+            _ => {
+                acc.push(part.clone());
+                continue;
+            }
+        };
+        if let Some(pos) = text.find(']') {
+            if text.as_bytes().get(pos + 1) == Some(&b'=') {
+                // Store just the subscript expression: `[3]=y` -> `3`,
+                // `[$i]=y` -> `$i`.  The executor expands it and then parses
+                // (or arith-evaluates) the resulting string.
+                let mut index = acc.clone();
+                if index.is_empty() {
+                    let inner = text[..pos].strip_prefix('[').unwrap_or(&text[..pos]);
+                    if !inner.is_empty() {
+                        index.push(WordPart::Text(inner.to_string(), false));
+                    }
+                } else {
+                    if let Some(WordPart::Text(t, false)) = index.first_mut() {
+                        if let Some(rest) = t.strip_prefix('[') {
+                            *t = rest.to_string();
+                        }
+                    }
+                    index.retain(|p| !matches!(p, WordPart::Text(t, false) if t.is_empty()));
+                    if pos > 0 {
+                        index.push(WordPart::Text(text[..pos].to_string(), false));
+                    }
+                }
+                let mut value = Vec::new();
+                if pos + 2 < text.len() {
+                    value.push(WordPart::Text(text[pos + 2..].to_string(), false));
+                }
+                value.extend(parts[i + 1..].iter().cloned());
+                return (Some(index), value);
+            }
+        }
+        acc.push(part.clone());
+    }
+    (None, parts.to_vec())
+}
+
 /// Parse an array assignment `name=( ... )` whose `name=` token is at index
 /// `*i`. Advances `*i` to the closing `)` and returns the array name together
 /// with its element words (each element is itself a list of `WordPart`s, so it
@@ -2074,7 +2253,7 @@ fn is_array_assignment_head(parts: &[WordPart], tokens: &[Token], i: usize) -> b
 fn parse_array_assignment(
     tokens: &[Token],
     i: &mut usize,
-) -> Option<(String, Vec<Vec<WordPart>>, bool)> {
+) -> Option<(String, Vec<ArrayElementWord>, bool)> {
     let head = match &tokens[*i] {
         Token::Word(p) => p,
         _ => return None,
@@ -2086,13 +2265,13 @@ fn parse_array_assignment(
         _ => return None,
     }
     let mut j = *i + 2; // skip `name=` and `(`
-    let mut elems: Vec<Vec<WordPart>> = Vec::new();
+    let mut elems: Vec<ArrayElementWord> = Vec::new();
     let mut depth: i32 = 1;
     while j < tokens.len() {
         match &tokens[j] {
             Token::Word(p) if is_plain_text(p) && plain_text(p) == "(" => {
                 depth += 1;
-                elems.push(p.clone());
+                elems.push(parse_array_element(p));
             }
             Token::Word(p) if is_plain_text(p) && plain_text(p) == ")" => {
                 depth -= 1;
@@ -2100,9 +2279,9 @@ fn parse_array_assignment(
                     *i = j;
                     return Some((name, elems, append));
                 }
-                elems.push(p.clone());
+                elems.push(parse_array_element(p));
             }
-            Token::Word(p) => elems.push(p.clone()),
+            Token::Word(p) => elems.push(parse_array_element(p)),
             // Reserved words / compounds / operators are not valid array
             // elements; skip them so the scan keeps looking for the closing `)`.
             _ => {}
@@ -2315,7 +2494,7 @@ fn parse_simple(tokens: &[Token]) -> Result<SimpleCommand> {
                     name
                 )));
             }
-            Token::Redirect { kind, fd, heredoc } => {
+            Token::Redirect { kind, fd, heredoc, dup_raw } => {
                 // Every redirection operator consumes a word.  A missing one
                 // is reported against the token that actually follows the
                 // operator (`newline` at end of input, `;`, `|`, ...), the
@@ -2375,6 +2554,7 @@ fn parse_simple(tokens: &[Token]) -> Result<SimpleCommand> {
                     RedirKind::Dup => redirs.push(Redir::Dup {
                         fd: fd.unwrap_or(1),
                         file,
+                        raw_word: dup_raw.clone(),
                     }),
                 }
                 i += 2;

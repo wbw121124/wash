@@ -139,6 +139,11 @@ pub struct ExpandCtx<'a> {
     /// the assignments are collected here and written back to the shell by
     /// the executor once the expansion is done.
     pub pending_assign: Option<&'a RefCell<Vec<(String, String)>>>,
+    /// Immediate view of `${var:=word}` / `${var=word}` assignments made
+    /// earlier in the SAME command line.  `pending_assign` only reaches
+    /// `sh.env` after the whole command is expanded, but bash makes the new
+    /// value visible to later words right away (like `$(( x++ ))`).
+    pub assign_overlay: Option<&'a RefCell<HashMap<String, String>>>,
     /// Variables assigned by arithmetic expansions earlier on the same
     /// command line.  bash applies `$(( x++ ))` immediately, so a later
     /// `$x` in the *same* command sees the incremented value even though
@@ -221,6 +226,78 @@ pub fn expand_scalar(parts: &[WordPart], ctx: &ExpandCtx) -> String {
         }
     }
     out
+}
+
+/// Sentinel for the SYNTACTIC `/` separator of `${v/pat/repl}`.  It keeps a
+/// slash produced by `$x` from being mistaken for the separator after the
+/// word has been expanded (`x=/; ${v//$x/-}` must replace with `/`, not
+/// produce an empty pattern).
+const PARAM_REPL_SEP: char = '\u{e000}';
+
+/// Expand the word of a parameter operator exactly once, as bash does before
+/// applying `${v:-word}` / `${a[@]/pat/repl}` / ...  The raw source word is
+/// scanned into `WordPart`s (quote removal included) and then expanded with
+/// the same scalar path as an assignment RHS, so nested `$x`, `$(cmd)` and
+/// `$((expr))` all fire while the result is never word-split or globbed.
+fn expand_op_arg(src: &str, op: &str, ctx: &ExpandCtx) -> String {
+    if src.is_empty() {
+        return String::new();
+    }
+    // Pattern operators keep backslashes: they escape pattern metacharacters
+    // and the `/` separator, and are interpreted by `unescape_pattern` /
+    // `expand_replacement` AFTER this expansion step.  The generic word
+    // scanner would otherwise consume them as quote-removal escapes.  Double
+    // only those backslashes so the scanner emits one literal backslash.
+    let prepared = if matches!(op, "/" | "//" | "#" | "##" | "%" | "%%") {
+        let chars: Vec<char> = src.chars().collect();
+        // First mark the syntactic separator (unescaped `/` for `/` / `//`)
+        // so an expanded `$x` containing `/` stays part of the pattern.
+        let mut marked = String::new();
+        let mut i = 0usize;
+        let mut sep_marked = false;
+        while i < chars.len() {
+            if chars[i] == '\\' && i + 1 < chars.len() {
+                marked.push(chars[i]);
+                marked.push(chars[i + 1]);
+                i += 2;
+            } else {
+                // Only the FIRST unescaped `/` is the syntactic separator;
+                // later ones belong to the replacement (`${v/a/b/c}`).
+                if !sep_marked && chars[i] == '/' && matches!(op, "/" | "//") {
+                    marked.push(PARAM_REPL_SEP);
+                    sep_marked = true;
+                } else {
+                    marked.push(chars[i]);
+                }
+                i += 1;
+            }
+        }
+        // Then preserve pattern/replacement escapes through the word
+        // scanner (it would otherwise treat them as quote removal).
+        let chars: Vec<char> = marked.chars().collect();
+        let mut out = String::new();
+        let mut i = 0usize;
+        while i < chars.len() {
+            if chars[i] == '\\'
+                && i + 1 < chars.len()
+                && matches!(chars[i + 1], '/' | '\\' | '*' | '?' | '[' | ']' | '&' | '#' | '%')
+            {
+                out.push('\\');
+                out.push('\\');
+                out.push(chars[i + 1]);
+                i += 2;
+            } else {
+                out.push(chars[i]);
+                i += 1;
+            }
+        }
+        out
+    } else {
+        src.to_string()
+    };
+    let chars: Vec<char> = prepared.chars().collect();
+    let parts = crate::lexer::read_parameter_word(&chars);
+    expand_scalar(&parts, ctx)
 }
 
 /// Expand a here-document body the way bash does for an unquoted delimiter:
@@ -833,13 +910,7 @@ fn eval_braced(body: &str, ctx: &ExpandCtx) -> Expansion {
                 Expansion::Scalar(n.to_string())
             }
                 _ => {
-                    let idx = subscript.parse::<i64>().ok().or_else(|| {
-                        crate::arith::eval(
-                            subscript,
-                            &mut crate::arith::ReadOnlyEnv { vars: ctx.env },
-                        )
-                        .ok()
-                    });
+                    let idx = resolve_array_index(subscript, ctx);
                     let len = match (elems, idx) {
                         (Some(e), Some(i)) if i >= 0 && (i as usize) < e.len() => {
                             crate::byteval::decoded_len(&e[i as usize])
@@ -963,7 +1034,13 @@ fn eval_braced(body: &str, ctx: &ExpandCtx) -> Expansion {
         };
     }
 
-    let (rawname, op, arg) = split_braced(body);
+    let (rawname, op, arg_src) = split_braced(body);
+    // bash expands the operator's word before using it as a default value,
+    // alternate value, error message, pattern or replacement.  Keep `arg` a
+    // `&str` so every downstream helper (including the array path) sees the
+    // expanded text without further changes.
+    let arg_expanded = expand_op_arg(arg_src, op, ctx);
+    let arg = arg_expanded.as_str();
 
     // Numeric names are positional parameters (`${1}`, `${10}`, `${0}`), not
     // environment variables.  Route them through the same resolver used by
@@ -1080,13 +1157,7 @@ fn eval_braced(body: &str, ctx: &ExpandCtx) -> Expansion {
                 // An indexed subscript is an arithmetic expression, so a
                 // symbolic name (`a[key]`) evaluates the same way bash does
                 // (an unbound variable evaluates to 0).
-                let idx = subscript.parse::<i64>().ok().or_else(|| {
-                    crate::arith::eval(
-                        subscript,
-                        &mut crate::arith::ReadOnlyEnv { vars: ctx.env },
-                    )
-                    .ok()
-                });
+                let idx = resolve_array_index(subscript, ctx);
                 let val = match idx {
                     Some(i) if i >= 0 && (i as usize) < elems.len() => {
                         elems[i as usize].clone()
@@ -1202,6 +1273,43 @@ fn eval_offset(expr: &str, ctx: &ExpandCtx) -> Option<i64> {
     crate::arith::eval(s, &mut env).ok()
 }
 
+/// Resolve an indexed-array subscript.  bash evaluates it as an arithmetic
+/// expression, so `$i`, bare `i` and `i+1` all work; the length path already
+/// did this, but the element-read path only parsed literals.  A leading `$`
+/// is resolved through `expand_env_get` so same-command `${i:=3}` overlays
+/// are honoured too.
+fn resolve_array_index(subscript: &str, ctx: &ExpandCtx) -> Option<i64> {
+    let src = subscript.trim();
+    if let Ok(n) = src.parse::<i64>() {
+        return Some(n);
+    }
+    let expr = if let Some(name) = src.strip_prefix('$') {
+        if is_valid_name(name) {
+            expand_env_get(ctx, name).unwrap_or_default()
+        } else {
+            src.to_string()
+        }
+    } else {
+        src.to_string()
+    };
+    if expr.is_empty() {
+        // `$i` where `i` is unset expands to nothing; in arithmetic context
+        // bash treats that as 0 (`${a[$i]}` reads element 0).
+        return Some(0);
+    }
+    if let Ok(n) = expr.parse::<i64>() {
+        return Some(n);
+    }
+    // Use the same arithmetic environment as `eval_arith`: it resolves bare
+    // variable names (`i+1`) and honours same-command overlays, which the
+    // plain `ReadOnlyEnv` used by the old length path could not do.
+    let mut env = ArithCtx {
+        ctx,
+        assigned: RefCell::new(HashMap::new()),
+    };
+    crate::arith::eval(&expr, &mut env).ok()
+}
+
 /// Slice a list of fields for `${a[@]:off:len}` / `${@:off:len}`.
 /// A negative offset counts back from the end.  A negative *length* is a
 /// fatal error for a list slice in bash (`substring expression < 0`), which
@@ -1245,6 +1353,21 @@ fn array_word_op(
     arg: &str,
     ctx: &ExpandCtx,
 ) -> Option<Expansion> {
+    // bash applies `${arr[@]/pat/repl}` element by element, keeping one field
+    // per array element (`@`) or joining them with IFS (`*`).  The scalar
+    // path already implements the pattern engine; reuse it verbatim.
+    if op == "/" || op == "//" {
+        let all = op == "//";
+        let fields: Vec<String> = elems
+            .iter()
+            .map(|e| replace_pattern(e, arg, all))
+            .collect();
+        return Some(if subscript == "@" {
+            Expansion::At(fields)
+        } else {
+            Expansion::Star(fields)
+        });
+    }
     let joined = if subscript == "@" {
         elems.join(" ")
     } else {
@@ -1386,11 +1509,23 @@ fn assign_default(ctx: &ExpandCtx, name: &str, value: &str) {
     if let Some(cell) = &ctx.pending_assign {
         cell.borrow_mut().push((name.to_string(), value.to_string()));
     }
+    // Same-command visibility: later `$name` words read this overlay even
+    // though the executor has not yet written back to `sh.env`.
+    if let Some(overlay) = &ctx.assign_overlay {
+        overlay
+            .borrow_mut()
+            .insert(name.to_string(), value.to_string());
+    }
 }
 
 /// Read a scalar variable during expansion, honouring assignments made by
 /// earlier `$(( ... ))` expansions on this command line.
 fn expand_env_get(ctx: &ExpandCtx, name: &str) -> Option<String> {
+    if let Some(overlay) = &ctx.assign_overlay {
+        if let Some(value) = overlay.borrow().get(name) {
+            return Some(value.clone());
+        }
+    }
     if let Some(overlay) = &ctx.arith_overlay {
         if let Some(value) = overlay.borrow().get(name) {
             return Some(value.clone());
@@ -1402,6 +1537,11 @@ fn expand_env_get(ctx: &ExpandCtx, name: &str) -> Option<String> {
 /// Whether a scalar variable is set during expansion, including values
 /// introduced by an earlier arithmetic assignment on this command line.
 fn expand_env_contains(ctx: &ExpandCtx, name: &str) -> bool {
+    if let Some(overlay) = &ctx.assign_overlay {
+        if overlay.borrow().contains_key(name) {
+            return true;
+        }
+    }
     if let Some(overlay) = &ctx.arith_overlay {
         if overlay.borrow().contains_key(name) {
             return true;
@@ -1419,8 +1559,34 @@ fn expansion_error(name: &str, word: &str) -> String {
 
 fn split_braced(body: &str) -> (&str, &str, &str) {
     // Find the first operator at top level. Two-char operators take priority.
+    // Operator characters inside an array subscript (`${a[i+1]}`, `${a[-1]}`)
+    // belong to the arithmetic expression, not to the parameter operator, so
+    // they are skipped while bracket depth is nonzero.
     let b = body.as_bytes();
+    let mut bracket_depth = 0usize;
+    let mut escaped = false;
     for (i, &ch) in b.iter().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == b'\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == b'[' {
+            bracket_depth += 1;
+            continue;
+        }
+        if ch == b']' {
+            if bracket_depth > 0 {
+                bracket_depth -= 1;
+            }
+            continue;
+        }
+        if bracket_depth > 0 {
+            continue;
+        }
         match ch as char {
             ':' => {
                 let nxt = b.get(i + 1).copied().map(|c| c as char);
@@ -1566,20 +1732,25 @@ fn strip_suffix(value: &str, pat: &str, longest: bool) -> String {
     crate::byteval::encode_raw(&chars_as_bytes(&chars))
 }
 
-/// Split the `pattern/replacement` argument of `${v/pat/rep}`.  A `/` escaped
-/// with a backslash belongs to the pattern (`${v/\//-}`), so only an
-/// unescaped slash separates the two halves.  With no slash at all bash
-/// deletes the matches.
+/// Split the `pattern/replacement` argument of `${v/pat/rep}`.  Every caller
+/// passes the word after `expand_op_arg`, which has already converted the one
+/// *syntactic* separator (an unescaped `/` in the operator's word) into
+/// `PARAM_REPL_SEP`.  Any plain `/` left in the string is therefore a real
+/// slash — either backslash-escaped (`${v/\//-}`) or produced by expansion
+/// (`x=/; ${v//$x/-}`) — and belongs to the pattern or replacement, so it
+/// must NOT split here.  With no separator at all bash deletes the matches.
 fn split_replacement(arg: &str) -> (&str, &str) {
-    let b = arg.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'\\' && i + 1 < b.len() {
+    let chars: Vec<char> = arg.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] == '\\' && i + 1 < chars.len() {
             i += 2;
             continue;
         }
-        if b[i] == b'/' {
-            return (&arg[..i], &arg[i + 1..]);
+        if chars[i] == PARAM_REPL_SEP {
+            let pos: usize = chars[..i].iter().map(|c| c.len_utf8()).sum();
+            let sep_len = chars[i].len_utf8();
+            return (&arg[..pos], &arg[pos + sep_len..]);
         }
         i += 1;
     }
